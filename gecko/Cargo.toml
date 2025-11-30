@@ -1,0 +1,53 @@
+[package]
+name = "geckoOS-gecko-integration"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Gecko embedding
+geckoview = "110.0"  # Latest stable Gecko
+servo-angle = "0.1"
+# Wayland client
+wayland-client = "0.30"
+wayland-protocols = { version = "0.31", features = ["client"] }
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# IPC & communication
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Graphics
+gl = "0.14"
+glutin = { version = "0.31", features = ["wayland"] }
+# JavaScript interop
+neon = { version = "0.10", features = ["default"] }
+# Storage
+rusqlite = { version = "0.30", features = ["bundled"] }
+# Concurrency
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+chrono = "0.4"
+wayland-client = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[lib]
+name = "geckoOS_gecko_integration"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gecko-shell"
+path = "bin/gecko-shell.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

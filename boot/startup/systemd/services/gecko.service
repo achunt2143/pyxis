@@ -1,0 +1,19 @@
+[Unit]
+Description=GECKO Firefox/Gecko Integration
+Documentation=man:gecko(1)
+After=cronus.service echo.service
+Requires=cronus.service echo.service
+
+[Service]
+Type=simple
+ExecStart=/opt/geckoOS/bin/gecko
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gecko
+User=geckouser
+Group=geckouser
+
+[Install]
+WantedBy=multi-user.target

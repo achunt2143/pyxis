@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: GeckoOS Gecko Integration
+Description: Firefox/Gecko engine integration layer for GeckoOS desktop
+Version: @PROJECT_VERSION@
+Requires: dbus-1 libwebsockets
+Libs: -L${libdir} -lgecko
+Cflags: -I${includedir}/geckoOS/gecko

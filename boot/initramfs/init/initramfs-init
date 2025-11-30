@@ -1,0 +1,250 @@
+#!/bin/sh
+# ============================================================================
+# GeckoOS Initial RAM Filesystem (initramfs) Init Script
+# Runs as PID 1 during early boot
+# Mounts root filesystem and transitions to real system init
+# ============================================================================
+
+set -e
+
+# ============================================================================
+# EARLY BOOT SETUP
+# ============================================================================
+
+echo "========================================="
+echo "GeckoOS Initramfs Init"
+echo "========================================="
+
+# Mount virtual filesystems needed for boot
+echo "[INIT] Mounting virtual filesystems..."
+mount -t devtmpfs -o size=10M,nr_inodes=250k,mode=0755 udev /dev 2>/dev/null || true
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
+mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup
+
+# Create essential device nodes if they don't exist
+echo "[INIT] Creating essential device nodes..."
+[ -e /dev/console ] || mknod /dev/console c 5 1
+[ -e /dev/null ] || mknod /dev/null c 1 3
+[ -e /dev/zero ] || mknod /dev/zero c 1 5
+[ -e /dev/random ] || mknod /dev/random c 1 8
+[ -e /dev/urandom ] || mknod /dev/urandom c 1 9
+[ -e /dev/tty ] || mknod /dev/tty c 5 0
+[ -e /dev/tty0 ] || mknod /dev/tty0 c 4 0
+[ -e /dev/tty1 ] || mknod /dev/tty1 c 4 1
+[ -e /dev/mem ] || mknod /dev/mem c 1 1
+[ -e /dev/kmem ] || mknod /dev/kmem c 1 2
+
+# Create /dev directories
+mkdir -p /dev/shm
+mkdir -p /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t devpts -o gid=5,mode=620 devpts /dev/pts
+
+# ============================================================================
+# KERNEL MODULE LOADING
+# ============================================================================
+
+echo "[INIT] Loading kernel modules..."
+
+# Function to load module safely
+load_module() {
+    local module=$1
+    if [ -f "/lib/modules/$(uname -r)/$module" ] || modinfo "$module" >/dev/null 2>&1; then
+        echo "[INIT] Loading module: $module"
+        modprobe "$module" 2>/dev/null || echo "[WARN] Failed to load $module"
+    fi
+}
+
+# Load graphics modules
+echo "[INIT] Loading graphics modules..."
+load_module i915
+load_module nouveau
+load_module amdgpu
+load_module radeon
+load_module mgag200
+load_module cirrus
+
+# Load input modules
+echo "[INIT] Loading input modules..."
+load_module usbhid
+load_module evdev
+load_module psmouse
+load_module atkbd
+
+# Load USB modules
+echo "[INIT] Loading USB modules..."
+load_module usbcore
+load_module ehci_pci
+load_module xhci_pci
+load_module uas
+load_module usb_storage
+
+# Load audio modules
+echo "[INIT] Loading audio modules..."
+load_module snd
+load_module snd_hda_intel
+load_module snd_usb_audio
+
+# Load filesystem modules
+echo "[INIT] Loading filesystem modules..."
+load_module ext4
+load_module iso9660
+load_module vfat
+load_module ntfs3
+
+# ============================================================================
+# ROOT FILESYSTEM DETECTION AND MOUNTING
+# ============================================================================
+
+echo "[INIT] Detecting and mounting root filesystem..."
+
+# Detect root device
+ROOT_DEVICE=""
+ROOT_FSTYPE=""
+
+# Try LABEL first
+if [ -z "$ROOT_DEVICE" ]; then
+    ROOT_DEVICE=$(blkid -L geckoOS 2>/dev/null || echo "")
+    ROOT_FSTYPE="ext4"
+fi
+
+# Try UUID next
+if [ -z "$ROOT_DEVICE" ]; then
+    ROOT_DEVICE=$(blkid -U "$(echo $ROOT_UUID 2>/dev/null)" 2>/dev/null || echo "")
+    ROOT_FSTYPE="ext4"
+fi
+
+# Fallback to /dev/vda or /dev/sda
+if [ -z "$ROOT_DEVICE" ]; then
+    if [ -b /dev/vda1 ]; then
+        ROOT_DEVICE="/dev/vda1"
+    elif [ -b /dev/sda1 ]; then
+        ROOT_DEVICE="/dev/sda1"
+    elif [ -b /dev/nvme0n1p1 ]; then
+        ROOT_DEVICE="/dev/nvme0n1p1"
+    fi
+    ROOT_FSTYPE="ext4"
+fi
+
+# Attempt to mount root filesystem
+if [ -n "$ROOT_DEVICE" ]; then
+    echo "[INIT] Root device: $ROOT_DEVICE"
+    echo "[INIT] Root filesystem type: $ROOT_FSTYPE"
+    
+    # Wait for device to appear
+    echo "[INIT] Waiting for device..."
+    COUNT=0
+    while [ ! -e "$ROOT_DEVICE" ] && [ $COUNT -lt 30 ]; do
+        sleep 1
+        COUNT=$((COUNT + 1))
+    done
+    
+    if [ -e "$ROOT_DEVICE" ]; then
+        echo "[INIT] Mounting root filesystem..."
+        mkdir -p /newroot
+        
+        if mount -t "$ROOT_FSTYPE" -o ro "$ROOT_DEVICE" /newroot; then
+            echo "[INIT] Root filesystem mounted successfully"
+        else
+            echo "[ERROR] Failed to mount root filesystem!"
+            echo "[ERROR] Device: $ROOT_DEVICE"
+            echo "[ERROR] Filesystem: $ROOT_FSTYPE"
+            echo "[INIT] Dropping to rescue shell..."
+            sh -i
+            exit 1
+        fi
+    else
+        echo "[ERROR] Root device not found: $ROOT_DEVICE"
+        echo "[INIT] Dropping to rescue shell..."
+        sh -i
+        exit 1
+    fi
+else
+    echo "[ERROR] Could not detect root device"
+    echo "[INIT] Dropping to rescue shell..."
+    sh -i
+    exit 1
+fi
+
+# ============================================================================
+# MOUNTING ESSENTIAL FILESYSTEMS ON NEW ROOT
+# ============================================================================
+
+echo "[INIT] Mounting essential filesystems on new root..."
+
+# Verify required directories exist
+for dir in /newroot/proc /newroot/sys /newroot/dev /newroot/run; do
+    mkdir -p "$dir"
+done
+
+# Mount proc and sys on new root
+mount -t proc -o nosuid,nodev,noexec proc /newroot/proc 2>/dev/null || true
+mount -t sysfs -o nosuid,nodev,noexec sysfs /newroot/sys 2>/dev/null || true
+mount -o bind /dev /newroot/dev 2>/dev/null || true
+mount -o bind /run /newroot/run 2>/dev/null || true
+
+# ============================================================================
+# SWITCH TO NEW ROOT FILESYSTEM
+# ============================================================================
+
+echo "[INIT] Preparing to switch to new root filesystem..."
+
+# Check if real init exists
+if [ -x /newroot/bin/sh ]; then
+    echo "[INIT] Switching to real root filesystem..."
+    
+    # Clean up mount points
+    umount /proc
+    umount /sys
+    umount /dev/shm 2>/dev/null || true
+    umount /dev/pts 2>/dev/null || true
+    
+    # Switch to new root
+    cd /newroot
+    
+    # Use pivot_root if available, otherwise use chroot
+    if command -v pivot_root >/dev/null 2>&1; then
+        echo "[INIT] Using pivot_root..."
+        mkdir -p /newroot/oldroot
+        pivot_root /newroot /newroot/oldroot 2>/dev/null || chroot /newroot
+        umount -l /oldroot 2>/dev/null || true
+    else
+        echo "[INIT] Using chroot..."
+        chroot /newroot
+    fi
+    
+    # Execute real init
+    if [ -x /sbin/init ]; then
+        echo "[INIT] Executing /sbin/init"
+        exec /sbin/init "$@"
+    elif [ -x /lib/systemd/systemd ]; then
+        echo "[INIT] Executing systemd"
+        exec /lib/systemd/systemd "$@"
+    elif [ -x /bin/init ]; then
+        echo "[INIT] Executing /bin/init"
+        exec /bin/init "$@"
+    elif [ -x /sbin/busybox init ]; then
+        echo "[INIT] Executing busybox init"
+        exec /sbin/busybox init "$@"
+    else
+        echo "[ERROR] No init found on root filesystem"
+        echo "[INIT] Dropping to rescue shell..."
+        sh -i
+        exit 1
+    fi
+else
+    echo "[ERROR] /bin/sh not found on root filesystem"
+    echo "[INIT] Dropping to rescue shell..."
+    sh -i
+    exit 1
+fi
+
+# ============================================================================
+# EMERGENCY SHELL (should not reach here)
+# ============================================================================
+
+echo "[ERROR] Failed to initialize system"
+echo "[INIT] Starting emergency rescue shell..."
+sh -i
+exit 1

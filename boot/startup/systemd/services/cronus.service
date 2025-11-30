@@ -1,0 +1,18 @@
+[Unit]
+Description=CRONUS Process Manager
+Documentation=man:cronus(1)
+After=syslog.target
+
+[Service]
+Type=simple
+ExecStart=/opt/geckoOS/bin/cronus-daemon
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cronus
+User=root
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

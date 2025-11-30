@@ -1,0 +1,18 @@
+[Unit]
+Description=PERSEPHONE Linux Compatibility Layer
+Documentation=man:persephone(1)
+After=cronus.service echo.service
+Requires=cronus.service echo.service
+
+[Service]
+Type=simple
+ExecStart=/opt/geckoOS/bin/persephone-daemon
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=persephone
+User=root
+
+[Install]
+WantedBy=multi-user.target

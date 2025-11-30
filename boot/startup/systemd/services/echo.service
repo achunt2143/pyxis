@@ -1,0 +1,21 @@
+[Unit]
+Description=ECHO IPC Manager (DBus)
+Documentation=man:echo(1)
+After=cronus.service
+Requires=cronus.service
+Before=ouranos.service
+
+[Service]
+Type=simple
+ExecStart=/opt/geckoOS/bin/echo-daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=echo
+User=geckouser
+Group=geckouser
+Environment="DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket"
+
+[Install]
+WantedBy=multi-user.target

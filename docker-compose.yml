@@ -1,0 +1,181 @@
+version: '3.8'
+
+services:
+  # ========================================================================
+  # BUILD SERVICE: Full build pipeline
+  # Usage: docker-compose run build
+  # Runs complete build in isolated environment
+  # ========================================================================
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: geckoOS:latest
+    container_name: geckoOS-build
+    volumes:
+      # Source code mount (read-write for build)
+      - .:/build:rw
+      # Cargo cache (persistent across builds)
+      - geckoOS_cargo_cache:/home/builder/.cargo:rw
+      # NPM cache (persistent across builds)
+      - geckoOS_npm_cache:/home/builder/.npm:rw
+      # Build output
+      - ./target:/build/target:rw
+    environment:
+      # Rust configuration
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "1"
+      RUST_LOG: info
+      # Node.js configuration
+      NODE_ENV: development
+      # Build configuration
+      CI: "false"
+    working_dir: /build
+    command: ./scripts/build.sh all
+    user: builder
+    networks:
+      - geckoOS-network
+    # Resource limits (optional)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '4'
+    #       memory: 8G
+    #     reservations:
+    #       cpus: '2'
+    #       memory: 4G
+
+  # ========================================================================
+  # DEV SERVICE: Interactive development environment
+  # Usage: docker-compose run dev bash
+  # Mount volumes and provide interactive shell for debugging
+  # ========================================================================
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: geckoOS:latest
+    container_name: geckoOS-dev
+    volumes:
+      # Source code mount (read-write for development)
+      - .:/build:rw
+      # Cargo cache (persistent across sessions)
+      - geckoOS_cargo_cache:/home/builder/.cargo:rw
+      # NPM cache (persistent across sessions)
+      - geckoOS_npm_cache:/home/builder/.npm:rw
+      # Build output
+      - ./target:/build/target:rw
+    environment:
+      # Rust configuration
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "1"
+      RUST_LOG: debug
+      # Node.js configuration
+      NODE_ENV: development
+      # Development ports (if needed)
+      DEV_SERVER_PORT: "3000"
+    working_dir: /build
+    command: /bin/bash
+    user: builder
+    stdin_open: true
+    tty: true
+    networks:
+      - geckoOS-network
+    # Port mapping for development servers (if needed)
+    # ports:
+    #   - "3000:3000"  # Frontend dev server
+    #   - "8080:8080"  # API server
+    # Uncomment to keep running without command override
+    # stdin_open: true
+    # tty: true
+
+  # ========================================================================
+  # EMULATE SERVICE: Run in QEMU emulator
+  # Usage: docker-compose run emulate
+  # Runs built image in QEMU environment
+  # Requires --privileged for KVM access
+  # ========================================================================
+  emulate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: geckoOS:latest
+    container_name: geckoOS-emulate
+    volumes:
+      # Disk image location
+      - ./target/images:/var/geckoOS/images:ro
+      # Build scripts
+      - ./scripts:/opt/geckoOS/scripts:ro
+      # QEMU settings (optional)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    environment:
+      # QEMU configuration
+      QEMU_MEMORY: "2048"
+      QEMU_CPUS: "4"
+      QEMU_NET: "user"
+      # Display (if running graphically)
+      DISPLAY: ${DISPLAY:-}
+    working_dir: /opt/geckoOS
+    command: ./scripts/emulate.sh
+    # Privileged mode required for KVM acceleration
+    privileged: true
+    networks:
+      - geckoOS-network
+    # Only needed for graphical output
+    # environment:
+    #   DISPLAY: host.docker.internal:0
+
+# ============================================================================
+# VOLUMES: Named volumes for build cache persistence
+# These persist across container deletion and improve rebuild times
+# ============================================================================
+volumes:
+  # Cargo registry cache (~500MB)
+  # Persists downloaded Rust dependencies
+  geckoOS_cargo_cache:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+  # NPM package cache (~200MB)
+  # Persists downloaded npm packages
+  geckoOS_npm_cache:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+# ============================================================================
+# NETWORKS: Custom network for service communication
+# ============================================================================
+networks:
+  geckoOS-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ============================================================================
+# USAGE EXAMPLES
+# ============================================================================
+# Build Docker image:
+#   $ docker-compose build
+#
+# Run full build:
+#   $ docker-compose run build
+#
+# Interactive development:
+#   $ docker-compose run dev bash
+#   (inside container)
+#   $ make build
+#   $ make test
+#
+# View logs:
+#   $ docker-compose logs -f build
+#
+# Clean up:
+#   $ docker-compose down -v
+#
+# Run emulation:
+#   $ docker-compose run emulate

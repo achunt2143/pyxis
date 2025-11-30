@@ -1,0 +1,21 @@
+[Unit]
+Description=OURANOS Wayland Compositor
+Documentation=man:ouranos(1)
+After=echo.service cronus.service
+Requires=echo.service
+Before=geckoOS.service
+
+[Service]
+Type=simple
+ExecStart=/opt/geckoOS/bin/ouranos
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ouranos
+User=geckouser
+Group=geckouser
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+
+[Install]
+WantedBy=multi-user.target
