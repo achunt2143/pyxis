@@ -5,39 +5,36 @@ edition = "2021"
 
 [dependencies]
 # Gecko embedding
-geckoview = "110.0"  # Latest stable Gecko
-servo-angle = "0.1"
+#geckoview = "140.0"  # Latest stable Gecko
+#servo-angle = "0.1"
 # Wayland client
-wayland-client = "0.30"
-wayland-protocols = { version = "0.31", features = ["client"] }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["client"] }
+geckoOS-echo = { path = "../echo" }
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 # IPC & communication
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 # Error handling
-thiserror = "1.0"
-anyhow = "1.0"
+thiserror = { workspace = true }
+anyhow = { workspace = true }
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 # Graphics
-gl = "0.14"
-glutin = { version = "0.31", features = ["wayland"] }
+gl = { workspace = true }
+glutin = { workspace = true, features = ["wayland"] }
 # JavaScript interop
 neon = { version = "0.10", features = ["default"] }
 # Storage
 rusqlite = { version = "0.30", features = ["bundled"] }
 # Concurrency
-parking_lot = "0.12"
-crossbeam-channel = "0.5"
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
 # Utilities
-uuid = { version = "1.0", features = ["v4"] }
-chrono = "0.4"
-wayland-client = { workspace = true }
-anyhow = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+chrono = { workspace = true }
 
 [lib]
 name = "geckoOS_gecko_integration"
@@ -47,7 +44,3 @@ path = "src/lib.rs"
 name = "gecko-shell"
 path = "bin/gecko-shell.rs"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1

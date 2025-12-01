@@ -45,7 +45,7 @@ impl ServiceRegistry {
         let info = ServiceInfo {
             service_id: service_id.clone(),
             service_name: service_name.to_string(),
-            interface,
+            interface: interface.clone(),
             pid: None,
             registered_at: Utc::now().to_rfc3339(),
             owner_uid: None,
@@ -55,7 +55,7 @@ impl ServiceRegistry {
         self.services.insert(service_id.clone(), info);
         self.name_to_id.insert(service_name.to_string(), service_id.clone());
 
-        tracing::info!("Service registered: {} ({})", service_name, service_id);
+        tracing::info!("Service registered: {} ({})", service_name, service_id.clone());
         Ok(service_id)
     }
 

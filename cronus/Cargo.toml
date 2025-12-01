@@ -5,35 +5,33 @@ edition = "2021"
 
 [dependencies]
 # Process management
-nix = { version = "0.27", features = ["process", "signal"] }
-libc = "0.2"
+nix = { workspace = true, features = ["process", "signal"] }
+libc = { workspace = true }
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
+geckoOS-echo = { path = "../echo" }
 # Data structures
-dashmap = "5.5"
-parking_lot = "0.12"
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 # Errors
-thiserror = "1.0"
-anyhow = "1.0"
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# UUID and IDs
-uuid = { version = "1.0", features = ["v4"] }
-# Time handling
-chrono = "0.4"
-# Process utilities
-procfs = "0.15"
-# Concurrency
-crossbeam-channel = "0.5"
-# Math for resource limits
-num = "0.4"
+thiserror = { workspace = true }
 anyhow = { workspace = true }
+# Logging
 tracing = { workspace = true }
-
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+# UUID and IDs
+uuid = { workspace = true, features = ["v4"] }
+# Time handling
+chrono = { workspace = true }
+# Process utilities
+procfs = { workspace = true }
+# Concurrency
+crossbeam-channel = { workspace = true }
+# Math for resource limits
+num = { workspace = true }
 
 [lib]
 name = "geckoOS_cronus"
@@ -47,7 +45,4 @@ path = "bin/daemon.rs"
 name = "cronus"
 path = "bin/cli.rs"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+

@@ -4,72 +4,62 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-smithay = { version = "0.3", features = ["wayland_frontend", "wayland_backend", "drm-support", "libinput_backend", "egl"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-anyhow = "1.0"
-calloop = "0.12"
-wayland-server = "0.30"
-wayland-protocols = { version = "0.31", features = ["server"] }
-xkbcommon = "0.7"
-input = "0.8"
-gl = "0.14"
-glutin = { version = "0.31", features = ["wayland"] }
-drm = "0.12"
-drm-fourcc = "4.1"
-gbm = "0.14"
-libinput = "0.16"
-udev = "0.8"
-image = "0.24"
-futures = "0.3"
-log = "0.4"
-toml = "0.8"
-nalgebra = { version = "0.32", features = ["serde-serialize"] }
-cgmath = "0.18"
-parking_lot = "0.12"
-arc-swap = "1.6"
-once_cell = "1.19"
-lazy_static = "1.4"
-wayland-client = { workspace = true }
-anyhow = { workspace = true }
+smithay = { workspace = true, features = ["wayland_frontend", "backend_drm", "backend_libinput", "backend_egl"] }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+calloop = { workspace = true }
+wayland-server = { workspace = true }
+wayland-protocols = { workspace = true, features = ["server"] }
+xkbcommon = { workspace = true }
+input = { workspace = true }
+gl = { workspace = true }
+glutin = { workspace = true, features = ["wayland"] }
+drm = { workspace = true }
+drm-fourcc = { workspace = true }
+gbm = { workspace = true }
+udev = { workspace = true }
+image = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+toml = { workspace = true }
+nalgebra = { workspace = true, features = ["serde-serialize"] }
+cgmath = { workspace = true }
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+once_cell = { workspace = true }
+lazy_static = { workspace = true }
+wayland-client = { workspace = true }
 
 [[bin]]
 name = "geckoOS-ouranos"
 path = "src/main.rs"
 
 # Testing and benchmarking
-[dev-dependencies]
-criterion = "0.5"
-tempfile = "3"
-mockito = "1.2"
+#[dev-dependencies]
+#criterion = { workspace = true }
+#tempfile = { workspace = true }
+#mockito = { workspace = true }
 
-[[bench]]
-name = "rendering_benchmarks"
-harness = false
+#[[bench]]
+#name = "rendering_benchmarks"
+#harness = false
 
-[[bench]]
-name = "input_latency"
-harness = false
+#[[bench]]
+#name = "input_latency"
+#harness = false
 
 [features]
 default = ["drm-support", "libinput_backend", "egl-backend"]
 drm-support = []
 libinput_backend = []
 egl-backend = []
-profiling = ["smithay/profiling"]
+#profiling = ["smithay/profiling"]
 debug = []
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
 
-[profile.dev]
-opt-level = 0
-debug = true
+

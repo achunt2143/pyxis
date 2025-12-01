@@ -1,117 +1,160 @@
-[package]
-name = "geckoOS"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.70"
-authors = ["GeckoOS Contributors"]
-description = "A Firefox Gecko-based desktop operating system built on Linux kernel"
-license = "MPL-2.0"
-repository = "https://github.com/gecko-os/geckoOS"
+# geckoos/Cargo.toml - Workspace Configuration
+#
+# Unified workspace for all GeckoOS components
+# Run: cargo build --release --all
 
 [workspace]
 members = [
-    "ouranos",
+    "gecko",
     "cronus",
     "echo",
-    "gaia",
-    "gecko",
+    "ouranos",
     "kratos",
     "persephone",
+    "gaia",
 ]
 
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["GeckoOS Contributors"]
+license = "MPL-2.0"
+
 [workspace.dependencies]
-smithay = "0.3"
+# Wayland and compositor
+smithay = "0.7.0"
+wayland-client = "0.30"
+wayland-server = "0.30"
+wayland-protocols = "0.31"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# IPC and DBus
+zbus = "3.14"
+zvariant = "4.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-anyhow = "1.0"
 
-[dependencies]
-# Web Framework & HTTP
-actix-web = "4.4"
-actix-rt = "2.9"
-actix-web-actors = "4.2"
-tokio = { version = "1.35", features = ["full"] }
-tokio-util = "0.7"
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+toml = "0.8"
 
-# Async & Concurrency
+# Linux utilities
+udev = "0.8"
+input = "0.9.1"
+drm = "0.6"
+gbm = "0.15"
+shellexpand = "3.1.1"
+x11 = "2.21.0"
+
+# System
+libc = "0.2"
+nix = { version = "0.27", features = ["process", "signal", "mount", "user"] }
+
+# Graphics/Rendering
+wgpu = "27.0.1"
+wgpu-hal = "27.0.4"
+image = "0.24"
+glow = "0.13"
+gl = "0.14"
+
+#Async and Misc
 futures = "0.3"
 async-trait = "0.1"
 parking_lot = "0.12"
+bytes = "1.5"
+tokio-util = { version = "0.7", features = ["codec", "net"] }
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
-
-# Wayland & Graphics (Smithay-based)
-smithay = { version = "0.3", features = ["backend_drm", "backend_libinput", "renderer_gl"] }
-wayland-server = "0.31"
-wayland-client = "0.31"
-wayland-protocols = "0.31"
-x11-rb = "0.4"
-drm = "0.5"
-drm-fourcc = "4.1"
-gbm = "0.14"
-
-# GPU Rendering
-glow = "0.13"
-gl = "0.14"
-image = "0.24"
-texture-synthesis = "0.9"
-
-# System & OS Integration
-libc = "0.2"
-nix = { version = "0.27", features = ["process", "signal", "mount", "user"] }
-procfs = "0.15"
-tempfile = "3.8"
-
-# Device Management
-udev = "0.8"
-input = "0.8"
-alsa = "0.9"
-
-# Logging & Debugging
+# Misc
 log = "0.4"
 env_logger = "0.11"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-
-# Error Handling
-anyhow = "1.0"
-thiserror = "1.0"
 once_cell = "1.19"
-
-# Time & Scheduling
 chrono = "0.4"
-
-# FFI & C Interop
-libxul-sys = { path = "./gecko-bindings/libxul-sys" }
-bindgen = "0.69"
-
-# Process Management
-pgrep = "0.2"
-signal-hook = "0.3"
-
-# IPC & Networking
-tokio-util = { version = "0.7", features = ["codec", "net"] }
-bytes = "1.5"
-
-[dev-dependencies]
+bitflags = "2.4"
+hashbrown = "0.14"
+indexmap = "2.1"
+crossbeam-channel = "0.5"
+glutin = "0.31"
+calloop = "0.12"
+xkbcommon = "0.7"
+drm-fourcc = "2.2.0"
+nalgebra = "0.32"
+cgmath = "0.18"
+arc-swap = "1.6"
+lazy_static = "1.4"
+uuid = { version = "1.0", features = ["v4"] }
+bincode = "1.3"
+num = "0.4"
+regex = "1.10"
+xml-rs = "0.8"
+which = "5.0"
+users = "0.11"
+dashmap = "5.5"
+procfs = "0.15"
+metrics = "0.21"
+prometheus = "0.13"
+pprof = "0.13"
 criterion = "0.5"
-proptest = "1.4"
-tempfile = "3.8"
+lru = "0.12"
+crossbeam = "0.8"
+rayon = "1.7"
+naga = "0.13"
+subprocess = "0.2"
+
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
+strip = false
+debug = false
 
 [profile.dev]
 opt-level = 0
 debug = true
 
+# Per-package configuration
+[workspace.metadata.gecko]
+description = "Firefox Gecko rendering engine integration"
+features = ["wayland", "gpu-rendering"]
+
+[workspace.metadata.cronus]
+description = "Process manager and lifecycle control"
+features = ["dbus", "signals"]
+
+[workspace.metadata.echo]
+description = "Inter-process communication bus"
+features = ["dbus", "unix-sockets"]
+
+[workspace.metadata.ouranos]
+description = "Wayland compositor (Smithay-based)"
+features = ["wayland", "drm", "libinput"]
+
+[workspace.metadata.kratos]
+description = "Performance monitoring and optimization"
+features = ["gpu-monitoring", "profiling"]
+
+[workspace.metadata.persephone]
+description = "Linux application compatibility layer"
+features = ["elf-loading", "wayland"]
+
+[workspace.metadata.gaia]
+description = "Desktop shell and UI framework"
+features = ["web-frontend", "rust-backend"]
+
+# Build settings for Gecko (special handling for C++ integration)
+[workspace.metadata.cargo-tarpaulin]
+exclude-files = ["gecko/src/gecko-wrapper.cpp", "gecko/src/*-bridge.cpp"]
+
+# Note: Individual Cargo.toml files for each package override these settings
+# This workspace file provides unified dependency management and build configuration

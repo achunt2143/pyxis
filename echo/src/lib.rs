@@ -19,6 +19,7 @@ use parking_lot::RwLock;
 use tracing;
 use uuid::Uuid;
 use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 
 /// IPC Bus: Message passing framework for GeckoOS
 /// Enables inter-process communication between system components
@@ -209,7 +210,7 @@ impl IPCBus {
 }
 
 /// Service interface definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceInterface {
     pub name: String,
     pub methods: Vec<MethodDefinition>,
@@ -217,34 +218,34 @@ pub struct ServiceInterface {
     pub properties: Vec<PropertyDefinition>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MethodDefinition {
     pub name: String,
     pub input_args: Vec<ArgumentDefinition>,
     pub output_args: Vec<ArgumentDefinition>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalDefinition {
     pub name: String,
     pub arguments: Vec<ArgumentDefinition>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropertyDefinition {
     pub name: String,
     pub property_type: String,
     pub access: PropertyAccess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PropertyAccess {
     Read,
     Write,
     ReadWrite,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArgumentDefinition {
     pub name: String,
     pub arg_type: String,

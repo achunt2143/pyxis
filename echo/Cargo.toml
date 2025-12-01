@@ -5,39 +5,36 @@ edition = "2021"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 # Networking
-tokio-util = { version = "0.7", features = ["codec"] }
-bytes = "1.5"
+tokio-util = { workspace = true, features = ["codec"] }
+bytes = { workspace = true }
 # Data structures
-dashmap = "5.5"
-parking_lot = "0.12"
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+bincode = { workspace = true }
 # Errors
-thiserror = "1.0"
-anyhow = "1.0"
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# UUID and IDs
-uuid = { version = "1.0", features = ["v4"] }
-# Time
-chrono = "0.4"
-# Message queue
-crossbeam-channel = "0.5"
-# Pattern matching
-regex = "1.10"
-# D-Bus compatibility
-xml-rs = "0.8"
-# Unix sockets
-nix = { version = "0.27", features = ["uio"] }
-wayland-client = { workspace = true }
+thiserror = { workspace = true }
 anyhow = { workspace = true }
+# Logging
 tracing = { workspace = true }
-tokio = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+# UUID and IDs
+uuid = { workspace = true, features = ["v4"] }
+# Time
+chrono = { workspace = true }
+# Message queue
+crossbeam-channel = { workspace = true }
+# Pattern matching
+regex = { workspace = true }
+# D-Bus compatibility
+xml-rs = { workspace = true }
+# Unix sockets
+nix = { workspace = true, features = ["uio"] }
+wayland-client = { workspace = true }
 
 [lib]
 name = "geckoOS_echo"
@@ -48,10 +45,8 @@ name = "echo-daemon"
 path = "bin/daemon.rs"
 
 [[bin]]
-name = "wcho-cli"
+name = "echo-cli"
 path = "bin/client.rs"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+
+
