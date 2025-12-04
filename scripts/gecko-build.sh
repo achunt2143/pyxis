@@ -10,13 +10,17 @@
 
 set -e
 
-GECKO_ROOT="${GECKO_ROOT:-.}"
+# ✅ Get absolute paths
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GECKO_ROOT="${GECKO_ROOT:-$PROJECT_ROOT}"
 GECKO_BUILD_DIR="$GECKO_ROOT/gecko-build"
-RUST_TARGET_DIR="target/release"
+RUST_TARGET_DIR="$PROJECT_ROOT/target/release"
 
 echo "=== GeckoOS Gecko Build Script ==="
+echo "Project root: $PROJECT_ROOT"
 echo "Gecko root: $GECKO_ROOT"
 echo "Build directory: $GECKO_BUILD_DIR"
+
 
 # Stage 1: Check or download Gecko
 stage_gecko_init() {

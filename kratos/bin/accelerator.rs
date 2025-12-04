@@ -3,56 +3,56 @@
 // Purpose: GPU acceleration and backend management
 
 use std::error::Error;
-use structopt::StructOpt;
+use clap::{Parser};
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "performance-accelerator", about = "GPU Acceleration Control")]
+#[derive(Parser)]
+#[command(name = "performance-accelerator", about = "GPU Acceleration Control")]
 enum Command {
     /// Show GPU information
-    #[structopt(name = "info")]
+    #[command(name = "info")]
     Info,
     
     /// List available GPU backends
-    #[structopt(name = "backends")]
+    #[command(name = "backends")]
     Backends,
     
     /// Select GPU backend
-    #[structopt(name = "select")]
+    #[command(name = "select")]
     Select {
         /// Backend name (vulkan, metal, directx12, webgpu)
         backend: String,
     },
     
     /// Compile shaders
-    #[structopt(name = "compile")]
+    #[command(name = "compile")]
     Compile {
         /// Shader file path
         shader_path: String,
     },
     
     /// Optimize textures
-    #[structopt(name = "optimize-textures")]
+    #[command(name = "optimize-textures")]
     OptimizeTextures {
         /// Texture directory
         texture_dir: String,
     },
     
     /// Enable GPU acceleration
-    #[structopt(name = "enable")]
+    #[command(name = "enable")]
     Enable,
     
     /// Disable GPU acceleration
-    #[structopt(name = "disable")]
+    #[command(name = "disable")]
     Disable,
     
     /// Run GPU benchmark
-    #[structopt(name = "benchmark")]
+    #[command(name = "benchmark")]
     Benchmark,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let command = Command::from_args();
+    let command = Command::parse();
     
     match command {
         Command::Info => show_info()?,

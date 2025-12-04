@@ -114,4 +114,4 @@ class CacheService {
   }
 }
 
-export default CacheService;
+export { CacheService };

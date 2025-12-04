@@ -4,9 +4,9 @@
 
 #[cfg(test)]
 mod tests {
-    use persephone::elf_loader::ElfLoader;
-    use persephone::runtime::Runtime;
-    use persephone::compatibility::CompatibilityLayer;
+    use geckoOS_persephone::elf_loader::ElfLoader;
+    use geckoOS_persephone::runtime::Runtime;
+    use geckoOS_persephone::compatibility::CompatibilityLayer;
     
     #[test]
     fn test_elf_loader_initialization() {

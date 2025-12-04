@@ -4,46 +4,49 @@
 
 use std::error::Error;
 use std::path::Path;
-use structopt::StructOpt;
-use persephone::elf_loader::ElfLoader;
-use persephone::compatibility::CompatibilityLayer;
-use persephone::runtime::Runtime;
+use clap::{Parser, Subcommand};
+use geckoOS_persephone::ElfLoader;
+use geckoOS_persephone::CompatibilityLayer;
+use geckoOS_persephone::Runtime;
+// use persephone::elf_loader::ElfLoader;
+// use persephone::compatibility::CompatibilityLayer;
+// use persephone::runtime::Runtime;
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "persephone-compat", about = "Application Compatibility Checker")]
+#[derive(Parser)]
+#[command(name = "persephone-compat", about = "Application Compatibility Checker")]
 enum Command {
     /// Check binary compatibility
-    #[structopt(name = "check")]
+    #[command(name = "check")]
     Check {
         /// Path to binary
         binary: String,
     },
     
     /// Test syscall compatibility
-    #[structopt(name = "syscalls")]
+    #[command(name = "syscalls")]
     Syscalls {
         /// Show all supported syscalls
-        #[structopt(short, long)]
+        #[arg(short, long)]
         list: bool,
     },
     
     /// Test Linux capability support
-    #[structopt(name = "capabilities")]
+    #[command(name = "capabilities")]
     Capabilities,
     
     /// Simulate binary execution
-    #[structopt(name = "simulate")]
+    #[command(name = "simulate")]
     Simulate {
         /// Binary path
         binary: String,
         
         /// Arguments
-        #[structopt(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
     
     /// Full compatibility report
-    #[structopt(name = "report")]
+    #[command(name = "report")]
     Report {
         /// Binary path
         binary: String,
@@ -54,7 +57,7 @@ enum Command {
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt().init();
     
-    let command = Command::from_args();
+    let command = Command::parse();
     
     match command {
         Command::Check { binary } => check_binary(&binary).await?,
@@ -80,10 +83,10 @@ async fn check_binary(path: &str) -> Result<(), Box<dyn Error>> {
     println!("  Segments: {}", binary.segments.len());
     println!("  Symbols: {}", binary.symbols.len());
     
-    if let Some(dynamic) = &binary.dynamic {
+    if let Some(dynamic) = &binary.dynamic_info {
         println!("  Dynamic linking: Yes");
-        println!("  Interpreter: {}", dynamic.interpreter);
-        println!("  Needed libraries: {}", dynamic.needed_libs.len());
+        println!("  Interpreter: {}", dynamic.interpreter.clone().unwrap_or("default".to_string()));
+        println!("  Needed libraries: {}", dynamic.needed_libraries.len());
     } else {
         println!("  Dynamic linking: Static");
     }

@@ -151,7 +151,7 @@ impl PersephoneEchoService {
         debug!("SetEnvironment called: {}={}", var_name, var_value);
 
         // Note: Environment changes apply to future spawned processes
-        std::env::set_var(var_name, var_value);
+        unsafe { std::env::set_var(var_name, var_value) };
 
         Ok(())
     }

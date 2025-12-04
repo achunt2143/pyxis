@@ -32,6 +32,8 @@ procfs = { workspace = true }
 crossbeam-channel = { workspace = true }
 # Math for resource limits
 num = { workspace = true }
+# CLI
+clap = { workspace = true, features = ["derive"] }
 
 [lib]
 name = "geckoOS_cronus"
@@ -44,5 +46,3 @@ path = "bin/daemon.rs"
 [[bin]]
 name = "cronus"
 path = "bin/cli.rs"
-
-

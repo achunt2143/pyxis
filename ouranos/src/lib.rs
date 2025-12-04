@@ -10,68 +10,67 @@
 
 #![warn(missing_docs)]
 
-pub mod compositor;
+pub mod backend;
 pub mod config;
+pub mod damage_tracker;
 pub mod data_device;
-pub mod hotplug;
-pub mod input;
-pub mod rendering;
-pub mod shell;
-pub mod utils;
+pub mod decorations;
 pub mod gecko_surface;
+pub mod hotplug;
+pub mod input_advanced;
+pub mod state;
+pub mod window;
+
+pub use config::Config;
+pub use state::GeckoOSState;
+pub use window::{WindowState, WindowGeometry, WindowMetadata};
 
 use anyhow::Result;
-use std::sync::{Arc, Mutex};
-use tracing::{error, info};
+use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::reexports::calloop::EventLoop;
+use tracing::info;
 
-pub use compositor::CompositorState;
-pub use config::Config;
-pub use input::InputManager;
-pub use rendering::RenderingEngine;
-pub use shell::ShellManager;
-pub use gecko_surface::{GeckoSurfaceManager, GeckoSurface};
-
-/// Global compositor instance
-static COMPOSITOR: once_cell::sync::OnceCell<Arc<Mutex<CompositorState>>> =
-    once_cell::sync::OnceCell::new();
-
-/// Initialize the Wayland compositor
+/// Initialize and run the GeckoOS Wayland compositor
 ///
 /// # Arguments
 /// * `config` - Compositor configuration
 ///
 /// # Returns
-/// Result containing the initialized compositor state
-pub fn initialize_compositor(config: Config) -> Result<Arc<Mutex<CompositorState>>> {
+/// Result containing the compositor state, event loop, and display
+///
+/// # Example
+/// ```
+/// use geckoos::initialize;
+/// use geckoos::Config;
+///
+/// let config = Config::default();
+/// let (mut state, event_loop, display) = initialize(config)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn initialize(config: Config) -> Result<(GeckoOSState, EventLoop<'static, GeckoOSState>, Display<GeckoOSState>)> {
     info!("Initializing GeckoOS Wayland Compositor");
     
-    let compositor = Arc::new(Mutex::new(CompositorState::new(config)?));
-    
-    if let Err(_) = COMPOSITOR.set(compositor.clone()) {
-        error!("Compositor already initialized");
-        anyhow::bail!("Compositor already initialized");
-    }
+    let (state, event_loop, display) = GeckoOSState::new()?;
     
     info!("Compositor initialized successfully");
-    Ok(compositor)
+    info!("Wayland socket: {}", state.socket_name());
+    
+    Ok((state, event_loop, display))
 }
 
-/// Get the global compositor instance
-pub fn get_compositor() -> Option<Arc<Mutex<CompositorState>>> {
-    COMPOSITOR.get().cloned()
+/// Get the socket name for the Wayland display
+pub fn get_socket_name(state: &GeckoOSState) -> &str {
+    state.socket_name()
 }
 
-/// Shutdown the compositor
-pub fn shutdown_compositor() -> Result<()> {
-    info!("Shutting down Wayland Compositor");
-    
-    if let Some(compositor) = COMPOSITOR.get() {
-        let mut comp = compositor.lock().unwrap();
-        comp.shutdown()?;
-    }
-    
+/// Shutdown the compositor gracefully
+///
+/// # Arguments
+/// * `state` - Mutable reference to the compositor state
+pub fn shutdown(state: &mut GeckoOSState) {
+    info!("Shutting down GeckoOS Wayland Compositor");
+    state.stop();
     info!("Compositor shutdown complete");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -79,15 +78,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compositor_initialization() {
+    fn test_config_default() {
         let config = Config::default();
-        let result = initialize_compositor(config);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_compositor() {
-        let comp = get_compositor();
-        assert!(comp.is_some());
+        assert!(config.display.default_width > 0);
+        assert!(config.display.default_height > 0);
     }
 }

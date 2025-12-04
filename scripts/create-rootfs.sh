@@ -175,26 +175,18 @@ stage_rootfs_dirs() {
     log_section "Stage 3: Rootfs Directory Structure"
     
     log_info "Creating directory structure..."
-    mkdir -p "${ROOTFS_DIR}"/{
-        boot,
-        dev,
-        etc/{init.d,systemd/system,geckoOS},
-        home/user,
-        lib/{modules,gecko},
-        mnt,
-        opt,
-        proc,
-        root,
-        run,
-        srv,
-        sys,
-        tmp,
-        usr/{bin,lib,sbin,local/bin,share/{applications,geckoOS}},
-        var/{cache,log,run,tmp}
-    }
+    
+    # Create all directories
+    mkdir -p "${ROOTFS_DIR}"/{boot,dev,mnt,opt,proc,root,run,srv,sys,tmp}
+    mkdir -p "${ROOTFS_DIR}"/etc/{init.d,systemd/system,geckoOS,rc.d,ld.so.conf.d}
+    mkdir -p "${ROOTFS_DIR}"/home/user
+    mkdir -p "${ROOTFS_DIR}"/lib/{modules,gecko}
+    mkdir -p "${ROOTFS_DIR}"/usr/{bin,lib,sbin,local/bin,share/{applications,geckoOS}}
+    mkdir -p "${ROOTFS_DIR}"/var/{cache,log,run,tmp}
     
     log_success "Directory structure created"
 }
+
 
 # ============================================================================
 # STAGE 4: System Configuration Files

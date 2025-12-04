@@ -35,6 +35,7 @@ crossbeam-channel = { workspace = true }
 # Utilities
 uuid = { workspace = true, features = ["v4"] }
 chrono = { workspace = true }
+dashmap = { workspace = true }
 
 [lib]
 name = "geckoOS_gecko_integration"

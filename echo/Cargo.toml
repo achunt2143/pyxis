@@ -30,11 +30,11 @@ chrono = { workspace = true }
 crossbeam-channel = { workspace = true }
 # Pattern matching
 regex = { workspace = true }
-# D-Bus compatibility
-xml-rs = { workspace = true }
 # Unix sockets
-nix = { workspace = true, features = ["uio"] }
-wayland-client = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+futures = { workspace = true }
+# CLI
+clap = { workspace = true, features = ["derive"] }
 
 [lib]
 name = "geckoOS_echo"
@@ -47,6 +47,3 @@ path = "bin/daemon.rs"
 [[bin]]
 name = "echo-cli"
 path = "bin/client.rs"
-
-
-

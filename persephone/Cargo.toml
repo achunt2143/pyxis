@@ -8,10 +8,12 @@ edition = "2021"
 tokio = { workspace = true, features = ["full"] }
 # IPC Bus client
 geckoOS-echo = { path = "../echo" }
+geckoOS-gaia-shell = { path = "../gaia" }
 # Process management
 libc = { workspace = true }
-nix = { workspace = true, features = ["process", "signal"] }
+nix = { workspace = true, features = ["process", "signal", "resource"] }
 users = { workspace = true }
+clap = { workspace = true }
 # Wayland
 wayland-client = { workspace = true }
 wayland-protocols = { workspace = true, features = ["client"] }
@@ -39,6 +41,7 @@ chrono = { workspace = true }
 which = { workspace = true }
 shellexpand = { workspace = true }
 # Security
+goblin = { workspace = true }
 
 [lib]
 name = "geckoOS_persephone"

@@ -8,6 +8,8 @@ edition = "2021"
 actix-web = "4.12.1"
 actix-files = "0.6.9"
 actix-rt = "2.11.0"
+actix-ws = "0.3"
+futures = "0.3.31"
 # WebSockets
 tokio-tungstenite = "0.28.0"
 tokio = { workspace = true, features = ["full"] }
@@ -34,18 +36,14 @@ which = { workspace = true }
 subprocess = { workspace = true }
 users = { workspace = true }
 wayland-client = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+clap = { workspace = true }
 
 [lib]
 name = "geckoOS_gaia"
 path = "src/lib.rs"
 
-[[bin]]
-name = "gaia-shell"
-path = "src/bin/shell.rs"
-
-[[bin]]
-name = "gaia-daemon"
-path = "src/bin/daemon.rs"
 
 
 

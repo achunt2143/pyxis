@@ -4,30 +4,30 @@
 
 use std::error::Error;
 use std::io::{self, BufRead};
-use structopt::StructOpt;
-use performance::optimization::{OptimizationEngine, OptimizationProfile};
+use clap::{Parser};
+use geckoOS_kratos::optimization::{OptimizationEngine, OptimizationProfile};
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "performance-tuner", about = "Interactive Performance Tuning")]
+#[derive(Parser)]
+#[command(name = "performance-tuner", about = "Interactive Performance Tuning")]
 struct Args {
     /// Start in interactive mode
-    #[structopt(short, long)]
+    #[arg(short, long)]
     interactive: bool,
     
     /// Set profile (power, balanced, performance)
-    #[structopt(short, long)]
+    #[arg(short, long)]
     profile: Option<String>,
     
     /// Show recommendations
-    #[structopt(short, long)]
+    #[arg(short, long)]
     recommend: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::from_args();
+    let args = Args::parse();
     
-    let engine = OptimizationEngine::new();
+    let engine = OptimizationEngine::new().await;
     
     if args.interactive {
         interactive_tuner(&engine).await?;
@@ -86,8 +86,8 @@ async fn interactive_tuner(engine: &OptimizationEngine) -> Result<(), Box<dyn Er
             ["metrics"] => {
                 let metrics = engine.get_metrics();
                 println!("Current metrics:");
-                println!("  CPU: {:.1}%", metrics.cpu_usage);
-                println!("  Memory: {:.1}%", metrics.memory_usage);
+                println!("  CPU: {:.1}%", metrics.cpu_utilization);
+                println!("  Memory: {:.1}%", metrics.memory_usage_mb);
                 println!("  FPS: {}", metrics.fps);
                 println!("  Cache hit rate: {:.1}%", metrics.cache_hit_rate);
                 println!("  GPU utilization: {:.1}%", metrics.gpu_utilization);

@@ -68,4 +68,4 @@ class MediaService {
   }
 }
 
-export default MediaService;
+export { MediaService };

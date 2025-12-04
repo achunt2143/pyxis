@@ -29,7 +29,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 log_info "Verifying build dependencies..."
 
-for cmd in gcc make bc bison flex openssl; do
+for cmd in gcc make bc bison flex openssl libelf-dev libdw-dev binutils-dev; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         log_error "Missing dependency: $cmd"
         echo "Install with: sudo apt install build-essential bison flex libelf-dev libssl-dev"

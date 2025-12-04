@@ -1,0 +1,23 @@
+# GeckoOS minimal Gecko build
+ac_add_options --enable-application=browser
+ac_add_options --disable-artifact-builds
+ac_add_options --disable-debug
+ac_add_options --enable-release
+ac_add_options --disable-tests
+ac_add_options --disable-crashreporter
+ac_add_options --disable-sync
+ac_add_options --disable-services/sync
+
+# Wayland support
+ac_add_options --enable-default-toolkit=wayland
+
+# libxul library
+ac_add_options --disable-xul
+
+# JavaScript engine
+ac_add_options --enable-shared-js
+
+# Minimize dependencies
+ac_add_options --with-system-icu
+ac_add_options --with-system-zlib
+ac_add_options --with-system-bz2

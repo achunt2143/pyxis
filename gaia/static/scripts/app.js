@@ -5,13 +5,13 @@
  */
 
 // Import services
-import { APIService } from './services/api.js';
-import { EchoService } from './services/echo.js';
-import { CacheService } from './services/cache.js';
-import { PerformanceService } from './services/performance.js';
+import { APIService } from '../services/api-service.js';
+import { EchoService } from '../services/echo-service.js';
+import { CacheService } from '../services/cache-service.js';
+import { PerformanceService } from '../services/performance-service.js';
 
 // Import module loader if it's a separate file
-import { ModuleLoader } from './modules/loader.js';
+import { ModuleLoader } from './module_loader.js';
 
 
 class GaiaApp {

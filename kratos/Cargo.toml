@@ -39,6 +39,10 @@ crossbeam = { workspace = true }
 rayon = { workspace = true }
 # Time
 chrono = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+num_cpus = { workspace = true }
+goblin = { workspace = true }
+clap = { workspace = true }
 
 [lib]
 name = "geckoOS_kratos"

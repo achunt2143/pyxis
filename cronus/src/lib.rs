@@ -3,7 +3,6 @@ pub mod lifecycle;
 pub mod resources;
 pub mod tree;
 pub mod signals;
-pub mod ipc;
 pub mod echo_ipc;
 
 pub use process::{Process, ProcessState, ProcessInfo};
@@ -11,16 +10,13 @@ pub use lifecycle::{ProcessLifecycle, LifecycleEvent};
 pub use resources::{ResourceManager, ResourceLimit, ResourceUsage};
 pub use tree::{ProcessTree, ProcessNode};
 pub use signals::SignalHandler;
-pub use ipc::IPCServer;
 pub use echo_ipc::CronusEchoService;
-
 
 use anyhow::Result;
 use dashmap::DashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing;
-use uuid::Uuid;
+use tracing::{info, debug, error};
 use std::collections::HashMap;
 
 /// Cronus: Process Manager for GeckoOS
@@ -31,7 +27,7 @@ pub struct Cronus {
     resource_manager: Arc<ResourceManager>,
     signal_handler: Arc<SignalHandler>,
     lifecycle: Arc<ProcessLifecycle>,
-    ipc: Arc<IPCServer>,
+    echo_service: Arc<CronusEchoService>,
     next_pid: Arc<parking_lot::Mutex<u32>>,
 }
 
@@ -39,13 +35,13 @@ impl Cronus {
     /// Initialize Cronus process manager
     pub async fn new() -> Result<Self> {
         tracing::info!("Initializing Cronus Process Manager");
-
+        
         let processes = Arc::new(DashMap::new());
         let process_tree = Arc::new(RwLock::new(ProcessTree::new()));
         let resource_manager = Arc::new(ResourceManager::new()?);
         let signal_handler = Arc::new(SignalHandler::new()?);
         let lifecycle = Arc::new(ProcessLifecycle::new());
-        let ipc = Arc::new(IPCServer::new()?);
+        let echo_service = Arc::new(CronusEchoService::new()?);
 
         let cronus = Cronus {
             processes,
@@ -53,12 +49,18 @@ impl Cronus {
             resource_manager,
             signal_handler,
             lifecycle,
-            ipc,
+            echo_service,
             next_pid: Arc::new(parking_lot::Mutex::new(1000)),
         };
 
         tracing::info!("Cronus initialized successfully");
         Ok(cronus)
+    }
+
+    /// Register with ECHO IPC bus
+    pub async fn register_echo(&self) -> Result<()> {
+        let mut serv = self.echo_service().clone();
+        serv.register().await
     }
 
     /// Launch a process
@@ -93,6 +95,13 @@ impl Cronus {
         // Record lifecycle event
         self.lifecycle.record_event(pid, LifecycleEvent::Started)?;
 
+        // Update process state
+        process_arc.update_state(ProcessState::Running);
+
+        // Emit ECHO signal
+        let process_info = process_arc.get_info();
+        self.echo_service.emit_process_created(pid, &config.app_id).await?;
+
         tracing::info!("Process launched: pid={}, child_pid={}", pid, child_pid);
         Ok(pid)
     }
@@ -117,6 +126,9 @@ impl Cronus {
                 tree.remove_process(pid)?;
             }
 
+            // Emit ECHO signal
+            self.echo_service.emit_process_terminated(pid, 0).await?;
+
             tracing::info!("Process terminated: pid={}", pid);
             Ok(())
         } else {
@@ -124,10 +136,16 @@ impl Cronus {
         }
     }
 
+    /// Kill a process forcefully
+    pub async fn kill(&self, pid: u32) -> Result<()> {
+        self.terminate(pid, libc::SIGKILL).await
+    }
+
     /// Suspend a process
     pub async fn suspend(&self, pid: u32) -> Result<()> {
         if let Some(process) = self.processes.get(&pid) {
             process.send_signal(libc::SIGSTOP)?;
+            process.update_state(ProcessState::Suspended);
             self.lifecycle.record_event(pid, LifecycleEvent::Suspended)?;
             tracing::debug!("Process suspended: pid={}", pid);
             Ok(())
@@ -140,6 +158,7 @@ impl Cronus {
     pub async fn resume(&self, pid: u32) -> Result<()> {
         if let Some(process) = self.processes.get(&pid) {
             process.send_signal(libc::SIGCONT)?;
+            process.update_state(ProcessState::Running);
             self.lifecycle.record_event(pid, LifecycleEvent::Resumed)?;
             tracing::debug!("Process resumed: pid={}", pid);
             Ok(())
@@ -175,6 +194,19 @@ impl Cronus {
     /// Set resource limits for process
     pub fn set_resource_limits(&self, pid: u32, limits: ResourceLimit) -> Result<()> {
         self.resource_manager.set_limits(pid, limits)
+    }
+
+    /// Update resource usage statistics
+    pub async fn update_resource_usage(&self) -> Result<()> {
+        for entry in self.processes.iter() {
+            let pid = *entry.key();
+            
+            // In production, read from /proc or use procfs crate
+            // For now, simulate resource usage
+            let usage = self.sample_process_resources(pid).await?;
+            self.resource_manager.update_usage(pid, usage)?;
+        }
+        Ok(())
     }
 
     /// Wait for process termination
@@ -235,9 +267,40 @@ impl Cronus {
         tree.get_descendants(pid)
     }
 
+    /// Get all resource usage statistics
+    pub fn get_all_resource_usage(&self) -> Vec<ResourceUsage> {
+        self.resource_manager.all_processes_usage()
+    }
+
+    /// Get lifecycle events for a process
+    pub fn get_lifecycle_events(&self, pid: u32) -> Vec<lifecycle::LifecycleEventRecord> {
+        self.lifecycle.get_events(pid)
+    }
+
     /// Handle system signals
     pub async fn handle_signals(&self) -> Result<()> {
         self.signal_handler.listen().await
+    }
+
+    /// Shutdown all processes gracefully
+    pub async fn shutdown_all(&self) -> Result<()> {
+        tracing::info!("Shutting down all processes");
+        
+        let pids: Vec<u32> = self.processes.iter().map(|e| *e.key()).collect();
+        
+        for pid in pids {
+            if let Err(e) = self.terminate(pid, libc::SIGTERM).await {
+                tracing::warn!("Failed to terminate process {}: {}", pid, e);
+            }
+        }
+        
+        tracing::info!("All processes shutdown complete");
+        Ok(())
+    }
+
+    /// Get ECHO service reference
+    pub fn echo_service(&self) -> &CronusEchoService {
+        &self.echo_service
     }
 
     // Private methods
@@ -252,8 +315,7 @@ impl Cronus {
         // 2. Set up environment
         // 3. Configure resource limits
         // 4. Exec binary
-
-        tracing::trace!(
+        tracing::debug!(
             "Fork/exec for process: app_id={}, executable={}",
             config.app_id,
             config.executable
@@ -271,6 +333,21 @@ impl Cronus {
             *next = 1000;
         }
         Ok(pid)
+    }
+
+    async fn sample_process_resources(&self, pid: u32) -> Result<ResourceUsage> {
+        // In production, use procfs crate to read /proc/{pid}/stat, /proc/{pid}/status
+        // For now, return simulated data
+        Ok(ResourceUsage {
+            pid,
+            memory_mb: 50,
+            cpu_percent: 5.0,
+            cpu_time_ms: 1000,
+            io_read_bytes: 1024 * 100,
+            io_write_bytes: 1024 * 50,
+            num_threads: 2,
+            num_fds: 5,
+        })
     }
 }
 
@@ -322,5 +399,22 @@ mod tests {
         let pid1 = cronus.allocate_pid().unwrap();
         let pid2 = cronus.allocate_pid().unwrap();
         assert!(pid2 > pid1);
+    }
+
+    #[tokio::test]
+    async fn test_launch_and_terminate() {
+        let cronus = Cronus::new().await.unwrap();
+        
+        let config = ProcessLaunchConfig {
+            app_id: "test.app".to_string(),
+            executable: "/bin/true".to_string(),
+            ..Default::default()
+        };
+        
+        let pid = cronus.launch(config).await.unwrap();
+        assert!(cronus.get_process_info(pid).is_some());
+        
+        cronus.terminate(pid, libc::SIGTERM).await.unwrap();
+        assert!(cronus.get_process_info(pid).is_none());
     }
 }

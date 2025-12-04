@@ -100,7 +100,7 @@ impl X11CompatibilityLayer {
     pub async fn setup_x11_env(&self) -> Result<()> {
         if let Some(display) = &self.display {
             std::env::set_var("DISPLAY", display);
-            tracing::debug!("Set DISPLAY={}", display);
+            // tracing::debug!("Set DISPLAY={}", display);
         }
         Ok(())
     }

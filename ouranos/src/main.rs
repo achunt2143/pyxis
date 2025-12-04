@@ -1,29 +1,22 @@
-mod backend;
-mod input;
-mod render;
-mod shell;
-mod state;
-mod window;
-mod input_advanced;
-mod decorations;
-mod hotplug;
-mod damage_tracker;
-mod data_device;
-mod config;
-
+//! GeckoOS Ouranos - Wayland Compositor
+//!
+//! Main entry point for the compositor
 
 use anyhow::Result;
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-pub use state::{GeckoOSState, WindowElement};
-pub use window::WindowState;
-pub use input_advanced::*;
-pub use decorations::*;
-pub use hotplug::*;
-pub use damage_tracker::*;
-pub use data_device::*;
-pub use config::*;
+mod backend;
+mod config;
+mod data_device;
+mod damage_tracker;
+mod decorations;
+mod gecko_surface;
+mod hotplug;
+mod input_advanced;
+mod state;
+mod window;
+
+use state::GeckoOSState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,16 +28,21 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    tracing::info!("GeckoOS Compositor starting...");
+    tracing::info!("╔════════════════════════════════════════╗");
+    tracing::info!("║  GeckoOS Ouranos Compositor v0.1.0    ║");
+    tracing::info!("╚════════════════════════════════════════╝");
 
     // Initialize compositor state
-    let mut state = GeckoOSState::new().await?;
-    
-    tracing::info!("Compositor initialized successfully");
-    tracing::info!("Wayland socket: {}", state.socket_name());
+    let (mut state, mut event_loop, display) = GeckoOSState::new()?;
+    tracing::info!("✓ Compositor initialized");
+    tracing::info!("✓ Wayland socket: {}", state.socket_name);
 
-    // Run event loop
-    state.run().await?;
+    /// Run event loop
+    event_loop.run(
+        std::time::Duration::from_millis(16), // timeout (~60 FPS)
+        &mut state,
+        |_| {}, // callback
+    )?;
 
     tracing::info!("GeckoOS Compositor shutting down");
     Ok(())

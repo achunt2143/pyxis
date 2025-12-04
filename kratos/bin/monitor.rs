@@ -4,31 +4,31 @@
 
 use std::error::Error;
 use std::time::Duration;
-use structopt::StructOpt;
+use clap::{Parser};
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "performance-monitor", about = "Real-time Performance Monitor")]
+#[derive(Parser)]
+#[command(name = "performance-monitor", about = "Real-time Performance Monitor")]
 struct Args {
     /// Refresh interval in milliseconds
-    #[structopt(short, long, default_value = "1000")]
+    #[arg(short, long, default_value = "1000")]
     interval: u64,
     
     /// Show only critical alerts
-    #[structopt(short = "c", long)]
+    #[arg(short = 'c', long)]
     critical_only: bool,
     
     /// Export to file
-    #[structopt(short, long)]
+    #[arg(short, long)]
     export: Option<String>,
     
     /// Detailed view
-    #[structopt(short, long)]
+    #[arg(short, long)]
     detailed: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::from_args();
+    let args = Args::parse();
     
     println!("🔍 Performance Monitor v2.0");
     println!();

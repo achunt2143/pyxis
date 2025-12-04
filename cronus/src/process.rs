@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use chrono::{DateTime, Utc};
 use nix::unistd::Pid;
@@ -81,6 +80,18 @@ pub struct ProcessInfo {
     pub uptime_seconds: u64,
 }
 
+impl ProcessInfo {
+    pub fn state_string(&self) -> String {
+        match self.state {
+            ProcessState::Created => "Created".to_string(),
+            ProcessState::Running => "Running".to_string(),
+            ProcessState::Suspended => "Suspended".to_string(),
+            ProcessState::Zombie => "Zombie".to_string(),
+            ProcessState::Exited => "Exited".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,7 +104,6 @@ mod tests {
             executable: "/usr/bin/test".to_string(),
             ..Default::default()
         };
-
         let process = Process::new(1001, config).unwrap();
         assert_eq!(process.pid, 1001);
         assert_eq!(process.app_id, "test-app");
@@ -107,11 +117,9 @@ mod tests {
             executable: "/usr/bin/test".to_string(),
             ..Default::default()
         };
-
         let process = Process::new(1001, config).unwrap();
         process.update_state(ProcessState::Running);
         assert_eq!(process.get_state(), ProcessState::Running);
-
         process.update_state(ProcessState::Suspended);
         assert_eq!(process.get_state(), ProcessState::Suspended);
     }

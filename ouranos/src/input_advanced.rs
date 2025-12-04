@@ -1,422 +1,415 @@
-//! Advanced Input Handling
+//! Advanced Input Management
 //!
-//! Extends basic input handling with gesture recognition, IME support,
-//! multi-touch tracking, and shortcut bindings
+//! Comprehensive input handling for keyboard, pointer, touch, and tablets
 
-use std::collections::{HashMap, VecDeque};
+use smithay::input::keyboard::{KeyboardHandle, KeysymHandle, ModifiersState};
+use smithay::input::pointer::{PointerHandle, AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::touch::TouchHandle;
+use smithay::backend::input::{
+    Event, InputEvent, KeyboardKeyEvent, PointerMotionEvent,
+    PointerButtonEvent, PointerAxisEvent, TouchEvent,
+};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+use anyhow::Result;
 
-/// Gesture types for touch input
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GestureType {
-    Swipe,
-    Pinch,
-    LongPress,
-    Rotate,
-    DoubleTap,
+/// Advanced input manager
+pub struct AdvancedInputManager {
+    // Keyboard state
+    pub pressed_keys: HashSet<u32>,
+    pub modifiers: ModifiersState,
+    pub keyboard_repeat: KeyboardRepeat,
+    
+    // Pointer state
+    pub pointer_position: (f64, f64),
+    pub pointer_buttons: HashSet<u32>,
+    pub pointer_accumulated_scroll: (f64, f64),
+    
+    // Touch state
+    pub active_touches: HashMap<i32, TouchPoint>,
+    pub touch_gestures: GestureRecognizer,
+    
+    // Tablet state
+    pub tablet_tool: Option<TabletTool>,
+    
+    // Configuration
+    pub pointer_acceleration: f64,
+    pub scroll_factor: f64,
+    pub long_press_threshold: Duration,
 }
 
-/// Direction of swipe gesture
+/// Keyboard repeat configuration
+#[derive(Debug, Clone)]
+pub struct KeyboardRepeat {
+    pub delay: Duration,
+    pub rate: u32,
+    pub last_key: Option<u32>,
+    pub last_press: Option<Instant>,
+}
+
+impl KeyboardRepeat {
+    pub fn new(delay_ms: u32, rate: u32) -> Self {
+        KeyboardRepeat {
+            delay: Duration::from_millis(delay_ms as u64),
+            rate,
+            last_key: None,
+            last_press: None,
+        }
+    }
+    
+    pub fn key_pressed(&mut self, key: u32) {
+        self.last_key = Some(key);
+        self.last_press = Some(Instant::now());
+    }
+    
+    pub fn key_released(&mut self, key: u32) {
+        if self.last_key == Some(key) {
+            self.last_key = None;
+            self.last_press = None;
+        }
+    }
+    
+    pub fn should_repeat(&self) -> Option<u32> {
+        if let (Some(key), Some(press_time)) = (self.last_key, self.last_press) {
+            if press_time.elapsed() > self.delay {
+                return Some(key);
+            }
+        }
+        None
+    }
+}
+
+/// Touch point tracking
+#[derive(Debug, Clone, Copy)]
+pub struct TouchPoint {
+    pub id: i32,
+    pub x: f64,
+    pub y: f64,
+    pub start_time: Instant,
+    pub last_update: Instant,
+}
+
+impl TouchPoint {
+    pub fn new(id: i32, x: f64, y: f64) -> Self {
+        let now = Instant::now();
+        TouchPoint {
+            id,
+            x,
+            y,
+            start_time: now,
+            last_update: now,
+        }
+    }
+    
+    pub fn update_position(&mut self, x: f64, y: f64) {
+        self.x = x;
+        self.y = y;
+        self.last_update = Instant::now();
+    }
+    
+    pub fn duration(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+    
+    pub fn distance_from_start(&self, start_x: f64, start_y: f64) -> f64 {
+        let dx = self.x - start_x;
+        let dy = self.y - start_y;
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+/// Gesture recognizer
+#[derive(Debug, Clone)]
+pub struct GestureRecognizer {
+    pub swipe_threshold: f64,
+    pub pinch_threshold: f64,
+    pub tap_max_duration: Duration,
+    pub tap_max_distance: f64,
+}
+
+impl GestureRecognizer {
+    pub fn new() -> Self {
+        GestureRecognizer {
+            swipe_threshold: 100.0,
+            pinch_threshold: 50.0,
+            tap_max_duration: Duration::from_millis(200),
+            tap_max_distance: 20.0,
+        }
+    }
+    
+    pub fn recognize_tap(&self, touch: &TouchPoint, start_x: f64, start_y: f64) -> bool {
+        touch.duration() < self.tap_max_duration
+            && touch.distance_from_start(start_x, start_y) < self.tap_max_distance
+    }
+    
+    pub fn recognize_swipe(&self, touches: &HashMap<i32, TouchPoint>) -> Option<SwipeGesture> {
+        if touches.len() != 1 {
+            return None;
+        }
+        
+        let touch = touches.values().next()?;
+        
+        // Simple swipe detection (would be more sophisticated in production)
+        if touch.duration() > Duration::from_millis(100) {
+            let dx = touch.x; // Would calculate from start position
+            let dy = touch.y;
+            
+            if dx.abs() > self.swipe_threshold {
+                return Some(if dx > 0.0 {
+                    SwipeGesture::Right
+                } else {
+                    SwipeGesture::Left
+                });
+            }
+            
+            if dy.abs() > self.swipe_threshold {
+                return Some(if dy > 0.0 {
+                    SwipeGesture::Down
+                } else {
+                    SwipeGesture::Up
+                });
+            }
+        }
+        
+        None
+    }
+}
+
+/// Swipe gesture direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwipeDirection {
+pub enum SwipeGesture {
     Up,
     Down,
     Left,
     Right,
 }
 
-/// Gesture event
+/// Tablet tool information
 #[derive(Debug, Clone)]
-pub struct GestureEvent {
-    pub gesture_type: GestureType,
-    pub position: (f64, f64),
-    pub delta: Option<(f64, f64)>,
-    pub scale: Option<f64>,
-    pub rotation: Option<f64>,
-    pub direction: Option<SwipeDirection>,
-    pub timestamp: Instant,
-}
-
-/// Multi-touch tracker for gesture recognition
-pub struct TouchTracker {
-    active_touches: HashMap<u32, TouchPoint>,
-    gesture_history: VecDeque<GestureEvent>,
-    last_tap_time: Option<Instant>,
-    long_press_threshold: Duration,
-    swipe_min_distance: f64,
-    pinch_threshold: f64,
-}
-
-#[derive(Debug, Clone)]
-struct TouchPoint {
-    id: u32,
-    x: f64,
-    y: f64,
-    pressure: f64,
-    start_time: Instant,
-}
-
-impl TouchTracker {
-    pub fn new() -> Self {
-        TouchTracker {
-            active_touches: HashMap::new(),
-            gesture_history: VecDeque::with_capacity(100),
-            last_tap_time: None,
-            long_press_threshold: Duration::from_millis(500),
-            swipe_min_distance: 50.0,
-            pinch_threshold: 0.1,
-        }
-    }
-
-    /// Track touch down event
-    pub fn touch_down(&mut self, touch_id: u32, x: f64, y: f64, pressure: f64) {
-        let touch = TouchPoint {
-            id: touch_id,
-            x,
-            y,
-            pressure,
-            start_time: Instant::now(),
-        };
-        self.active_touches.insert(touch_id, touch);
-        tracing::debug!("Touch down: id={}, x={:.2}, y={:.2}, pressure={:.2}", touch_id, x, y, pressure);
-    }
-
-    /// Track touch motion event
-    pub fn touch_motion(&mut self, touch_id: u32, x: f64, y: f64, pressure: f64) {
-        if let Some(touch) = self.active_touches.get_mut(&touch_id) {
-            touch.x = x;
-            touch.y = y;
-            touch.pressure = pressure;
-        }
-    }
-
-    /// Track touch up event
-    pub fn touch_up(&mut self, touch_id: u32) -> Option<GestureEvent> {
-        if let Some(touch) = self.active_touches.remove(&touch_id) {
-            let duration = touch.start_time.elapsed();
-            
-            // Check for long press
-            if duration > self.long_press_threshold {
-                let event = GestureEvent {
-                    gesture_type: GestureType::LongPress,
-                    position: (touch.x, touch.y),
-                    delta: None,
-                    scale: None,
-                    rotation: None,
-                    direction: None,
-                    timestamp: Instant::now(),
-                };
-                self.gesture_history.push_back(event.clone());
-                return Some(event);
-            }
-            
-            // Check for double tap
-            if let Some(last_time) = self.last_tap_time {
-                if last_time.elapsed() < Duration::from_millis(300) {
-                    let event = GestureEvent {
-                        gesture_type: GestureType::DoubleTap,
-                        position: (touch.x, touch.y),
-                        delta: None,
-                        scale: None,
-                        rotation: None,
-                        direction: None,
-                        timestamp: Instant::now(),
-                    };
-                    self.gesture_history.push_back(event.clone());
-                    self.last_tap_time = None;
-                    return Some(event);
-                }
-            }
-            self.last_tap_time = Some(Instant::now());
-            
-            tracing::debug!("Touch up: id={}, duration={:?}", touch_id, duration);
-        }
-        None
-    }
-
-    /// Detect swipe gesture from multiple touches
-    pub fn detect_swipe(&self) -> Option<GestureEvent> {
-        if self.active_touches.len() < 1 {
-            return None;
-        }
-
-        // Get first touch point
-        if let Some(touch) = self.active_touches.values().next() {
-            // Simple swipe detection based on movement
-            let dx = 0.0; // Would track from start position
-            let dy = 0.0;
-            
-            let distance = (dx * dx + dy * dy).sqrt();
-            if distance > self.swipe_min_distance {
-                let direction = if dx.abs() > dy.abs() {
-                    if dx > 0.0 { SwipeDirection::Right } else { SwipeDirection::Left }
-                } else {
-                    if dy > 0.0 { SwipeDirection::Down } else { SwipeDirection::Up }
-                };
-                
-                let event = GestureEvent {
-                    gesture_type: GestureType::Swipe,
-                    position: (touch.x, touch.y),
-                    delta: Some((dx, dy)),
-                    scale: None,
-                    rotation: None,
-                    direction: Some(direction),
-                    timestamp: Instant::now(),
-                };
-                return Some(event);
-            }
-        }
-        None
-    }
-
-    /// Detect pinch gesture (scale)
-    pub fn detect_pinch(&self) -> Option<f64> {
-        if self.active_touches.len() < 2 {
-            return None;
-        }
-
-        let touches: Vec<_> = self.active_touches.values().collect();
-        if touches.len() >= 2 {
-            let t1 = touches[0];
-            let t2 = touches[1];
-            
-            let dx = t2.x - t1.x;
-            let dy = t2.y - t1.y;
-            let distance = (dx * dx + dy * dy).sqrt();
-            
-            // Normalized scale (1.0 = no scale, >1.0 = zoom in, <1.0 = zoom out)
-            if distance > 0.0 {
-                return Some(distance / 100.0); // Normalized to ~100px baseline
-            }
-        }
-        None
-    }
-
-    /// Get active touch count
-    pub fn touch_count(&self) -> usize {
-        self.active_touches.len()
-    }
-
-    /// Clear all touches
-    pub fn clear(&mut self) {
-        self.active_touches.clear();
-    }
-}
-
-/// Input Method Engine integration
-pub struct ImeState {
-    pub enabled: bool,
-    pub preedit_text: String,
-    pub cursor_position: usize,
-    pub surrounding_text: String,
-    pub surrounding_cursor: usize,
-}
-
-impl Default for ImeState {
-    fn default() -> Self {
-        ImeState {
-            enabled: false,
-            preedit_text: String::new(),
-            cursor_position: 0,
-            surrounding_text: String::new(),
-            surrounding_cursor: 0,
-        }
-    }
-}
-
-impl ImeState {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    pub fn update_preedit(&mut self, text: String, cursor: usize) {
-        self.preedit_text = text;
-        self.cursor_position = cursor;
-        tracing::trace!("Preedit updated: '{}' cursor={}", self.preedit_text, cursor);
-    }
-
-    pub fn commit(&mut self, text: String) {
-        self.surrounding_text.push_str(&text);
-        tracing::debug!("IME commit: '{}', surrounding='{}'", text, self.surrounding_text);
-    }
-
-    pub fn set_surrounding_text(&mut self, text: String, cursor: usize) {
-        self.surrounding_text = text;
-        self.surrounding_cursor = cursor;
-    }
-}
-
-/// Keyboard layout manager
-pub struct KeyboardLayout {
-    pub current_layout: String,
-    pub available_layouts: Vec<String>,
-    pub variant: Option<String>,
-}
-
-impl KeyboardLayout {
-    pub fn new() -> Self {
-        KeyboardLayout {
-            current_layout: "us".to_string(),
-            available_layouts: vec!["us".to_string(), "fr".to_string(), "de".to_string()],
-            variant: None,
-        }
-    }
-
-    pub fn switch_layout(&mut self, layout: &str) -> bool {
-        if self.available_layouts.contains(&layout.to_string()) {
-            self.current_layout = layout.to_string();
-            tracing::info!("Keyboard layout switched to: {}", layout);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn next_layout(&mut self) {
-        let current_idx = self.available_layouts.iter()
-            .position(|l| l == &self.current_layout)
-            .unwrap_or(0);
-        let next_idx = (current_idx + 1) % self.available_layouts.len();
-        self.current_layout = self.available_layouts[next_idx].clone();
-        tracing::info!("Switched to layout: {}", self.current_layout);
-    }
-}
-
-/// Text input protocol support
-pub struct TextInputState {
-    pub enabled: bool,
-    pub surrounding_text: String,
-    pub cursor_position: usize,
-    pub anchor_position: Option<usize>,
-    pub content_type: ContentType,
+pub struct TabletTool {
+    pub tool_type: TabletToolType,
+    pub serial: u32,
+    pub pressure: f64,
+    pub distance: f64,
+    pub tilt_x: f64,
+    pub tilt_y: f64,
+    pub rotation: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentType {
-    Text,
-    Number,
-    Email,
-    Password,
-    Date,
-    Time,
+pub enum TabletToolType {
+    Pen,
+    Eraser,
+    Brush,
+    Pencil,
+    Airbrush,
+    Mouse,
+    Lens,
 }
 
-impl TextInputState {
+impl AdvancedInputManager {
     pub fn new() -> Self {
-        TextInputState {
-            enabled: false,
-            surrounding_text: String::new(),
-            cursor_position: 0,
-            anchor_position: None,
-            content_type: ContentType::Text,
+        AdvancedInputManager {
+            pressed_keys: HashSet::new(),
+            modifiers: ModifiersState::default(),
+            keyboard_repeat: KeyboardRepeat::new(500, 30),
+            pointer_position: (0.0, 0.0),
+            pointer_buttons: HashSet::new(),
+            pointer_accumulated_scroll: (0.0, 0.0),
+            active_touches: HashMap::new(),
+            touch_gestures: GestureRecognizer::new(),
+            tablet_tool: None,
+            pointer_acceleration: 1.0,
+            scroll_factor: 1.0,
+            long_press_threshold: Duration::from_millis(500),
         }
     }
-
-    pub fn set_surrounding_text(&mut self, text: String, cursor: usize) {
-        self.surrounding_text = text;
-        self.cursor_position = cursor;
-        tracing::trace!("Text input surrounding updated: cursor={}", cursor);
-    }
-
-    pub fn set_selection(&mut self, cursor: usize, anchor: usize) {
-        self.cursor_position = cursor;
-        self.anchor_position = Some(anchor);
-    }
-}
-
-/// Shortcut binding system
-pub struct ShortcutBinder {
-    bindings: HashMap<(u32, u32), String>, // (key_code, modifier_mask) -> action
-}
-
-impl ShortcutBinder {
-    pub fn new() -> Self {
-        ShortcutBinder {
-            bindings: HashMap::new(),
+    
+    /// Process keyboard event
+    pub fn process_keyboard<B: smithay::backend::input::InputBackend>(&mut self, event: &B::KeyboardKeyEvent) -> Result<KeyboardAction> {
+        let key_code = event.key_code();
+        let pressed = event.state() == smithay::backend::input::KeyState::Pressed;
+        
+        if pressed {
+            self.pressed_keys.insert(key_code.raw());
+            self.keyboard_repeat.key_pressed(key_code.raw());
+            tracing::trace!("Key pressed: {}", key_code.raw());
+            Ok(KeyboardAction::KeyPressed(key_code.raw()))
+        } else {
+            self.pressed_keys.remove(&key_code.raw());
+            self.keyboard_repeat.key_released(key_code.raw());
+            tracing::trace!("Key released: {}", key_code.raw());
+            Ok(KeyboardAction::KeyReleased(key_code.raw()))
         }
     }
-
-    /// Bind a key combination to an action
-    pub fn bind(&mut self, key_code: u32, modifiers: u32, action: String) {
-        self.bindings.insert((key_code, modifiers), action);
-        tracing::debug!("Shortcut bound: key={}, mods={:08x} -> {}", key_code, modifiers, action);
+    
+    /// Process pointer motion
+    pub fn process_pointer_motion<B: smithay::backend::input::InputBackend>(&mut self, event: &B::PointerMotionEvent) -> Result<PointerAction> {
+        let dx = event.delta_x() * self.pointer_acceleration;
+        let dy = event.delta_y() * self.pointer_acceleration;
+        
+        self.pointer_position.0 += dx;
+        self.pointer_position.1 += dy;
+        
+        // Clamp to screen bounds (would use actual screen size)
+        self.pointer_position.0 = self.pointer_position.0.max(0.0).min(1920.0);
+        self.pointer_position.1 = self.pointer_position.1.max(0.0).min(1080.0);
+        
+        tracing::trace!("Pointer motion: ({:.1}, {:.1})", self.pointer_position.0, self.pointer_position.1);
+        
+        Ok(PointerAction::Motion {
+            x: self.pointer_position.0,
+            y: self.pointer_position.1,
+        })
     }
-
-    /// Lookup action for key combination
-    pub fn lookup(&self, key_code: u32, modifiers: u32) -> Option<&str> {
-        self.bindings.get(&(key_code, modifiers)).map(|s| s.as_str())
+    
+    /// Process pointer button
+    pub fn process_pointer_button<B: smithay::backend::input::InputBackend>(&mut self, event: &B::PointerButtonEvent) -> Result<PointerAction> {
+        let button = event.button_code();
+        let pressed = event.state() == smithay::backend::input::ButtonState::Pressed;
+        
+        if pressed {
+            self.pointer_buttons.insert(button);
+            tracing::trace!("Pointer button pressed: {}", button);
+            Ok(PointerAction::ButtonPressed(button))
+        } else {
+            self.pointer_buttons.remove(&button);
+            tracing::trace!("Pointer button released: {}", button);
+            Ok(PointerAction::ButtonReleased(button))
+        }
     }
-
-    /// Register common system shortcuts
-    pub fn register_defaults(&mut self) {
-        // Alt+Tab: Window switcher
-        self.bind(23, 0x04, "window_switcher".to_string());
+    
+    /// Process pointer axis (scroll)
+    pub fn process_pointer_axis<B: smithay::backend::input::InputBackend>(&mut self, event: &B::PointerAxisEvent) -> Result<PointerAction> {
+        let horizontal = event.amount(smithay::backend::input::Axis::Horizontal)
+            .unwrap_or(0.0) * self.scroll_factor;
+        let vertical = event.amount(smithay::backend::input::Axis::Vertical)
+            .unwrap_or(0.0) * self.scroll_factor;
         
-        // Super+D: Show desktop
-        self.bind(50, 0x08, "show_desktop".to_string());
+        self.pointer_accumulated_scroll.0 += horizontal;
+        self.pointer_accumulated_scroll.1 += vertical;
         
-        // Super+L: Lock screen
-        self.bind(38, 0x08, "lock_screen".to_string());
+        tracing::trace!("Pointer scroll: h={:.1}, v={:.1}", horizontal, vertical);
         
-        // Ctrl+Alt+T: Terminal
-        self.bind(28, 0x06, "open_terminal".to_string());
+        Ok(PointerAction::Scroll { horizontal, vertical })
+    }
+    
+    /// Process touch down
+    pub fn process_touch_down(&mut self, id: i32, x: f64, y: f64) -> Result<TouchAction> {
+        let touch = TouchPoint::new(id, x, y);
+        self.active_touches.insert(id, touch);
         
-        // Super+Space: App launcher
-        self.bind(65, 0x08, "app_launcher".to_string());
+        tracing::trace!("Touch down: id={}, ({:.1}, {:.1})", id, x, y);
         
-        tracing::info!("Default shortcuts registered");
+        Ok(TouchAction::Down { id, x, y })
+    }
+    
+    /// Process touch motion
+    pub fn process_touch_motion(&mut self, id: i32, x: f64, y: f64) -> Result<TouchAction> {
+        if let Some(touch) = self.active_touches.get_mut(&id) {
+            touch.update_position(x, y);
+            tracing::trace!("Touch motion: id={}, ({:.1}, {:.1})", id, x, y);
+            Ok(TouchAction::Motion { id, x, y })
+        } else {
+            Ok(TouchAction::None)
+        }
+    }
+    
+    /// Process touch up
+    pub fn process_touch_up(&mut self, id: i32) -> Result<TouchAction> {
+        if let Some(touch) = self.active_touches.remove(&id) {
+            tracing::trace!("Touch up: id={}", id);
+            
+            // Check for tap gesture
+            if self.touch_gestures.recognize_tap(&touch, touch.x, touch.y) {
+                return Ok(TouchAction::Tap { id, x: touch.x, y: touch.y });
+            }
+            
+            Ok(TouchAction::Up { id })
+        } else {
+            Ok(TouchAction::None)
+        }
+    }
+    
+    /// Check for keyboard shortcuts
+    pub fn check_shortcut(&self, key: u32) -> Option<Shortcut> {
+        let ctrl = self.modifiers.ctrl;
+        let shift = self.modifiers.shift;
+        let alt = self.modifiers.alt;
+        let logo = self.modifiers.logo;
+        
+        // Common shortcuts (using evdev key codes)
+        match (ctrl, shift, alt, logo, key) {
+            (true, false, false, false, 24) => Some(Shortcut::Quit),        // Ctrl+Q
+            (true, false, false, false, 46) => Some(Shortcut::Copy),        // Ctrl+C
+            (true, false, false, false, 47) => Some(Shortcut::Paste),       // Ctrl+V
+            (true, false, false, false, 45) => Some(Shortcut::Cut),         // Ctrl+X
+            (true, false, false, false, 31) => Some(Shortcut::Save),        // Ctrl+S
+            (false, false, false, true, 36) => Some(Shortcut::Terminal),    // Super+Enter
+            (false, false, false, true, 32) => Some(Shortcut::AppLauncher), // Super+D
+            _ => None,
+        }
+    }
+    
+    /// Get pointer position
+    pub fn pointer_position(&self) -> (f64, f64) {
+        self.pointer_position
+    }
+    
+    /// Check if key is pressed
+    pub fn is_key_pressed(&self, key: u32) -> bool {
+        self.pressed_keys.contains(&key)
+    }
+    
+    /// Check if pointer button is pressed
+    pub fn is_button_pressed(&self, button: u32) -> bool {
+        self.pointer_buttons.contains(&button)
+    }
+    
+    /// Get active touch count
+    pub fn active_touch_count(&self) -> usize {
+        self.active_touches.len()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Keyboard action result
+#[derive(Debug, Clone, Copy)]
+pub enum KeyboardAction {
+    KeyPressed(u32),
+    KeyReleased(u32),
+    Repeat(u32),
+}
 
-    #[test]
-    fn test_touch_tracker_creation() {
-        let tracker = TouchTracker::new();
-        assert_eq!(tracker.touch_count(), 0);
-    }
+/// Pointer action result
+#[derive(Debug, Clone, Copy)]
+pub enum PointerAction {
+    Motion { x: f64, y: f64 },
+    ButtonPressed(u32),
+    ButtonReleased(u32),
+    Scroll { horizontal: f64, vertical: f64 },
+}
 
-    #[test]
-    fn test_touch_tracking() {
-        let mut tracker = TouchTracker::new();
-        tracker.touch_down(1, 100.0, 200.0, 0.8);
-        assert_eq!(tracker.touch_count(), 1);
-        
-        tracker.touch_motion(1, 105.0, 205.0, 0.8);
-        assert_eq!(tracker.touch_count(), 1);
-        
-        tracker.touch_up(1);
-        assert_eq!(tracker.touch_count(), 0);
-    }
+/// Touch action result
+#[derive(Debug, Clone, Copy)]
+pub enum TouchAction {
+    Down { id: i32, x: f64, y: f64 },
+    Motion { id: i32, x: f64, y: f64 },
+    Up { id: i32 },
+    Tap { id: i32, x: f64, y: f64 },
+    LongPress { id: i32, x: f64, y: f64 },
+    None,
+}
 
-    #[test]
-    fn test_keyboard_layout() {
-        let mut layout = KeyboardLayout::new();
-        assert_eq!(layout.current_layout, "us");
-        
-        layout.switch_layout("fr");
-        assert_eq!(layout.current_layout, "fr");
-        
-        layout.next_layout();
-        assert_eq!(layout.current_layout, "de");
-    }
-
-    #[test]
-    fn test_shortcut_binder() {
-        let mut binder = ShortcutBinder::new();
-        binder.bind(23, 0x04, "test_action".to_string());
-        
-        assert_eq!(binder.lookup(23, 0x04), Some("test_action"));
-        assert_eq!(binder.lookup(24, 0x04), None);
-    }
-
-    #[test]
-    fn test_ime_state() {
-        let mut ime = ImeState::new();
-        ime.update_preedit("hello".to_string(), 3);
-        assert_eq!(ime.preedit_text, "hello");
-        assert_eq!(ime.cursor_position, 3);
-    }
+/// Keyboard shortcuts
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortcut {
+    Quit,
+    Copy,
+    Paste,
+    Cut,
+    Save,
+    Terminal,
+    AppLauncher,
+    SwitchWorkspace(u8),
+    CloseWindow,
 }

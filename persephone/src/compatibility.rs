@@ -2,14 +2,16 @@
 // File: persephone/src/compatibility.rs
 // Purpose: Provide Linux system compatibility shims
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf, fs};
 use std::error::Error;
 use tracing::{info, debug, warn};
+use anyhow::anyhow;
 
 pub struct CompatibilityLayer {
     syscall_map: HashMap<u32, String>,
     errno_map: HashMap<i32, String>,
     capability_set: Vec<String>,
+    search_paths: Vec<PathBuf>,
 }
 
 impl CompatibilityLayer {
@@ -21,6 +23,14 @@ impl CompatibilityLayer {
             syscall_map: HashMap::new(),
             errno_map: HashMap::new(),
             capability_set: Vec::new(),
+            search_paths: vec![
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/sbin"),
+                PathBuf::from("/usr/sbin"),
+                PathBuf::from("/opt/bin"),
+            ],
         };
         
         compat.init_syscall_map();
@@ -123,6 +133,30 @@ impl CompatibilityLayer {
             debug!("Granted capability: {}", capability);
         }
     }
+
+    pub async fn resolve_binary(&self, binary: &str) -> Result<PathBuf, anyhow::Error> {
+    use std::fs;
+    
+    // If absolute path, check it exists
+    if binary.starts_with('/') {
+        let path = PathBuf::from(binary);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(anyhow!("Binary not found: {}", binary));
+    }
+    
+    // Search in PATH-like directories
+    for search_path in &self.search_paths {
+        let full_path = search_path.join(binary);
+        if full_path.exists() && fs::metadata(&full_path)?.is_file() {
+            return Ok(full_path);
+        }
+    }
+    
+    Err(anyhow!("Binary not found in search paths: {}", binary))
+}
+
     
     /// Revoke capability
     pub fn revoke_capability(&mut self, capability: &str) {

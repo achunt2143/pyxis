@@ -1,170 +1,90 @@
+// gecko/src/surface.rs
+//! Wayland surface abstraction
+
 use anyhow::Result;
-use std::collections::HashMap;
-use parking_lot::RwLock;
-use tracing;
-use crate::WindowInfo;
+use tracing::debug;
 
-/// Manages mapping between Gecko windows and Wayland surfaces
-pub struct SurfaceManager {
-    window_to_surface: RwLock<HashMap<u32, u32>>,
-    surface_to_window: RwLock<HashMap<u32, u32>>,
-    window_metadata: RwLock<HashMap<u32, WindowMetadata>>,
+/// Surface configuration for Wayland
+#[derive(Debug, Clone)]
+pub struct SurfaceConfig {
+    /// Surface width
+    pub width: u32,
+    /// Surface height
+    pub height: u32,
+    /// Requested frame rate
+    pub fps: u32,
 }
 
-#[derive(Clone, Debug)]
-struct WindowMetadata {
-    window_id: u32,
+impl Default for SurfaceConfig {
+    fn default() -> Self {
+        SurfaceConfig {
+            width: 1024,
+            height: 768,
+            fps: 60,
+        }
+    }
+}
+
+/// Represents a Wayland surface
+#[derive(Debug, Clone)]
+pub struct Surface {
     surface_id: u32,
-    app_id: String,
-    url: String,
-    width: u32,
-    height: u32,
-    is_visible: bool,
+    config: SurfaceConfig,
+    attached: bool,
+    committed: bool,
 }
 
-impl SurfaceManager {
-    pub fn new() -> Self {
-        SurfaceManager {
-            window_to_surface: RwLock::new(HashMap::new()),
-            surface_to_window: RwLock::new(HashMap::new()),
-            window_metadata: RwLock::new(HashMap::new()),
-        }
-    }
-
-    /// Map Gecko window to Wayland surface
-    pub fn map_window_to_surface(
-        &self,
-        window_id: u32,
-        surface_id: u32,
-        width: u32,
-        height: u32,
-    ) -> Result<()> {
-        let mut w2s = self.window_to_surface.write();
-        let mut s2w = self.surface_to_window.write();
-        let mut metadata = self.window_metadata.write();
-
-        w2s.insert(window_id, surface_id);
-        s2w.insert(surface_id, window_id);
-
-        // Store metadata for later retrieval
-        metadata.insert(
-            window_id,
-            WindowMetadata {
-                window_id,
-                surface_id,
-                app_id: String::new(),
-                url: String::new(),
-                width,
-                height,
-                is_visible: true,
-            },
-        );
-
-        tracing::debug!(
-            "Mapped window {} to surface {} ({}x{})",
-            window_id,
+impl Surface {
+    /// Create new surface
+    pub fn new(surface_id: u32, config: SurfaceConfig) -> Self {
+        Surface {
             surface_id,
-            width,
-            height
-        );
-        Ok(())
-    }
-
-    /// Unmap Gecko window from surface
-    pub fn unmap_window(&self, window_id: u32) -> Result<()> {
-        let mut w2s = self.window_to_surface.write();
-        let mut s2w = self.surface_to_window.write();
-        let mut metadata = self.window_metadata.write();
-
-        if let Some(surface_id) = w2s.remove(&window_id) {
-            s2w.remove(&surface_id);
-            metadata.remove(&window_id);
-
-            tracing::debug!("Unmapped window {}", window_id);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Window {} not mapped", window_id))
+            config,
+            attached: false,
+            committed: false,
         }
     }
 
-    /// Get surface ID for window
-    pub fn get_surface_for_window(&self, window_id: u32) -> Result<u32> {
-        self.window_to_surface
-            .read()
-            .get(&window_id)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("Window {} not mapped to surface", window_id))
+    /// Get surface ID
+    pub fn surface_id(&self) -> u32 {
+        self.surface_id
     }
 
-    /// Get window ID for surface
-    pub fn get_window_for_surface(&self, surface_id: u32) -> Result<u32> {
-        self.surface_to_window
-            .read()
-            .get(&surface_id)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("Surface {} not mapped to window", surface_id))
+    /// Get configuration
+    pub fn config(&self) -> &SurfaceConfig {
+        &self.config
     }
 
-    /// Update window metadata
-    pub fn update_window_metadata(
-        &self,
-        window_id: u32,
-        app_id: &str,
-        url: &str,
-        is_visible: bool,
-    ) -> Result<()> {
-        let mut metadata = self.window_metadata.write();
-
-        if let Some(meta) = metadata.get_mut(&window_id) {
-            meta.app_id = app_id.to_string();
-            meta.url = url.to_string();
-            meta.is_visible = is_visible;
-
-            tracing::trace!(
-                "Updated metadata for window {}: app_id={}, url={}",
-                window_id,
-                app_id,
-                url
-            );
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Window {} not tracked", window_id))
-        }
+    /// Get dimensions
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
     }
 
-    /// Get window info
-    pub fn get_window_info(&self, window_id: u32) -> Option<WindowInfo> {
-        self.window_metadata.read().get(&window_id).map(|meta| WindowInfo {
-            window_id: meta.window_id,
-            surface_id: meta.surface_id,
-            app_id: meta.app_id.clone(),
-            url: meta.url.clone(),
-            width: meta.width,
-            height: meta.height,
-            is_visible: meta.is_visible,
-        })
+    /// Mark buffer as attached (ready for content)
+    pub fn mark_attached(&mut self) {
+        debug!("Surface {} buffer attached", self.surface_id);
+        self.attached = true;
     }
 
-    /// List all windows
-    pub fn list_all_windows(&self) -> Vec<WindowInfo> {
-        self.window_metadata
-            .read()
-            .values()
-            .map(|meta| WindowInfo {
-                window_id: meta.window_id,
-                surface_id: meta.surface_id,
-                app_id: meta.app_id.clone(),
-                url: meta.url.clone(),
-                width: meta.width,
-                height: meta.height,
-                is_visible: meta.is_visible,
-            })
-            .collect()
+    /// Check if buffer is attached
+    pub fn is_attached(&self) -> bool {
+        self.attached
     }
 
-    /// Count mapped windows
-    pub fn window_count(&self) -> usize {
-        self.window_to_surface.read().len()
+    /// Mark changes as committed
+    pub fn mark_committed(&mut self) {
+        debug!("Surface {} committed", self.surface_id);
+        self.committed = true;
+    }
+
+    /// Check if committed
+    pub fn is_committed(&self) -> bool {
+        self.committed
+    }
+
+    /// Check if surface is ready for rendering
+    pub fn is_ready(&self) -> bool {
+        self.attached && self.committed
     }
 }
 
@@ -173,33 +93,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_window_surface_mapping() {
-        let manager = SurfaceManager::new();
-        manager.map_window_to_surface(1, 1, 800, 600).unwrap();
-
-        assert_eq!(manager.get_surface_for_window(1).unwrap(), 1);
-        assert_eq!(manager.get_window_for_surface(1).unwrap(), 1);
+    fn test_surface_creation() {
+        let config = SurfaceConfig {
+            width: 800,
+            height: 600,
+            fps: 60,
+        };
+        let surface = Surface::new(1, config);
+        assert_eq!(surface.surface_id(), 1);
+        assert_eq!(surface.size(), (800, 600));
     }
 
     #[test]
-    fn test_window_unmapping() {
-        let manager = SurfaceManager::new();
-        manager.map_window_to_surface(1, 1, 800, 600).unwrap();
-        manager.unmap_window(1).unwrap();
+    fn test_surface_lifecycle() {
+        let config = SurfaceConfig::default();
+        let mut surface = Surface::new(1, config);
 
-        assert!(manager.get_surface_for_window(1).is_err());
-    }
+        assert!(!surface.is_ready());
 
-    #[test]
-    fn test_window_metadata() {
-        let manager = SurfaceManager::new();
-        manager.map_window_to_surface(1, 1, 800, 600).unwrap();
-        manager
-            .update_window_metadata(1, "test-app", "https://example.com", true)
-            .unwrap();
+        surface.mark_attached();
+        assert!(surface.is_attached());
+        assert!(!surface.is_ready());
 
-        let info = manager.get_window_info(1).unwrap();
-        assert_eq!(info.app_id, "test-app");
-        assert_eq!(info.url, "https://example.com");
+        surface.mark_committed();
+        assert!(surface.is_committed());
+        assert!(surface.is_ready());
     }
 }

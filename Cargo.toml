@@ -24,7 +24,7 @@ license = "MPL-2.0"
 
 [workspace.dependencies]
 # Wayland and compositor
-smithay = "0.7.0"
+smithay = { version = "0.7", features = ["backend_drm"] }
 wayland-client = "0.30"
 wayland-server = "0.30"
 wayland-protocols = "0.31"
@@ -56,10 +56,12 @@ drm = "0.6"
 gbm = "0.15"
 shellexpand = "3.1.1"
 x11 = "2.21.0"
+num_cpus = "1.16"
+goblin = "0.8"
 
 # System
 libc = "0.2"
-nix = { version = "0.27", features = ["process", "signal", "mount", "user"] }
+nix = { version = "0.27", features = ["process", "signal", "resource", "mount", "user"] }
 
 # Graphics/Rendering
 wgpu = "27.0.1"
@@ -99,7 +101,7 @@ regex = "1.10"
 xml-rs = "0.8"
 which = "5.0"
 users = "0.11"
-dashmap = "5.5"
+dashmap = "6.1"
 procfs = "0.15"
 metrics = "0.21"
 prometheus = "0.13"
@@ -110,6 +112,8 @@ crossbeam = "0.8"
 rayon = "1.7"
 naga = "0.13"
 subprocess = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
 
 
 [profile.release]

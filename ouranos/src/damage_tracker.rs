@@ -137,7 +137,7 @@ impl DamageTracker {
             return Vec::new();
         }
 
-        let mut merged = Vec::new();
+        let mut merged = Vec::<Region>::new();
         let mut sorted = regions.to_vec();
         sorted.sort_by_key(|r| (r.x, r.y));
 

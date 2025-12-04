@@ -1,3 +1,7 @@
+// Persephone: Linux Application Support Layer for GeckoOS
+// File: persephone/src/lib.rs
+// Purpose: Main orchestrator for Linux compatibility
+
 pub mod native;
 pub mod wayland;
 pub mod x11;
@@ -11,8 +15,8 @@ pub use native::NativeExecutor;
 pub use wayland::WaylandClientAdapter;
 pub use x11::X11CompatibilityLayer;
 pub use dbus_session::DBusSessionManager;
-pub use elf_loader::ELFLoader;
-pub use runtime::LinuxRuntime;
+pub use elf_loader::ElfLoader;
+pub use runtime::Runtime;
 pub use compatibility::CompatibilityLayer;
 pub use echo_ipc::PersephoneEchoService;
 
@@ -21,6 +25,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 /// Persephone: Linux Application Support Layer for GeckoOS
 /// Provides native binary execution, Wayland/X11 compatibility, and D-Bus access
@@ -29,8 +34,8 @@ pub struct Persephone {
     wayland_adapter: Arc<WaylandClientAdapter>,
     x11_compat: Arc<X11CompatibilityLayer>,
     dbus_manager: Arc<DBusSessionManager>,
-    elf_loader: Arc<ELFLoader>,
-    runtime: Arc<LinuxRuntime>,
+    elf_loader: Arc<ElfLoader>,
+    runtime: Arc<Runtime>,
     compat_layer: Arc<CompatibilityLayer>,
     state: Arc<RwLock<PersephoneState>>,
 }
@@ -83,8 +88,8 @@ impl Persephone {
         tracing::info!("Initializing Persephone Linux Compatibility Layer");
 
         let native_executor = Arc::new(NativeExecutor::new().await?);
-        let elf_loader = Arc::new(ELFLoader::new(&config.library_paths).await?);
-        let runtime = Arc::new(LinuxRuntime::new().await?);
+        let elf_loader = Arc::new(ElfLoader);
+        let runtime = Arc::new(Runtime::new(std::process::id()));
 
         let wayland_adapter = if config.enable_wayland {
             Arc::new(WaylandClientAdapter::new(&config.wayland_socket).await?)
@@ -104,7 +109,7 @@ impl Persephone {
             Arc::new(DBusSessionManager::disabled().await?)
         };
 
-        let compat_layer = Arc::new(CompatibilityLayer::new(&config.app_search_paths).await?);
+        let compat_layer = Arc::new(CompatibilityLayer::new());
 
         let state = Arc::new(RwLock::new(PersephoneState {
             initialized: true,
@@ -133,7 +138,7 @@ impl Persephone {
         &self,
         binary: &str,
         args: Vec<String>,
-        env: Option<std::collections::HashMap<String, String>>,
+        env: Option<HashMap<String, String>>,
     ) -> Result<u32> {
         tracing::info!("Executing binary: {} with {} args", binary, args.len());
 
@@ -141,7 +146,9 @@ impl Persephone {
         let binary_path = self.compat_layer.resolve_binary(binary).await?;
 
         // Load and validate ELF binary
-        let elf_info = self.elf_loader.load(&binary_path).await?;
+        let elf_info = ElfLoader::load(&binary_path)?;
+        
+        tracing::debug!("ELF info - Entry: 0x{:x}, PIE: {}", elf_info.entry_point, elf_info.is_pie);
 
         // Execute via native executor
         let pid = self.native_executor.exec(&binary_path, args, env).await?;
@@ -175,12 +182,12 @@ impl Persephone {
     }
 
     /// Get ELF loader
-    pub fn elf_loader(&self) -> Arc<ELFLoader> {
-        self.elf_loader.clone()
+    pub fn elf_loader(&self) -> Arc<ElfLoader> {
+        Arc::new(ElfLoader)
     }
 
     /// Get runtime
-    pub fn runtime(&self) -> Arc<LinuxRuntime> {
+    pub fn runtime(&self) -> Arc<Runtime> {
         self.runtime.clone()
     }
 
@@ -191,14 +198,18 @@ impl Persephone {
         let mut report = CompatibilityReport::new(app_path.to_string_lossy().to_string());
 
         // Check ELF format
-        if let Ok(elf_info) = self.elf_loader.load(app_path).await {
+        if let Ok(elf_info) = ElfLoader::load(app_path) {
             report.is_elf = true;
-            report.arch = Some(elf_info.arch);
-            report.bits = Some(elf_info.bits);
+            report.arch = Some(if elf_info.is_pie { "PIE".to_string() } else { "Executable".to_string() });
+            report.bits = Some(64); // TODO: Detect actual bits from ELF header
         }
 
         // Check dependencies
-        report.dependencies = self.elf_loader.get_dependencies(app_path).await.unwrap_or_default();
+        if let Ok(elf_info) = ElfLoader::load(app_path) {
+            if let Some(dyn_info) = &elf_info.dynamic_info {
+                report.dependencies = dyn_info.needed_libraries.clone();
+            }
+        }
 
         // Check D-Bus requirements
         if self.dbus_manager.is_enabled().await {
@@ -215,6 +226,20 @@ impl Persephone {
     /// Get state
     pub fn state(&self) -> Arc<RwLock<PersephoneState>> {
         self.state.clone()
+    }
+
+    /// Shutdown Persephone
+    pub async fn shutdown(&self) -> Result<()> {
+        tracing::info!("Shutting down Persephone");
+        
+        // Kill all running processes
+        let processes = self.native_executor.list_processes().await?;
+        for process in processes {
+            let _ = self.native_executor.kill_process(process.pid).await;
+        }
+        
+        tracing::info!("Persephone shutdown complete");
+        Ok(())
     }
 }
 

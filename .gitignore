@@ -6,7 +6,7 @@ Cargo.lock
 
 # JavaScript build artifacts
 /dist/
-/node_modules/
+**/node_modules/**/*.*
 npm-debug.log
 yarn-debug.log
 yarn-error.log
@@ -31,6 +31,7 @@ Thumbs.db
 *.so
 *.dylib
 *.dll
+/build-logs/
 
 # Documentation
 /docs/build/

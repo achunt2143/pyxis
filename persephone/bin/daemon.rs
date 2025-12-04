@@ -4,12 +4,13 @@
 
 use std::error::Error;
 use std::sync::Arc;
+use geckoOS_echo::EchoClient;
+use geckoOS_echo::{ArgumentDefinition, SignalDefinition, ServiceInterface, MethodDefinition};
+use geckoOS_persephone::CompatibilityLayer;
+use geckoOS_gaia::{GeckoAppLauncher};
+use geckoOS_gaia::gecko_app_launcher::{AppDescriptor, GeckoApp};
 use tokio::signal;
 use tracing::{info, error};
-use persephone::elf_loader::ElfLoader;
-use persephone::runtime::Runtime;
-use persephone::compatibility::CompatibilityLayer;
-use persephone::app_launcher::AppLauncher;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -21,8 +22,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("🐧 Persephone Linux Layer v2.0.0 starting");
     
     // Create components
-    let compat_layer = Arc::new(CompatibilityLayer::new());
-    let app_launcher = Arc::new(AppLauncher::new(compat_layer.clone())?);
+    let _compat_layer = Arc::new(CompatibilityLayer::new());
+    let app_launcher = Arc::new(GeckoAppLauncher::new());
     
     info!("✓ Compatibility layer initialized");
     info!("✓ Application launcher initialized");
@@ -45,25 +46,63 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn connect_to_cronus(launcher: &Arc<AppLauncher>) -> Result<(), Box<dyn Error>> {
+/// Connect Persephone to Cronus process manager via Echo IPC
+/// 
+/// Registers Persephone as a service on the Echo IPC bus so that
+/// Cronus and other system components can request application launches.
+async fn connect_to_cronus(launcher: &Arc<GeckoAppLauncher>) -> Result<(), Box<dyn Error>> {
     info!("Connecting to Cronus Process Manager...");
     
-    // Register with Echo IPC
-    launcher.register_with_echo(
-        "org.geckoOS.Persephone",
-        &[
-            "executeApplication",
-            "getApplicationInfo",
-            "listApplications",
-            "getCompatibility",
-            "setResourceLimit",
-        ],
-    ).await?;
+    // Connect to Echo IPC daemon
+    let mut echo_client = EchoClient::connect().await?;
     
-    info!("✓ Registered with Echo IPC");
+    // Define Persephone service interface
+    let interface = ServiceInterface {
+        name: "org.geckoOS.Persephone".to_string(),
+        methods: vec![
+            MethodDefinition {
+                name: "LaunchApplication".to_string(),
+                input_args: vec![
+                    ArgumentDefinition { name: "app_id".to_string(), arg_type: "s".to_string() },
+                    ArgumentDefinition { name: "args".to_string(), arg_type: "s".to_string() },
+                ],
+                output_args: vec![
+                    ArgumentDefinition { name: "pid".to_string(), arg_type: "u".to_string() },
+                ],
+            },
+            MethodDefinition {
+                name: "TerminateApplication".to_string(),
+                input_args: vec![
+                    ArgumentDefinition { name: "app_id".to_string(), arg_type: "s".to_string() },
+                ],
+                output_args: vec![],
+            },
+        ],
+        signals: vec![
+            SignalDefinition {
+                name: "ApplicationLaunched".to_string(),
+                arguments: vec![
+                    ArgumentDefinition { name: "app_id".to_string(), arg_type: "s".to_string() },
+                    ArgumentDefinition { name: "pid".to_string(), arg_type: "u".to_string() },
+                ],
+            },
+        ],
+        properties: vec![],
+    };
+    
+    // Register on Echo bus
+    let _service_id = echo_client.register_service("org.geckoOS.Persephone", interface).await?;
+    
+    info!("✓ Registered Persephone on Echo IPC bus");
     Ok(())
 }
 
+
+/// Wait for shutdown signals (CTRL+C or SIGTERM)
+/// 
+/// Blocks until the daemon receives either:
+/// - SIGINT (CTRL+C)
+/// - SIGTERM (termination signal)
 async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -94,11 +133,30 @@ async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn cleanup(launcher: &Arc<AppLauncher>) -> Result<(), Box<dyn Error>> {
+/// Graceful shutdown - terminate all running applications
+/// 
+/// 1. Gets list of all running applications
+/// 2. Sends graceful termination request to each
+/// 3. Cleans up resources
+async fn cleanup(launcher: &Arc<GeckoAppLauncher>) -> Result<(), Box<dyn Error>> {
     info!("Cleaning up resources...");
+
+    // Get list of running applications
+    let apps = launcher.list_apps();
     
-    // Terminate all running applications
-    launcher.shutdown_all().await?;
+    if apps.is_empty() {
+        info!("No applications running");
+    } else {
+        info!("Terminating {} running application(s)", apps.len());
+        
+        // Terminate all running applications gracefully
+        for app in apps {
+            match launcher.terminate_app(&app.app_id) {
+                Ok(()) => info!("✓ Terminated: {}", app.app_id),
+                Err(e) => error!("✗ Failed to terminate {}: {}", app.app_id, e),
+            }
+        }
+    }
     
     info!("✓ All applications terminated");
     info!("✓ Resources cleaned up");
@@ -106,6 +164,7 @@ async fn cleanup(launcher: &Arc<AppLauncher>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Print Persephone system information banner
 fn print_system_info() {
     println!();
     println!("╔═════════════════════════════════════╗");

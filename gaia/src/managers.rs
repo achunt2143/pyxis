@@ -25,9 +25,7 @@ pub struct WindowManager {
     service: Arc<ShellService>,
 }
 
-pub struct UIServer {
-    port: u16,
-}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledApp {
@@ -163,14 +161,4 @@ impl WindowManager {
     }
 }
 
-impl UIServer {
-    pub async fn new(port: u16) -> Result<Self> {
-        tracing::info!("Initializing UI Server on port {}", port);
-        Ok(UIServer { port })
-    }
 
-    pub async fn start(&self) -> Result<()> {
-        tracing::info!("Starting UI Server");
-        Ok(())
-    }
-}

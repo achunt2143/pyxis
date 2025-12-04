@@ -125,13 +125,13 @@ impl WindowDecoration {
             title_bar: Rect {
                 x: window_geom.x,
                 y: window_geom.y,
-                width: window_geom.width,
+                width: window_geom.width as i32,
                 height: self.config.title_bar_height as i32,
             },
             top_border: Rect {
                 x: window_geom.x,
                 y: window_geom.y,
-                width: window_geom.width,
+                width: window_geom.width as i32,
                 height: self.config.border_width as i32,
             },
             left_border: Rect {
@@ -149,7 +149,7 @@ impl WindowDecoration {
             bottom_border: Rect {
                 x: window_geom.x,
                 y: window_geom.y + window_geom.height as i32 - self.config.border_width as i32,
-                width: window_geom.width,
+                width: window_geom.width as i32,
                 height: self.config.border_width as i32,
             },
             close_button: self.get_button_rect(ControlButton::Close, window_geom),

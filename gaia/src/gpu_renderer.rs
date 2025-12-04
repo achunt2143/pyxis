@@ -12,7 +12,8 @@ lazy_static! {
     static ref GPU_CONTEXT: Mutex<Option<GPUContext>> = Mutex::new(None);
 }
 
-pub struct GPURenderer;
+pub struct GPURenderer {}
+
 
 pub struct GPUContext {
     vendor: String,

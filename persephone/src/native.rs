@@ -6,6 +6,8 @@ use tracing;
 use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+#[cfg(unix)]
+use libc::{ptrace, PTRACE_TRACEME, PTRACE_SYSCALL, PTRACE_GETREGS};
 
 /// Native Linux binary executor
 pub struct NativeExecutor {
@@ -101,7 +103,7 @@ impl NativeExecutor {
         #[cfg(unix)]
         {
             use nix::unistd::Pid;
-            use nix::signal::{kill, Signal};
+            use nix::sys::signal::{kill, Signal};
 
             kill(Pid::from_raw(pid as i32), Signal::SIGTERM)?;
         }
@@ -118,7 +120,7 @@ impl NativeExecutor {
         #[cfg(unix)]
         {
             use nix::unistd::Pid;
-            use nix::signal::{kill, Signal};
+            use nix::sys::signal::{kill, Signal};
 
             kill(Pid::from_raw(pid as i32), Signal::SIGKILL)?;
         }

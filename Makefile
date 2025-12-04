@@ -90,15 +90,16 @@ install-deps: stage1
 	@echo "$(YELLOW)Installing Rust dependencies...$(NC)"
 	$(CARGO) fetch
 	@echo "$(YELLOW)Installing Node.js dependencies...$(NC)"
-	npm ci
+	cd gaia && npm install
 	@echo "$(GREEN)✓ Dependencies installed$(NC)"
+	cd ..
 
 install-system-deps:
 	@echo "$(YELLOW)Installing system libraries (requires sudo)...$(NC)"
 	@command -v apt >/dev/null 2>&1 && sudo apt install -y \
 		libdrm-dev libinput-dev wayland-protocols libwayland-dev \
 		libgl1-mesa-dev libgbm-dev libudev-dev libasound2-dev \
-		linux-headers-$(shell uname -r) || true
+		libseat-dev linux-headers-$(shell uname -r) || true
 	@command -v pacman >/dev/null 2>&1 && sudo pacman -S \
 		libdrm libinput wayland-protocols libgl gbm udev alsa-lib \
 		linux-headers || true
@@ -121,7 +122,7 @@ stage2-rust-release: verify-rust
 
 stage2-js: verify-node
 	@echo "$(YELLOW)Building JavaScript components...$(NC)"
-	npm run build
+	cd gaia && npm run build
 	@echo "$(GREEN)✓ JavaScript build complete$(NC)"
 
 system: stage2-rust

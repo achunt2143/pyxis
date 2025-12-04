@@ -86,16 +86,16 @@ impl Runtime {
         #[cfg(unix)]
         {
             use nix::sys::resource::{setrlimit, Resource};
-            use nix::sys::resource::rlim::RlimT;
+            // use nix::sys::resource::Resource;
             
             let mem_limit = (self.resource_limits.max_memory_mb as u64) * 1024 * 1024;
             setrlimit(Resource::RLIMIT_AS, mem_limit, mem_limit)?;
             debug!("Memory limit set to: {} MB", self.resource_limits.max_memory_mb);
             
-            setrlimit(Resource::RLIMIT_NOFILE, self.resource_limits.max_open_files as RlimT, self.resource_limits.max_open_files as RlimT)?;
+            setrlimit(Resource::RLIMIT_NOFILE, self.resource_limits.max_open_files.into(), self.resource_limits.max_open_files.into())?;
             debug!("Open files limit set to: {}", self.resource_limits.max_open_files);
             
-            setrlimit(Resource::RLIMIT_NPROC, self.resource_limits.max_threads as RlimT, self.resource_limits.max_threads as RlimT)?;
+            setrlimit(Resource::RLIMIT_NPROC, self.resource_limits.max_threads.into(), self.resource_limits.max_threads.into())?;
             debug!("Thread limit set to: {}", self.resource_limits.max_threads);
         }
         

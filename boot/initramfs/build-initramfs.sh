@@ -39,9 +39,19 @@ mkdir -p "$(dirname "$OUTPUT_FILE")"
 # ============================================================================
 
 log_info "Copying init script..."
-cp "${SCRIPT_DIR}/init" "$INITRAMFS_DIR/init"
-chmod +x "$INITRAMFS_DIR/init"
-log_success "Init script copied"
+
+# Look for initramfs-init file
+INIT_SCRIPT="${SCRIPT_DIR}/initramfs-init"
+
+if [ -f "$INIT_SCRIPT" ]; then
+    mkdir -p "$INITRAMFS_DIR"
+    cp "$INIT_SCRIPT" "$INITRAMFS_DIR/init"
+    chmod +x "$INITRAMFS_DIR/init"
+    log_success "Init script copied"
+else
+    log_error "Init script not found at $INIT_SCRIPT"
+    exit 1
+fi
 
 # ============================================================================
 # COPY BUSYBOX BINARY
@@ -154,12 +164,13 @@ log_success "Device nodes created"
 
 log_info "Creating filesystem structure..."
 mkdir -p "$INITRAMFS_DIR"/{proc,sys,dev,run,root,mnt,oldroot,newroot}
-mkdir -p "$INITRAMFS_DIR/etc"
+mkdir -p "$INITRAMFS_DIR/etc"/{init.d,rc.d,ld.so.conf.d}
 mkdir -p "$INITRAMFS_DIR/sbin"
 mkdir -p "$INITRAMFS_DIR/var"/{log,lock}
 
 # Create basic config files
 echo "#!/bin/sh" > "$INITRAMFS_DIR/etc/init.d/rcS"
+
 chmod +x "$INITRAMFS_DIR/etc/init.d/rcS"
 
 log_success "Filesystem structure created"

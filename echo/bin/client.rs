@@ -1,207 +1,323 @@
-// Echo IPC Client - CLI Tool
-// File: echo/bin/client.rs
-// Purpose: Command-line tool for Echo IPC interaction
+//! Echo IPC Client - CLI Tool
+//!
+//! Command-line interface for interacting with the Echo IPC bus.
 
 use std::error::Error;
-use structopt::StructOpt;
-use echo::echo_client::EchoClient;
+use clap::{Parser, Subcommand};
+use geckoOS_echo::{EchoClient, ServiceInterface, MethodDefinition, SignalDefinition, ArgumentDefinition};
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "echo-cli", about = "Echo IPC Message Bus CLI")]
-enum Command {
+#[derive(Parser)]
+#[command(name = "echo-cli", about = "Echo IPC Message Bus CLI", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
     /// List all registered services
-    #[structopt(name = "services")]
+    #[command(name = "services")]
     ListServices,
-    
+
     /// Show service information
-    #[structopt(name = "service-info")]
+    #[command(name = "info")]
     ServiceInfo {
         /// Service name
         service: String,
     },
-    
+
     /// Call a service method
-    #[structopt(name = "call")]
+    #[command(name = "call")]
     CallMethod {
         /// Service name
         service: String,
-        
+
+        /// Interface name
+        #[arg(short, long, default_value = "")]
+        interface: String,
+
         /// Method name
         method: String,
-        
+
         /// Arguments in JSON format
-        #[structopt(default_value = "{}")]
+        #[arg(short, long, default_value = "{}")]
         args: String,
     },
-    
-    /// Listen for signals from a service
-    #[structopt(name = "listen")]
-    Listen {
-        /// Service name
-        service: String,
-        
-        /// Signal name
-        signal: String,
-    },
-    
+
     /// Emit a signal
-    #[structopt(name = "emit")]
-    Emit {
-        /// Service name
-        service: String,
-        
+    #[command(name = "emit")]
+    EmitSignal {
+        /// Interface name
+        interface: String,
+
         /// Signal name
         signal: String,
-        
+
         /// Signal data in JSON format
-        #[structopt(default_value = "{}")]
+        #[arg(short, long, default_value = "{}")]
         data: String,
     },
-    
+
     /// Get Echo bus status
-    #[structopt(name = "status")]
+    #[command(name = "status")]
     Status,
-    
-    /// Monitor IPC traffic
-    #[structopt(name = "monitor")]
-    Monitor,
+
+    /// Register a test service
+    #[command(name = "register")]
+    RegisterService {
+        /// Service name
+        name: String,
+    },
+
+    /// Ping the Echo daemon
+    #[command(name = "ping")]
+    Ping,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let command = Command::from_args();
-    
-    let client = EchoClient::connect().await?;
-    
-    match command {
-        Command::ListServices => list_services(&client).await?,
-        Command::ServiceInfo { service } => service_info(&client, &service).await?,
-        Command::CallMethod { service, method, args } => call_method(&client, &service, &method, &args).await?,
-        Command::Listen { service, signal } => listen_signal(&client, &service, &signal).await?,
-        Command::Emit { service, signal, data } => emit_signal(&client, &service, &signal, &data).await?,
-        Command::Status => show_status(&client).await?,
-        Command::Monitor => monitor_traffic(&client).await?,
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .init();
+
+    let cli = Cli::parse();
+
+    let client = match EchoClient::connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ Failed to connect to Echo daemon: {}", e);
+            eprintln!("   Make sure echo-daemon is running.");
+            std::process::exit(1);
+        }
+    };
+
+    match cli.command {
+        Commands::ListServices => list_services(&client).await?,
+        Commands::ServiceInfo { service } => service_info(&client, &service).await?,
+        Commands::CallMethod { service, interface, method, args } => {
+            call_method(&client, &service, &interface, &method, &args).await?
+        }
+        Commands::EmitSignal { interface, signal, data } => {
+            emit_signal(&client, &interface, &signal, &data).await?
+        }
+        Commands::Status => show_status(&client).await?,
+        Commands::RegisterService { name } => register_service(&client, &name).await?,
+        Commands::Ping => ping(&client).await?,
     }
-    
+
     Ok(())
 }
 
 async fn list_services(client: &EchoClient) -> Result<(), Box<dyn Error>> {
     println!("Echo IPC Registered Services:");
     println!();
-    
-    let services = client.list_services().await?;
-    
-    for service in services {
-        println!("📦 {}", service.name);
-        println!("   PID: {}", service.pid);
-        println!("   Methods: {}", service.methods.join(", "));
-        println!("   Signals: {}", service.signals.join(", "));
-        println!();
+
+    let result = client.call_method(
+        "org.geckoOS.Echo",
+        "Bus",
+        "ListServices",
+        serde_json::json!({}),
+    ).await?;
+
+    let services = result["services"].as_array()
+        .ok_or("Invalid response format")?;
+
+    if services.is_empty() {
+        println!("  (no services registered)");
+    } else {
+        for service in services {
+            let name = service["service_name"].as_str().unwrap_or("unknown");
+            let id = service["service_id"].as_str().unwrap_or("unknown");
+            let registered_at = service["registered_at"].as_str().unwrap_or("unknown");
+            
+            println!("📦 {}", name);
+            println!("   ID: {}", id);
+            println!("   Registered: {}", registered_at);
+            println!();
+        }
     }
-    
+
+    println!("Total: {} services", services.len());
     Ok(())
 }
 
 async fn service_info(client: &EchoClient, service: &str) -> Result<(), Box<dyn Error>> {
-    let info = client.get_service_info(service).await?;
-    
+    let result = client.call_method(
+        "org.geckoOS.Echo",
+        "Bus",
+        "GetServiceInfo",
+        serde_json::json!({
+            "service_name": service
+        }),
+    ).await?;
+
     println!("Service Information: {}", service);
     println!("═════════════════════════════════════");
-    println!("PID: {}", info.pid);
-    println!("Owner: {}", info.owner);
-    println!("Created: {}", info.created_at);
+    println!("Service ID: {}", result["service_id"].as_str().unwrap_or("unknown"));
+    println!("Registered: {}", result["registered_at"].as_str().unwrap_or("unknown"));
     println!();
-    println!("Methods:");
-    for method in &info.methods {
-        println!("  - {}", method);
+
+    if let Some(interface) = result.get("interface") {
+        if let Some(methods) = interface["methods"].as_array() {
+            if !methods.is_empty() {
+                println!("Methods:");
+                for method in methods {
+                    let name = method["name"].as_str().unwrap_or("unknown");
+                    println!("  • {}", name);
+                }
+                println!();
+            }
+        }
+
+        if let Some(signals) = interface["signals"].as_array() {
+            if !signals.is_empty() {
+                println!("Signals:");
+                for signal in signals {
+                    let name = signal["name"].as_str().unwrap_or("unknown");
+                    println!("  • {}", name);
+                }
+                println!();
+            }
+        }
     }
-    println!();
-    println!("Signals:");
-    for signal in &info.signals {
-        println!("  - {}", signal);
-    }
-    
+
     Ok(())
 }
 
-async fn call_method(client: &EchoClient, service: &str, method: &str, args: &str) -> Result<(), Box<dyn Error>> {
-    println!("Calling {}.{}({})", service, method, args);
-    
-    let result = client.call_method(service, method, args).await?;
-    
+async fn call_method(
+    client: &EchoClient,
+    service: &str,
+    interface: &str,
+    method: &str,
+    args: &str,
+) -> Result<(), Box<dyn Error>> {
+    let interface = if interface.is_empty() {
+        service.to_string()
+    } else {
+        interface.to_string()
+    };
+
+    println!("Calling {}.{}.{}({}) ...", service, interface, method, args);
+
+    let args_json: serde_json::Value = serde_json::from_str(args)?;
+
+    let result = client.call_method(service, &interface, method, args_json).await?;
+
     println!("✓ Method call successful");
-    println!("Response: {}", result);
-    
-    Ok(())
-}
-
-async fn listen_signal(client: &EchoClient, service: &str, signal: &str) -> Result<(), Box<dyn Error>> {
-    println!("Listening for {}.{} signal...", service, signal);
-    println!("Press Ctrl+C to stop");
     println!();
-    
-    let mut receiver = client.listen(service, signal).await?;
-    
-    while let Some(event) = receiver.recv().await {
-        println!("📨 Signal received: {}", event.timestamp);
-        println!("   Data: {}", event.data);
-    }
-    
+    println!("Response:");
+    println!("{}", serde_json::to_string_pretty(&result)?);
+
     Ok(())
 }
 
-async fn emit_signal(client: &EchoClient, service: &str, signal: &str, data: &str) -> Result<(), Box<dyn Error>> {
-    println!("Emitting {}.{}", service, signal);
-    
-    client.emit_signal(service, signal, data).await?;
-    
+async fn emit_signal(
+    client: &EchoClient,
+    interface: &str,
+    signal: &str,
+    data: &str,
+) -> Result<(), Box<dyn Error>> {
+    println!("Emitting {}.{} ...", interface, signal);
+
+    let data_json: serde_json::Value = serde_json::from_str(data)?;
+    client.emit_signal(interface, signal, data_json).await?;
+
     println!("✓ Signal emitted");
-    
     Ok(())
 }
 
 async fn show_status(client: &EchoClient) -> Result<(), Box<dyn Error>> {
-    let status = client.get_status().await?;
-    
+    let services_result = client.call_method(
+        "org.geckoOS.Echo",
+        "Bus",
+        "ListServices",
+        serde_json::json!({}),
+    ).await?;
+
+    let service_count = services_result["count"].as_u64().unwrap_or(0);
+
     println!("Echo IPC Bus Status");
     println!("═══════════════════════════════════════");
-    println!("Status: {}", if status.is_running { "Running ✓" } else { "Stopped ✗" });
-    println!("Uptime: {}", status.uptime);
-    println!("Connected Services: {}", status.service_count);
-    println!("Total Messages: {}", status.message_count);
-    println!("Active Connections: {}", status.connection_count);
+    println!("Status: Running ✓");
+    println!("Registered Services: {}", service_count);
     println!();
-    println!("Top Services:");
-    for (name, count) in &status.top_services {
-        println!("  - {}: {} messages", name, count);
-    }
-    
-    Ok(())
-}
 
-async fn monitor_traffic(client: &EchoClient) -> Result<(), Box<dyn Error>> {
-    println!("Monitoring Echo IPC Traffic (Ctrl+C to stop)");
-    println!();
-    
-    let mut monitor = client.create_monitor().await?;
-    
-    println!("{:<35} {:<20} {:<15}", "Service", "Method/Signal", "Status");
-    println!("{}", "-".repeat(70));
-    
-    while let Some(event) = monitor.next().await {
-        match event.event_type {
-            echo::MonitorEventType::MethodCall => {
-                println!("{:<35} {:<20} {:<15}", event.service, event.method, "CALL");
-            }
-            echo::MonitorEventType::MethodReturn => {
-                println!("{:<35} {:<20} {:<15}", event.service, event.method, "RETURN");
-            }
-            echo::MonitorEventType::Signal => {
-                println!("{:<35} {:<20} {:<15}", event.service, event.signal, "SIGNAL");
+    if service_count > 0 {
+        println!("Active Services:");
+        if let Some(services) = services_result["services"].as_array() {
+            for service in services {
+                let name = service["service_name"].as_str().unwrap_or("unknown");
+                println!("  • {}", name);
             }
         }
     }
+
+    Ok(())
+}
+
+async fn register_service(client: &EchoClient, name: &str) -> Result<(), Box<dyn Error>> {
+    println!("Registering test service: {}", name);
+
+    let interface = ServiceInterface {
+        name: name.to_string(),
+        methods: vec![
+            MethodDefinition {
+                name: "TestMethod".to_string(),
+                input_args: vec![
+                    ArgumentDefinition {
+                        name: "arg1".to_string(),
+                        arg_type: "string".to_string(),
+                    }
+                ],
+                output_args: vec![
+                    ArgumentDefinition {
+                        name: "result".to_string(),
+                        arg_type: "string".to_string(),
+                    }
+                ],
+            }
+        ],
+        signals: vec![
+            SignalDefinition {
+                name: "TestSignal".to_string(),
+                arguments: vec![],
+            }
+        ],
+        properties: vec![],
+    };
+
+    let result = client.call_method(
+        "org.geckoOS.Echo",
+        "Bus",
+        "RegisterService",
+        serde_json::json!({
+            "name": name,
+            "interface": interface,
+        }),
+    ).await?;
+
+    println!("✓ Service registered");
+    println!("  Service ID: {}", result["service_id"].as_str().unwrap_or("unknown"));
+    println!("  Status: {}", result["status"].as_str().unwrap_or("unknown"));
+
+    Ok(())
+}
+
+async fn ping(client: &EchoClient) -> Result<(), Box<dyn Error>> {
+    println!("Pinging Echo daemon...");
+
+    let start = std::time::Instant::now();
     
+    // Try to list services as a ping
+    let _ = client.call_method(
+        "org.geckoOS.Echo",
+        "Bus",
+        "ListServices",
+        serde_json::json!({}),
+    ).await?;
+
+    let elapsed = start.elapsed();
+
+    println!("✓ Pong! ({:.2}ms)", elapsed.as_secs_f64() * 1000.0);
     Ok(())
 }

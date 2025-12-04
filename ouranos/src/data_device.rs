@@ -120,7 +120,7 @@ impl ClipboardManager {
     pub fn copy_data(&mut self, mime_type: &str, data: Vec<u8>) -> Result<()> {
         let offer = DataOffer::new(vec![mime_type.to_string()], data);
         self.selection_manager.set_selection(SelectionType::Clipboard, offer);
-        tracing::debug!("Data copied: {} MIME type: {}", offer.data.len(), mime_type);
+        // tracing::debug!("Data copied: {} MIME type: {}", offer. .data.len(), mime_type);
         Ok(())
     }
 

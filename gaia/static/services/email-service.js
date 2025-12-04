@@ -47,4 +47,4 @@ class EmailService {
   }
 }
 
-export default EmailService;
+export { EmailService };
