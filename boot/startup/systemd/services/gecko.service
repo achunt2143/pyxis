@@ -6,7 +6,7 @@ Requires=cronus.service echo.service
 
 [Service]
 Type=simple
-ExecStart=/opt/geckoOS/bin/gecko
+ExecStart=/usr/bin/gecko
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

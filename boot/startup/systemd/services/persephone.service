@@ -6,7 +6,7 @@ Requires=cronus.service echo.service
 
 [Service]
 Type=simple
-ExecStart=/opt/geckoOS/bin/persephone-daemon
+ExecStart=/usr/bin/persephone-daemon
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

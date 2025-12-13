@@ -36,14 +36,14 @@ main() {
     log_info "Launching QEMU with ${QEMU_CPUS} CPUs, ${QEMU_MEMORY}MB RAM"
     
     qemu-system-x86_64 \
-        -drive file="${IMAGE_FILE}",format=raw,media=disk \
+    -bios /usr/share/ovmf/OVMF.fd \
+        -drive file="${IMAGE_FILE}",format=raw \
         -m "${QEMU_MEMORY}" \
         -smp "${QEMU_CPUS}" \
         -net "${QEMU_NET}" \
-        -serial mon:stdio \
-        -display gtk \
-        -enable-kvm \
-        -bios /usr/share/ovmf/OVMF.fd
+        -serial stdio \
+        -enable-kvm
+    
 }
 
 main "$@"

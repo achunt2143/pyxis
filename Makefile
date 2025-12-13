@@ -42,12 +42,12 @@ help:
 	@echo "  stage2: Build components (Rust binary, JavaScript)"
 	@echo "  stage3: Package filesystem and create disk image"
 	@echo ""
-	@echo "$(BLUE)Docker Commands:$(NC)"
-	@echo "  docker-build              Build Docker image locally"
-	@echo "  docker-shell              Interactive development shell in container"
-	@echo "  docker-build-image        Perform full build inside container"
-	@echo "  docker-clean              Clean Docker resources"
-	@echo "  docker-logs               View Docker build logs"
+# 	@echo "$(BLUE)Docker Commands:$(NC)"
+# 	@echo "  docker-build              Build Docker image locally"
+# 	@echo "  docker-shell              Interactive development shell in container"
+# 	@echo "  docker-build-image        Perform full build inside container"
+# 	@echo "  docker-clean              Clean Docker resources"
+# 	@echo "  docker-logs               View Docker build logs"
 
 # ============================================================================
 # DEPENDENCY VERIFICATION
@@ -134,7 +134,7 @@ userspace: stage2-js
 build: stage1 install-deps stage2-rust stage2-js
 	@echo "$(GREEN)✓ Full build complete$(NC)"
 
-build-release: stage1 install-deps stage2-rust-release stage2-js
+build-release: stage1 install-deps stage2-rust-release stage2-js build-kernel build-initramfs build-rootfs package
 	@echo "$(GREEN)✓ Release build complete$(NC)"
 
 build-debug: stage1 install-deps
@@ -142,6 +142,31 @@ build-debug: stage1 install-deps
 	$(CARGO) build
 	npm run build
 	@echo "$(GREEN)✓ Debug build complete$(NC)"
+
+build-kernel:
+	@echo "$(YELLOW)Building kernel image...$(NC)"
+	./scripts/build-kernel.sh
+	@echo "$(GREEN)✓ Kernel build complete$(NC)"
+
+build-rootfs:
+	@echo "$(YELLOW)Building root fs...$(NC)"
+	./scripts/create-rootfs.sh --kernel-prebuilt
+	@echo "$(GREEN)✓ Root fs build complete$(NC)"
+
+build-initramfs:
+	@echo "$(YELLOW)Building initramfs image...$(NC)"
+	./scripts/build-initramfs.sh
+	@echo "$(GREEN)✓ Initramfs build complete$(NC)"
+
+build-busybox:
+	@echo "$(YELLOW)Building busybox...$(NC)"
+	./scripts/busybox-install.sh
+	@echo "$(GREEN)✓ Busybox build complete$(NC)"	
+
+package:
+	@echo "$(YELLOW)Packaging image...$(NC)"
+	./scripts/package.sh --x86_64-efi
+	@echo "$(GREEN)✓ Packaging complete$(NC)"
 
 # ============================================================================
 # TESTING
@@ -197,7 +222,7 @@ check:
 # RUNTIME
 # ============================================================================
 
-run: build
+run:
 	@echo "$(YELLOW)Starting GeckoOS (debug mode)...$(NC)"
 	./scripts/emulate.sh
 
@@ -234,70 +259,70 @@ distclean: clean
 # DOCKER
 # ============================================================================
 
-docker-build:
-	@echo "$(BLUE)Building GeckoOS Docker image...$(NC)"
-	@scripts/docker-build.sh $(DOCKER_IMAGE_TAG)
-	@echo "$(GREEN)[✓]$(NC) Docker image built successfully"
+# docker-build:
+# 	@echo "$(BLUE)Building GeckoOS Docker image...$(NC)"
+# 	@scripts/docker-build.sh $(DOCKER_IMAGE_TAG)
+# 	@echo "$(GREEN)[✓]$(NC) Docker image built successfully"
 
-docker-shell:
-	@echo "$(BLUE)Launching interactive GeckoOS development shell...$(NC)"
-	@$(DOCKER_COMPOSE) run --rm dev bash
-	@echo "$(GREEN)[✓]$(NC) Development shell closed"
+# docker-shell:
+# 	@echo "$(BLUE)Launching interactive GeckoOS development shell...$(NC)"
+# 	@$(DOCKER_COMPOSE) run --rm dev bash
+# 	@echo "$(GREEN)[✓]$(NC) Development shell closed"
 
-docker-build-image:
-	@echo "$(BLUE)Building GeckoOS inside Docker container...$(NC)"
-	@$(DOCKER_COMPOSE) run --rm build
-	@echo "$(GREEN)[✓]$(NC) Build complete - artifacts in target/"
+# docker-build-image:
+# 	@echo "$(BLUE)Building GeckoOS inside Docker container...$(NC)"
+# 	@$(DOCKER_COMPOSE) run --rm build
+# 	@echo "$(GREEN)[✓]$(NC) Build complete - artifacts in target/"
 
-docker-run: docker-build
-	@echo "$(YELLOW)Running GeckoOS in Docker...$(NC)"
-	docker run -it --rm geckoOS:latest
+# docker-run: docker-build
+# 	@echo "$(YELLOW)Running GeckoOS in Docker...$(NC)"
+# 	docker run -it --rm geckoOS:latest
 
-docker-clean:
-	@echo "$(BLUE)Cleaning Docker containers, images, and volumes...$(NC)"
-	@$(DOCKER_COMPOSE) down -v 2>/dev/null || true
-	@docker rmi $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG) 2>/dev/null || true
-	@docker rmi $(DOCKER_IMAGE_NAME):dev 2>/dev/null || true
-	@docker volume prune -f 2>/dev/null || true
-	@echo "$(GREEN)[✓]$(NC) Docker cleanup complete"
+# docker-clean:
+# 	@echo "$(BLUE)Cleaning Docker containers, images, and volumes...$(NC)"
+# 	@$(DOCKER_COMPOSE) down -v 2>/dev/null || true
+# 	@docker rmi $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG) 2>/dev/null || true
+# 	@docker rmi $(DOCKER_IMAGE_NAME):dev 2>/dev/null || true
+# 	@docker volume prune -f 2>/dev/null || true
+# 	@echo "$(GREEN)[✓]$(NC) Docker cleanup complete"
 
-docker-logs:
-	@$(DOCKER_COMPOSE) logs -f
+# docker-logs:
+# 	@$(DOCKER_COMPOSE) logs -f
 
-docker-images:
-	@echo "$(BLUE)GeckoOS Docker Images:$(NC)"
-	@docker images | grep $(DOCKER_IMAGE_NAME) || echo "No $(DOCKER_IMAGE_NAME) images found"
+# docker-images:
+# 	@echo "$(BLUE)GeckoOS Docker Images:$(NC)"
+# 	@docker images | grep $(DOCKER_IMAGE_NAME) || echo "No $(DOCKER_IMAGE_NAME) images found"
 
-docker-volumes:
-	@echo "$(BLUE)GeckoOS Docker Volumes:$(NC)"
-	@docker volume ls | grep $(DOCKER_IMAGE_NAME) || echo "No $(DOCKER_IMAGE_NAME) volumes found"
+# docker-volumes:
+# 	@echo "$(BLUE)GeckoOS Docker Volumes:$(NC)"
+# 	@docker volume ls | grep $(DOCKER_IMAGE_NAME) || echo "No $(DOCKER_IMAGE_NAME) volumes found"
 
-docker-ps:
-	@echo "$(BLUE)Running GeckoOS Containers:$(NC)"
-	@docker ps --filter "ancestor=$(DOCKER_IMAGE_NAME):*" || echo "No running containers"
+# docker-ps:
+# 	@echo "$(BLUE)Running GeckoOS Containers:$(NC)"
+# 	@docker ps --filter "ancestor=$(DOCKER_IMAGE_NAME):*" || echo "No running containers"
 
-docker-inspect:
-	@echo "$(BLUE)Inspecting $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)...$(NC)"
-	@docker inspect $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG) | jq '.[0] | {Created, RepoDigests, Size, Architecture}'
+# docker-inspect:
+# 	@echo "$(BLUE)Inspecting $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)...$(NC)"
+# 	@docker inspect $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG) | jq '.[0] | {Created, RepoDigests, Size, Architecture}'
 
-docker-help:
-	@echo "$(BLUE)Docker Targets:$(NC)"
-	@echo ""
-	@echo "  $(YELLOW)docker-build$(NC)         Build Docker image"
-	@echo "  $(YELLOW)docker-shell$(NC)         Interactive development shell"
-	@echo "  $(YELLOW)docker-build-image$(NC)   Full build inside container"
-	@echo "  $(YELLOW)docker-clean$(NC)         Clean Docker containers/images/volumes"
-	@echo "  $(YELLOW)docker-logs$(NC)          View Docker logs"
-	@echo "  $(YELLOW)docker-images$(NC)        List GeckoOS images"
-	@echo "  $(YELLOW)docker-volumes$(NC)       List GeckoOS volumes"
-	@echo "  $(YELLOW)docker-ps$(NC)            List running containers"
-	@echo "  $(YELLOW)docker-inspect$(NC)       Inspect Docker image"
-	@echo ""
-	@echo "$(BLUE)Examples:$(NC)"
-	@echo "  make docker-build              # Build image"
-	@echo "  make docker-shell              # Interactive shell"
-	@echo "  make docker-build-image        # Build in container"
-	@echo "  make docker-clean              # Clean everything"
+# docker-help:
+# 	@echo "$(BLUE)Docker Targets:$(NC)"
+# 	@echo ""
+# 	@echo "  $(YELLOW)docker-build$(NC)         Build Docker image"
+# 	@echo "  $(YELLOW)docker-shell$(NC)         Interactive development shell"
+# 	@echo "  $(YELLOW)docker-build-image$(NC)   Full build inside container"
+# 	@echo "  $(YELLOW)docker-clean$(NC)         Clean Docker containers/images/volumes"
+# 	@echo "  $(YELLOW)docker-logs$(NC)          View Docker logs"
+# 	@echo "  $(YELLOW)docker-images$(NC)        List GeckoOS images"
+# 	@echo "  $(YELLOW)docker-volumes$(NC)       List GeckoOS volumes"
+# 	@echo "  $(YELLOW)docker-ps$(NC)            List running containers"
+# 	@echo "  $(YELLOW)docker-inspect$(NC)       Inspect Docker image"
+# 	@echo ""
+# 	@echo "$(BLUE)Examples:$(NC)"
+# 	@echo "  make docker-build              # Build image"
+# 	@echo "  make docker-shell              # Interactive shell"
+# 	@echo "  make docker-build-image        # Build in container"
+# 	@echo "  make docker-clean              # Clean everything"
 
 # ============================================================================
 # DOCUMENTATION

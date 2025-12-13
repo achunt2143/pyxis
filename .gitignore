@@ -7,6 +7,9 @@ Cargo.lock
 # JavaScript build artifacts
 /dist/
 **/node_modules/**/*.*
+*node_modules/
+**node_modules/
+**node_modules**
 npm-debug.log
 yarn-debug.log
 yarn-error.log
@@ -20,6 +23,28 @@ yarn-error.log
 .DS_Store
 .project
 .classpath
+**.bak
+**.backup
+**/*.bak
+
+#Local debugging stuff
+boot-debug.sh
+build-mini.sh
+build-minimal-linux.sh
+/testing
+test-init.sh
+diagnose-boot.sh
+diagnose-bootloader.sh
+mini
+boot/initramfs
+boot/initramfs/*.*
+boot/initramfs/*
+boot/initramfs/**
+boot/initramfs*
+boot/initramfs/
+boot/initramfs**
+boot/kernel/
+**gonk
 
 # OS-specific files
 Thumbs.db
@@ -36,3 +61,4 @@ Thumbs.db
 # Documentation
 /docs/build/
 *.pdf
+boot/initramfs/initramfs-init

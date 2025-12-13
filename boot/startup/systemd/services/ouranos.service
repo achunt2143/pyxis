@@ -7,7 +7,7 @@ Before=geckoOS.service
 
 [Service]
 Type=simple
-ExecStart=/opt/geckoOS/bin/ouranos
+ExecStart=/usr/bin/ouranos
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

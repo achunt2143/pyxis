@@ -5,7 +5,7 @@ After=syslog.target
 
 [Service]
 Type=simple
-ExecStart=/opt/geckoOS/bin/cronus-daemon
+ExecStart=/usr/bin/cronus-daemon
 Restart=always
 RestartSec=10
 StandardOutput=journal
