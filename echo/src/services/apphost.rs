@@ -16,8 +16,12 @@
 //!   - real Wayland surface registration (compositor work)
 //!   - sandboxing / cgroups / namespaces / portals
 //!   - permissions enforcement
-//!   - SIGCHLD-driven async crash detection (we currently use poll-on-read)
 //!   - tarball signature verification
+//!
+//! Crash detection: a single tokio task started in `start_child_reaper` listens
+//! for SIGCHLD and calls `waitpid(-1, WNOHANG)` in a loop, mapping reaped pids
+//! back to sessions. Non-zero exit / signal termination -> `AppCrashed`; clean
+//! exit (or pre-recorded `Stopped` from CloseApp/KillApp) -> `AppStopped`.
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
@@ -31,6 +35,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use nix::sys::signal::{kill, Signal};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use uuid::Uuid;
 
@@ -131,6 +136,13 @@ pub struct AppHost {
     /// Optional bus for signal emission. When `None` (e.g. tests), lifecycle
     /// transitions still happen but no signal is broadcast.
     bus: RwLock<Option<Arc<IPCBus>>>,
+    /// pid -> session_id, populated on spawn, drained by the reaper or by
+    /// CloseApp/KillApp. Used to map waitpid() results back to sessions.
+    pid_index: RwLock<HashMap<u32, String>>,
+    /// Sessions whose stop was user-initiated (CloseApp/KillApp). The reaper
+    /// uses this to decide between `Stopped` and `Crashed` when the process
+    /// finally exits, regardless of exit code.
+    expected_stops: RwLock<std::collections::HashSet<String>>,
 }
 
 impl AppHost {
@@ -139,6 +151,8 @@ impl AppHost {
             sessions: DashMap::new(),
             active: RwLock::new(None),
             bus: RwLock::new(None),
+            pid_index: RwLock::new(HashMap::new()),
+            expected_stops: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -288,9 +302,14 @@ impl AppHost {
         };
 
         let pid = child.id();
-        // Drop the Child intentionally — see TODO at top of file. Switching
-        // to a global Child registry + SIGCHLD handler is followup work.
+        // We hand the OS the responsibility of reaping; the SIGCHLD task
+        // (see `start_child_reaper`) will pick up exits via waitpid(WNOHANG).
+        // The Child handle is forgotten so its Drop doesn't try to wait().
         std::mem::forget(child);
+        // Track pid -> session_id so the reaper can look it up O(1).
+        if let Ok(mut idx) = self.pid_index.write() {
+            idx.insert(pid, session_id.clone());
+        }
 
         let running = AppSession {
             session_id: session_id.clone(),
@@ -326,18 +345,26 @@ impl AppHost {
         latest
     }
 
-    /// SIGTERM a session; updates state to `Stopped`.
+    /// SIGTERM a session; updates state to `Stopped`. The session stays in
+    /// the map until the SIGCHLD reaper observes the process exit, so
+    /// `list_running` accurately shows draining sessions.
     pub fn close(&self, session_id: &str) -> Result<AppSession> {
         let session = self
             .sessions
             .get(session_id)
             .map(|s| s.clone())
             .ok_or_else(|| anyhow!("session '{}' not found", session_id))?;
+        if let Ok(mut set) = self.expected_stops.write() {
+            set.insert(session_id.to_string());
+        }
         if session.pid > 0 {
             let _ = Self::send_signal(session.pid, Signal::SIGTERM);
+        } else {
+            // Foreign-synthesized or pre-spawn sessions never had a child;
+            // finalize immediately since SIGCHLD won't fire.
+            self.finalize_exit(session_id, AppState::Stopped);
         }
         let stopped = self.transition(session_id, AppState::Stopped);
-        self.sessions.remove(session_id);
         if let Ok(mut slot) = self.active.write() {
             if slot.as_deref() == Some(session_id) {
                 *slot = None;
@@ -353,11 +380,15 @@ impl AppHost {
             .get(session_id)
             .map(|s| s.clone())
             .ok_or_else(|| anyhow!("session '{}' not found", session_id))?;
+        if let Ok(mut set) = self.expected_stops.write() {
+            set.insert(session_id.to_string());
+        }
         if session.pid > 0 {
             let _ = Self::send_signal(session.pid, Signal::SIGKILL);
+        } else {
+            self.finalize_exit(session_id, AppState::Crashed);
         }
         let crashed = self.transition(session_id, AppState::Crashed);
-        self.sessions.remove(session_id);
         if let Ok(mut slot) = self.active.write() {
             if slot.as_deref() == Some(session_id) {
                 *slot = None;
@@ -414,6 +445,123 @@ impl AppHost {
             .map_err(|_| anyhow!("active lock poisoned"))?;
         *slot = Some(session_id.to_string());
         Ok(())
+    }
+
+    // ---------- Child reaping ----------
+
+    /// Look up a session by pid (used by the SIGCHLD reaper).
+    fn session_id_for_pid(&self, pid: u32) -> Option<String> {
+        self.pid_index.read().ok()?.get(&pid).cloned()
+    }
+
+    /// Apply terminal lifecycle bookkeeping for `session_id`: emit the
+    /// matching signal, drop pid_index + expected_stops entries, drop the
+    /// session from the live map, and clear `active` if necessary.
+    fn finalize_exit(&self, session_id: &str, terminal: AppState) {
+        if let Some(mut s) = self.sessions.get_mut(session_id) {
+            s.state = terminal;
+        }
+        let snapshot = self.sessions.get(session_id).map(|s| s.clone());
+        if let Some(s) = snapshot.as_ref() {
+            let signal = match terminal {
+                AppState::Stopped => "AppStopped",
+                AppState::Crashed => "AppCrashed",
+                _ => return,
+            };
+            self.emit_lifecycle(signal, s);
+            // Drop pid_index entry
+            if let Ok(mut idx) = self.pid_index.write() {
+                if s.pid > 0 {
+                    idx.remove(&s.pid);
+                }
+            }
+        }
+        if let Ok(mut set) = self.expected_stops.write() {
+            set.remove(session_id);
+        }
+        self.sessions.remove(session_id);
+        if let Ok(mut slot) = self.active.write() {
+            if slot.as_deref() == Some(session_id) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Reap any zombie children non-blocking. Called from the SIGCHLD task
+    /// (and exposed for tests). Returns the number of children reaped.
+    pub fn reap_once(&self) -> usize {
+        let mut reaped = 0usize;
+        loop {
+            match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => break,
+                Ok(WaitStatus::Exited(pid, code)) => {
+                    let pid = pid.as_raw() as u32;
+                    self.handle_reaped(pid, code == 0);
+                    reaped += 1;
+                }
+                Ok(WaitStatus::Signaled(pid, _, _)) => {
+                    let pid = pid.as_raw() as u32;
+                    // Treat signal-termination as crash unless the user
+                    // initiated it (CloseApp/KillApp set expected_stops).
+                    self.handle_reaped(pid, false);
+                    reaped += 1;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        reaped
+    }
+
+    fn handle_reaped(&self, pid: u32, clean_exit: bool) {
+        let Some(session_id) = self.session_id_for_pid(pid) else {
+            return;
+        };
+        let was_expected = self
+            .expected_stops
+            .read()
+            .map(|s| s.contains(&session_id))
+            .unwrap_or(false);
+        let terminal = if was_expected || clean_exit {
+            AppState::Stopped
+        } else {
+            AppState::Crashed
+        };
+        self.finalize_exit(&session_id, terminal);
+    }
+
+    /// Spawn the singleton SIGCHLD watcher. Idempotent: only the first call
+    /// installs the listener. Safe to call without a tokio runtime; in that
+    /// case it silently no-ops (tests rely on `reap_once` directly).
+    pub fn start_child_reaper(self: &Arc<Self>) {
+        static STARTED: OnceLock<()> = OnceLock::new();
+        if STARTED.set(()).is_err() {
+            return;
+        }
+        let host = Arc::clone(self);
+        // If we're not in a tokio runtime, fall back to a std thread that
+        // polls every 250ms. Compositor + daemon both run inside tokio, so
+        // the fast path is the signal listener.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let Ok(mut sigchld) = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::child(),
+                ) else {
+                    return;
+                };
+                // Drain any pre-existing zombies (e.g. children that exited
+                // between spawn and reaper start).
+                host.reap_once();
+                while sigchld.recv().await.is_some() {
+                    host.reap_once();
+                }
+            });
+        } else {
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                host.reap_once();
+            });
+        }
     }
 
     // ---------- Compositor surface binding ----------
@@ -765,5 +913,66 @@ mod tests {
         let _ = host.bind_surface("a", 2, None, None);
         let _ = host.unbind_surface(1);
         assert_eq!(host.list_surface_sessions()[0].surfaces, vec![2]);
+    }
+
+    #[test]
+    fn reaper_marks_unexpected_exit_as_crashed() {
+        // Spawn a child that exits non-zero immediately; verify the reaper
+        // reports AppCrashed and clears the session.
+        let host = AppHost::new();
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id();
+        std::mem::forget(child);
+        let sid = "sess-crash".to_string();
+        host.sessions.insert(
+            sid.clone(),
+            AppSession {
+                session_id: sid.clone(),
+                app_id: "crashy".into(),
+                pid,
+                started_at: 0,
+                state: AppState::Running,
+                surfaces: vec![],
+            },
+        );
+        host.pid_index.write().unwrap().insert(pid, sid.clone());
+        // Give the kernel a beat to deliver the exit.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = host.reap_once();
+        assert!(
+            host.get_state(&sid).is_none(),
+            "crashed session should be removed after reap"
+        );
+    }
+
+    #[test]
+    fn reaper_marks_expected_exit_as_stopped() {
+        let host = AppHost::new();
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id();
+        std::mem::forget(child);
+        let sid = "sess-stop".to_string();
+        host.sessions.insert(
+            sid.clone(),
+            AppSession {
+                session_id: sid.clone(),
+                app_id: "stoppy".into(),
+                pid,
+                started_at: 0,
+                state: AppState::Running,
+                surfaces: vec![],
+            },
+        );
+        host.pid_index.write().unwrap().insert(pid, sid.clone());
+        host.expected_stops.write().unwrap().insert(sid.clone());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = host.reap_once();
+        assert!(host.get_state(&sid).is_none());
     }
 }

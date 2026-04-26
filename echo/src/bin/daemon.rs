@@ -1660,6 +1660,9 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
     // Wire the bus into the global AppHost so lifecycle transitions can
     // emit signals on the `org.geckoOS.appHost` interface.
     services::AppHost::global().set_bus(bus.clone());
+    // Start the SIGCHLD reaper so process exits map to AppStopped/AppCrashed
+    // signals automatically. Idempotent.
+    services::AppHost::global().start_child_reaper();
 
     // LaunchApp(appId, params?) -> AppSession
     bus.router().register_handler(
