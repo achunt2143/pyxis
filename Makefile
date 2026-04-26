@@ -1,5 +1,5 @@
 .PHONY: help build build-release build-debug run test clean install-deps pyxis-build pyxis-install pyxis-dev \
-        format lint kernel gecko system userspace docker all stage1 stage2 stage3 \
+        format lint kernel gecko system docker all stage1 stage2 stage3 \
 		docker-build docker-shell docker-build-image docker-clean docker-logs \
 		docker-images docker-volumes docker-ps docker-inspect docker-help
 
@@ -14,7 +14,6 @@ CARGO = cargo
 CARGO_FLAGS = --verbose
 CARGO_RELEASE_FLAGS = --release $(CARGO_FLAGS)
 RUST_VERSION = 1.70
-NODE_VERSION = 18
 LINUX_VERSION = 6.6
 
 # Docker configuration
@@ -29,18 +28,21 @@ help:
 	@echo "  make build-release  - Build all components (release optimized)"
 	@echo "  make build-debug    - Build all components (with debug symbols)"
 	@echo "  make system         - Build Rust system components only"
-	@echo "  make userspace      - Build JavaScript userspace only"
 	@echo "  make run            - Run emulated system with QEMU"
 	@echo "  make test           - Run test suite"
 	@echo "  make clean          - Remove all build artifacts"
 	@echo "  make install-deps   - Install all dependencies"
-	@echo "  make format         - Format code (Rust + JavaScript)"
+	@echo "  make format         - Format code (Rust)"
 	@echo "  make lint           - Run linters"
 	@echo ""
 	@echo "$(YELLOW)Build stages:$(NC)"
-	@echo "  stage1: Verify dependencies (Rust, Node, Linux headers)"
-	@echo "  stage2: Build components (Rust binary, JavaScript)"
+	@echo "  stage1: Verify dependencies (Rust, Linux headers)"
+	@echo "  stage2: Build components (Rust binary)"
 	@echo "  stage3: Package filesystem and create disk image"
+	@echo ""
+	@echo "$(YELLOW)Note:$(NC) JS/CSS compilation is handled by bloom (pyxis-experience)"
+	@echo "  make pyxis-build    - Pull & build Pyxis shell from bloom into gaia/static"
+	@echo "  make pyxis-dev      - Start bloom dev server"
 	@echo ""
 # 	@echo "$(BLUE)Docker Commands:$(NC)"
 # 	@echo "  docker-build              Build Docker image locally"
@@ -58,11 +60,6 @@ verify-rust:
 	@command -v cargo >/dev/null 2>&1 || { echo "$(RED)Rust not found. Install from https://rustup.rs/$(NC)"; exit 1; }
 	@rustc --version | grep -q "$(RUST_VERSION)" || echo "$(YELLOW)Warning: Rust version may differ. Expected $(RUST_VERSION)+$(NC)"
 
-verify-node:
-	@echo "$(YELLOW)Checking Node.js installation...$(NC)"
-	@command -v node >/dev/null 2>&1 || { echo "$(RED)Node.js not found. Install from https://nodejs.org/$(NC)"; exit 1; }
-	@node --version | grep -q "v$(NODE_VERSION)" || echo "$(YELLOW)Warning: Node version $(NODE_VERSION)+ recommended$(NC)"
-
 verify-linux-headers:
 	@echo "$(YELLOW)Checking Linux kernel headers...$(NC)"
 	@[ -d /usr/include/linux ] || { echo "$(RED)Linux headers not found. Install linux-headers package$(NC)"; exit 1; }
@@ -79,7 +76,7 @@ verify-system-libs:
 	@pkg-config --exists libinput || { echo "$(RED)libinput not found$(NC)"; exit 1; }
 	@pkg-config --exists wayland-server || { echo "$(RED)wayland-server not found$(NC)"; exit 1; }
 
-stage1: verify-rust verify-node verify-linux-headers verify-build-tools verify-system-libs
+stage1: verify-rust verify-linux-headers verify-build-tools verify-system-libs
 	@echo "$(GREEN)✓ All dependencies verified$(NC)"
 
 # ============================================================================
@@ -89,8 +86,6 @@ stage1: verify-rust verify-node verify-linux-headers verify-build-tools verify-s
 install-deps: stage1
 	@echo "$(YELLOW)Installing Rust dependencies...$(NC)"
 	$(CARGO) fetch
-	@echo "$(YELLOW)Installing Node.js dependencies...$(NC)"
-	cd gaia && npm install
 	@echo "$(GREEN)✓ Dependencies installed$(NC)"
 
 install-system-deps:
@@ -119,16 +114,8 @@ stage2-rust-release: verify-rust
 	$(CARGO) build $(CARGO_RELEASE_FLAGS)
 	@echo "$(GREEN)✓ Rust release build complete$(NC)"
 
-stage2-js: verify-node
-	@echo "$(YELLOW)Building JavaScript components...$(NC)"
-	cd gaia && npm run build
-	@echo "$(GREEN)✓ JavaScript build complete$(NC)"
-
 system: stage2-rust-release
 	@echo "$(GREEN)✓ System components built$(NC)"
-
-userspace: stage2-js
-	@echo "$(GREEN)✓ Userspace built$(NC)"
 
 # ============================================================================
 # PYXIS DESKTOP SHELL
@@ -150,16 +137,15 @@ pyxis-dev:
 	cd $(PYXIS_REPO) && npm run dev
 
 
-build: stage1 install-deps stage2-rust stage2-js
+build: stage1 install-deps stage2-rust
 	@echo "$(GREEN)✓ Full build complete$(NC)"
 
-build-release: stage1 install-deps stage2-rust-release stage2-js build-kernel build-initramfs build-rootfs package
+build-release: stage1 install-deps stage2-rust-release build-kernel build-initramfs build-rootfs package
 	@echo "$(GREEN)✓ Release build complete$(NC)"
 
 build-debug: stage1 install-deps
 	@echo "$(YELLOW)Building with debug symbols...$(NC)"
 	$(CARGO) build
-	cd gaia && npm run build
 	@echo "$(GREEN)✓ Debug build complete$(NC)"
 
 build-kernel:
@@ -194,8 +180,6 @@ package:
 test: build
 	@echo "$(YELLOW)Running Rust tests...$(NC)"
 	$(CARGO) test $(CARGO_FLAGS)
-	@echo "$(YELLOW)Running JavaScript tests...$(NC)"
-	cd gaia && npm test
 	@echo "$(GREEN)✓ Tests complete$(NC)"
 
 test-rust:
@@ -205,10 +189,6 @@ test-rust:
 test-integration:
 	@echo "$(YELLOW)Running integration tests...$(NC)"
 	$(CARGO) test --test '*' $(CARGO_FLAGS)
-
-test-js:
-	@echo "$(YELLOW)Running JavaScript tests...$(NC)"
-	cd gaia && npm test
 
 bench:
 	@echo "$(YELLOW)Running benchmarks...$(NC)"
@@ -221,15 +201,11 @@ bench:
 format:
 	@echo "$(YELLOW)Formatting Rust code...$(NC)"
 	$(CARGO) fmt
-	@echo "$(YELLOW)Formatting JavaScript code...$(NC)"
-	cd gaia && npm run format
 	@echo "$(GREEN)✓ Code formatted$(NC)"
 
 lint:
 	@echo "$(YELLOW)Linting Rust code...$(NC)"
 	$(CARGO) clippy -- -D warnings
-	@echo "$(YELLOW)Linting JavaScript code...$(NC)"
-	cd gaia && npm run lint
 	@echo "$(GREEN)✓ Linting complete$(NC)"
 
 check:
