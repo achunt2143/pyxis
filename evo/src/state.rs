@@ -1493,7 +1493,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
 
         #[cfg(feature = "echo-ipc")]
         {
-            if let Some(wl_surface) = window.wl_surface() {
+            if let Some(_wl_surface) = window.wl_surface() {
                 if let Some(toplevel) = window.0.toplevel() {
                     let geometry = window.geometry();
                     let id = self.register_window(window.clone());
@@ -1517,6 +1517,19 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                         &app_id,
                         geometry.size.w as u32,
                         geometry.size.h as u32,
+                    );
+
+                    // Bind the freshly mapped Wayland surface to its AppHost
+                    // session. Same-process call — AppHost is a global —
+                    // so this is cheap and safe to issue from the
+                    // compositor's hot path. We pass `pid: None` because
+                    // `WindowElement` doesn't surface the client pid; the
+                    // session that LaunchApp created already carries it.
+                    geckoOS_echo::AppHost::global().bind_surface(
+                        &app_id,
+                        id,
+                        None,
+                        None,
                     );
                 }
             }
@@ -1552,6 +1565,9 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         {
             if let Some(id) = self.unregister_window(window) {
                 let _ = self.echo_service.read().emit_window_closed(id);
+                // Unbind from the AppHost session so its `surfaces` list
+                // and `AppSurfaceUnmapped` signal stay in sync.
+                let _ = geckoOS_echo::AppHost::global().unbind_surface(id);
             }
         }
     }
