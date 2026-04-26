@@ -1,0 +1,154 @@
+{
+  "services": [
+    {
+      "name": "filesystem",
+      "methods": [
+        {
+          "name": "readDirectory",
+          "params": { "path": "string" },
+          "response": { "entries": "array", "path": "string" }
+        },
+        {
+          "name": "readFile",
+          "params": { "path": "string", "encoding": "string" },
+          "response": { "content": "string", "encoding": "string", "size": "integer" }
+        },
+        {
+          "name": "writeFile",
+          "params": { "path": "string", "content": "string", "encoding": "string" },
+          "response": { "success": "boolean", "bytes_written": "integer" }
+        },
+        {
+          "name": "appendFile",
+          "params": { "path": "string", "content": "string", "encoding": "string" },
+          "response": { "success": "boolean", "bytes_written": "integer" }
+        },
+        {
+          "name": "deleteFile",
+          "params": { "path": "string" },
+          "response": { "success": "boolean" }
+        },
+        {
+          "name": "deleteDirectory",
+          "params": { "path": "string", "recursive": "boolean" },
+          "response": { "success": "boolean", "removed_count": "integer" }
+        },
+        {
+          "name": "createDirectory",
+          "params": { "path": "string", "mode": "integer" },
+          "response": { "success": "boolean", "path": "string" }
+        },
+        {
+          "name": "exists",
+          "params": { "path": "string" },
+          "response": { "exists": "boolean", "is_file": "boolean", "is_dir": "boolean" }
+        },
+        {
+          "name": "stat",
+          "params": { "path": "string" },
+          "response": { "size": "integer", "modified": "integer", "is_dir": "boolean", "is_file": "boolean", "mode": "integer" }
+        },
+        {
+          "name": "copy",
+          "params": { "source": "string", "destination": "string" },
+          "response": { "success": "boolean", "destination": "string" }
+        },
+        {
+          "name": "move",
+          "params": { "source": "string", "destination": "string" },
+          "response": { "success": "boolean", "destination": "string" }
+        },
+        {
+          "name": "chmod",
+          "params": { "path": "string", "mode": "integer" },
+          "response": { "success": "boolean", "new_mode": "integer" }
+        }
+      ]
+    },
+    {
+      "name": "deviceInfo",
+      "methods": [
+        { "name": "getOS", "response": { "name": "string", "version": "string" } },
+        { "name": "getKernel", "response": { "version": "string", "release": "string" } },
+        { "name": "getModel", "response": { "model": "string" } },
+        { "name": "getManufacturer", "response": { "manufacturer": "string" } },
+        { "name": "getSerial", "response": { "serial": "string" } },
+        { "name": "getHardware", "response": { "hardware": "string" } },
+        { "name": "getUUID", "response": { "uuid": "string" } },
+        { "name": "getHostname", "response": { "hostname": "string" } },
+        { "name": "getMemoryInfo", "response": { "total": "integer", "free": "integer", "available": "integer" } },
+        { "name": "getStorageInfo", "response": { "total": "integer", "used": "integer", "available": "integer" } },
+        { "name": "getCPUInfo", "response": { "count": "integer", "model": "string", "frequency_mhz": "integer" } }
+      ]
+    },
+    {
+      "name": "power",
+      "methods": [
+        { "name": "shutdown", "response": { "success": "boolean", "message": "string" } },
+        { "name": "reboot", "response": { "success": "boolean", "message": "string" } },
+        { "name": "sleep", "response": { "success": "boolean", "message": "string" } },
+        { "name": "wake", "response": { "success": "boolean" } },
+        { "name": "getBatteryStatus", "response": { "level": "integer", "charging": "boolean", "status": "string" } },
+        { "name": "setScreenBrightness", "params": { "brightness": "integer" }, "response": { "success": "boolean", "brightness": "integer" } },
+        { "name": "getScreenBrightness", "response": { "brightness": "integer" } },
+        { "name": "setScreenTimeout", "params": { "timeout": "integer" }, "response": { "success": "boolean", "timeout": "integer" } },
+        { "name": "getScreenTimeout", "response": { "timeout": "integer" } }
+      ]
+    },
+    {
+      "name": "settings",
+      "methods": [
+        { "name": "get", "params": { "key": "string" }, "response": { "key": "string", "value": "any" } },
+        { "name": "set", "params": { "key": "string", "value": "any" }, "response": { "success": "boolean" } },
+        { "name": "getAll", "response": { "settings": "object" } },
+        { "name": "delete", "params": { "key": "string" }, "response": { "success": "boolean" } },
+        { "name": "clear", "response": { "success": "boolean" } },
+        { "name": "reset", "response": { "success": "boolean" } }
+      ]
+    },
+    {
+      "name": "network",
+      "methods": [
+        { "name": "getStatus", "response": { "connected": "boolean", "interface": "string" } },
+        { "name": "getType", "response": { "type": "string" } },
+        { "name": "getInterfaces", "response": { "interfaces": "array" } },
+        { "name": "getIPAddress", "response": { "ipv4": "string", "ipv6": "string" } },
+        { "name": "getGateway", "response": { "gateway": "string" } },
+        { "name": "getDNS", "response": { "dns": "array" } }
+      ]
+    },
+    {
+      "name": "notification",
+      "methods": [
+        { "name": "show", "params": { "title": "string", "options": "object" }, "response": { "notification_id": "string", "success": "boolean" } },
+        { "name": "close", "params": { "notification_id": "string" }, "response": { "success": "boolean" } },
+        { "name": "closeAll", "response": { "success": "boolean", "closed_count": "integer" } }
+      ]
+    },
+    {
+      "name": "process",
+      "methods": [
+        { "name": "spawn", "params": { "command": "string", "args": "array", "options": "object" }, "response": { "pid": "integer", "success": "boolean" } },
+        { "name": "kill", "params": { "pid": "integer" }, "response": { "success": "boolean" } },
+        { "name": "killGroup", "params": { "pgid": "integer" }, "response": { "success": "boolean", "killed": "integer" } },
+        { "name": "list", "response": { "processes": "array" } },
+        { "name": "getInfo", "params": { "pid": "integer" }, "response": { "pid": "integer", "name": "string", "memory_mb": "integer", "cpu_percent": "number" } }
+      ]
+    },
+    {
+      "name": "appManager",
+      "methods": [
+        { "name": "launch", "params": { "appId": "string", "params": "object" }, "response": { "success": "boolean", "app_id": "string" } },
+        { "name": "close", "params": { "appId": "string" }, "response": { "success": "boolean" } },
+        { "name": "list", "response": { "apps": "array" } },
+        { "name": "getInfo", "params": { "appId": "string" }, "response": { "app_id": "string", "name": "string", "version": "string", "icon": "string" } },
+        { "name": "install", "params": { "appPath": "string" }, "response": { "success": "boolean", "app_id": "string" } },
+        { "name": "uninstall", "params": { "appId": "string" }, "response": { "success": "boolean" } },
+        { "name": "kill", "params": { "appId": "string" }, "response": { "success": "boolean" } },
+        { "name": "restart", "params": { "appId": "string" }, "response": { "success": "boolean" } },
+        { "name": "setActive", "params": { "appId": "string" }, "response": { "success": "boolean", "app_id": "string" } },
+        { "name": "getActive", "response": { "app_id": "string", "name": "string" } }
+      ]
+    }
+  ]
+}

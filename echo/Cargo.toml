@@ -42,8 +42,8 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "echo-daemon"
-path = "bin/daemon.rs"
+path = "src/bin/daemon.rs"
 
 [[bin]]
 name = "echo-cli"
-path = "bin/client.rs"
+path = "src/bin/client.rs"

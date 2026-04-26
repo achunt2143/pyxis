@@ -1,0 +1,9 @@
+{
+  "name": "com.geckoOS.extension",
+  "description": "GeckoOS native messaging host for Firefox extension",
+  "path": "/home/andrew/geckos/geckos/gecko/bridge/native/native-host.sh",
+  "type": "stdio",
+  "allowed_extensions": [
+    "geckoos-bridge@geckoos.local"
+  ]
+}

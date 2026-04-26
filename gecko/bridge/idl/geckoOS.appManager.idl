@@ -1,0 +1,23 @@
+// GeckoOS App Manager
+// Controls application lifecycle
+
+interface ApplicationInfo {
+  id: string;
+  name: string;
+  icon: string;
+  running: boolean;
+}
+
+interface AppManager {
+  // Launch an application
+  launch(appId: string, args?: Record<string, any>): Promise<void>;
+
+  // Terminate an application
+  kill(appId: string): Promise<void>;
+
+  // List all known applications
+  listApplications(): Promise<ApplicationInfo[]>;
+
+  // Get info about running app
+  getFocused(): Promise<ApplicationInfo | null>;
+}

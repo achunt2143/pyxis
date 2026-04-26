@@ -13,13 +13,13 @@ pub trait Transport: Send + Sync {
 
 pub struct UnixSocketTransport {
     socket_path: PathBuf,
-    listener: Arc<tokio::sync::Mutex<Option<UnixListener>>>,
+    listener: Arc<Mutex<Option<UnixListener>>>,
 }
 
 impl UnixSocketTransport {
     pub fn new(socket_path: &Path) -> Result<Self> {
         tracing::info!("Initializing Unix Socket Transport: {:?}", socket_path);
-        
+
         // Create parent directory if needed
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -39,7 +39,7 @@ impl UnixSocketTransport {
     pub async fn bind(&self) -> Result<()> {
         tracing::info!("Binding to: {:?}", self.socket_path);
         let listener = UnixListener::bind(&self.socket_path)?;
-        
+
         // Set permissions to allow all users (0666)
         #[cfg(unix)]
         {
@@ -49,8 +49,9 @@ impl UnixSocketTransport {
         }
 
         let mut listener_guard = self.listener.lock().await;
-    *listener_guard = Some(listener);
-    drop(listener_guard);
+        *listener_guard = Some(listener);
+        drop(listener_guard);
+
         tracing::info!("Listening on: {:?}", self.socket_path);
         Ok(())
     }
@@ -73,28 +74,37 @@ impl UnixSocketTransport {
         Ok(stream)
     }
 
+    /// Send a message with length prefix (4 bytes, LITTLE-ENDIAN - CRITICAL!)
+    /// MUST MATCH: native-host and daemon must both use little-endian
     pub async fn send_message(stream: &mut UnixStream, data: &[u8]) -> Result<()> {
-        // Send length prefix (4 bytes, big-endian)
+        // Send length prefix (4 bytes, little-endian - u32)
         let len = data.len() as u32;
-        stream.write_u32(len).await?;
-        
+        stream.write_u32_le(len).await?;
+
         // Send message data
         stream.write_all(data).await?;
         stream.flush().await?;
-        
-        tracing::trace!("Sent {} bytes", data.len());
+
+        tracing::trace!("Sent {} bytes (total with length prefix: {} bytes)", data.len(), data.len() + 4);
         Ok(())
     }
 
+    /// Receive a message with length prefix (4 bytes, LITTLE-ENDIAN - CRITICAL!)
     pub async fn recv_message(stream: &mut UnixStream) -> Result<Vec<u8>> {
-        // Read length prefix
-        let len = stream.read_u32().await? as usize;
-        
+        // Read length prefix (4 bytes, little-endian)
+        let len = stream.read_u32_le().await? as usize;
+
+        // Sanity check
+        if len > 16 * 1024 * 1024 {
+            // Max 16MB
+            return Err(anyhow::anyhow!("Message too large: {} bytes", len));
+        }
+
         // Read message data
         let mut buffer = vec![0u8; len];
         stream.read_exact(&mut buffer).await?;
-        
-        tracing::trace!("Received {} bytes", len);
+
+        tracing::trace!("Received {} bytes (total with length prefix: {} bytes)", len, len + 4);
         Ok(buffer)
     }
 
@@ -111,26 +121,3 @@ impl Drop for UnixSocketTransport {
         }
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use tempfile::TempDir;
-
-//     #[test]
-//     fn test_unix_socket_creation() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let socket_path = temp_dir.path().join("test.sock");
-//         let transport = UnixSocketTransport::new(&socket_path).unwrap();
-//         assert_eq!(transport.socket_path(), socket_path);
-//     }
-
-//     #[tokio::test]
-//     async fn test_socket_bind() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let socket_path = temp_dir.path().join("test.sock");
-//         let transport = UnixSocketTransport::new(&socket_path).unwrap();
-//         transport.bind().await.unwrap();
-//         assert!(socket_path.exists());
-//     }
-// }

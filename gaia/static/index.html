@@ -1,41 +1,341 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gaia Enhanced - Desktop Shell v2.0</title>
-    <link rel="stylesheet" href="styles/theme.css">
-    <link rel="stylesheet" href="styles/global.css">
-    <link rel="stylesheet" href="styles/components.css">
-    <link rel="stylesheet" href="styles/responsive.css">
-    <link rel="stylesheet" href="styles/accessibility.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GeckoOS</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    h1 { color: #333; }
+    h2 { margin-top: 24px; }
+    button {
+      padding: 8px 16px;
+      margin: 4px;
+      background: #0078d4;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover { background: #005a9e; }
+    input {
+      padding: 8px;
+      margin: 4px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    #output {
+      margin-top: 20px;
+      padding: 15px;
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      max-height: 400px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    .error { color: #d32f2f; }
+    .success { color: #388e3c; }
+  </style>
 </head>
-<body class="gaia-shell" role="application" aria-label="Gaia Desktop Environment">
-    <!-- Taskbar -->
-    <div id="taskbar" role="navigation" aria-label="Taskbar" class="taskbar"></div>
+<body>
+  <div class="container">
+    <h1>GeckoOS Gaia Shell</h1>
 
-    <!-- Sidebar -->
-    <aside id="sidebar" role="complementary" aria-label="Sidebar" class="sidebar"></aside>
+    <section>
+      <h2>Filesystem API</h2>
+      <input type="text" id="filePath" placeholder="Enter path" value="/home">
+      <button onclick="testFilesystem()">Load Directory</button>
+    </section>
 
-    <!-- Main Desktop Area -->
-    <main id="desktop" role="main" aria-label="Desktop" class="desktop">
-        <!-- Dashboard -->
-        <div id="dashboard" role="region" aria-label="Dashboard" class="dashboard"></div>
-        
-        <!-- Windows Container -->
-        <div id="windows-container" role="region" aria-label="Application Windows" class="windows-container"></div>
-    </main>
+    <section>
+      <h2>App Manager API</h2>
+      <button onclick="listApps()">List Applications</button>
+    </section>
 
-    <!-- Context Menu -->
-    <div id="context-menu" role="menu" aria-hidden="true" class="context-menu"></div>
+    <section>
+      <h2>Power API</h2>
+      <button onclick="getBatteryStatus()">Battery Status</button>
+      <button onclick="suspend()">Suspend</button>
+      <button onclick="shutdown()" style="background: #d32f2f;">Shutdown</button>
+    </section>
 
-    <!-- Notifications -->
-    <div id="notifications" role="region" aria-label="Notifications" aria-live="polite" class="notifications"></div>
+    <section>
+      <h2>Gecko Compositor API (Echo)</h2>
+      <div>
+        <button onclick="testCreateWindow()">CreateWindow</button>
+        <button onclick="testCloseWindow()">CloseWindow</button>
+        <button onclick="testListWindows()">ListWindows</button>
+        <button onclick="testGetRenderingStatus()">GetRenderingStatus</button>
+      </div>
+      <div>
+        <button onclick="testSwitchWorkspace()">SwitchWorkspace</button>
+        <button onclick="testCreateWorkspace()">CreateWorkspace</button>
+        <button onclick="testMoveWindowToWorkspace()">MoveWindowToWorkspace</button>
+        <button onclick="testListWorkspaces()">ListWorkspaces</button>
+        <button onclick="testGetActiveWorkspace()">GetActiveWorkspace</button>
+      </div>
+    </section>
 
-    <!-- Modal Overlay -->
-    <div id="modal-overlay" role="presentation" aria-hidden="true" class="modal-overlay"></div>
+    <section>
+      <h2>Gecko Compositor Events</h2>
+      <p style="font-size: 13px;">
+        Events from Echo → GeckoOS daemon → extension will be logged below after the bridge is ready.
+      </p>
+    </section>
 
-    <!-- Startup Scripts -->
-    <script type="module" src="scripts/app.js"></script>
+    <div id="output">Ready...</div>
+  </div>
+
+  <script>
+    const output = document.getElementById('output');
+
+    // Unified logger
+    function log(msg, data, isError = false) {
+      const line = document.createElement('div');
+      if (typeof data !== 'undefined' && data !== null) {
+        line.textContent = msg + ' ' + JSON.stringify(data, null, 2);
+      } else {
+        line.textContent = msg;
+      }
+      if (isError) line.className = 'error';
+      output.appendChild(line);
+      output.scrollTop = output.scrollHeight;
+    }
+
+    // ---------- Existing API tests ----------
+
+    async function testFilesystem() {
+      const path = document.getElementById('filePath').value;
+      log(`Filesystem.readDirectory(${path})...`);
+      try {
+        const result = await navigator.geckoOS.filesystem.readDirectory(path);
+        log(`✓ Got ${result.entries.length} entries:`);
+        result.entries.forEach(entry => {
+          log(`  ${entry.isDirectory ? '[DIR]' : '[FILE]'} ${entry.name} (${entry.size} bytes)`);
+        });
+      } catch (e) {
+        log(`✗ Filesystem error: ${e.message}`, null, true);
+      }
+    }
+
+    async function listApps() {
+      log('appManager.list()...');
+      try {
+        const apps = await navigator.geckoOS.appManager.list();
+        log(`✓ Found ${apps.length} applications:`);
+        apps.forEach(app => {
+          log(`  ${app.running ? '[RUN]' : '[STOP]'} ${app.name} (${app.id})`);
+        });
+      } catch (e) {
+        log(`✗ AppManager error: ${e.message}`, null, true);
+      }
+    }
+
+    async function getBatteryStatus() {
+      log('power.getBatteryStatus()...');
+      try {
+        const status = await navigator.geckoOS.power.getBatteryStatus();
+        log(`✓ Battery: ${status.level}% ${status.charging ? '(charging)' : ''}`);
+      } catch (e) {
+        log(`✗ Power error: ${e.message}`, null, true);
+      }
+    }
+
+    async function suspend() {
+      if (!confirm('Suspend the system?')) return;
+      try {
+        await navigator.geckoOS.power.sleep();
+        log('✓ Suspending...');
+      } catch (e) {
+        log(`✗ Suspend error: ${e.message}`, null, true);
+      }
+    }
+
+    async function shutdown() {
+      if (!confirm('Really shutdown?')) return;
+      try {
+        await navigator.geckoOS.power.shutdown();
+        log('✓ Shutting down...');
+      } catch (e) {
+        log(`✗ Shutdown error: ${e.message}`, null, true);
+      }
+    }
+
+    // ---------- Generic bridge helpers ----------
+
+    async function callService(service, method, params = {}) {
+      if (!window.geckoOS || !window.geckoOS.initialized) {
+        throw new Error('geckoOS bridge not initialized');
+      }
+      return window.geckoOS.callService(service, method, params);
+    }
+
+    // Adjust this to match the daemon service name that exposes Gecko Echo methods.
+    const GECKO_SERVICE = 'evo';
+
+    // ---------- Gecko compositor method tests ----------
+
+    async function testCreateWindow() {
+      try {
+        const res = await callService(GECKO_SERVICE, 'CreateWindow', {
+          app_id: 'test.gaia-app',
+          app_type: 'gaia',
+          width: 800,
+          height: 600,
+        });
+        log('CreateWindow →', res);
+      } catch (e) {
+        log('CreateWindow error:', e.message, true);
+      }
+    }
+
+    async function testCloseWindow() {
+      const windowid = parseInt(prompt('Window ID to close', '1'), 10);
+      if (Number.isNaN(windowid)) return;
+      try {
+        const res = await callService(GECKO_SERVICE, 'CloseWindow', { windowid });
+        log('CloseWindow →', res);
+      } catch (e) {
+        log('CloseWindow error:', e.message, true);
+      }
+    }
+
+    async function testListWindows() {
+      try {
+        const res = await callService(GECKO_SERVICE, 'ListWindows', {});
+        log('ListWindows →', res);
+      } catch (e) {
+        log('ListWindows error:', e.message, true);
+      }
+    }
+
+    async function testGetRenderingStatus() {
+      try {
+        const res = await callService(GECKO_SERVICE, 'GetRenderingStatus', {});
+        log('GetRenderingStatus →', res);
+      } catch (e) {
+        log('GetRenderingStatus error:', e.message, true);
+      }
+    }
+
+    async function testSwitchWorkspace() {
+      const workspaceid = parseInt(prompt('Workspace ID', '1'), 10);
+      if (Number.isNaN(workspaceid)) return;
+      try {
+        const res = await callService(GECKO_SERVICE, 'SwitchWorkspace', { workspaceid });
+        log('SwitchWorkspace →', res);
+      } catch (e) {
+        log('SwitchWorkspace error:', e.message, true);
+      }
+    }
+
+    async function testCreateWorkspace() {
+      const name = prompt('Workspace name', 'Test Workspace');
+      if (!name) return;
+      try {
+        const res = await callService(GECKO_SERVICE, 'CreateWorkspace', { workspacename: name });
+        log('CreateWorkspace →', res);
+      } catch (e) {
+        log('CreateWorkspace error:', e.message, true);
+      }
+    }
+
+    async function testMoveWindowToWorkspace() {
+      const windowid = parseInt(prompt('Window ID', '1'), 10);
+      const workspaceid = parseInt(prompt('Workspace ID', '1'), 10);
+      if (Number.isNaN(windowid) || Number.isNaN(workspaceid)) return;
+      try {
+        const res = await callService(GECKO_SERVICE, 'MoveWindowToWorkspace', {
+          windowid,
+          workspaceid,
+        });
+        log('MoveWindowToWorkspace →', res);
+      } catch (e) {
+        log('MoveWindowToWorkspace error:', e.message, true);
+      }
+    }
+
+    async function testListWorkspaces() {
+      try {
+        const res = await callService(GECKO_SERVICE, 'ListWorkspaces', {});
+        log('ListWorkspaces →', res);
+      } catch (e) {
+        log('ListWorkspaces error:', e.message, true);
+      }
+    }
+
+    async function testGetActiveWorkspace() {
+      try {
+        const res = await callService(GECKO_SERVICE, 'GetActiveWorkspace', {});
+        log('GetActiveWorkspace →', res);
+      } catch (e) {
+        log('GetActiveWorkspace error:', e.message, true);
+      }
+    }
+
+    // ---------- Gecko compositor event logging ----------
+
+    function setupEventLogging() {
+      if (!window.geckoOS) return;
+
+      // Echo → GeckoOS daemon → extension should emit events with these names.
+      // Adapt service/event names to whatever your native host actually uses.
+      geckoOS.addEventListener('gecko', 'WindowCreated', data =>
+        log('EVENT gecko:WindowCreated', data)
+      );
+      geckoOS.addEventListener('gecko', 'WindowClosed', data =>
+        log('EVENT gecko:WindowClosed', data)
+      );
+      geckoOS.addEventListener('gecko', 'WorkspaceChanged', data =>
+        log('EVENT gecko:WorkspaceChanged', data)
+      );
+      geckoOS.addEventListener('gecko', 'WindowFocusChanged', data =>
+        log('EVENT gecko:WindowFocusChanged', data)
+      );
+      geckoOS.addEventListener('gecko', 'WindowMinimized', data =>
+        log('EVENT gecko:WindowMinimized', data)
+      );
+      geckoOS.addEventListener('gecko', 'WindowMaximized', data =>
+        log('EVENT gecko:WindowMaximized', data)
+      );
+      geckoOS.addEventListener('gecko', 'WindowFullscreen', data =>
+        log('EVENT gecko:WindowFullscreen', data)
+      );
+      geckoOS.addEventListener('gecko', 'WorkspaceCreated', data =>
+        log('EVENT gecko:WorkspaceCreated', data)
+      );
+      geckoOS.addEventListener('gecko', 'WorkspaceDeleted', data =>
+        log('EVENT gecko:WorkspaceDeleted', data)
+      );
+    }
+
+    // Bridge ready hook from gaia-bridge.js
+    window.addEventListener('geckoOSReady', () => {
+      log('geckoOSReady fired');
+      setupEventLogging();
+    });
+
+    // Basic availability check
+    window.addEventListener('load', () => {
+      if (navigator.geckoOS) {
+        log('✓ GeckoOS APIs available!');
+      } else {
+        log('✗ GeckoOS APIs not available (extension not loaded)', null, true);
+      }
+    });
+  </script>
 </body>
 </html>

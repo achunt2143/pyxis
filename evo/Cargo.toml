@@ -1,0 +1,131 @@
+[package]
+name = "geckoOS-evo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+geckoOS-echo = { path = "../echo" }
+smithay = { workspace = true }
+smithay-drm-extras = { workspace = true, optional = true }
+smithay-client-toolkit = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt",] }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+calloop = { workspace = true }
+wayland-server = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["server"] }
+xkbcommon = { workspace = true }
+toml = { workspace = true }
+once_cell = { workspace = true }
+shellexpand = "3.1"
+nix = { workspace = true }
+gl = "0.14"
+wgpu = { version = "0.19", optional = true }
+glium = { version = "0.33", optional = true }
+dashmap = "5.5"
+parking_lot = "0.12"
+indexmap = "2.1"
+bincode = "1.3"
+log = "0.4"
+udev = { workspace = true }
+gbm = { workspace = true }
+drm = { workspace = true }
+uuid = { workspace = true }
+image = { workspace = true, optional = true }
+profiling = { workspace = true }
+xcursor = {version = "0.3.3", optional = true}
+rand = "0.8"
+
+# Time
+chrono = "0.4"
+
+# File/IO
+walkdir = "2.4"
+dirs = "5.0"
+tempfile = "3.8"
+
+# Proc macros
+bitflags = "2.4"
+num_enum = "0.7"
+
+# Development
+[dev-dependencies]
+tempfile = "3.8"
+mockall = "0.12"
+
+[[bin]]
+name = "evo"
+path = "src/main.rs"
+
+# Testing and benchmarking
+#[dev-dependencies]
+#criterion = { workspace = true }
+#tempfile = { workspace = true }
+#mockito = { workspace = true }
+
+#[[bench]]
+#name = "rendering_benchmarks"
+#harness = false
+
+#[[bench]]
+#name = "input_latency"
+#harness = false
+
+[features]
+drm-support = []
+libinput_backend = []
+egl-backend = []
+#profiling = ["smithay/profiling"]
+debug = []
+default = ["egl", "winit", "udev", "xwayland", "echo-ipc", "decorations"]
+
+# Individual features
+damage-tracking = []
+decorations = []
+hotplug = []
+echo-ipc = []
+advanced-input = []
+data-device = []
+
+# Meta features
+all-features = [
+    "damage-tracking",
+    "decorations",
+    "hotplug",
+    "echo-ipc",
+    "advanced-input",
+    "data-device",
+]
+
+minimal = []  # Only core, no enhancements
+
+egl = ["smithay/use_system_lib", "smithay/backend_egl"]
+test_all_features = ["default", "debug"]
+udev = [
+  "smithay-drm-extras",
+  "smithay/backend_libinput",
+  "smithay/backend_udev",
+  "smithay/backend_drm",
+  "smithay/backend_gbm",
+  "smithay/backend_vulkan",
+  "smithay/backend_egl",
+  "smithay/backend_session_libseat",
+  "image",
+  "smithay/renderer_gl",
+  "smithay/renderer_pixman",
+  "smithay/renderer_multi",
+  "xcursor",
+]
+winit = ["smithay/backend_winit", "smithay/backend_drm"]
+x11 = ["smithay/backend_x11", "smithay/renderer_gl", "smithay/backend_vulkan"]
+xwayland = ["smithay/xwayland", "smithay/x11rb_event_source", "xcursor"]
+renderer_sync = []
+
+
+

@@ -273,6 +273,16 @@ log_info "Verifying filesystems..."
 sudo blkid "${LOOP_DEV}p1" "${LOOP_DEV}p2"
 
 # # Extract UUIDs from blkid output
+# Capture UUIDs and update grub.cfg
+# Get the new UUID of the root partition
+# ROOT_UUID=$(sudo blkid -s UUID -o value "${LOOP_DEV}p2")
+# log_info "Updating grub.cfg with new root UUID: $ROOT_UUID"
+
+# # Use regex to find root=UUID=... and replace it with the new one
+# # This works regardless of what the old UUID was
+# sudo sed -i "s|root=UUID=[a-zA-Z0-9-]*|root=UUID=$ROOT_UUID|g" "$ROOTFS_DIR/boot/grub/grub.cfg"
+# sudo sed -i "s|root=UUID=[a-zA-Z0-9-]*|root=UUID=$ROOT_UUID|g" "$ESP_MOUNT/boot/grub/grub.cfg"
+
 # EFI_UUID=$(sudo blkid "${LOOP_DEV}p1" | grep -oP 'UUID="\K[^"]+' | head -1)
 # ROOT_PARTUUID=$(sudo blkid "${LOOP_DEV}p2" | grep -oP 'PARTUUID="\K[^"]+' | head -1)
 # ROOT_FS_UUID=$(sudo blkid "${LOOP_DEV}p2" | grep -oP 'UUID="\K[^"]+' | head -1)
@@ -307,6 +317,13 @@ if ! sudo mount "${LOOP_DEV}p2" "$ROOT_MOUNT"; then
     exit 1
 fi
 log_success "Root partition mounted"
+
+ROOT_UUID=$(sudo blkid -s UUID -o value "${LOOP_DEV}p2")
+log_info "Updating GRUB source config with new root UUID: $ROOT_UUID"
+
+sudo sed -Ei "s#root=UUID=[A-Fa-f0-9-]+#root=UUID=${ROOT_UUID}#g" "$GRUB_CONFIG"
+
+log_success "Updated source grub.cfg with root UUID: $ROOT_UUID"
 
 # Verify mounts
 log_info "Mount status:"
@@ -382,160 +399,25 @@ fi
 # BUILD UEFI BOOTLOADER
 # ============================================================================
     log_section "Building UEFI Bootloader"
-    
-    log_info "Creating UEFI bootloader with embedded configuration..."
-    
-    # GRUB modules to include in the bootloader
-    CD_MODULES="
-	all_video
-	bli
-	boot
-	btrfs
-	cat
-	chain
-	configfile
-	echo
-	efifwsetup
-	efinet
-	ext2
-	fat
-	font
-	gettext
-	gfxmenu
-	gfxterm
-	gfxterm_background
-	gzio
-	halt
-	help
-	hfsplus
-	iso9660
-	jpeg
-	keystatus
-	loadenv
-	loopback
-	linux
-	ls
-	lsefi
-	lsefimmap
-	lsefisystab
-	lssal
-	memdisk
-	minicmd
-	normal
-	part_apple
-	part_msdos
-	part_gpt
-	password_pbkdf2
-	peimage
-	png
-	probe
-	reboot
-	regexp
-	search
-	search_fs_uuid
-	search_fs_file
-	search_label
-	serial
-	sleep
-	smbios
-	squash4
-	test
-	tpm
-	true
-	video
-	xfs
-	zfs
-	zfscrypt
-	zfsinfo
-	"
 
-# Platform-specific modules
-case $platform in
-    x86_64-efi|i386-efi)
-	CD_MODULES="$CD_MODULES
-	cpuid
-	play
-	"
-	;;
-    arm64-efi)
-	CD_MODULES="$CD_MODULES
-	fdt
-	"
-	;;
-esac
+log_info "Installing GRUB UEFI bootloader to ESP..."
+sudo grub-install \
+    --target=x86_64-efi \
+    --efi-directory="$ESP_MOUNT" \
+    --bootloader-id=GRUB \
+    --no-nvram \
+    --removable \
+    --modules="efi_gop efi_uga gfxterm gfxterm_background linux normal fat ext2 part_gpt part_msdos" \
+    "$LOOP_DEV"
 
-GRUB_MODULES="$CD_MODULES
-	cryptodisk
-	gcry_arcfour
-	gcry_blowfish
-	gcry_camellia
-	gcry_cast5
-	gcry_crc
-	gcry_des
-	gcry_dsa
-	gcry_idea
-	gcry_md4
-	gcry_md5
-	gcry_rfc2268
-	gcry_rijndael
-	gcry_rmd160
-	gcry_rsa
-	gcry_seed
-	gcry_serpent
-	gcry_sha1
-	gcry_sha256
-	gcry_sha512
-	gcry_tiger
-	gcry_twofish
-	gcry_whirlpool
-	luks
-	lvm
-	mdraid09
-	mdraid1x
-	raid5rec
-	raid6rec
-	"
-    
-    # log_info "Modules: $GRUB_MODULES"
-
-    # BOOTLOADER="${ESP_MOUNT}/efi/boot/grub/bootx64.efi"
-
-    # log_info "$(sudo ls $ESP_MOUNT)"
-    # log_info "$(sudo ls $ESP_MOUNT/boot)"
-    # log_info "$(sudo ls $ESP_MOUNT/boot/grub)"
-    # log_info "$(sudo ls $ESP_MOUNT/efi)"
-    # log_info "$(sudo ls $ESP_MOUNT/efi/boot)"
-    # log_info "$(sudo ls $ESP_MOUNT/efi/boot/grub)"
-    
-    # Build bootx64.efi with bootstrap config embedded
-    # if sudo grub-mkimage \
-    #     -c "$GRUB_BOOTSTRAP" \
-    #     -d "$GRUB_MODULES_DIR" \
-    #     -o "$BOOTLOADER" \
-    #     -O x86_64-efi \
-    #     -p "/EFI/BOOT" \
-    #     $GRUB_MODULES; then
-    #     log_success "UEFI bootloader created: $BOOTLOADER"
-    #     log_info "Size: $(du -h $BOOTLOADER | cut -f1)"
-    # else
-    #     log_error "Failed to create UEFI bootloader"
-    #     exit 1
-    # fi
-
-    if sudo grub-install --target=x86_64-efi \
-        --efi-directory=$ESP_MOUNT \
-        --bootloader-id=GRUB \
-        --no-nvram \
-        --modules="efi_gop efi_uga" \
-        /dev/loop3; then
-        log_success "UEFI bootloader created: $BOOTLOADER"
-        log_info "Size: $(du -h $BOOTLOADER | cut -f1)"
-    else
-        log_error "Failed to create UEFI bootloader"
-        exit 1
-    fi
-
-    # grub-install --target=x86_64-efi --efi-directory=$ESP_MOUNT --bootloader-id=GRUB --no-nvram --modules="efi_gop efi_uga" /dev/loop3
+# Verify bootloader was installed
+if [ -f "$ESP_MOUNT/EFI/BOOT/bootx64.efi" ]; then
+    BOOTLOADER_SIZE=$(sudo du -h "$ESP_MOUNT/EFI/BOOT/bootx64.efi" | cut -f1)
+    log_success "UEFI bootloader installed: $ESP_MOUNT/EFI/BOOT/bootx64.efi ($BOOTLOADER_SIZE)"
+else
+    log_error "UEFI bootloader not found after installation"
+    exit 1
+fi
 
 # ============================================================================
 # CONFIGURE GRUB
@@ -551,30 +433,32 @@ GRUB_MODULES="$CD_MODULES
     fi
     
     # Copy grub.cfg to rootfs if not already there
-    if [ ! -f "$ROOTFS_DIR/boot/grub/grub.cfg" ]; then
-        log_info "Copying grub.cfg to rootfs..."
-        cp "$GRUB_CONFIG" "$ROOTFS_DIR/boot/grub/grub.cfg"
-        log_success "GRUB config installed in rootfs"
-    else
-        log_info "GRUB config already in rootfs, verifying..."
-        if ! cmp -s "$GRUB_CONFIG" "$ROOTFS_DIR/boot/grub/grub.cfg"; then
-            log_warn "Rootfs config differs from source, updating..."
-            cp "$GRUB_CONFIG" "$ROOTFS_DIR/boot/grub/grub.cfg"
-        fi
-        log_success "GRUB config verified in rootfs"
+    # Copy grub.cfg to rootfs if not already there
+if [ ! -f "$ROOTFS_DIR/boot/grub/grub.cfg" ]; then
+    log_info "Copying grub.cfg to rootfs..."
+    sudo cp "$GRUB_CONFIG" "$ROOTFS_DIR/boot/grub/grub.cfg"
+    log_success "GRUB config installed in rootfs"
+else
+    log_info "GRUB config already in rootfs, verifying..."
+    if ! cmp -s "$GRUB_CONFIG" "$ROOTFS_DIR/boot/grub/grub.cfg"; then
+        log_warn "Rootfs config differs from source, updating..."
+        sudo cp "$GRUB_CONFIG" "$ROOTFS_DIR/boot/grub/grub.cfg"
     fi
-    if [ ! -f "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg" ]; then
-        log_info "Copying grub-bootstrap.cfg to rootfs..."
-        cp "$GRUB_BOOTSTRAP" "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg"
-        log_success "GRUB bootstrap installed in rootfs"
-    else
-        log_info "GRUB bootstrap already in rootfs, verifying..."
-        if ! cmp -s "$GRUB_BOOTSTRAP" "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg"; then
-            log_warn "Rootfs config differs from source, updating..."
-            cp "$GRUB_BOOTSTRAP" "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg"
-        fi
-        log_success "GRUB bootstrap verified in rootfs"
+    log_success "GRUB config verified in rootfs"
+fi
+
+if [ ! -f "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg" ]; then
+    log_info "Copying grub-bootstrap.cfg to rootfs..."
+    sudo cp "$GRUB_BOOTSTRAP" "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg"
+    log_success "GRUB bootstrap installed in rootfs"
+else
+    log_info "GRUB bootstrap already in rootfs, verifying..."
+    if ! cmp -s "$GRUB_BOOTSTRAP" "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg"; then
+        log_warn "Rootfs bootstrap differs from source, updating..."
+        sudo cp "$GRUB_BOOTSTRAP" "$ROOTFS_DIR/boot/grub/grub-bootstrap.cfg"
     fi
+    log_success "GRUB bootstrap verified in rootfs"
+fi
     
     # Verify config
     if grep -q "^menuentry" "$ROOTFS_DIR/boot/grub/grub.cfg"; then
@@ -582,13 +466,13 @@ GRUB_MODULES="$CD_MODULES
         log_success "Found $COUNT boot menu entries"
         log_info "Copying grub to the EFI"
         if [ ! -f "$ESP_MOUNT/boot/grub/grub.cfg" ]; then
-            sudo cp "$GRUB_CONFIG" "$ESP_MOUNT/boot/grub/grub.cfg"
-            log_success "Copied the config"
-        fi
-        if [ ! -f "$ESP_MOUNT/boot/grub/grub-bootstrap.cfg" ]; then
-            sudo cp "$GRUB_BOOTSTRAP" "$ESP_MOUNT/boot/grub/grub-bootstrap.cfg"
-            log_success "Copied the bootstrap"
-        fi
+    sudo cp "$GRUB_CONFIG" "$ESP_MOUNT/boot/grub/grub.cfg"
+    log_success "Copied grub.cfg to ESP"
+fi
+if [ ! -f "$ESP_MOUNT/boot/grub/grub-bootstrap.cfg" ]; then
+    sudo cp "$GRUB_BOOTSTRAP" "$ESP_MOUNT/boot/grub/grub-bootstrap.cfg"
+    log_success "Copied grub-bootstrap.cfg to ESP"
+fi
     else
         log_error "No boot entries found in grub.cfg!"
         exit 1

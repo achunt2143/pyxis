@@ -4,6 +4,7 @@ pub mod transport;
 pub mod dbus;
 pub mod routing;
 pub mod signals;
+pub mod services;
 
 pub use message::{Message, MessageType, MessageHeader};
 pub use registry::{ServiceRegistry, ServiceInfo};
@@ -11,9 +12,12 @@ pub use transport::{Transport, UnixSocketTransport};
 pub use dbus::DBusCompatLayer;
 pub use routing::MessageRouter;
 pub use signals::SignalBus;
+pub use services::{FilesystemService, AppManagerService, PowerService, SettingsService, NetworkService, DeviceInfoService, NotificationService, ProcessService};
 
 use anyhow::Result;
 use dashmap::DashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing;
@@ -21,7 +25,7 @@ use uuid::Uuid;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// IPC Bus: Message passing framework for GeckoOS
 /// Enables inter-process communication between system components
@@ -33,15 +37,40 @@ pub struct IPCBus {
     signal_bus: Arc<SignalBus>,
     active_connections: Arc<DashMap<String, BusConnection>>,
     message_handlers: Arc<DashMap<String, Arc<HandlerFn>>>,
+    connection_senders: Arc<DashMap<String, mpsc::Sender<ForwardRequest>>>,
+    external_services: Arc<DashMap<String, String>>,
 }
 
-pub type HandlerFn = Box<dyn Fn(Message) -> Result<Message> + Send + Sync>;
+// pub type HandlerFn = Box<dyn Fn(Message) -> Pin<Box<dyn Future<Output = Result<Message>> + Send>> + Send + Sync>;
+// MARKER TRAIT: Makes handlers cloneable
+pub trait CloneableHandler: Fn(Message) -> Pin<Box<dyn Future<Output = Result<Message>> + Send>> + Send + Sync + 'static {}
+impl<F> CloneableHandler for F 
+where 
+    F: Fn(Message) -> Pin<Box<dyn Future<Output = Result<Message>> + Send>> + Send + Sync + Clone + 'static,
+{}
+
+// NEW HandlerFn - now cloneable!
+pub type HandlerFn = Arc<dyn CloneableHandler>;
+
+// Helper to convert closures to HandlerFn
+pub fn handler<F>(f: F) -> HandlerFn 
+where 
+    F: Fn(Message) -> Pin<Box<dyn Future<Output = Result<Message>> + Send>> + Send + Sync + Clone + 'static,
+{
+    Arc::new(f)
+}
+
 
 #[derive(Debug, Clone)]
 pub struct BusConnection {
     pub id: String,
     pub service_name: Option<String>,
     pub connected_at: String,
+}
+
+pub struct ForwardRequest {
+    pub message: Message,
+    pub response_tx: oneshot::Sender<anyhow::Result<Message>>,
 }
 
 impl IPCBus {
@@ -63,6 +92,8 @@ impl IPCBus {
             signal_bus,
             active_connections: Arc::new(DashMap::new()),
             message_handlers: Arc::new(DashMap::new()),
+            external_services: Arc::new(DashMap::new()),
+            connection_senders: Arc::new(DashMap::new()),
         };
 
         tracing::info!("IPC Bus initialized successfully");
@@ -72,7 +103,7 @@ impl IPCBus {
     /// Start the IPC bus daemon
     pub async fn start(&self) -> Result<()> {
         self.transport.bind().await?;
-        tracing::info!("IPC Bus listening on: {:?}", self.transport.socket_path());
+        // tracing::info!("IPC Bus listening on: {:?}", self.transport. .socket_path());
         Ok(())
     }
 
@@ -82,6 +113,32 @@ impl IPCBus {
         let service_id = self.registry.register_service(name, interface).await?;
         tracing::info!("Service registered: {} ({})", name, service_id);
         Ok(service_id)
+    }
+
+     pub async fn register_external_service(
+        &self,
+        service_name: &str,
+        connection_id: &str,
+    ) {
+        self.external_services
+            .insert(service_name.to_string(), connection_id.to_string());
+        if let Some(mut conn) = self.active_connections.get_mut(connection_id) {
+            conn.service_name = Some(service_name.to_string());
+        }
+        tracing::info!(
+            "External service '{}' registered by connection {}",
+            service_name,
+            connection_id
+        );
+    }
+
+    pub async fn get_connection_for_service(
+        &self,
+        service_name: &str,
+    ) -> Option<String> {
+        self.external_services
+            .get(service_name)
+            .map(|v| v.value().clone())
     }
 
     /// Unregister a service
@@ -113,6 +170,54 @@ impl IPCBus {
         let response = self.router.route_message(message).await?;
         Ok(response)
     }
+
+    /// Register a sender for a connection so others can forward to it
+    pub fn add_connection_sender(&self, id: String, tx: mpsc::Sender<ForwardRequest>) {
+        self.connection_senders.insert(id, tx);
+    }
+
+    pub fn remove_connection(&self, id: &str) {
+        self.active_connections.remove(id);
+        self.connection_senders.remove(id);
+        self.external_services.retain(|_, conn_id| conn_id != id);
+    }
+
+    /// Forwarding logic: sends a request to the target connection's task
+    pub async fn forward_call(&self, target_id: &str, msg: Message) -> anyhow::Result<Message> {
+        tracing::info!("Trying to forward to this connection now {}", target_id);
+        let sender = self.connection_senders.get(target_id)
+            .ok_or_else(|| anyhow::anyhow!("Connection {} no longer active", target_id))?
+            .clone();
+
+        let (tx, rx) = oneshot::channel();
+        sender.send(ForwardRequest { message: msg, response_tx: tx }).await
+            .map_err(|_| anyhow::anyhow!("Failed to communicate with connection task"))?;
+
+        // Wait for the specific response to this message
+        rx.await.map_err(|_| anyhow::anyhow!("Connection task dropped the request"))?
+    }
+
+    // pub async fn forward_to_connection(
+    //     &self,
+    //     target_conn_id: &str,
+    //     msg: Message,
+    // ) -> anyhow::Result<Message> {
+    //     use crate::transport::UnixSocketTransport;
+
+    //     // get raw UnixStream from transport
+    //     let mut stream = self
+    //         .transport
+    //         .get_stream(target_conn_id)
+    //         .await
+    //         .ok_or_else(|| anyhow::anyhow!("Connection not found for service"))?;
+
+    //     let data = serde_json::to_vec(&msg)?;
+    //     UnixSocketTransport::send_message(&mut stream, &data).await?;
+
+    //     let resp_bytes = UnixSocketTransport::recv_message(&mut stream).await?;
+    //     let resp: Message = serde_json::from_slice(&resp_bytes)?;
+    //     Ok(resp)
+    // }
 
     /// Call a method on a service and wait for response
     pub async fn call_method(
@@ -181,11 +286,29 @@ impl IPCBus {
         Ok((connection_id, stream))
     }
 
-    /// Remove a connection
-    pub fn remove_connection(&self, connection_id: &str) {
-        self.active_connections.remove(connection_id);
-        tracing::debug!("Removed connection: {}", connection_id);
+    pub async fn register_connection(&self, connection_id: String) {
+        if let Some(mut conn) = self.active_connections.get_mut(&connection_id) {
+            conn.service_name = None;
+        }
+        tracing::debug!("Registered connection {}", connection_id);
     }
+
+    // /// Remove a connection
+    // pub fn remove_connection(&self, connection_id: &str) {
+    //     self.active_connections.remove(connection_id);
+    //     // Remove all services owned by this connection
+    //     let to_remove: Vec<String> = self
+    //         .external_services
+    //         .iter()
+    //         .filter(|entry| entry.value() == connection_id)
+    //         .map(|entry| entry.key().clone())
+    //         .collect();
+    //     for svc in to_remove {
+    //         self.external_services.remove(&svc);
+    //         tracing::debug!("Unregistered external service '{}' from {}", svc, connection_id);
+    //     }
+    //     tracing::debug!("Removed connection: {}", connection_id);
+    // }
 
     /// Get D-Bus compatibility layer
     pub fn dbus(&self) -> Arc<DBusCompatLayer> {
@@ -193,8 +316,11 @@ impl IPCBus {
     }
 
     /// Register message handler
-    pub fn register_handler(&self, service: &str, method: &str, handler: HandlerFn) {
-        self.router.register_handler(service, method, handler);
+    pub async fn register_handler(&self, service: &str, method: &str, handler: HandlerFn) {
+        let key = format!("{}.{}", service, method);
+        self.message_handlers.insert(key, handler.clone().into());
+        self.router.register_handler(service, method, handler.into());
+        tracing::debug!("Handler registered: {}.{}", service, method);
     }
 
     /// Get all connections count
@@ -208,32 +334,43 @@ impl IPCBus {
     }
 
     /// Get router reference
-    pub fn router(&self) -> &MessageRouter {
-        &self.router
+    pub fn router(&self) -> Arc<MessageRouter> {
+        self.router.clone()
     }
 
     /// Get signal bus reference
-    pub fn signal_bus(&self) -> &SignalBus {
-        &self.signal_bus
+    pub fn signal_bus(&self) -> Arc<SignalBus> {
+        self.signal_bus.clone()
     }
 
     /// Get registry reference
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
     }
+
+    /// Convenience helper: check if a local handler is registered
+    pub fn has_handler(&self, service: &str, method: &str) -> bool {
+        self.router.has_handler(service, method)
+    }
 }
 
 /// Echo Client - For services to connect to the bus
+#[derive(Debug, Clone)]
 pub struct EchoClient {
     stream: Arc<tokio::sync::Mutex<UnixStream>>,
-    pending_replies: Arc<DashMap<String, oneshot::Sender<Message>>>,
-    service_name: Option<String>,
+    // pending_replies: Arc<DashMap<String, oneshot::Sender<Message>>>,
+    // service_name: Option<String>,
 }
 
 impl EchoClient {
     /// Connect to Echo daemon
     pub async fn connect() -> Result<Self> {
-        Self::connect_to(&Self::default_socket_path()).await
+        let socket_path = get_socket_path();
+        let transport = UnixSocketTransport::new(&socket_path)?;
+        let stream = transport.connect().await?;
+        Ok(EchoClient {
+            stream: Arc::new(Mutex::new(stream)),
+        })
     }
 
     /// Connect to specific socket path
@@ -245,8 +382,8 @@ impl EchoClient {
         
         Ok(EchoClient {
             stream: Arc::new(tokio::sync::Mutex::new(stream)),
-            pending_replies: Arc::new(DashMap::new()),
-            service_name: None,
+            // pending_replies: Arc::new(DashMap::new()),
+            // service_name: None,
         })
     }
 
@@ -268,28 +405,22 @@ impl EchoClient {
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let message = Message::method_call(service, interface, method, args)?;
-        let message_id = message.header.message_id.clone();
-        
-        // Register pending reply
-        let (tx, rx) = oneshot::channel();
-        self.pending_replies.insert(message_id.clone(), tx);
-        
-        // Send message
         let mut stream = self.stream.lock().await;
         let data = serde_json::to_vec(&message)?;
-        UnixSocketTransport::send_message(&mut *stream, &data).await?;
-        
-        // Wait for reply with timeout
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            rx
-        ).await??;
-        
+        UnixSocketTransport::send_message(&mut stream, &data).await?;
+
+        let response_data = UnixSocketTransport::recv_message(&mut stream).await?;
+        let response: Message = serde_json::from_slice(&response_data)?;
+
         match response.header.message_type {
             MessageType::MethodReturn => Ok(response.body),
             MessageType::Error => Err(anyhow::anyhow!(
-                "Method call failed: {}",
-                response.body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown")
+                "{}",
+                response
+                    .body
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown error")
             )),
             _ => Err(anyhow::anyhow!("Unexpected response type")),
         }
@@ -307,7 +438,7 @@ impl EchoClient {
             }),
         ).await?;
         
-        self.service_name = Some(name.to_string());
+        // self.service_name = Some(name.to_string());
         Ok(result["service_id"].as_str().unwrap_or("").to_string())
     }
 
@@ -325,6 +456,14 @@ impl EchoClient {
         UnixSocketTransport::send_message(&mut *stream, &data).await?;
         
         Ok(())
+    }
+}
+
+fn get_socket_path() -> PathBuf {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime_dir).join("geckoOS/echo.sock")
+    } else {
+        PathBuf::from("/tmp/geckoOS/echo.sock")
     }
 }
 

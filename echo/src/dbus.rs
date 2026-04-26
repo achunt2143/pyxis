@@ -637,7 +637,7 @@ mod tests {
                 sender: todo!(),
                 timestamp: todo!(),
                 reply_to: todo!(),
-                error_code: todo!(),
+                signature: todo!(),
             },
             body: json!({}),
         };

@@ -125,7 +125,7 @@ stage2-js: verify-node
 	cd gaia && npm run build
 	@echo "$(GREEN)✓ JavaScript build complete$(NC)"
 
-system: stage2-rust
+system: stage2-rust-release
 	@echo "$(GREEN)✓ System components built$(NC)"
 
 userspace: stage2-js

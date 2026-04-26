@@ -1,0 +1,17 @@
+interface Power {
+  // Shut down the system
+  shutdown(): Promise<void>;
+
+  // Reboot the system
+  reboot(): Promise<void>;
+
+  // Suspend the system
+  suspend(): Promise<void>;
+
+  // Get battery info
+  getBatteryStatus(): Promise<{
+    level: number;        // 0-100
+    charging: boolean;
+    timeRemaining: number; // seconds
+  }>;
+}

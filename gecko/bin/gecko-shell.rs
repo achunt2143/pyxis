@@ -60,34 +60,34 @@ async fn main() -> Result<()> {
 
     info!("Connecting to Wayland compositor: {}", socket_path);
 
-    let gecko = match  geckoOS_gecko_integration::initialize(&socket_path).await {
-        Ok(wm) => {
-            info!("✓ Gecko Window Manager initialized");
-            wm
-        }
-        Err(e) => {
-            error!("Failed to initialize Gecko: {}", e);
-            error!("Make sure OURANOS compositor is running");
-            std::process::exit(1);
-        }
-    };
+    // let gecko = match  geckoOS_gecko_integration::initialize(&socket_path).await {
+    //     Ok(wm) => {
+    //         info!("✓ Gecko Window Manager initialized");
+    //         wm
+    //     }
+    //     Err(e) => {
+    //         error!("Failed to initialize Gecko: {}", e);
+    //         error!("Make sure OURANOS compositor is running");
+    //         std::process::exit(1);
+    //     }
+    // };
 
     // Register signal handlers for window events
     // (In production, these would receive events from compositor)
     info!("Gecko Window Manager ready to accept connections");
 
     // Keep daemon alive, checking for shutdown signal
-    let mut check_interval = tokio::time::interval(Duration::from_secs(1));
+    // let mut check_interval = tokio::time::interval(Duration::from_secs(1));
 
-    while running.load(Ordering::Relaxed) {
-        check_interval.tick().await;
+    // while running.load(Ordering::Relaxed) {
+    //     check_interval.tick().await;
 
-        // Optional: Log active windows periodically for debugging
-        let windows = gecko.list_windows();
-        if !windows.is_empty() {
-            tracing::trace!("Active windows: {}", windows.len());
-        }
-    }
+    //     // Optional: Log active windows periodically for debugging
+    //     // let windows = gecko.list_windows();
+    //     // if !windows.is_empty() {
+    //     //     tracing::trace!("Active windows: {}", windows.len());
+    //     // }
+    // }
 
     info!("=== GeckoOS Daemon Shutting Down ===");
     Ok(())

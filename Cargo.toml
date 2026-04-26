@@ -8,7 +8,7 @@ members = [
     "gecko",
     "cronus",
     "echo",
-    "ouranos",
+    "evo",
     "kratos",
     "persephone",
     "gaia",
@@ -24,10 +24,30 @@ license = "MPL-2.0"
 
 [workspace.dependencies]
 # Wayland and compositor
-smithay = { version = "0.7", features = ["backend_drm"] }
-wayland-client = "0.30"
-wayland-server = "0.30"
-wayland-protocols = "0.31"
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "1ce7b74d2d70fa62ebdf05889e6849f40954db8a",  features = [
+    "desktop",
+    "wayland_frontend",
+    "backend_winit",
+    "backend_drm",
+    "renderer_glow",
+    "use_system_lib",
+] }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git" }
+smithay-client-toolkit = { git = "https://github.com/smithay/client-toolkit" }
+udev = { version = "0.9.0" }
+# Require never `wayland-client`/`wayland-cursor` than winit uses to fix `-Z minimal-versions`
+# due to issue in older version.
+wayland-client = { version = "0.31.10" }
+wayland-cursor = { version = "0.31.10" }
+wayland-egl = { version = "0.32.7" }
+wayland-protocols = { version = "0.32.9", features = ["unstable", "staging", "server"] }
+wayland-protocols-wlr = { version = "0.3.8", features = ["server"] }
+wayland-protocols-misc = { version = "0.3.8", features = ["server"] }
+wayland-server = { version = "0.31.11" }
+wayland-sys = { version = "0.31.6" }
+wayland-backend = { version = "0.3.10" }
+winit = { version = "0.30.0", default-features = false, features = ["wayland", "wayland-dlopen", "x11", "rwh_06"] }
+x11rb = { version = "0.13.0", features = ["res"]}
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -50,10 +70,9 @@ serde_json = "1.0.145"
 toml = "0.8"
 
 # Linux utilities
-udev = "0.8"
 input = "0.9.1"
-drm = "0.6"
-gbm = "0.15"
+drm = "0.14"
+gbm = "0.18"
 shellexpand = "3.1.1"
 x11 = "2.21.0"
 num_cpus = "1.16"
@@ -66,9 +85,9 @@ nix = { version = "0.27", features = ["process", "signal", "resource", "mount", 
 # Graphics/Rendering
 wgpu = "27.0.1"
 wgpu-hal = "27.0.4"
-image = "0.24"
 glow = "0.13"
 gl = "0.14"
+image = "0.25"
 
 #Async and Misc
 futures = "0.3"
@@ -114,6 +133,7 @@ naga = "0.13"
 subprocess = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
+profiling = "1.0"
 
 
 [profile.release]
@@ -140,7 +160,7 @@ features = ["dbus", "signals"]
 description = "Inter-process communication bus"
 features = ["dbus", "unix-sockets"]
 
-[workspace.metadata.ouranos]
+[workspace.metadata.evo]
 description = "Wayland compositor (Smithay-based)"
 features = ["wayland", "drm", "libinput"]
 

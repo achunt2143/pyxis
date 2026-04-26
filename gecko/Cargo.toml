@@ -22,6 +22,8 @@ anyhow = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+log = { workspace = true }
+env_logger = { workspace = true }
 # Graphics
 gl = { workspace = true }
 glutin = { workspace = true, features = ["wayland"] }
@@ -45,3 +47,6 @@ path = "src/lib.rs"
 name = "gecko-shell"
 path = "bin/gecko-shell.rs"
 
+[[bin]]
+name = "geckoOS-native-host"
+path = "bridge/native/geckoOS-native-host.rs"

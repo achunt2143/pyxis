@@ -69,8 +69,10 @@ impl PersephoneEchoService {
     pub fn handle_execute_application(&self, app_id: &str, executable: &str, args: Vec<String>) -> Result<u32> {
         debug!("ExecuteApplication called: {} ({})", app_id, executable);
 
-        let wayland_display = std::env::var("WAYLAND_DISPLAY")
-            .unwrap_or_else(|_| "wayland-0".to_string());
+        // let wayland_display = std::env::var("WAYLAND_DISPLAY")
+        //     .unwrap_or_else(|_| "wayland-0".to_string());
+        let wayland_display = "evo-wayland-0".to_string();
+
 
         debug!("Using WAYLAND_DISPLAY: {}", wayland_display);
 

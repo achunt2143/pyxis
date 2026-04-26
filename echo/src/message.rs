@@ -3,12 +3,14 @@ use anyhow::Result;
 use uuid::Uuid;
 use chrono::Utc;
 
+/// Represents a full message with header and body
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub header: MessageHeader,
     pub body: serde_json::Value,
 }
 
+/// Message header with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageHeader {
     pub message_id: String,
@@ -17,46 +19,57 @@ pub struct MessageHeader {
     pub destination: String,
     pub interface: String,
     pub method: String,
-    pub timestamp: String,
+    pub signature: String,
     pub reply_to: Option<String>,
-    pub error_code: Option<String>,
+    pub timestamp: u64,
 }
 
+/// Enum representing the type of message
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MessageType {
-    MethodCall,
-    MethodReturn,
+    Ping,
+    Handshake,
+    EchoServiceCall,
+    EchoSubscribe,
+    EchoUnsubscribe,
+    Success,
     Error,
     Signal,
+    GeckoosPBridgeEvent,
+    Status,
+    Pong,
+    HandshakeAck,
+    MethodCall,
+    MethodReturn,
 }
 
+/// Helper implementations for creating messages
 impl Message {
-    /// Create a method call message
     pub fn method_call(
-        destination: &str,
-        interface: &str,
-        method: &str,
-        args: serde_json::Value,
+        destination: impl Into<String>,
+        interface: impl Into<String>,
+        method: impl Into<String>,
+        body: serde_json::Value,
     ) -> Result<Self> {
         Ok(Message {
             header: MessageHeader {
                 message_id: Uuid::new_v4().to_string(),
                 message_type: MessageType::MethodCall,
                 sender: None,
-                destination: destination.to_string(),
-                interface: interface.to_string(),
-                method: method.to_string(),
-                timestamp: Utc::now().to_rfc3339(),
+                destination: destination.into(),
+                interface: interface.into(),
+                method: method.into(),
+                signature: "".to_string(),
                 reply_to: None,
-                error_code: None,
+                timestamp: Utc::now().timestamp_millis() as u64,
             },
-            body: args,
+            body,
         })
     }
 
-    /// Create a method return message
-    pub fn method_return(reply_to: &str, result: serde_json::Value) -> Result<Self> {
-        Ok(Message {
+    pub fn method_return(message_id: String, body: serde_json::Value) -> Self {
+        Message {
             header: MessageHeader {
                 message_id: Uuid::new_v4().to_string(),
                 message_type: MessageType::MethodReturn,
@@ -64,17 +77,16 @@ impl Message {
                 destination: String::new(),
                 interface: String::new(),
                 method: String::new(),
-                timestamp: Utc::now().to_rfc3339(),
-                reply_to: Some(reply_to.to_string()),
-                error_code: None,
+                signature: "".to_string(),
+                reply_to: Some(message_id),
+                timestamp: Utc::now().timestamp_millis() as u64,
             },
-            body: result,
-        })
+            body,
+        }
     }
 
-    /// Create an error message
-    pub fn error(reply_to: &str, error_code: &str, message: &str) -> Result<Self> {
-        Ok(Message {
+    pub fn error(message_id: String, error_name: &str) -> Self {
+        Message {
             header: MessageHeader {
                 message_id: Uuid::new_v4().to_string(),
                 message_type: MessageType::Error,
@@ -82,29 +94,32 @@ impl Message {
                 destination: String::new(),
                 interface: String::new(),
                 method: String::new(),
-                timestamp: Utc::now().to_rfc3339(),
-                reply_to: Some(reply_to.to_string()),
-                error_code: Some(error_code.to_string()),
+                signature: "".to_string(),
+                reply_to: Some(message_id),
+                timestamp: Utc::now().timestamp_millis() as u64,
             },
-            body: serde_json::json!({ "message": message }),
-        })
+            body: serde_json::json!({ "message": error_name }),
+        }
     }
 
-    /// Create a signal message
-    pub fn signal(interface: &str, signal_name: &str, data: serde_json::Value) -> Result<Self> {
+    pub fn signal(
+        interface: impl Into<String>,
+        signal_name: impl Into<String>,
+        body: serde_json::Value,
+    ) -> Result<Self> {
         Ok(Message {
             header: MessageHeader {
                 message_id: Uuid::new_v4().to_string(),
                 message_type: MessageType::Signal,
                 sender: None,
                 destination: String::new(),
-                interface: interface.to_string(),
-                method: signal_name.to_string(),
-                timestamp: Utc::now().to_rfc3339(),
+                interface: interface.into(),
+                method: signal_name.into(),
+                signature: "".to_string(),
                 reply_to: None,
-                error_code: None,
+                timestamp: Utc::now().timestamp_millis() as u64,
             },
-            body: data,
+            body,
         })
     }
 
@@ -116,18 +131,17 @@ impl Message {
 
     /// Get message size in bytes
     pub fn size(&self) -> usize {
-        serde_json::to_vec(self)
-            .map(|v| v.len())
-            .unwrap_or(0)
+        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
     }
 
-    /// Get message priority (0-255, higher = more important)
+    /// Get message priority (0-255)
     pub fn priority(&self) -> u8 {
         match self.header.message_type {
             MessageType::MethodCall => 100,
             MessageType::MethodReturn => 80,
             MessageType::Signal => 50,
             MessageType::Error => 120,
+            _ => 50,
         }
     }
 }
@@ -138,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_method_call_creation() {
-        let msg = Message::method_call("org.geckoOS.calculator", "Math", "Add", 
+        let msg = Message::method_call("org.geckoOS.calculator", "Math", "Add",
             serde_json::json!({ "a": 5, "b": 3 })).unwrap();
         assert_eq!(msg.header.message_type, MessageType::MethodCall);
         assert_eq!(msg.header.destination, "org.geckoOS.calculator");

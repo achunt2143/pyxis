@@ -1,0 +1,22 @@
+[Unit]
+Description=GeckoOS Desktop Environment (GAIA)
+Documentation=man:gaia(1)
+After=ouranos.service echo.service cronus.service
+Requires=ouranos.service echo.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/evo
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gaia
+User=geckouser
+Group=geckouser
+Environment="DISPLAY=:0"
+Environment="WAYLAND_DISPLAY=wayland-0"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+
+[Install]
+WantedBy=multi-user.target

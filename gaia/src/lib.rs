@@ -16,7 +16,7 @@ pub mod taskbar;
 pub mod services;
 pub mod gecko_app_launcher;
 pub mod managers;
-pub mod echo_ipc;
+// pub mod echo_ipc;
 
 // Re-export public types
 pub use services::ShellState;
@@ -28,7 +28,7 @@ pub use managers::SettingsManager;
 pub use managers::BrowserManager;
 pub use managers::WindowManager;
 pub use ui_server::UIServer;
-pub use echo_ipc::GeckoEchoService;
+// pub use echo_ipc::GeckoEchoService;
 
 /// Process event types from Cronus
 #[derive(Debug, Clone)]
