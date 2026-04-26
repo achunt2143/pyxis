@@ -1,0 +1,12 @@
+#!/bin/sh
+# Placeholder launch script for the Settings app. See apps/terminal/launch
+# for a description of why this is a long-running shell stub.
+
+echo "[settings] starting (pid=$$)"
+trap 'echo "[settings] SIGTERM"; exit 0' TERM
+trap 'echo "[settings] SIGUSR1 (raise)"' USR1
+
+while :; do
+    sleep 60 &
+    wait $!
+done

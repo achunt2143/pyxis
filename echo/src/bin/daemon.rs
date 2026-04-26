@@ -537,8 +537,11 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
     // ==================== FILESYSTEM SERVICE ====================
     register_filesystem_handlers(bus).await?;
 
-    // ==================== APPMANAGER SERVICE ====================
+    // ==================== APPMANAGER SERVICE (legacy shim) ====================
     register_appmanager_handlers(bus).await?;
+
+    // ==================== APPHOST SERVICE (lifecycle) ====================
+    register_apphost_handlers(bus).await?;
 
     // ==================== POWER SERVICE ====================
     register_power_handlers(bus).await?;
@@ -1647,6 +1650,166 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
     );
 
     info!("✓ AppManager service handlers registered");
+    Ok(())
+}
+
+// ==================== APPHOST SERVICE HANDLERS ====================
+async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Registering appHost service handlers");
+
+    // Wire the bus into the global AppHost so lifecycle transitions can
+    // emit signals on the `org.geckoOS.appHost` interface.
+    services::AppHost::global().set_bus(bus.clone());
+
+    // LaunchApp(appId, params?) -> AppSession
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "LaunchApp",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                let params = msg.body.get("params").cloned();
+                match services::AppHost::global().launch_json(app_id, params) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // CloseApp(sessionId) -> AppSession
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "CloseApp",
+        handler(move |msg| {
+            Box::pin(async move {
+                let sid = msg
+                    .body
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::AppHost::global().close_json(sid) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // KillApp(sessionId) -> AppSession
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "KillApp",
+        handler(move |msg| {
+            Box::pin(async move {
+                let sid = msg
+                    .body
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::AppHost::global().kill_json(sid) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // RestartApp(sessionId) -> AppSession
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "RestartApp",
+        handler(move |msg| {
+            Box::pin(async move {
+                let sid = msg
+                    .body
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::AppHost::global().restart_json(sid) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // ListApps() -> { apps: [...] }
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "ListApps",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::AppHost::global().list_apps_json() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // ListRunningApps() -> { sessions: [...] }
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "ListRunningApps",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::AppHost::global().list_running_json() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // GetAppState(sessionId) -> { sessionId, state }
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "GetAppState",
+        handler(move |msg| {
+            Box::pin(async move {
+                let sid = msg
+                    .body
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::AppHost::global().get_state_json(sid) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // SubscribeAppLifecycle() -> { interface }
+    //
+    // Echo's signal subscription is handled at the transport layer (see the
+    // signal bus + connection broadcasting); this method exists so shells can
+    // explicitly express intent and discover the canonical interface name.
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "SubscribeAppLifecycle",
+        handler(move |msg| {
+            Box::pin(async move {
+                let result = json!({
+                    "success": true,
+                    "interface": services::APPHOST_IFACE,
+                    "signals": ["AppStarting", "AppRunning", "AppStopped", "AppCrashed"],
+                });
+                Ok(Message::method_return(msg.header.message_id, result))
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ AppHost service handlers registered");
     Ok(())
 }
 
