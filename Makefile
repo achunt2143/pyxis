@@ -92,7 +92,6 @@ install-deps: stage1
 	@echo "$(YELLOW)Installing Node.js dependencies...$(NC)"
 	cd gaia && npm install
 	@echo "$(GREEN)✓ Dependencies installed$(NC)"
-	cd ..
 
 install-system-deps:
 	@echo "$(YELLOW)Installing system libraries (requires sudo)...$(NC)"
@@ -160,7 +159,7 @@ build-release: stage1 install-deps stage2-rust-release stage2-js build-kernel bu
 build-debug: stage1 install-deps
 	@echo "$(YELLOW)Building with debug symbols...$(NC)"
 	$(CARGO) build
-	npm run build
+	cd gaia && npm run build
 	@echo "$(GREEN)✓ Debug build complete$(NC)"
 
 build-kernel:
@@ -196,7 +195,7 @@ test: build
 	@echo "$(YELLOW)Running Rust tests...$(NC)"
 	$(CARGO) test $(CARGO_FLAGS)
 	@echo "$(YELLOW)Running JavaScript tests...$(NC)"
-	npm test
+	cd gaia && npm test
 	@echo "$(GREEN)✓ Tests complete$(NC)"
 
 test-rust:
@@ -209,7 +208,7 @@ test-integration:
 
 test-js:
 	@echo "$(YELLOW)Running JavaScript tests...$(NC)"
-	npm test
+	cd gaia && npm test
 
 bench:
 	@echo "$(YELLOW)Running benchmarks...$(NC)"
@@ -223,14 +222,14 @@ format:
 	@echo "$(YELLOW)Formatting Rust code...$(NC)"
 	$(CARGO) fmt
 	@echo "$(YELLOW)Formatting JavaScript code...$(NC)"
-	npm run format
+	cd gaia && npm run format
 	@echo "$(GREEN)✓ Code formatted$(NC)"
 
 lint:
 	@echo "$(YELLOW)Linting Rust code...$(NC)"
 	$(CARGO) clippy -- -D warnings
 	@echo "$(YELLOW)Linting JavaScript code...$(NC)"
-	npm run lint
+	cd gaia && npm run lint
 	@echo "$(GREEN)✓ Linting complete$(NC)"
 
 check:
