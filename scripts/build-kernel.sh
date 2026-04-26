@@ -69,6 +69,17 @@ force_kconfig() {
   ensure_y CONFIG_FRAMEBUFFER_CONSOLE
   ensure_y CONFIG_DEVTMPFS
   ensure_y CONFIG_DEVTMPFS_MOUNT
+
+  # -----------------------------------------------------------------------
+  # initramfs decompression support — REQUIRED or the kernel will panic with
+  # "Initramfs unpacking failed: decompressor failed" at boot.
+  # build-initramfs.sh produces a gzip-compressed cpio archive; the kernel
+  # must have both BLK_DEV_INITRD (initramfs support at all) and RD_GZIP
+  # (gzip decompressor) compiled in (=y, not =m — cannot be a module because
+  # modules are not yet loaded when initramfs is unpacked).
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_BLK_DEV_INITRD
+  ensure_y CONFIG_RD_GZIP
 }
 
 main() {
