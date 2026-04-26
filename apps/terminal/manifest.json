@@ -1,0 +1,9 @@
+{
+  "id": "terminal",
+  "name": "Terminal",
+  "exec": "./launch",
+  "icon": "icon.png",
+  "version": "0.1.0",
+  "category": "system",
+  "entry": "TerminalApp"
+}

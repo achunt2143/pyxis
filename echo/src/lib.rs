@@ -12,7 +12,7 @@ pub use transport::{Transport, UnixSocketTransport};
 pub use dbus::DBusCompatLayer;
 pub use routing::MessageRouter;
 pub use signals::SignalBus;
-pub use services::{FilesystemService, AppManagerService, PowerService, SettingsService, NetworkService, DeviceInfoService, NotificationService, ProcessService};
+pub use services::{FilesystemService, AppManagerService, AppHost, AppManifest, AppSession, AppState, APPHOST_IFACE, PowerService, SettingsService, NetworkService, DeviceInfoService, NotificationService, ProcessService};
 
 use anyhow::Result;
 use dashmap::DashMap;

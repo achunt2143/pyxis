@@ -484,6 +484,18 @@ stage_userspace_apps() {
         log_success "Pyxis shell assets copied to /usr/share/geckoOS/static/pyxis/"
     fi
 
+    # Stage installed app manifests + placeholder launch scripts.
+    # Each app lives at apps/<id>/ with a manifest.json and a `launch` script;
+    # the AppHost service reads these from /usr/share/geckoOS/apps/ at runtime.
+    if [[ -d "${PROJECT_ROOT}/apps" ]]; then
+        sudo rsync -a "${PROJECT_ROOT}/apps/" "${ROOTFS_DIR}/usr/share/geckoOS/apps/"
+        # Make sure launch scripts are executable inside the rootfs.
+        sudo find "${ROOTFS_DIR}/usr/share/geckoOS/apps" -name launch -type f -exec chmod 0755 {} +
+        log_success "Sample app manifests copied to /usr/share/geckoOS/apps/"
+    else
+        log_info "No apps/ directory found at project root; skipping app manifest stage"
+    fi
+
     # Write a minimal landing index.html that redirects to the Pyxis shell
     # if no top-level index has been provided by another stage.
     if ! sudo test -f "${ROOTFS_DIR}/usr/share/geckoOS/static/index.html"; then

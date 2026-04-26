@@ -5,6 +5,7 @@
 
 pub mod filesystem;
 pub mod appmanager;
+pub mod apphost;
 pub mod power;
 pub mod settings;
 pub mod network;
@@ -15,6 +16,7 @@ pub mod process;
 // Re-exports for convenience
 pub use filesystem::FilesystemService;
 pub use appmanager::AppManagerService;
+pub use apphost::{AppHost, AppManifest, AppSession, AppState, APPHOST_IFACE};
 pub use power::PowerService;
 pub use settings::SettingsService;
 pub use network::NetworkService;
