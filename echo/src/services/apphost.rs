@@ -97,6 +97,12 @@ pub struct AppSession {
     /// Seconds since UNIX_EPOCH.
     pub started_at: u64,
     pub state: AppState,
+    /// Compositor surfaces (Wayland window ids in evo) currently bound to
+    /// this session. A session may have 0..N surfaces; 0 means the process
+    /// is running but has not produced a window yet (e.g. headless tools or
+    /// not-yet-mapped startup).
+    #[serde(default)]
+    pub surfaces: Vec<u32>,
 }
 
 impl AppSession {
@@ -107,6 +113,7 @@ impl AppSession {
             "pid": self.pid,
             "startedAt": self.started_at,
             "state": self.state.as_str(),
+            "surfaces": self.surfaces,
         })
     }
 }
@@ -240,6 +247,7 @@ impl AppHost {
             pid: 0,
             started_at,
             state: AppState::Starting,
+            surfaces: Vec::new(),
         };
         self.sessions.insert(session_id.clone(), starting.clone());
         self.emit_lifecycle("AppStarting", &starting);
@@ -290,6 +298,7 @@ impl AppHost {
             pid,
             started_at,
             state: AppState::Running,
+            surfaces: Vec::new(),
         };
         self.sessions.insert(session_id.clone(), running.clone());
         self.emit_lifecycle("AppRunning", &running);
@@ -405,6 +414,133 @@ impl AppHost {
             .map_err(|_| anyhow!("active lock poisoned"))?;
         *slot = Some(session_id.to_string());
         Ok(())
+    }
+
+    // ---------- Compositor surface binding ----------
+    //
+    // Evo (the GeckoOS Smithay compositor) holds the authoritative window
+    // registry: every mapped XDG toplevel gets a numeric `window_id` and an
+    // `app_id` lifted from the toplevel's `XdgToplevelSurfaceData`. We mirror
+    // that mapping here so any consumer of `AppHost` (the shell, the dock,
+    // future portals) can answer "which surfaces does this session own?"
+    // without having to know about Wayland.
+    //
+    // Bind/unbind only mutates the session record and emits a lightweight
+    // signal — it never spawns or kills a process. That keeps these calls
+    // safe to issue from the compositor's hot path.
+
+    /// Attach a compositor surface (Wayland window id) to a session.
+    /// If `session_id` is `None`, the most recent session for `app_id` is
+    /// used; if no session exists yet, a synthetic one is created in the
+    /// `Running` state so external windows (e.g. system X11 clients started
+    /// outside the host) can still appear in the registry.
+    ///
+    /// Returns the (possibly synthesized) session.
+    pub fn bind_surface(
+        &self,
+        app_id: &str,
+        surface_id: u32,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+    ) -> AppSession {
+        let target_id = session_id
+            .map(|s| s.to_string())
+            .or_else(|| self.find_session_by_app(app_id).map(|s| s.session_id))
+            .unwrap_or_else(|| {
+                // Synthesize a foreign-process session so the compositor can
+                // still surface the window in the lifecycle stream.
+                let session_id = Uuid::new_v4().to_string();
+                let started_at = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let synth = AppSession {
+                    session_id: session_id.clone(),
+                    app_id: app_id.to_string(),
+                    pid: pid.unwrap_or(0),
+                    started_at,
+                    state: AppState::Running,
+                    surfaces: Vec::new(),
+                };
+                self.sessions.insert(session_id.clone(), synth.clone());
+                self.emit_lifecycle("AppRunning", &synth);
+                session_id
+            });
+
+        let mut updated: Option<AppSession> = None;
+        if let Some(mut entry) = self.sessions.get_mut(&target_id) {
+            if !entry.surfaces.contains(&surface_id) {
+                entry.surfaces.push(surface_id);
+            }
+            if let Some(p) = pid {
+                if entry.pid == 0 {
+                    entry.pid = p;
+                }
+            }
+            updated = Some(entry.clone());
+        }
+
+        let session = updated.unwrap_or_else(|| AppSession {
+            session_id: target_id.clone(),
+            app_id: app_id.to_string(),
+            pid: pid.unwrap_or(0),
+            started_at: 0,
+            state: AppState::Running,
+            surfaces: vec![surface_id],
+        });
+        self.emit_lifecycle("AppSurfaceMapped", &session);
+        session
+    }
+
+    /// Detach a surface from whichever session currently owns it. If the
+    /// session was synthesized for a foreign-process window and now has no
+    /// remaining surfaces, it is dropped to keep the registry tidy.
+    pub fn unbind_surface(&self, surface_id: u32) -> Option<AppSession> {
+        let mut owner: Option<String> = None;
+        for entry in self.sessions.iter() {
+            if entry.surfaces.contains(&surface_id) {
+                owner = Some(entry.session_id.clone());
+                break;
+            }
+        }
+        let owner = owner?;
+
+        let mut updated: Option<AppSession> = None;
+        if let Some(mut entry) = self.sessions.get_mut(&owner) {
+            entry.surfaces.retain(|s| *s != surface_id);
+            updated = Some(entry.clone());
+        }
+        let session = updated?;
+        self.emit_lifecycle("AppSurfaceUnmapped", &session);
+
+        // Drop synthesized foreign-process sessions when their last surface
+        // goes away. We detect those as pid==0 sessions that hold no surfaces.
+        if session.surfaces.is_empty() && session.pid == 0 {
+            self.sessions.remove(&owner);
+        }
+        Some(session)
+    }
+
+    /// All sessions that currently own at least one surface.
+    pub fn list_surface_sessions(&self) -> Vec<AppSession> {
+        let mut v: Vec<AppSession> = self
+            .sessions
+            .iter()
+            .filter(|e| !e.surfaces.is_empty())
+            .map(|e| e.clone())
+            .collect();
+        v.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        v
+    }
+
+    /// Look up the session owning a specific surface, if any.
+    pub fn session_for_surface(&self, surface_id: u32) -> Option<AppSession> {
+        for entry in self.sessions.iter() {
+            if entry.surfaces.contains(&surface_id) {
+                return Some(entry.clone());
+            }
+        }
+        None
     }
 
     // ---------- Internal helpers ----------
@@ -530,6 +666,34 @@ impl AppHost {
             None => Err(anyhow!("session '{}' not found", session_id)),
         }
     }
+
+    pub fn bind_surface_json(
+        &self,
+        app_id: &str,
+        surface_id: u32,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+    ) -> Result<Value> {
+        let session = self.bind_surface(app_id, surface_id, session_id, pid);
+        Ok(session.to_json())
+    }
+
+    pub fn unbind_surface_json(&self, surface_id: u32) -> Result<Value> {
+        match self.unbind_surface(surface_id) {
+            Some(session) => Ok(session.to_json()),
+            None => Ok(json!({ "surfaceId": surface_id, "unbound": false })),
+        }
+    }
+
+    pub fn list_surface_sessions_json(&self) -> Result<Value> {
+        let sessions: Vec<Value> = self
+            .list_surface_sessions()
+            .iter()
+            .map(|s| s.to_json())
+            .collect();
+        let count = sessions.len();
+        Ok(json!({ "sessions": sessions, "count": count }))
+    }
 }
 
 #[cfg(test)]
@@ -565,5 +729,41 @@ mod tests {
         let host = AppHost::new();
         assert!(host.list_running().is_empty());
         assert!(host.active_session().is_none());
+    }
+
+    #[test]
+    fn bind_surface_synthesizes_foreign_session() {
+        let host = AppHost::new();
+        let session = host.bind_surface("some.app", 42, None, Some(1234));
+        assert_eq!(session.surfaces, vec![42]);
+        assert_eq!(session.app_id, "some.app");
+        assert_eq!(session.pid, 1234);
+        assert_eq!(host.list_surface_sessions().len(), 1);
+        assert_eq!(
+            host.session_for_surface(42).map(|s| s.session_id),
+            Some(session.session_id.clone())
+        );
+    }
+
+    #[test]
+    fn unbind_surface_drops_foreign_session_when_last() {
+        let host = AppHost::new();
+        let s = host.bind_surface("foreign.app", 7, None, None);
+        assert_eq!(host.list_surface_sessions().len(), 1);
+        let unbound = host.unbind_surface(7).expect("should unbind");
+        assert!(unbound.surfaces.is_empty());
+        // pid==0 + 0 surfaces should reap the synthesized session.
+        assert!(host.list_surface_sessions().is_empty());
+        assert!(host.get_state(&s.session_id).is_none());
+    }
+
+    #[test]
+    fn bind_then_unbind_emits_no_panic_without_bus() {
+        // Without `set_bus`, emit_lifecycle is a no-op — exercise the path.
+        let host = AppHost::new();
+        let _ = host.bind_surface("a", 1, None, None);
+        let _ = host.bind_surface("a", 2, None, None);
+        let _ = host.unbind_surface(1);
+        assert_eq!(host.list_surface_sessions()[0].surfaces, vec![2]);
     }
 }
