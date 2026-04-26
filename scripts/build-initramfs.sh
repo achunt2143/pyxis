@@ -21,7 +21,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_success() { echo -e "${GREEN}[✓]${NC} $*"; }
+log_success() { echo -e "${GREEN}[\u2713]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 log_info "Preparing initramfs build..."
@@ -41,7 +41,6 @@ if [ ! -f "$ROOTFS/bin/busybox" ]; then
 fi
 
 log_info "Copying BusyBox from rootfs into initramfs..."
-# Copy contents instead of the directory node itself
 cp -a "$ROOTFS/bin/"* "$INITRAMFS/bin/"
 cp -a "$ROOTFS/sbin/"* "$INITRAMFS/sbin/"
 if [ -d "$ROOTFS/usr/bin" ]; then cp -a "$ROOTFS/usr/bin/"* "$INITRAMFS/usr/bin/"; fi
@@ -68,16 +67,17 @@ log_info "Creating init script..."
 cat > "$INITRAMFS/init" <<'INITSCRIPT'
 #!/bin/busybox sh
 
+# Bootstrap: install all busybox applets as symlinks using absolute path
+# so this works before PATH is fully populated.
+/bin/busybox --install -s
+
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
 NEWROOT="/newroot"
-KCMD="/proc/cmdline"
 
 echo ""
 echo "=============================="
 echo " GeckoOS initramfs starting"
 echo "=============================="
-
-busybox --install -s
 
 mkdir -p /proc /sys /dev /tmp /run /newroot
 mount -t devtmpfs devtmpfs /dev
@@ -87,8 +87,8 @@ mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts || true
 
 [ -e /dev/console ] || mknod /dev/console c 5 1
-[ -e /dev/null ] || mknod /dev/null c 1 3
-[ -e /dev/tty ] || mknod /dev/tty c 5 0
+[ -e /dev/null ]    || mknod /dev/null    c 1 3
+[ -e /dev/tty ]     || mknod /dev/tty     c 5 0
 
 echo "[initramfs] cmdline: $(cat /proc/cmdline)"
 
@@ -105,34 +105,48 @@ echo "[initramfs] requested root: ${ROOT_SPEC}"
 echo "[initramfs] requested init: ${INIT_BIN}"
 
 echo "[initramfs] loading modules..."
-modprobe virtio 2>/dev/null || true
+modprobe virtio      2>/dev/null || true
 modprobe virtio_ring 2>/dev/null || true
-modprobe virtio_pci 2>/dev/null || true
-modprobe virtio_blk 2>/dev/null || true
-modprobe virtio_gpu 2>/dev/null || true
-modprobe ahci 2>/dev/null || true
-modprobe sd_mod 2>/dev/null || true
-modprobe ext4 2>/dev/null || true
-modprobe mbcache 2>/dev/null || true
-modprobe jbd2 2>/dev/null || true
+modprobe virtio_pci  2>/dev/null || true
+modprobe virtio_blk  2>/dev/null || true
+modprobe virtio_gpu  2>/dev/null || true
+modprobe ahci        2>/dev/null || true
+modprobe sd_mod      2>/dev/null || true
+modprobe ext4        2>/dev/null || true
+modprobe mbcache     2>/dev/null || true
+modprobe jbd2        2>/dev/null || true
 sleep 1
 
 echo "[initramfs] block devices:"
 ls -l /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null || true
-ls -l /dev/disk/by-uuid 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# resolve_root: translate a root= spec into a block device path.
+#
+# devtmpfs does NOT create /dev/disk/by-uuid symlinks - that requires udev
+# which is not running here. We therefore scan with blkid instead, which
+# reads superblocks directly and works in a minimal initramfs.
+# ---------------------------------------------------------------------------
 resolve_root() {
-    case "$1" in
+    local spec="$1"
+    case "$spec" in
         UUID=*)
-            uuid="${1#UUID=}"
-            [ -e "/dev/disk/by-uuid/$uuid" ] && readlink -f "/dev/disk/by-uuid/$uuid" && return 0
+            local uuid="${spec#UUID=}"
+            # blkid -t searches all block devices for the given UUID tag
+            blkid -t "UUID=${uuid}" -o device 2>/dev/null | head -n1
+            ;;
+        PARTUUID=*)
+            local puuid="${spec#PARTUUID=}"
+            blkid -t "PARTUUID=${puuid}" -o device 2>/dev/null | head -n1
+            ;;
+        LABEL=*)
+            local label="${spec#LABEL=}"
+            blkid -t "LABEL=${label}" -o device 2>/dev/null | head -n1
             ;;
         /dev/*)
-            echo "$1"
-            return 0
+            echo "$spec"
             ;;
     esac
-    return 1
 }
 
 ROOTDEV=""
@@ -146,7 +160,9 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 if [ -z "$ROOTDEV" ] || [ ! -b "$ROOTDEV" ]; then
-    echo "[initramfs] ERROR: could not resolve root device"
+    echo "[initramfs] ERROR: could not resolve root device '${ROOT_SPEC}'"
+    echo "[initramfs] Available block devices:"
+    blkid 2>/dev/null || true
     exec sh
 fi
 
@@ -157,8 +173,8 @@ mount -t ext4 -o ro "$ROOTDEV" "$NEWROOT" || {
 }
 
 echo "[initramfs] mounted root"
-ls -l "$NEWROOT" || true
-ls -l "$NEWROOT/sbin" || true
+ls -l "$NEWROOT"       || true
+ls -l "$NEWROOT/sbin"  || true
 
 if [ ! -e "$NEWROOT/$INIT_BIN" ]; then
     echo "[initramfs] ERROR: init not found: $NEWROOT/$INIT_BIN"
@@ -171,9 +187,9 @@ if [ ! -x "$NEWROOT/$INIT_BIN" ]; then
 fi
 
 mkdir -p "$NEWROOT"/dev "$NEWROOT"/proc "$NEWROOT"/sys
-mount --move /dev "$NEWROOT/dev" || true
+mount --move /dev  "$NEWROOT/dev"  || true
 mount --move /proc "$NEWROOT/proc" || true
-mount --move /sys "$NEWROOT/sys" || true
+mount --move /sys  "$NEWROOT/sys"  || true
 
 echo "[initramfs] switching root to $NEWROOT, init=$INIT_BIN"
 exec switch_root -c /dev/console "$NEWROOT" "$INIT_BIN"
