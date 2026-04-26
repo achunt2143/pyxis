@@ -1660,6 +1660,9 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
     // Wire the bus into the global AppHost so lifecycle transitions can
     // emit signals on the `org.geckoOS.appHost` interface.
     services::AppHost::global().set_bus(bus.clone());
+    // Start the SIGCHLD reaper so process exits map to AppStopped/AppCrashed
+    // signals automatically. Idempotent.
+    services::AppHost::global().start_child_reaper();
 
     // LaunchApp(appId, params?) -> AppSession
     bus.router().register_handler(
@@ -1788,6 +1791,77 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
         .into(),
     );
 
+    // BindSurface(appId, surfaceId, sessionId?, pid?) -> AppSession
+    //
+    // Called from the compositor (evo) when an XDG toplevel is mapped. It
+    // attaches the Wayland window id to the matching AppSession (or
+    // synthesises one for foreign-process windows) and emits an
+    // `AppSurfaceMapped` signal so the shell can wire its UI slot.
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "BindSurface",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                let surface_id = msg
+                    .body
+                    .get("surfaceId")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(0);
+                let session_id = msg.body.get("sessionId").and_then(|v| v.as_str());
+                let pid = msg.body.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
+                match services::AppHost::global()
+                    .bind_surface_json(app_id, surface_id, session_id, pid)
+                {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // UnbindSurface(surfaceId) -> AppSession | { surfaceId, unbound: false }
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "UnbindSurface",
+        handler(move |msg| {
+            Box::pin(async move {
+                let surface_id = msg
+                    .body
+                    .get("surfaceId")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(0);
+                match services::AppHost::global().unbind_surface_json(surface_id) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // ListSurfaceSessions() -> { sessions: [...] }
+    //
+    // Returns only sessions that currently own at least one mapped
+    // compositor surface. Useful for the dock to render "phantom" icons
+    // for orphan surfaces.
+    bus.router().register_handler(
+        "org.geckoOS.appHost",
+        "ListSurfaceSessions",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::AppHost::global().list_surface_sessions_json() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
     // SubscribeAppLifecycle() -> { interface }
     //
     // Echo's signal subscription is handled at the transport layer (see the
@@ -1801,7 +1875,14 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                 let result = json!({
                     "success": true,
                     "interface": services::APPHOST_IFACE,
-                    "signals": ["AppStarting", "AppRunning", "AppStopped", "AppCrashed"],
+                    "signals": [
+                        "AppStarting",
+                        "AppRunning",
+                        "AppStopped",
+                        "AppCrashed",
+                        "AppSurfaceMapped",
+                        "AppSurfaceUnmapped",
+                    ],
                 });
                 Ok(Message::method_return(msg.header.message_id, result))
             })
