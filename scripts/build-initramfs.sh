@@ -67,8 +67,7 @@ log_info "Creating init script..."
 cat > "$INITRAMFS/init" <<'INITSCRIPT'
 #!/bin/busybox sh
 
-# Bootstrap: install all busybox applets as symlinks using absolute path
-# so this works before PATH is fully populated.
+# Bootstrap: install all busybox applets as symlinks.
 /bin/busybox --install -s
 
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
@@ -86,14 +85,12 @@ mount -t sysfs    sysfs    /sys
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts || true
 
-# Ensure basic device nodes exist even if devtmpfs didn't create them
+# Ensure basic device nodes exist
 [ -e /dev/console ] || mknod /dev/console c 5 1
 [ -e /dev/null ]    || mknod /dev/null    c 1 3
 [ -e /dev/tty ]     || mknod /dev/tty     c 5 0
 
-# Populate /dev with all block device nodes via mdev.
-# devtmpfs alone does not run udev-style hotplug scanning; mdev -s triggers
-# a full sysfs scan and creates the missing /dev/vda*, /dev/sda*, etc. nodes.
+# First mdev pass: populate /dev from sysfs before module loading
 /sbin/mdev -s
 
 echo "[initramfs] cmdline: $(cat /proc/cmdline)"
@@ -122,8 +119,7 @@ modprobe ext4        2>/dev/null || true
 modprobe mbcache     2>/dev/null || true
 modprobe jbd2        2>/dev/null || true
 
-# Re-run mdev after module loading so any newly-detected block devices
-# (e.g. virtio_blk registering vda) get their /dev nodes created.
+# Second mdev pass: catch any new block devices registered after modprobe
 /sbin/mdev -s
 sleep 2
 
@@ -131,45 +127,64 @@ echo "[initramfs] block devices:"
 ls -l /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# wait_for_any_block: give the kernel up to 5 extra seconds to finish
-# registering block devices before we start probing superblocks.
+# resolve_root: translate a root= spec into a block device path.
+#
+# For UUID/PARTUUID/LABEL we iterate every block device listed in
+# /proc/partitions and call `blkid -s <TAG> -o value <dev>` on each one.
+# This approach works with both BusyBox blkid and util-linux blkid, and
+# does NOT rely on -U, -t, or cache flags that may be absent in minimal
+# BusyBox builds compiled from defconfig.
 # ---------------------------------------------------------------------------
+resolve_root() {
+    local spec="$1"
+
+    case "$spec" in
+        /dev/*)
+            # Direct device path — return as-is
+            echo "$spec"
+            return
+            ;;
+    esac
+
+    # Determine which blkid tag and value to match
+    local tag value
+    case "$spec" in
+        UUID=*)     tag=UUID;     value="${spec#UUID=}"     ;;
+        PARTUUID=*) tag=PARTUUID; value="${spec#PARTUUID=}" ;;
+        LABEL=*)    tag=LABEL;    value="${spec#LABEL=}"    ;;
+        *)
+            echo "[initramfs] WARN: unrecognised root spec: $spec" >&2
+            return
+            ;;
+    esac
+
+    # Walk every partition listed in /proc/partitions (skip header lines)
+    # Format: major minor #blocks name
+    while read -r major minor blocks name; do
+        # Skip non-device lines (header, blank, loop, ram, etc.)
+        [ -z "$name" ] && continue
+        case "$name" in
+            loop*|ram*|fd*) continue ;;
+        esac
+        local dev="/dev/${name}"
+        [ -b "$dev" ] || continue
+
+        local got
+        got="$(blkid -s "$tag" -o value "$dev" 2>/dev/null)" || continue
+        if [ "$got" = "$value" ]; then
+            echo "$dev"
+            return
+        fi
+    done < /proc/partitions
+}
+
+# Wait up to 5 extra seconds for block device nodes to appear
 _blk_wait=0
 while [ "$_blk_wait" -lt 5 ]; do
     ls /dev/vd* /dev/sd* /dev/nvme* >/dev/null 2>&1 && break
     sleep 1
     _blk_wait=$(( _blk_wait + 1 ))
 done
-
-# ---------------------------------------------------------------------------
-# resolve_root: translate a root= spec into a block device path.
-#
-# Uses blkid in direct probe mode (-p) to bypass any stale cache and read
-# superblocks from disk. For UUID lookups we use the -U shorthand which is
-# the most reliable form in BusyBox blkid and does not require a cache file.
-# ---------------------------------------------------------------------------
-resolve_root() {
-    local spec="$1"
-    case "$spec" in
-        UUID=*)
-            local uuid="${spec#UUID=}"
-            # -U is BusyBox blkid's native UUID lookup; skips cache entirely
-            blkid -U "${uuid}" 2>/dev/null
-            ;;
-        PARTUUID=*)
-            local puuid="${spec#PARTUUID=}"
-            # -p = probe mode (no cache); -t matches by tag value
-            blkid -p -t "PARTUUID=${puuid}" -o device 2>/dev/null | head -n1
-            ;;
-        LABEL=*)
-            local label="${spec#LABEL=}"
-            blkid -p -t "LABEL=${label}" -o device 2>/dev/null | head -n1
-            ;;
-        /dev/*)
-            echo "$spec"
-            ;;
-    esac
-}
 
 ROOTDEV=""
 for _try in 1 2 3 4 5 6 7 8 9 10; do
@@ -184,7 +199,12 @@ done
 if [ -z "$ROOTDEV" ] || [ ! -b "$ROOTDEV" ]; then
     echo "[initramfs] ERROR: could not resolve root device '${ROOT_SPEC}'"
     echo "[initramfs] Available block devices:"
-    blkid 2>/dev/null || true
+    # Dump all blkid info for diagnostics
+    while read -r major minor blocks name; do
+        [ -z "$name" ] && continue
+        case "$name" in loop*|ram*|fd*) continue ;; esac
+        [ -b "/dev/${name}" ] && blkid "/dev/${name}" 2>/dev/null || true
+    done < /proc/partitions
     exec sh
 fi
 
@@ -214,7 +234,6 @@ mount --move /proc "$NEWROOT/proc" || true
 mount --move /sys  "$NEWROOT/sys"  || true
 
 echo "[initramfs] switching root to $NEWROOT, init=$INIT_BIN"
-# BusyBox switch_root does not support -c; pass NEWROOT and INIT directly.
 exec switch_root "$NEWROOT" "$INIT_BIN"
 
 echo "[initramfs] FATAL: switch_root returned"
