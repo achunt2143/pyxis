@@ -1,4 +1,4 @@
-.PHONY: help build build-release build-debug run test clean install-deps \
+.PHONY: help build build-release build-debug run test clean install-deps pyxis-build pyxis-install pyxis-dev \
         format lint kernel gecko system userspace docker all stage1 stage2 stage3 \
 		docker-build docker-shell docker-build-image docker-clean docker-logs \
 		docker-images docker-volumes docker-ps docker-inspect docker-help
@@ -130,6 +130,26 @@ system: stage2-rust-release
 
 userspace: stage2-js
 	@echo "$(GREEN)✓ Userspace built$(NC)"
+
+# ============================================================================
+# PYXIS DESKTOP SHELL
+# ============================================================================
+
+PYXIS_REPO   ?= ../pyxis-experience
+GAIA_STATIC   = gaia/static
+
+pyxis-build:
+	@echo "$(YELLOW)Building Pyxis desktop shell from $(PYXIS_REPO)...$(NC)"
+	cd $(PYXIS_REPO) && npm ci && npm run build
+	rm -rf $(GAIA_STATIC)
+	cp -r $(PYXIS_REPO)/dist $(GAIA_STATIC)
+	@echo "[✓] Pyxis shell installed to $(GAIA_STATIC)"
+
+pyxis-install: pyxis-build
+
+pyxis-dev:
+	cd $(PYXIS_REPO) && npm run dev
+
 
 build: stage1 install-deps stage2-rust stage2-js
 	@echo "$(GREEN)✓ Full build complete$(NC)"
