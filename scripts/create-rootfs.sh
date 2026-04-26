@@ -476,11 +476,22 @@ stage_userspace_apps() {
     log_section "Stage 10: Userspace assets"
 
     sudo mkdir -p "${ROOTFS_DIR}/usr/share/geckoOS/static"
+    sudo mkdir -p "${ROOTFS_DIR}/usr/share/geckoOS/static/pyxis"
     sudo mkdir -p "${ROOTFS_DIR}/usr/share/geckoOS/apps"
 
     if [[ -d "${PROJECT_ROOT}/gaia/static" ]]; then
-        sudo rsync -a "${PROJECT_ROOT}/gaia/static/" "${ROOTFS_DIR}/usr/share/geckoOS/static/"
-        log_success "GAIA static assets copied"
+        sudo rsync -a "${PROJECT_ROOT}/gaia/static/" "${ROOTFS_DIR}/usr/share/geckoOS/static/pyxis/"
+        log_success "Pyxis shell assets copied to /usr/share/geckoOS/static/pyxis/"
+    fi
+
+    # Write a minimal landing index.html that redirects to the Pyxis shell
+    # if no top-level index has been provided by another stage.
+    if ! sudo test -f "${ROOTFS_DIR}/usr/share/geckoOS/static/index.html"; then
+        sudo tee "${ROOTFS_DIR}/usr/share/geckoOS/static/index.html" >/dev/null <<'EOF'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>GeckoOS</title>
+<script>window.location.replace('./pyxis/index.html');</script></head></html>
+EOF
+        log_success "Wrote minimal landing index.html"
     fi
 }
 

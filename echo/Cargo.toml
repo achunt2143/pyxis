@@ -35,6 +35,9 @@ tokio-stream = { workspace = true, features = ["net"] }
 futures = { workspace = true }
 # CLI
 clap = { workspace = true, features = ["derive"] }
+# Unix signals / process control
+nix = { workspace = true }
+libc = { workspace = true }
 
 [lib]
 name = "geckoOS_echo"
