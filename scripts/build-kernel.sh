@@ -51,6 +51,9 @@ force_kconfig() {
     fi
   }
 
+  # -----------------------------------------------------------------------
+  # Block / storage
+  # -----------------------------------------------------------------------
   ensure_y CONFIG_PCI
   ensure_y CONFIG_VIRTIO
   ensure_y CONFIG_VIRTIO_PCI
@@ -63,23 +66,72 @@ force_kconfig() {
   ensure_y CONFIG_EXT4_FS
   ensure_y CONFIG_JBD2
   ensure_y CONFIG_MBCACHE
+
+  # -----------------------------------------------------------------------
+  # Display / GPU
+  # -----------------------------------------------------------------------
   ensure_y CONFIG_DRM
   ensure_y CONFIG_DRM_VIRTIO_GPU
   ensure_y CONFIG_FB
   ensure_y CONFIG_FRAMEBUFFER_CONSOLE
-  ensure_y CONFIG_DEVTMPFS
-  ensure_y CONFIG_DEVTMPFS_MOUNT
 
   # -----------------------------------------------------------------------
-  # initramfs decompression support — REQUIRED or the kernel will panic with
+  # Device management
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_DEVTMPFS
+  ensure_y CONFIG_DEVTMPFS_MOUNT
+  ensure_y CONFIG_SYSFS
+  ensure_y CONFIG_PROC_FS
+
+  # -----------------------------------------------------------------------
+  # Initramfs decompression — REQUIRED or the kernel panics with
   # "Initramfs unpacking failed: decompressor failed" at boot.
-  # build-initramfs.sh produces a gzip-compressed cpio archive; the kernel
-  # must have both BLK_DEV_INITRD (initramfs support at all) and RD_GZIP
-  # (gzip decompressor) compiled in (=y, not =m — cannot be a module because
-  # modules are not yet loaded when initramfs is unpacked).
+  # Must be =y (not =m) because modules are not yet loaded at unpack time.
   # -----------------------------------------------------------------------
   ensure_y CONFIG_BLK_DEV_INITRD
   ensure_y CONFIG_RD_GZIP
+
+  # -----------------------------------------------------------------------
+  # Filesystem: tmpfs
+  # Without CONFIG_TMPFS the kernel rejects mount options such as mode=
+  # with "Unknown parameter 'mode'" which causes systemd to fail mounting
+  # /run, /dev/shm, and /tmp at startup.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_TMPFS
+  ensure_y CONFIG_TMPFS_XATTR
+
+  # -----------------------------------------------------------------------
+  # Filesystem: autofs
+  # Renamed from autofs4 to autofs in Linux 5.7. systemd logs
+  # "Failed to find module 'autofs4'" when this is absent.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_AUTOFS_FS
+
+  # -----------------------------------------------------------------------
+  # Cgroups — required for systemd and container isolation.
+  # CONFIG_CGROUP_BPF + CONFIG_MEMCG are needed for the cgroup2 mount
+  # options nsdelegate and memory_recursiveprot that systemd requests.
+  # Without them: "Failed to mount cgroup2 ... No such file or directory"
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_CGROUPS
+  ensure_y CONFIG_CGROUP_BPF
+  ensure_y CONFIG_MEMCG
+  ensure_y CONFIG_CGROUP_WRITEBACK
+  ensure_y CONFIG_CGROUP_SCHED
+  ensure_y CONFIG_CGROUP_PIDS
+  ensure_y CONFIG_CGROUP_FREEZER
+  ensure_y CONFIG_CGROUP_DEVICE
+  ensure_y CONFIG_CPUSETS
+
+  # -----------------------------------------------------------------------
+  # Syscall / IPC interfaces required by systemd, dbus, and udev
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_INOTIFY_USER
+  ensure_y CONFIG_SIGNALFD
+  ensure_y CONFIG_TIMERFD
+  ensure_y CONFIG_EPOLL
+  ensure_y CONFIG_UNIX       # AF_UNIX sockets (dbus, systemd socket activation)
+  ensure_y CONFIG_NET        # base networking (AF_UNIX depends on this)
 }
 
 main() {
