@@ -21,7 +21,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_success() { echo -e "${GREEN}[\u2713]${NC} $*"; }
+log_success() { echo -e "${GREEN}[✓]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 log_info "Preparing initramfs build..."
@@ -32,8 +32,7 @@ mkdir -p "$MODULES_DST"
 log_success "Initramfs directory structure created"
 
 log_info "Building/installing BusyBox..."
-cd "$SCRIPT_DIR"
-./busybox-install.sh
+bash "$SCRIPT_DIR/busybox-install.sh"
 
 if [ ! -f "$ROOTFS/bin/busybox" ]; then
     log_error "BusyBox was not installed to rootfs at $ROOTFS/bin/busybox"
@@ -128,25 +127,17 @@ ls -l /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # resolve_root: translate a root= spec into a block device path.
-#
-# For UUID/PARTUUID/LABEL we iterate every block device listed in
-# /proc/partitions and call `blkid -s <TAG> -o value <dev>` on each one.
-# This approach works with both BusyBox blkid and util-linux blkid, and
-# does NOT rely on -U, -t, or cache flags that may be absent in minimal
-# BusyBox builds compiled from defconfig.
 # ---------------------------------------------------------------------------
 resolve_root() {
     local spec="$1"
 
     case "$spec" in
         /dev/*)
-            # Direct device path — return as-is
             echo "$spec"
             return
             ;;
     esac
 
-    # Determine which blkid tag and value to match
     local tag value
     case "$spec" in
         UUID=*)     tag=UUID;     value="${spec#UUID=}"     ;;
@@ -158,10 +149,7 @@ resolve_root() {
             ;;
     esac
 
-    # Walk every partition listed in /proc/partitions (skip header lines)
-    # Format: major minor #blocks name
     while read -r major minor blocks name; do
-        # Skip non-device lines (header, blank, loop, ram, etc.)
         [ -z "$name" ] && continue
         case "$name" in
             loop*|ram*|fd*) continue ;;
@@ -199,7 +187,6 @@ done
 if [ -z "$ROOTDEV" ] || [ ! -b "$ROOTDEV" ]; then
     echo "[initramfs] ERROR: could not resolve root device '${ROOT_SPEC}'"
     echo "[initramfs] Available block devices:"
-    # Dump all blkid info for diagnostics
     while read -r major minor blocks name; do
         [ -z "$name" ] && continue
         case "$name" in loop*|ram*|fd*) continue ;; esac
