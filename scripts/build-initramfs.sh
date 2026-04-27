@@ -127,10 +127,15 @@ ls -l /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # resolve_root: translate a root= spec into a block device path.
+#
+# Uses awk to read /proc/partitions so whitespace padding and the header
+# line are handled correctly -- plain `read` in BusyBox sh mis-parses the
+# space-padded columns and the header row.
 # ---------------------------------------------------------------------------
 resolve_root() {
     local spec="$1"
 
+    # Already a device path -- nothing to do.
     case "$spec" in
         /dev/*)
             echo "$spec"
@@ -149,12 +154,12 @@ resolve_root() {
             ;;
     esac
 
-    while read -r major minor blocks name; do
-        [ -z "$name" ] && continue
-        case "$name" in
-            loop*|ram*|fd*) continue ;;
-        esac
-        local dev="/dev/${name}"
+    # awk skips the header (NF<4) and comment lines, prints the device name
+    # field (4th column) trimmed of whitespace.
+    while IFS= read -r devname; do
+        [ -z "$devname" ] && continue
+        case "$devname" in loop*|ram*|fd*) continue ;; esac
+        local dev="/dev/${devname}"
         [ -b "$dev" ] || continue
 
         local got
@@ -163,7 +168,9 @@ resolve_root() {
             echo "$dev"
             return
         fi
-    done < /proc/partitions
+    done <<EOF
+$(awk 'NF==4 && $1+0>0 { print $4 }' /proc/partitions)
+EOF
 }
 
 # Wait up to 5 extra seconds for block device nodes to appear
@@ -187,16 +194,17 @@ done
 if [ -z "$ROOTDEV" ] || [ ! -b "$ROOTDEV" ]; then
     echo "[initramfs] ERROR: could not resolve root device '${ROOT_SPEC}'"
     echo "[initramfs] Available block devices:"
-    while read -r major minor blocks name; do
-        [ -z "$name" ] && continue
-        case "$name" in loop*|ram*|fd*) continue ;; esac
-        [ -b "/dev/${name}" ] && blkid "/dev/${name}" 2>/dev/null || true
-    done < /proc/partitions
+    awk 'NF==4 && $1+0>0 { print $4 }' /proc/partitions | while IFS= read -r n; do
+        [ -b "/dev/$n" ] && blkid "/dev/$n" 2>/dev/null || true
+    done
     exec sh
 fi
 
 echo "[initramfs] resolved root device: $ROOTDEV"
-mount -t ext4 -o ro "$ROOTDEV" "$NEWROOT" || {
+
+# Mount rw -- the kernel cmdline carries 'rw' and systemd expects a
+# writable root. Mounting ro here causes systemd to fail remounting.
+mount -t ext4 "$ROOTDEV" "$NEWROOT" || {
     echo "[initramfs] ERROR: failed to mount root"
     exec sh
 }
