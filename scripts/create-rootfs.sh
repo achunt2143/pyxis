@@ -427,15 +427,18 @@ stage_binaries() {
 stage_gecko() {
     log_section "Stage 8: Gecko runtime"
 
-    sudo mkdir -p "${ROOTFS_DIR}/usr/lib/gecko" "${GECKO_BUILD_DIR}/lib"
+    # GECKO_BUILD_DIR is inside target/build/ which is user-owned;
+    # do NOT use sudo here or curl will fail to write into it.
+    mkdir -p "${GECKO_BUILD_DIR}/lib"
+    sudo mkdir -p "${ROOTFS_DIR}/usr/lib/gecko"
 
     if [[ -f "${GECKO_BUILD_DIR}/firefox/libxul.so" ]]; then
         find "${GECKO_BUILD_DIR}/firefox" -maxdepth 1 -name 'lib*.so*' -exec cp -a {} "${GECKO_BUILD_DIR}/lib/" \;
     elif [[ "${GECKO_PREBUILT}" -eq 0 ]]; then
         local version="140.5"
         local url="https://archive.mozilla.org/pub/firefox/releases/${version}.0esr/linux-x86_64/en-US/firefox-${version}.0esr.tar.xz"
-        mkdir -p "${GECKO_BUILD_DIR}"
-        curl -L "$url" -o "${GECKO_BUILD_DIR}/firefox.tar.xz"
+        log_info "Downloading Firefox ESR ${version} as Gecko runtime..."
+        curl -L --fail --show-error "$url" -o "${GECKO_BUILD_DIR}/firefox.tar.xz"
         tar -xf "${GECKO_BUILD_DIR}/firefox.tar.xz" -C "${GECKO_BUILD_DIR}"
         find "${GECKO_BUILD_DIR}/firefox" -maxdepth 1 -name 'lib*.so*' -exec cp -a {} "${GECKO_BUILD_DIR}/lib/" \;
     fi
@@ -484,20 +487,14 @@ stage_userspace_apps() {
         log_success "Pyxis shell assets copied to /usr/share/geckoOS/static/pyxis/"
     fi
 
-    # Stage installed app manifests + placeholder launch scripts.
-    # Each app lives at apps/<id>/ with a manifest.json and a `launch` script;
-    # the AppHost service reads these from /usr/share/geckoOS/apps/ at runtime.
     if [[ -d "${PROJECT_ROOT}/apps" ]]; then
         sudo rsync -a "${PROJECT_ROOT}/apps/" "${ROOTFS_DIR}/usr/share/geckoOS/apps/"
-        # Make sure launch scripts are executable inside the rootfs.
         sudo find "${ROOTFS_DIR}/usr/share/geckoOS/apps" -name launch -type f -exec chmod 0755 {} +
         log_success "Sample app manifests copied to /usr/share/geckoOS/apps/"
     else
         log_info "No apps/ directory found at project root; skipping app manifest stage"
     fi
 
-    # Write a minimal landing index.html that redirects to the Pyxis shell
-    # if no top-level index has been provided by another stage.
     if ! sudo test -f "${ROOTFS_DIR}/usr/share/geckoOS/static/index.html"; then
         sudo tee "${ROOTFS_DIR}/usr/share/geckoOS/static/index.html" >/dev/null <<'EOF'
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>GeckoOS</title>
