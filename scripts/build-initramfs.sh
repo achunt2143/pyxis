@@ -135,7 +135,6 @@ ls -l /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null || true
 resolve_root() {
     local spec="$1"
 
-    # Already a device path -- nothing to do.
     case "$spec" in
         /dev/*)
             echo "$spec"
@@ -154,8 +153,6 @@ resolve_root() {
             ;;
     esac
 
-    # awk skips the header (NF<4) and comment lines, prints the device name
-    # field (4th column) trimmed of whitespace.
     while IFS= read -r devname; do
         [ -z "$devname" ] && continue
         case "$devname" in loop*|ram*|fd*) continue ;; esac
@@ -202,35 +199,34 @@ fi
 
 echo "[initramfs] resolved root device: $ROOTDEV"
 
-# Mount rw -- the kernel cmdline carries 'rw' and systemd expects a
-# writable root. Mounting ro here causes systemd to fail remounting.
+# Mount the root filesystem rw, matching what the manual boot sequence does:
+#   mount -t ext4 /dev/vda2 /newroot
+# No -o ro -- the kernel cmdline carries 'rw' and systemd requires a
+# writable root from the start.
 mount -t ext4 "$ROOTDEV" "$NEWROOT" || {
     echo "[initramfs] ERROR: failed to mount root"
     exec sh
 }
 
-echo "[initramfs] mounted root"
-ls -l "$NEWROOT"       || true
-ls -l "$NEWROOT/sbin"  || true
+echo "[initramfs] mounted root: $ROOTDEV -> $NEWROOT"
 
-if [ ! -e "$NEWROOT/$INIT_BIN" ]; then
-    echo "[initramfs] ERROR: init not found: $NEWROOT/$INIT_BIN"
-    exec sh
-fi
-
+# Verify init exists and is executable before moving anything
 if [ ! -x "$NEWROOT/$INIT_BIN" ]; then
-    echo "[initramfs] ERROR: init not executable: $NEWROOT/$INIT_BIN"
+    echo "[initramfs] ERROR: init not found or not executable: $NEWROOT/$INIT_BIN"
+    ls -la "$NEWROOT/sbin/" 2>/dev/null || true
     exec sh
 fi
 
-mkdir -p "$NEWROOT"/dev "$NEWROOT"/proc "$NEWROOT"/sys
-mount --move /dev  "$NEWROOT/dev"  || true
-mount --move /proc "$NEWROOT/proc" || true
-mount --move /sys  "$NEWROOT/sys"  || true
+# Move virtual filesystems into the new root -- same order as the
+# manual sequence that is known to work.
+mount --move /dev  "$NEWROOT/dev"
+mount --move /proc "$NEWROOT/proc"
+mount --move /sys  "$NEWROOT/sys"
 
-echo "[initramfs] switching root to $NEWROOT, init=$INIT_BIN"
+echo "[initramfs] switching root -> $INIT_BIN"
 exec switch_root "$NEWROOT" "$INIT_BIN"
 
+# Should never reach here
 echo "[initramfs] FATAL: switch_root returned"
 exec sh
 INITSCRIPT

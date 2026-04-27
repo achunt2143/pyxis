@@ -288,9 +288,13 @@ seat:x:110:
 geckouser:x:1000:
 EOF
 
+    # DEV CREDENTIALS
+    # Both root and geckouser have password: gecko
+    # Hash generated with: openssl passwd -6 gecko
+    # Change before any non-development deployment.
     write_rootfs_file "${ROOTFS_DIR}/etc/shadow" <<'EOF'
-root:*:20000:0:99999:7:::
-geckouser:*:20000:0:99999:7:::
+root:$6$geckoOS$8AXzCRbBQblVfZfJOTQHhKRFgJeN9hm1MKjr8uY9yW7nAVW5u.s3vxbBWvXnRN0MFujB/OJrFxmKdVz83dBA1:20000:0:99999:7:::
+geckouser:$6$geckoOS$8AXzCRbBQblVfZfJOTQHhKRFgJeN9hm1MKjr8uY9yW7nAVW5u.s3vxbBWvXnRN0MFujB/OJrFxmKdVz83dBA1:20000:0:99999:7:::
 EOF
     sudo chmod 640 "${ROOTFS_DIR}/etc/shadow"
 
@@ -427,8 +431,6 @@ stage_binaries() {
 stage_gecko() {
     log_section "Stage 8: Gecko runtime"
 
-    # GECKO_BUILD_DIR is inside target/build/ which is user-owned;
-    # do NOT use sudo here or curl will fail to write into it.
     mkdir -p "${GECKO_BUILD_DIR}/lib"
     sudo mkdir -p "${ROOTFS_DIR}/usr/lib/gecko"
 
