@@ -21,6 +21,12 @@ DOCKER_IMAGE_NAME := geckoOS
 DOCKER_IMAGE_TAG := latest
 DOCKER_COMPOSE := docker-compose
 
+# Script runner — always invoke via bash so execute-bit is not required.
+# The GitHub Contents API writes files as mode 100644 (non-executable), so
+# calling ./scripts/foo.sh directly would fail with "Permission denied" after
+# any API-sourced commit. Using BASH_SCRIPTS_RUN prevents that permanently.
+RUN_SCRIPT = bash
+
 help:
 	@echo "$(GREEN)GeckoOS Build System$(NC)"
 	@echo "$(YELLOW)Available targets:$(NC)"
@@ -44,12 +50,6 @@ help:
 	@echo "  make pyxis-build    - Pull & build Pyxis shell from bloom into gaia/static"
 	@echo "  make pyxis-dev      - Start bloom dev server"
 	@echo ""
-# 	@echo "$(BLUE)Docker Commands:$(NC)"
-# 	@echo "  docker-build              Build Docker image locally"
-# 	@echo "  docker-shell              Interactive development shell in container"
-# 	@echo "  docker-build-image        Perform full build inside container"
-# 	@echo "  docker-clean              Clean Docker resources"
-# 	@echo "  docker-logs               View Docker build logs"
 
 # ============================================================================
 # DEPENDENCY VERIFICATION
@@ -150,27 +150,27 @@ build-debug: stage1 install-deps
 
 build-kernel:
 	@echo "$(YELLOW)Building kernel image...$(NC)"
-	./scripts/build-kernel.sh
+	$(RUN_SCRIPT) scripts/build-kernel.sh
 	@echo "$(GREEN)✓ Kernel build complete$(NC)"
 
 build-rootfs:
 	@echo "$(YELLOW)Building root fs...$(NC)"
-	./scripts/create-rootfs.sh --kernel-prebuilt
+	$(RUN_SCRIPT) scripts/create-rootfs.sh --kernel-prebuilt
 	@echo "$(GREEN)✓ Root fs build complete$(NC)"
 
 build-initramfs:
 	@echo "$(YELLOW)Building initramfs image...$(NC)"
-	./scripts/build-initramfs.sh
+	$(RUN_SCRIPT) scripts/build-initramfs.sh
 	@echo "$(GREEN)✓ Initramfs build complete$(NC)"
 
 build-busybox:
 	@echo "$(YELLOW)Building busybox...$(NC)"
-	./scripts/busybox-install.sh
-	@echo "$(GREEN)✓ Busybox build complete$(NC)"	
+	$(RUN_SCRIPT) scripts/busybox-install.sh
+	@echo "$(GREEN)✓ Busybox build complete$(NC)"
 
 package:
 	@echo "$(YELLOW)Packaging image...$(NC)"
-	./scripts/package.sh --x86_64-efi
+	$(RUN_SCRIPT) scripts/package.sh --x86_64-efi
 	@echo "$(GREEN)✓ Packaging complete$(NC)"
 
 # ============================================================================
@@ -219,15 +219,15 @@ check:
 
 run:
 	@echo "$(YELLOW)Starting GeckoOS (debug mode)...$(NC)"
-	./scripts/emulate.sh
+	$(RUN_SCRIPT) scripts/emulate.sh
 
 run-release: build-release
 	@echo "$(YELLOW)Starting GeckoOS (release mode)...$(NC)"
-	./scripts/emulate.sh --release
+	$(RUN_SCRIPT) scripts/emulate.sh --release
 
 run-debug: build-debug
 	@echo "$(YELLOW)Starting GeckoOS with debugging...$(NC)"
-	./scripts/emulate.sh --debug
+	$(RUN_SCRIPT) scripts/emulate.sh --debug
 
 # ============================================================================
 # CLEANUP
@@ -249,75 +249,6 @@ distclean: clean
 	@echo "$(YELLOW)Removing all build and dependency artifacts...$(NC)"
 	rm -rf .cargo target
 	@echo "$(GREEN)✓ Distclean complete$(NC)"
-
-# ============================================================================
-# DOCKER
-# ============================================================================
-
-# docker-build:
-# 	@echo "$(BLUE)Building GeckoOS Docker image...$(NC)"
-# 	@scripts/docker-build.sh $(DOCKER_IMAGE_TAG)
-# 	@echo "$(GREEN)[✓]$(NC) Docker image built successfully"
-
-# docker-shell:
-# 	@echo "$(BLUE)Launching interactive GeckoOS development shell...$(NC)"
-# 	@$(DOCKER_COMPOSE) run --rm dev bash
-# 	@echo "$(GREEN)[✓]$(NC) Development shell closed"
-
-# docker-build-image:
-# 	@echo "$(BLUE)Building GeckoOS inside Docker container...$(NC)"
-# 	@$(DOCKER_COMPOSE) run --rm build
-# 	@echo "$(GREEN)[✓]$(NC) Build complete - artifacts in target/"
-
-# docker-run: docker-build
-# 	@echo "$(YELLOW)Running GeckoOS in Docker...$(NC)"
-# 	docker run -it --rm geckoOS:latest
-
-# docker-clean:
-# 	@echo "$(BLUE)Cleaning Docker containers, images, and volumes...$(NC)"
-# 	@$(DOCKER_COMPOSE) down -v 2>/dev/null || true
-# 	@docker rmi $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG) 2>/dev/null || true
-# 	@docker rmi $(DOCKER_IMAGE_NAME):dev 2>/dev/null || true
-# 	@docker volume prune -f 2>/dev/null || true
-# 	@echo "$(GREEN)[✓]$(NC) Docker cleanup complete"
-
-# docker-logs:
-# 	@$(DOCKER_COMPOSE) logs -f
-
-# docker-images:
-# 	@echo "$(BLUE)GeckoOS Docker Images:$(NC)"
-# 	@docker images | grep $(DOCKER_IMAGE_NAME) || echo "No $(DOCKER_IMAGE_NAME) images found"
-
-# docker-volumes:
-# 	@echo "$(BLUE)GeckoOS Docker Volumes:$(NC)"
-# 	@docker volume ls | grep $(DOCKER_IMAGE_NAME) || echo "No $(DOCKER_IMAGE_NAME) volumes found"
-
-# docker-ps:
-# 	@echo "$(BLUE)Running GeckoOS Containers:$(NC)"
-# 	@docker ps --filter "ancestor=$(DOCKER_IMAGE_NAME):*" || echo "No running containers"
-
-# docker-inspect:
-# 	@echo "$(BLUE)Inspecting $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)...$(NC)"
-# 	@docker inspect $(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG) | jq '.[0] | {Created, RepoDigests, Size, Architecture}'
-
-# docker-help:
-# 	@echo "$(BLUE)Docker Targets:$(NC)"
-# 	@echo ""
-# 	@echo "  $(YELLOW)docker-build$(NC)         Build Docker image"
-# 	@echo "  $(YELLOW)docker-shell$(NC)         Interactive development shell"
-# 	@echo "  $(YELLOW)docker-build-image$(NC)   Full build inside container"
-# 	@echo "  $(YELLOW)docker-clean$(NC)         Clean Docker containers/images/volumes"
-# 	@echo "  $(YELLOW)docker-logs$(NC)          View Docker logs"
-# 	@echo "  $(YELLOW)docker-images$(NC)        List GeckoOS images"
-# 	@echo "  $(YELLOW)docker-volumes$(NC)       List GeckoOS volumes"
-# 	@echo "  $(YELLOW)docker-ps$(NC)            List running containers"
-# 	@echo "  $(YELLOW)docker-inspect$(NC)       Inspect Docker image"
-# 	@echo ""
-# 	@echo "$(BLUE)Examples:$(NC)"
-# 	@echo "  make docker-build              # Build image"
-# 	@echo "  make docker-shell              # Interactive shell"
-# 	@echo "  make docker-build-image        # Build in container"
-# 	@echo "  make docker-clean              # Clean everything"
 
 # ============================================================================
 # DOCUMENTATION
