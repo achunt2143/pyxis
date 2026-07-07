@@ -1,0 +1,37 @@
+Not a real file to add as-is — this is a diff note for xpcom/ds/StaticAtoms.py
+(a large stock Mozilla file; only a single atom entry is added).
+
+REAL BUG, found via a real boot (2026-07-06): JSWindowActor `matches:
+["pyxis://*/*"]` (toolkit/modules/ActorManagerParent.sys.mjs's PyxisBridge
+entry) silently NEVER matched any pyxis:// document, even though the
+document itself loaded correctly (confirmed via an fprintf canary in
+PyxisProtocolHandler::NewChannel showing pyxis://bloom/index.html + its
+JS/CSS/favicon all being fetched normally, and separately confirming via
+console.error canaries in both PyxisBridgeChild's and PyxisBridgeParent's
+actorCreated() that neither ever fired). Root cause, traced into
+toolkit/components/extensions/MatchPattern.cpp's MatchPatternCore
+constructor: it consults a hardcoded `HostLocatorSchemes()` atom set to
+decide whether a scheme uses "scheme://host/path" syntax (requiring host
+parsing) vs "scheme:path" syntax (about:, data:, etc. — no host, path
+matched literally against everything after the colon). "pyxis" was not in
+that atom set, so the constructor treated the "//*/*" tail of our pattern as
+a literal PATH to match — which can never match a real
+pyxis://<app-id>/<path> URI's actual path (which never begins with "//").
+No error was thrown; the pattern just quietly matched nothing, ever.
+
+Fix requires a new nsGkAtoms atom (StaticAtoms.py has no "pyxis" atom yet)
+plus referencing it in HostLocatorSchemes() — see the companion diff note at
+gecko/patches/pyxis/toolkit/components/extensions/MatchPattern.cpp.PYXIS_DIFF.
+
+Add, near the existing WebExtensions atom (real precedent: `moz-extension`
+is the only other non-built-in scheme already in this file, and is also the
+one HostLocatorSchemes() entry closest to Pyxis's needs):
+
+    Atom("pyxis", "pyxis"),
+
+placed directly after:
+
+    Atom("moz_extension", "moz-extension"),
+
+(inside the `# WebExtensions` section of the big Atom(...) list — exact line
+number drifts across pulls, search for `moz_extension` to find it).

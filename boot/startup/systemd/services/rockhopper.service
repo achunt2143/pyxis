@@ -1,0 +1,18 @@
+[Unit]
+Description=ROCKHOPPER Linux Compatibility Layer
+Documentation=man:rockhopper(1)
+After=shift.service echo.service
+Requires=shift.service echo.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rockhopper-daemon
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rockhopper
+User=root
+
+[Install]
+WantedBy=multi-user.target

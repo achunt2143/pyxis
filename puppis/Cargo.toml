@@ -1,0 +1,15 @@
+[package]
+name = "geckoOS-puppis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lib]
+name = "geckoOS_puppis"
+path = "src/lib.rs"

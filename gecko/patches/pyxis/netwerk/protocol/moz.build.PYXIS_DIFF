@@ -1,0 +1,27 @@
+# Not a real moz.build — this is a diff note for the ONE line that must
+# change in the upstream file netwerk/protocol/moz.build (outside this
+# pyxis/ patch directory) to wire in netwerk/protocol/pyxis/.
+#
+# Verified against the real pinned tree (ESR 140.0.5,
+# target/gecko-src/gecko-dev/netwerk/protocol/moz.build), current content:
+#
+#   DIRS += ["about", "data", "file"]
+#   if CONFIG["MOZ_WIDGET_TOOLKIT"] == "gtk":
+#       DIRS += ["gio"]
+#   DIRS += ["http", "res", "viewsource", "websocket", "webtransport"]
+#
+# Required change (add "pyxis" to the unconditional DIRS list — Pyxis is not
+# gtk-only in the way gio's D-Bus/GVFS integration is, so it belongs in the
+# unconditional list alongside http/res/etc.):
+#
+#   DIRS += ["about", "data", "file"]
+#   if CONFIG["MOZ_WIDGET_TOOLKIT"] == "gtk":
+#       DIRS += ["gio"]
+#   DIRS += ["http", "pyxis", "res", "viewsource", "websocket", "webtransport"]
+#
+# Apply with (from the gecko-dev checkout root):
+#   sed -i 's/DIRS += \["http", "res"/DIRS += ["http", "pyxis", "res"/' \
+#       netwerk/protocol/moz.build
+# then verify by hand (sed one-liners against upstream files are worth a
+# manual diff check after every ESR rebase, since the exact line contents
+# may shift).

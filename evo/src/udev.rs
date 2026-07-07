@@ -1423,11 +1423,16 @@ impl EvoState<UdevData> {
 
         let start = Instant::now();
 
-        // TODO get scale from the rendersurface when supporting HiDPI
+        // HiDPI: use the actual output's integer scale (already resolved
+        // above to find `device`/`surface`) rather than a hardcoded 1 — a
+        // real gap on any output configured with e.g. `--scale 2`, where
+        // the cursor image would stay rendered at 1x while everything else
+        // scaled, looking undersized relative to the rest of the desktop.
+        let cursor_scale = output.current_scale().integer_scale().max(1) as u32;
         let frame = self
             .backend_data
             .pointer_image
-            .get_image(1 /*scale*/, self.clock.now().into());
+            .get_image(cursor_scale, self.clock.now().into());
 
         let primary_gpu = self.backend_data.primary_gpu;
         let render_node = surface.render_node.unwrap_or(primary_gpu);
@@ -1480,6 +1485,13 @@ impl EvoState<UdevData> {
             Ok((has_rendered, states)) => {
                 let dmabuf_feedback = surface.dmabuf_feedback.clone();
                 self.post_repaint(&output, frame_target, dmabuf_feedback, &states);
+                if has_rendered {
+                    // Real per-frame counter backing `get_rendering_status`'s
+                    // `fps` field (see enhancements/echo_ipc.rs), replacing a
+                    // previously hardcoded `60`. Only counts frames that
+                    // actually rendered new content, not idle reschedules.
+                    self.echo_service.read().record_frame();
+                }
                 !has_rendered
             }
             Err(err) => {

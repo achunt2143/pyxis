@@ -36,7 +36,9 @@ futures = { workspace = true }
 # CLI
 clap = { workspace = true, features = ["derive"] }
 # Unix signals / process control
-nix = { workspace = true }
+# "term" adds nix::pty (openpty) for the real terminal service (see
+# services/terminal.rs) on top of the workspace's base feature set.
+nix = { workspace = true, features = ["term"] }
 libc = { workspace = true }
 
 [lib]

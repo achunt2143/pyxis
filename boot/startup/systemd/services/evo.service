@@ -1,8 +1,8 @@
 [Unit]
-Description=GeckoOS Desktop Environment (GAIA)
-Documentation=man:gaia(1)
-After=ouranos.service echo.service cronus.service
-Requires=ouranos.service echo.service
+Description=EVO Wayland Compositor
+Documentation=man:evo(1)
+After=echo.service shift.service
+Requires=echo.service
 
 [Service]
 Type=simple
@@ -11,7 +11,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=gaia
+SyslogIdentifier=evo
 User=geckouser
 Group=geckouser
 Environment="DISPLAY=:0"

@@ -1,0 +1,55 @@
+# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
+# vim: set filetype=python:
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+# SCAFFOLD NOTICE (Pyxis, 2026-07-04): modeled directly on the real
+# netwerk/protocol/gio/moz.build in the pinned ESR 140.0.5 tree (the closest
+# "self-contained single-scheme protocol directory with its own
+# components.conf" precedent available).
+#
+# UPDATE (2026-07-05): the parent-brokered channel IPDL leg is now
+# implemented -- see PPyxisChannel.ipdl, PyxisChannelChild.h/.cpp, and
+# PyxisChannelParent.h/.cpp. Ultimately modeled less on PGIOChannel (a full
+# PNecko-managed remoted-nsIChildChannel actor, more machinery than this
+# scheme needs) and more on dom/locks/PLockManager.ipdl (a `manager
+# PBackground` protocol with hand-written final actor classes) -- see
+# PPyxisChannel.ipdl's own design note for the full reasoning.
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+EXPORTS.mozilla.net += [
+    "PyxisChannel.h",
+    "PyxisChannelChild.h",
+    "PyxisChannelParent.h",
+    "PyxisChannelUtils.h",
+    "PyxisOriginMap.h",
+    "PyxisProtocolHandler.h",
+]
+
+UNIFIED_SOURCES += [
+    "PyxisChannel.cpp",
+    "PyxisChannelChild.cpp",
+    "PyxisChannelParent.cpp",
+    "PyxisChannelUtils.cpp",
+    "PyxisOriginMap.cpp",
+    "PyxisProtocolHandler.cpp",
+]
+
+IPDL_SOURCES += [
+    "PPyxisChannel.ipdl",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+LOCAL_INCLUDES += [
+    "/netwerk/base",
+]
+
+FINAL_LIBRARY = "xul"
+
+with Files("**"):
+    BUG_COMPONENT = ("Pyxis", "App Runtime")

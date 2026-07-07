@@ -99,7 +99,14 @@ impl AppManagerService {
 
     pub fn install(app_path: &str) -> Result<Value> {
         // Tarball install — same logic as the previous AppManagerService.
-        // TODO: signature verification before extraction.
+        // No integrity verification here: this is the LEGACY native-app
+        // path (a tarball containing manifest.json + an already-native
+        // exec), kept only for old-style installs. The real, verified
+        // install path for actual pyxis:// web apps is now
+        // `services::nova::Nova::install` (SHA-256 `integrity.sha256` check
+        // against `manifest.webapp`, atomic staging + rename — see that
+        // module's doc comment) — new callers should prefer
+        // `org.geckoOS.nova` -> `Install`, not this shim.
         let path = Path::new(app_path);
         if !path.exists() {
             return Err(anyhow!("install source not found: {}", app_path));

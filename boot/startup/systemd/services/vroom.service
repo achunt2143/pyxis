@@ -1,0 +1,18 @@
+[Unit]
+Description=VROOM Performance Optimization
+Documentation=man:vroom(1)
+After=shift.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/performance-monitor
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vroom
+User=root
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

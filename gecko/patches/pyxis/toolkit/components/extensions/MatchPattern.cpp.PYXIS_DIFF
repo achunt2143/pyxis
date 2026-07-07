@@ -1,0 +1,24 @@
+Not a real file to add as-is — this is a diff note for
+toolkit/components/extensions/MatchPattern.cpp (a large stock Mozilla file;
+only one atom set entry is added).
+
+See the companion diff note at
+gecko/patches/pyxis/xpcom/ds/StaticAtoms.py.PYXIS_DIFF for the full
+root-cause writeup. This half of the fix: add the new `nsGkAtoms::pyxis`
+atom (added there) to the `HostLocatorSchemes()` static atom set here, so
+MatchPatternCore recognizes "pyxis://host/path" as using host-locator syntax
+instead of falling into the "unrecognized scheme, match path literally"
+branch that silently broke `matches: ["pyxis://*/*"]`.
+
+Real excerpt (search for `DEFINE_STATIC_ATOM_SET(HostLocatorSchemes` — near
+the top of the file, around the other atom-set definitions):
+
+    // Known schemes that are followed by "://" instead of ":".
+    DEFINE_STATIC_ATOM_SET(HostLocatorSchemes, nsGkAtoms::http, nsGkAtoms::https,
+                           nsGkAtoms::ws, nsGkAtoms::wss, nsGkAtoms::file,
+                           nsGkAtoms::ftp, nsGkAtoms::moz_extension,
+                           nsGkAtoms::chrome, nsGkAtoms::resource, nsGkAtoms::moz,
+                           nsGkAtoms::moz_icon, nsGkAtoms::moz_gio,
+                           nsGkAtoms::pyxis);
+
+(just `nsGkAtoms::pyxis` appended to the existing argument list.)

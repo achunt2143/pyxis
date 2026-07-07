@@ -34,7 +34,7 @@ use crate::{
 };
 
 use super::{
-    fullscreen_output_geometry, place_new_window, FullscreenSurface, PointerMoveSurfaceGrab,
+    fullscreen_output_geometry, place_new_window, FullscreenSurface, OldGeometry, PointerMoveSurfaceGrab,
     PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState, SurfaceData, WindowElement,
 };
 
@@ -343,6 +343,14 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             .expect("No outputs found");
         let geometry = self.space.output_geometry(output).unwrap();
 
+        // Remember pre-maximize geometry so unmaximize_request (whether
+        // client-requested or triggered by clicking the SSD maximize button
+        // again) can put the window back where/how big it was.
+        if let Some(old_geo) = self.space.element_bbox(&window) {
+            window.user_data().insert_if_missing(OldGeometry::default);
+            window.user_data().get::<OldGeometry>().unwrap().save(old_geo);
+        }
+
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = Some(geometry.size);
@@ -355,10 +363,22 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let window = self
+            .window_for_surface(surface.wl_surface().clone())
+            .unwrap();
+        let restored = window
+            .user_data()
+            .get::<OldGeometry>()
+            .and_then(|data| data.restore());
+
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = None;
+            state.size = restored.map(|geo| geo.size);
         });
+
+        if let Some(old_geo) = restored {
+            self.space.map_element(window, old_geo.loc, true);
+        }
 
         if surface.is_initial_configure_sent() {
             surface.send_configure();

@@ -233,8 +233,11 @@ async fn register_internal_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn Err
                     // Create signal message
                     let signal = Message::signal(&service_name, signal_name, args)?;
 
-                    // Broadcast signal
+                    // Broadcast signal to in-process subscribers, then push
+                    // it out over every connected socket client too (real
+                    // fix, 2026-07-07 -- see IPCBus::broadcast_to_all_connections).
                     bus.signal_bus().broadcast(signal.clone()).await?;
+                    bus.broadcast_to_all_connections(&signal).await;
 
                     info!("Signal emitted: {}.{}", service_name, signal_name);
 
@@ -297,6 +300,13 @@ async fn handle_connection(
     let (forward_tx, mut forward_rx) = mpsc::channel::<ForwardRequest>(32);
     bus.add_connection_sender(connection_id.clone(), forward_tx);
 
+    // Fire-and-forget channel used to push SIGNAL messages out over THIS
+    // connection's socket (see IPCBus::broadcast_to_all_connections's doc
+    // comment in lib.rs -- SignalBus::broadcast() alone never reaches
+    // remote socket clients, only in-process Rust subscribers).
+    let (broadcast_tx, mut broadcast_rx) = mpsc::channel::<Message>(64);
+    bus.add_broadcast_sender(connection_id.clone(), broadcast_tx);
+
     // Tracks in-flight forwarded calls that are waiting for a reply from THIS socket
     let pending_replies: Arc<DashMap<String, oneshot::Sender<anyhow::Result<Message>>>> =
         Arc::new(DashMap::new());
@@ -354,7 +364,14 @@ async fn handle_connection(
                     }
 
                     MessageType::Signal => {
-                        // Broadcast signal on the bus
+                        // Broadcast to in-process subscribers, then push out
+                        // over every OTHER connected socket client too (real
+                        // fix, 2026-07-07 -- see
+                        // IPCBus::broadcast_to_all_connections's doc comment;
+                        // this is the path external processes like Evo use,
+                        // as opposed to in-process services which go through
+                        // IPCBus::emit_signal instead).
+                        bus.broadcast_to_all_connections(&message).await;
                         if let Err(e) = bus.signal_bus().broadcast(message).await {
                             error!("Failed to broadcast signal: {}", e);
                         }
@@ -464,6 +481,16 @@ async fn handle_connection(
 
                 }
             }
+
+            // CASE 3: A SIGNAL was emitted somewhere and needs pushing out
+            // over THIS socket (fire-and-forget, no reply expected -- see
+            // IPCBus::broadcast_to_all_connections).
+            Some(signal_msg) = broadcast_rx.recv() => {
+                let data = serde_json::to_vec(&signal_msg)?;
+                if let Err(e) = UnixSocketTransport::send_message(&mut stream, &data).await {
+                    warn!("Failed to push signal to {}: {}", connection_id, e);
+                }
+            }
         }
     }
 
@@ -542,6 +569,12 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
 
     // ==================== APPHOST SERVICE (lifecycle) ====================
     register_apphost_handlers(bus).await?;
+
+    // ==================== NOVA SERVICE (web-app runtime host) ====================
+    register_nova_handlers(bus).await?;
+
+    // ==================== TERMINAL SERVICE (real PTY-backed shell) ====================
+    register_terminal_handlers(bus).await?;
 
     // ==================== POWER SERVICE ====================
     register_power_handlers(bus).await?;
@@ -1891,6 +1924,279 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
     );
 
     info!("✓ AppHost service handlers registered");
+    Ok(())
+}
+
+// ==================== NOVA SERVICE HANDLERS ====================
+async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Registering Nova service handlers");
+
+    services::Nova::global().set_bus(bus.clone());
+    // Initial registry scan — discovers whatever manifest.webapp entries
+    // are staged under the system/user app roots at daemon start. Safe to
+    // fail (e.g. roots don't exist yet on a fresh image); logged, not fatal.
+    if let Err(e) = services::Nova::global().reload() {
+        tracing::warn!("nova: initial registry scan failed: {}", e);
+    }
+
+    // Lifecycle: subscribe to Evo's real `WindowMinimized` signal (interface
+    // "org.geckoOS.evo", see evo/src/enhancements/echo_ipc.rs's
+    // emit_window_minimized) so backgrounding/restoring a card actually
+    // suspends/resumes its process — see Nova::handle_window_minimized/
+    // handle_window_restored's doc comment for the full rationale. This
+    // works in-process (no separate socket connection needed) because Evo,
+    // as an external client, emits signals via a MethodCall to THIS
+    // daemon's "org.geckoOS.Echo"/"EmitSignal" handler, which broadcasts
+    // through this same `SignalBus` — so subscribing here really does
+    // observe Evo's real signals, not a separate/parallel channel.
+    bus.signal_bus()
+        .subscribe(
+            "org.geckoOS.evo",
+            "nova-lifecycle".to_string(),
+            handler(move |msg| {
+                Box::pin(async move {
+                    if msg.header.method == "WindowMinimized" {
+                        let window_id = msg
+                            .body
+                            .get("window_id")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32);
+                        let minimized = msg
+                            .body
+                            .get("minimized")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if let Some(window_id) = window_id {
+                            if minimized {
+                                services::Nova::global().handle_window_minimized(window_id);
+                            } else {
+                                services::Nova::global().handle_window_restored(window_id);
+                            }
+                        }
+                    }
+                    // Signal subscribers' return value is discarded (see
+                    // SignalBus::broadcast) — this is never sent anywhere.
+                    Ok(Message::method_return(msg.header.message_id, json!({})))
+                })
+            })
+            .into(),
+        )
+        .await?;
+
+    // Launch(appId, params?) -> { sessionId, appId, raised }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "Launch",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                let params = msg.body.get("params").cloned();
+                match services::Nova::global().launch(app_id, params) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Close(appId) -> { appId, sessionId }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "Close",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                match services::Nova::global().close(app_id) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // List() -> { apps: [...] }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "List",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::Nova::global().list() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // GetInfo(appId) -> manifest projection
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "GetInfo",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                match services::Nova::global().get_info(app_id) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Install(packagePath) -> { appId, version }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "Install",
+        handler(move |msg| {
+            Box::pin(async move {
+                let package_path = msg
+                    .body
+                    .get("packagePath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::Nova::global().install(package_path) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Uninstall(appId, purgeData?) -> { appId }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "Uninstall",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                let purge = msg
+                    .body
+                    .get("purgeData")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match services::Nova::global().uninstall(app_id, purge) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Reload() -> { count }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "Reload",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::Nova::global().reload() {
+                    Ok(count) => Ok(Message::method_return(
+                        msg.header.message_id,
+                        json!({ "count": count }),
+                    )),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Nova service handlers registered");
+    Ok(())
+}
+
+// ==================== TERMINAL SERVICE HANDLERS ====================
+async fn register_terminal_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Registering Terminal service handlers");
+
+    services::TerminalService::global().set_bus(bus.clone());
+
+    // Open(cols?, rows?) -> { terminalId }
+    bus.router().register_handler(
+        "org.geckoOS.terminal",
+        "Open",
+        handler(move |msg| {
+            Box::pin(async move {
+                let cols = msg.body.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                let rows = msg.body.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                match services::TerminalService::global().open_json(cols, rows) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Write(terminalId, data) -> { success }
+    bus.router().register_handler(
+        "org.geckoOS.terminal",
+        "Write",
+        handler(move |msg| {
+            Box::pin(async move {
+                let terminal_id = msg
+                    .body
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let data = msg.body.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                match services::TerminalService::global().write_json(terminal_id, data) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Resize(terminalId, cols, rows) -> { success }
+    bus.router().register_handler(
+        "org.geckoOS.terminal",
+        "Resize",
+        handler(move |msg| {
+            Box::pin(async move {
+                let terminal_id = msg
+                    .body
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let cols = msg.body.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                let rows = msg.body.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                match services::TerminalService::global().resize_json(terminal_id, cols, rows) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Close(terminalId) -> { success }
+    bus.router().register_handler(
+        "org.geckoOS.terminal",
+        "Close",
+        handler(move |msg| {
+            Box::pin(async move {
+                let terminal_id = msg
+                    .body
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::TerminalService::global().close_json(terminal_id) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Terminal service handlers registered");
     Ok(())
 }
 

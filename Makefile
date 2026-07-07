@@ -122,14 +122,23 @@ system: stage2-rust-release
 # ============================================================================
 
 PYXIS_REPO   ?= ../pyxis-experience
-GAIA_STATIC   = gaia/static
 
+# REAL BUG, found via a real report (2026-07-07): `build-release`'s
+# dependency chain (stage1 install-deps stage2-rust-release build-kernel
+# build-initramfs build-rootfs package) never invoked this target at all --
+# `build-rootfs` (scripts/create-rootfs.sh) only COPIES from
+# ../pyxis-experience/dist/ (stage_bloom_app/stage_terminal_app), it never
+# runs `npm run build` itself. So `make build-release` silently packaged
+# whatever was already sitting in dist/ from whenever it was last built by
+# hand, with no indication anything was stale. Also removed the old
+# `rm -rf gaia/static; cp -r dist gaia/static` step this target used to
+# do -- gaia is retired in favor of Bloom (see CLAUDE.md), and
+# create-rootfs.sh reads directly from pyxis-experience/dist/ now, so that
+# copy was to a target nothing consumes anymore.
 pyxis-build:
 	@echo "$(YELLOW)Building Pyxis desktop shell from $(PYXIS_REPO)...$(NC)"
 	cd $(PYXIS_REPO) && npm ci && npm run build
-	rm -rf $(GAIA_STATIC)
-	cp -r $(PYXIS_REPO)/dist $(GAIA_STATIC)
-	@echo "[✓] Pyxis shell installed to $(GAIA_STATIC)"
+	@echo "[✓] Pyxis shell built at $(PYXIS_REPO)/dist"
 
 pyxis-install: pyxis-build
 
@@ -153,7 +162,7 @@ build-kernel:
 	$(RUN_SCRIPT) scripts/build-kernel.sh
 	@echo "$(GREEN)✓ Kernel build complete$(NC)"
 
-build-rootfs:
+build-rootfs: pyxis-build
 	@echo "$(YELLOW)Building root fs...$(NC)"
 	$(RUN_SCRIPT) scripts/create-rootfs.sh --kernel-prebuilt
 	@echo "$(GREEN)✓ Root fs build complete$(NC)"

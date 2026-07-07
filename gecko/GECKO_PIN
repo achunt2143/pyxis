@@ -1,0 +1,130 @@
+# Pyxis Gecko Source Pin
+
+Decided: 2026-07-04
+Revised: 2026-07-05 (pivoted off ESR — see "Why the pivot away from ESR 140" below)
+Decided by: automated build-prep session (see gecko/BUILD_RUNBOOK.md for full context)
+
+## Pin (current — this is what actually builds)
+
+- Upstream product: **mozilla-central** (trunk/nightly), not ESR.
+- Source repo: `https://github.com/mozilla/gecko-dev` (git mirror of
+  `hg.mozilla.org/mozilla-unified`), same repo as originally chosen — see
+  "Why gecko-dev over hg" below, unchanged.
+- Branch: `master` (gecko-dev's mirror of mozilla-central/mozilla-unified's
+  default branch), tracked locally as `origin/master`.
+- Local working branch: **`central-work`**, created off `origin/master` to
+  get off detached HEAD after the checkout (`git branch central-work HEAD`).
+  Build and all further patch work happens on this branch.
+- Pinned commit: `5836a062726f715fda621338a17b51aff30d0a8c`
+  ("Bug 1960567 - remove the last C++ and scriptable APIs to accumulate data
+  to legacy telemetry histograms, r=chutten") — this is the commit that
+  **actually produced a working build** (`./mach build` completed cleanly,
+  `obj-pyxis-webapp/dist/bin/vela --version` reports
+  `Mozilla Firefox 142.0a1`). Re-resolve and re-pin explicitly on any
+  deliberate rebase; do not silently float on `master`.
+- Local checkout root: `target/gecko-src/gecko-dev/` (gitignored — see
+  `.gitignore`'s `/target/` rule; this tree is multiple GB and must never be
+  committed).
+- Mozconfig: `gecko/mozconfig-vela` (in this repo, not inside the
+  gitignored checkout) — see that file's inline comments for two flags that
+  had to be removed to get a clean `./mach build` on this tree:
+  `--disable-maintenance-service` (Windows-only, not a registered configure
+  option on Linux) and `--enable-webrender` (fully removed from the tree —
+  WebRender is unconditional/default-on now, there's nothing left to opt
+  into).
+
+## Why the pivot away from ESR 140
+
+The original plan (below, kept for the record) picked ESR 140 on the
+`release` branch for slow-moving stability. In practice, real
+`./mach bootstrap` / `./mach build` attempts on that branch failed with:
+
+    mozbuild.configure.options.InvalidOptionError:
+    Could not find artifacts for a toolchain build named `toolchain-linux64-clang`
+
+Traced via `python/mozbuild/mozbuild/artifact_commands.py`: Taskcluster only
+indexes toolchain-build artifacts (prebuilt clang, clang-tidy, etc.) for
+**"trunk projects"** (mozilla-central), not for release/ESR branches — this
+is stated in the source's own comments, not a guess or a misconfiguration on
+our end. Checking out an older commit on the same branch reproduced the
+identical error, ruling out "bad/DONTBUILD commit" as the cause and
+confirming it's structural to how Mozilla's CI indexes artifacts per-branch.
+
+Fix: pivoted the whole checkout to mozilla-central via
+
+    git remote set-branches origin '*'
+    git fetch origin master
+    git checkout origin/master -b central-work
+
+This is a real, accepted trade-off away from the original ESR-stability
+rationale: Pyxis is now tracking a nightly-churn trunk branch, which means
+more frequent rebase pressure on the three Pyxis patches (protocol handler,
+bridge actor, kiosk mode) than an ESR base would have required. Revisit if
+Mozilla ever exposes toolchain artifacts for release/ESR branches, or if
+rebase churn on `master` becomes a real cost — but do not revert silently;
+any move back to ESR needs the same toolchain-artifact check re-verified
+first, since that's what killed the ESR path this time.
+
+## Original ESR 140 rationale (superseded, kept for context)
+
+Per `pyxis-gecko-embedding-plan.md` §2: Pyxis wanted a slow-moving,
+security-patched base with a predictable rebase cadence, not a 4-week nightly
+churn — ESR was the natural choice for that reason, and 140 over 128 because
+it had more runway (128.x was trailing off at 128.14.0 while 140.x was still
+being actively released). This reasoning is still sound in the abstract; it
+was simply blocked by the toolchain-artifact indexing gap above, which is a
+CI/infrastructure constraint rather than a flaw in the reasoning itself.
+
+Originally pinned commit on `release` (never successfully built — bootstrap
+failed before a build was attempted against it):
+`c61a6579702f4c73ee99131bd5fa216ec8f7b72c`.
+
+## Why gecko-dev (git) over mozilla-unified (hg)
+
+- This environment has no working `hg`/Mercurial install, and no interactive
+  sudo to install one (`mach bootstrap` itself needs interactive sudo, so
+  installing hg by hand only to then still be blocked on mach bootstrap
+  doesn't buy anything in this pass).
+- `git` and network access to github.com both work in this environment
+  (verified: `git ls-remote` and `curl` against github.com and ftp.mozilla.org
+  both succeeded).
+- `gecko-dev` is Mozilla's own official read-only git mirror of
+  mozilla-unified (github.com/mozilla/gecko-dev), kept in sync continuously —
+  it is not a stale third-party fork. It is an accepted, commonly-used source
+  for git-based Gecko contributors (`./mach` and the build system work
+  identically regardless of whether the working copy came from hg or git —
+  the build system does not require a live hg/VCS connection to build, only
+  to run `mach mercurial-setup`-style workflows which Pyxis doesn't need).
+- Tradeoff accepted: gecko-dev lacks the fine-grained per-build tags that
+  hg.mozilla.org's releases repo has, so the pin here is a commit SHA on a
+  branch, not a symbolic release tag. This is recorded explicitly above so a
+  future rebase knows exactly what "the pin" means.
+
+## Environment notes that mattered for a real build (not just a shallow read)
+
+- **Python**: mach hardcodes `MAX_PYTHON_VERSION_TO_CONSIDER = (3, 12)` and
+  fails on 3.14 with `AttributeError: 'Constant' object has no attribute 's'`
+  during bootstrap. Fixed with `pyenv install 3.12.12 && pyenv local 3.12.12`
+  in the gecko-dev checkout.
+- **clang-tidy toolchain artifact**: even on mozilla-central, `mach bootstrap`
+  failed trying to fetch `toolchain-linux64-clang-tidy`. Confirmed via
+  `mozboot/bootstrap.py` that clang-tidy is only a static-analysis/dev-tool
+  install, not required to compile the browser — proceeded straight to
+  `./mach build` rather than chasing bootstrap to a clean exit, and the build
+  succeeded anyway.
+- **Full, unshallowed clone was required** in practice, matching the original
+  plan's expectation below.
+
+## Clone strategy used this session
+
+Full clone of mozilla-unified/gecko-dev is very large (multi-GB, long git
+history spanning the Netscape/Mozilla/B2G lineage). This session did a
+**shallow, single-branch clone** to make source available for inspection
+(validating the `nsIProtocolHandler.idl` shape, `moz.build` conventions, etc.)
+without spending the whole session budget on transfer, then later widened the
+remote's branch set and fetched `master` directly (see pivot above) rather
+than re-cloning from scratch.
+
+Expect a real build-ready checkout to take a long time and a large amount of
+disk (tens of GB for full history with all objects); disk budget was checked
+at pin time and had 482GB free, which is ample headroom.

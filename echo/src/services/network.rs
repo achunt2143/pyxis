@@ -15,16 +15,18 @@ impl NetworkService {
             .output();
 
         let connected = output.is_ok() && !output.unwrap().stdout.is_empty();
-        
+
         let net_type = if connected {
             get_connection_type()?
         } else {
             "none".to_string()
         };
+        let ssid = if connected { get_active_connection_name() } else { String::new() };
 
         Ok(json!({
             "connected": connected,
-            "type": net_type
+            "type": net_type,
+            "ssid": ssid
         }))
     }
 
@@ -134,6 +136,34 @@ impl NetworkService {
             "nameservers": nameservers
         }))
     }
+}
+
+/// Real network name for the active connection: the WiFi SSID via
+/// `iwgetid -r` when on wireless, falling back to NetworkManager's active
+/// connection display name otherwise (e.g. a wired connection's profile
+/// name) — real values were missing entirely before (the JSON response had
+/// no `ssid` field at all, though the shell's `NetworkStatus` type and
+/// `TopSystemBar.tsx` both expect one), which is what made Bloom's status
+/// bar fall back to displaying nothing/mock data for the network name even
+/// once the method-name mismatch (see useEcho.ts) was fixed.
+fn get_active_connection_name() -> String {
+    if let Ok(output) = Command::new("iwgetid").arg("-r").output() {
+        let ssid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !ssid.is_empty() {
+            return ssid;
+        }
+    }
+    if let Ok(output) = Command::new("nmcli")
+        .args(&["-t", "-f", "NAME", "con", "show", "--active"])
+        .output()
+    {
+        if let Some(name) = String::from_utf8_lossy(&output.stdout).lines().next() {
+            if !name.trim().is_empty() {
+                return name.trim().to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 fn get_connection_type() -> Result<String> {

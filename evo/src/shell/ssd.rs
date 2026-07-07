@@ -5,16 +5,22 @@
 //! and sophisticated hit testing.
 
 use smithay::{
-    backend::renderer::{
-        element::{
-            solid::{SolidColorBuffer, SolidColorRenderElement},
-            AsRenderElements, Kind,
+    backend::{
+        allocator::Fourcc,
+        renderer::{
+            element::{
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                solid::{SolidColorBuffer, SolidColorRenderElement},
+                AsRenderElements, Kind,
+            },
+            ImportAll, ImportMem, Renderer, Texture,
         },
-        Renderer,
     },
     desktop::WindowSurface,
     input::Seat,
-    utils::{Logical, Point, Serial},
+    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
+    render_elements,
+    utils::{Logical, Point, Serial, Transform},
     wayland::shell::xdg::XdgShellHandler,
 };
 use std::cell::{RefCell, RefMut};
@@ -22,6 +28,129 @@ use tracing::{debug, warn};
 
 use crate::{state::Backend, EvoState};
 use super::WindowElement;
+
+// === PYXIS DECORATION SHAPE COLORS ===
+// Matches Bloom's window-chrome design language (src/components/DesktopWindow.tsx):
+// red circle (close), blue square (maximize), yellow downward triangle (minimize),
+// on a translucent "glass" title bar with 16px rounded top corners.
+const CLOSE_RGB: [u8; 3] = [0xFF, 0x52, 0x52];
+const CLOSE_HOVER_RGB: [u8; 3] = [0xD3, 0x2F, 0x2F];
+const MAXIMIZE_RGB: [u8; 3] = [0x21, 0x96, 0xF3];
+const MAXIMIZE_HOVER_RGB: [u8; 3] = [0x19, 0x76, 0xD2];
+const MINIMIZE_RGB: [u8; 3] = [0xFF, 0xC1, 0x07];
+const MINIMIZE_HOVER_RGB: [u8; 3] = [0xFF, 0xB3, 0x00];
+const GLASS_RGBA: [u8; 4] = [0xFF, 0xFF, 0xFF, 0x33];
+const GLASS_CORNER_RADIUS: f32 = 16.0;
+
+/// Writes one BGRA8888-in-memory pixel (matching `Fourcc::Argb8888`'s byte
+/// order) into `buf` at `(x, y)` for a buffer `stride` pixels wide.
+fn put_pixel(buf: &mut [u8], stride: u32, x: u32, y: u32, rgba: [u8; 4]) {
+    let idx = ((y * stride + x) * 4) as usize;
+    buf[idx] = rgba[2]; // B
+    buf[idx + 1] = rgba[1]; // G
+    buf[idx + 2] = rgba[0]; // R
+    buf[idx + 3] = rgba[3]; // A
+}
+
+/// Rasterizes a filled circle (transparent outside) into an RGBA buffer.
+fn rasterize_circle(size: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    let center = size as f32 / 2.0;
+    let radius = size as f32 / 2.0 - 2.0;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - center;
+            let dy = y as f32 + 0.5 - center;
+            if dx * dx + dy * dy <= radius * radius {
+                put_pixel(&mut buf, size, x, y, [rgb[0], rgb[1], rgb[2], 0xFF]);
+            }
+        }
+    }
+    buf
+}
+
+/// Rasterizes a downward-pointing equilateral-ish triangle (transparent
+/// outside), matching Bloom's minimize-button glyph orientation.
+fn rasterize_triangle_down(size: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    let margin = size as f32 * 0.22;
+    let top_left = (margin, margin);
+    let top_right = (size as f32 - margin, margin);
+    let apex = (size as f32 / 2.0, size as f32 - margin);
+
+    fn edge(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
+        (p.0 - a.0) * (b.1 - a.1) - (p.1 - a.1) * (b.0 - a.0)
+    }
+
+    for y in 0..size {
+        for x in 0..size {
+            let p = (x as f32 + 0.5, y as f32 + 0.5);
+            let d1 = edge(top_left, top_right, p);
+            let d2 = edge(top_right, apex, p);
+            let d3 = edge(apex, top_left, p);
+            let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+            let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+            if !(has_neg && has_pos) {
+                put_pixel(&mut buf, size, x, y, [rgb[0], rgb[1], rgb[2], 0xFF]);
+            }
+        }
+    }
+    buf
+}
+
+/// Rasterizes a translucent "glass" bar with rounded top corners only
+/// (the bottom edge meets the client area, so it stays square).
+fn rasterize_glass_bar(width: u32, height: u32, radius: f32, rgba: [u8; 4]) -> Vec<u8> {
+    let mut buf = vec![0u8; (width * height * 4) as usize];
+    let r = radius.min(width as f32 / 2.0).min(height as f32);
+    for y in 0..height {
+        for x in 0..width {
+            let xf = x as f32 + 0.5;
+            let yf = y as f32 + 0.5;
+            let mut inside = true;
+            if yf < r {
+                if xf < r {
+                    let (dx, dy) = (r - xf, r - yf);
+                    inside = dx * dx + dy * dy <= r * r;
+                } else if xf > width as f32 - r {
+                    let (dx, dy) = (xf - (width as f32 - r), r - yf);
+                    inside = dx * dx + dy * dy <= r * r;
+                }
+            }
+            if inside {
+                put_pixel(&mut buf, width, x, y, rgba);
+            }
+        }
+    }
+    buf
+}
+
+fn memory_buffer(width: u32, height: u32, pixels: Vec<u8>) -> MemoryRenderBuffer {
+    MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (width as i32, height as i32),
+        1,
+        Transform::Normal,
+        None,
+    )
+}
+
+render_elements! {
+    pub DecorationRenderElement<R> where R: ImportAll + ImportMem;
+    Solid=SolidColorRenderElement,
+    Memory=MemoryRenderBufferRenderElement<R>,
+}
+
+impl<R: Renderer> std::fmt::Debug for DecorationRenderElement<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Solid(arg0) => f.debug_tuple("Solid").field(arg0).finish(),
+            Self::Memory(arg0) => f.debug_tuple("Memory").field(arg0).finish(),
+            Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
+        }
+    }
+}
 
 // Import GeckoOS decorations when feature is enabled
 #[cfg(feature = "decorations")]
@@ -48,32 +177,18 @@ pub struct HeaderBar {
     pub maximize_button_hover: bool,
     pub minimize_button_hover: bool,  // NEW: Added minimize button support
     
-    // Rendering buffers
-    pub background: SolidColorBuffer,
-    pub close_button: SolidColorBuffer,
+    // Rendering buffers -- close/minimize are shaped (circle/triangle) so
+    // they're rasterized textures; maximize is a square, i.e. just a
+    // plain-colored rect, so it stays a SolidColorBuffer.
+    pub background: MemoryRenderBuffer,
+    pub close_button: MemoryRenderBuffer,
     pub maximize_button: SolidColorBuffer,
-    pub minimize_button: SolidColorBuffer,  // NEW: Minimize button buffer
+    pub minimize_button: MemoryRenderBuffer,
     
     // Theme support
     #[cfg(feature = "decorations")]
     pub theme: Theme,
 }
-
-// === FALLBACK COLORS (used when decorations feature is disabled) ===
-#[cfg(not(feature = "decorations"))]
-const BG_COLOR: [f32; 4] = [0.75f32, 0.9f32, 0.78f32, 1f32];
-#[cfg(not(feature = "decorations"))]
-const MAX_COLOR: [f32; 4] = [1f32, 0.965f32, 0.71f32, 1f32];
-#[cfg(not(feature = "decorations"))]
-const MIN_COLOR: [f32; 4] = [0.8f32, 0.8f32, 0.8f32, 1f32];
-#[cfg(not(feature = "decorations"))]
-const CLOSE_COLOR: [f32; 4] = [1f32, 0.66f32, 0.612f32, 1f32];
-#[cfg(not(feature = "decorations"))]
-const MAX_COLOR_HOVER: [f32; 4] = [0.71f32, 0.624f32, 0f32, 1f32];
-#[cfg(not(feature = "decorations"))]
-const MIN_COLOR_HOVER: [f32; 4] = [0.6f32, 0.6f32, 0.6f32, 1f32];
-#[cfg(not(feature = "decorations"))]
-const CLOSE_COLOR_HOVER: [f32; 4] = [0.75f32, 0.11f32, 0.016f32, 1f32];
 
 // Layout constants
 pub const HEADER_BAR_HEIGHT: i32 = 32;
@@ -89,26 +204,25 @@ impl HeaderBar {
             close_button_hover: false,
             maximize_button_hover: false,
             minimize_button_hover: false,
-            background: SolidColorBuffer::default(),
-            close_button: SolidColorBuffer::default(),
+            // Fixed 32x32 button size -- rasterize the real (non-hover)
+            // shapes up front; redraw() swaps to hover variants as needed.
+            background: memory_buffer(1, 1, vec![0; 4]),
+            close_button: memory_buffer(
+                BUTTON_WIDTH,
+                BUTTON_HEIGHT,
+                rasterize_circle(BUTTON_WIDTH, CLOSE_RGB),
+            ),
             maximize_button: SolidColorBuffer::default(),
-            minimize_button: SolidColorBuffer::default(),
+            minimize_button: memory_buffer(
+                BUTTON_WIDTH,
+                BUTTON_HEIGHT,
+                rasterize_triangle_down(BUTTON_WIDTH, MINIMIZE_RGB),
+            ),
             #[cfg(feature = "decorations")]
             theme: Theme::default(),
         }
     }
-    
-    /// Convert RGBA tuple to f32 array for Smithay
-    #[cfg(feature = "decorations")]
-    fn color_to_f32(rgba: (u8, u8, u8, u8)) -> [f32; 4] {
-        [
-            rgba.0 as f32 / 255.0,
-            rgba.1 as f32 / 255.0,
-            rgba.2 as f32 / 255.0,
-            rgba.3 as f32 / 255.0,
-        ]
-    }
-    
+
     /// Set theme and trigger redraw
     #[cfg(feature = "decorations")]
     pub fn set_theme(&mut self, theme: Theme) {
@@ -161,8 +275,8 @@ impl HeaderBar {
                         self.handle_maximize(state, window);
                     }
                     ControlButton::Minimize => {
-                        warn!("Minimize not yet fully implemented");
-                        // TODO: Implement minimize functionality
+                        debug!("Minimize button clicked (GeckoOS decoration)");
+                        self.handle_minimize(state, window);
                     }
                 }
                 return;
@@ -196,8 +310,8 @@ impl HeaderBar {
             
             // Minimize button (third from right)
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
-                warn!("Minimize not yet fully implemented");
-                // TODO: Implement minimize functionality
+                debug!("Minimize button clicked");
+                self.handle_minimize(state, window);
             }
             
             // Title bar drag area
@@ -220,18 +334,42 @@ impl HeaderBar {
         };
     }
     
-    /// Handle maximize button action
+    /// Handle maximize button action -- toggles: grows the window if it
+    /// isn't currently maximized, restores its pre-maximize geometry
+    /// (see `OldGeometry`) if it is.
     fn handle_maximize<B: Backend>(&self, state: &mut EvoState<B>, window: &WindowElement) {
         match window.0.underlying_surface() {
-            WindowSurface::Wayland(w) => state.maximize_request(w.clone()),
+            WindowSurface::Wayland(w) => {
+                let is_maximized =
+                    w.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Maximized));
+                if is_maximized {
+                    state.unmaximize_request(w.clone());
+                } else {
+                    state.maximize_request(w.clone());
+                }
+            }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(w) => {
+                let is_maximized = w.is_maximized();
                 let surface = w.clone();
-                state
-                    .handle
-                    .insert_idle(move |data| data.maximize_request_x11(&surface));
+                state.handle.insert_idle(move |data| {
+                    if is_maximized {
+                        data.unmaximize_request_x11(&surface);
+                    } else {
+                        data.maximize_request_x11(&surface);
+                    }
+                });
             }
         };
+    }
+
+    /// Handle minimize button action. Minimizing is purely a compositor-side
+    /// visibility choice (no client protocol round-trip needed, unlike
+    /// close/maximize) -- `EvoState::minimize_window` already implements
+    /// this correctly via the workspace manager, it just wasn't wired up to
+    /// the SSD button before now.
+    fn handle_minimize<B: Backend>(&self, state: &mut EvoState<B>, window: &WindowElement) {
+        state.minimize_window(window);
     }
     
     /// Handle window move action
@@ -296,7 +434,7 @@ impl HeaderBar {
                 self.handle_maximize(state, window);
             }
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
-                warn!("Minimize not yet fully implemented");
+                self.handle_minimize(state, window);
             }
             _ => {}
         }
@@ -308,108 +446,60 @@ impl HeaderBar {
             self.width = 0;
             return;
         }
-        
-        // Get colors from theme or use fallback
-        #[cfg(feature = "decorations")]
-        let (bg_color, close_color, close_hover, max_color, max_hover, min_color, min_hover) = {
-            (
-                Self::color_to_f32(self.theme.background),
-                Self::color_to_f32(self.theme.button_bg),
-                Self::color_to_f32(self.theme.button_hover),
-                Self::color_to_f32(self.theme.button_bg),
-                Self::color_to_f32(self.theme.button_hover),
-                Self::color_to_f32(self.theme.button_bg),
-                Self::color_to_f32(self.theme.button_hover),
-            )
-        };
-        
-        #[cfg(not(feature = "decorations"))]
-        let (bg_color, close_color, close_hover, max_color, max_hover, min_color, min_hover) = {
-            (BG_COLOR, CLOSE_COLOR, CLOSE_COLOR_HOVER, MAX_COLOR, MAX_COLOR_HOVER, MIN_COLOR, MIN_COLOR_HOVER)
-        };
-        
-        // Update background
-        self.background.update((width as i32, HEADER_BAR_HEIGHT), bg_color);
-        
-        let mut needs_redraw_buttons = false;
-        if width != self.width {
-            needs_redraw_buttons = true;
+
+        let needs_redraw_buttons = width != self.width;
+        if needs_redraw_buttons {
             self.width = width;
+            // Only the glass bar depends on window width -- (re)rasterize it
+            // now rather than on every hover-triggered redraw.
+            self.background = memory_buffer(
+                width,
+                HEADER_BAR_HEIGHT as u32,
+                rasterize_glass_bar(width, HEADER_BAR_HEIGHT as u32, GLASS_CORNER_RADIUS, GLASS_RGBA),
+            );
         }
-        
+
         // === CLOSE BUTTON (rightmost) ===
-        if self.pointer_loc
+        let close_hovered = self
+            .pointer_loc
             .as_ref()
             .map(|l| l.x >= (width - BUTTON_WIDTH) as f64)
-            .unwrap_or(false)
-            && (needs_redraw_buttons || !self.close_button_hover)
-        {
-            self.close_button.update(
-                (BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32),
-                close_hover,
-            );
-            self.close_button_hover = true;
-        } else if !self.pointer_loc
-            .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH) as f64)
-            .unwrap_or(false)
-            && (needs_redraw_buttons || self.close_button_hover)
-        {
-            self.close_button.update(
-                (BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32),
-                close_color,
-            );
-            self.close_button_hover = false;
+            .unwrap_or(false);
+        if needs_redraw_buttons || close_hovered != self.close_button_hover {
+            let rgb = if close_hovered { CLOSE_HOVER_RGB } else { CLOSE_RGB };
+            self.close_button = memory_buffer(BUTTON_WIDTH, BUTTON_HEIGHT, rasterize_circle(BUTTON_WIDTH, rgb));
+            self.close_button_hover = close_hovered;
         }
-        
-        // === MAXIMIZE BUTTON (second from right) ===
-        if self.pointer_loc
+
+        // === MAXIMIZE BUTTON (second from right, plain colored square) ===
+        let maximize_hovered = self
+            .pointer_loc
             .as_ref()
             .map(|l| l.x >= (width - BUTTON_WIDTH * 2) as f64 && l.x <= (width - BUTTON_WIDTH) as f64)
-            .unwrap_or(false)
-            && (needs_redraw_buttons || !self.maximize_button_hover)
-        {
+            .unwrap_or(false);
+        if needs_redraw_buttons || maximize_hovered != self.maximize_button_hover {
+            let rgb = if maximize_hovered { MAXIMIZE_HOVER_RGB } else { MAXIMIZE_RGB };
             self.maximize_button.update(
                 (BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32),
-                max_hover,
+                [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0, 1.0],
             );
-            self.maximize_button_hover = true;
-        } else if !self.pointer_loc
-            .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH * 2) as f64 && l.x <= (width - BUTTON_WIDTH) as f64)
-            .unwrap_or(false)
-            && (needs_redraw_buttons || self.maximize_button_hover)
-        {
-            self.maximize_button.update(
-                (BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32),
-                max_color,
-            );
-            self.maximize_button_hover = false;
+            self.maximize_button_hover = maximize_hovered;
         }
-        
-        // === MINIMIZE BUTTON (third from right) === NEW!
-        if self.pointer_loc
+
+        // === MINIMIZE BUTTON (third from right) ===
+        let minimize_hovered = self
+            .pointer_loc
             .as_ref()
             .map(|l| l.x >= (width - BUTTON_WIDTH * 3) as f64 && l.x <= (width - BUTTON_WIDTH * 2) as f64)
-            .unwrap_or(false)
-            && (needs_redraw_buttons || !self.minimize_button_hover)
-        {
-            self.minimize_button.update(
-                (BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32),
-                min_hover,
+            .unwrap_or(false);
+        if needs_redraw_buttons || minimize_hovered != self.minimize_button_hover {
+            let rgb = if minimize_hovered { MINIMIZE_HOVER_RGB } else { MINIMIZE_RGB };
+            self.minimize_button = memory_buffer(
+                BUTTON_WIDTH,
+                BUTTON_HEIGHT,
+                rasterize_triangle_down(BUTTON_WIDTH, rgb),
             );
-            self.minimize_button_hover = true;
-        } else if !self.pointer_loc
-            .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH * 3) as f64 && l.x <= (width - BUTTON_WIDTH * 2) as f64)
-            .unwrap_or(false)
-            && (needs_redraw_buttons || self.minimize_button_hover)
-        {
-            self.minimize_button.update(
-                (BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32),
-                min_color,
-            );
-            self.minimize_button_hover = false;
+            self.minimize_button_hover = minimize_hovered;
         }
     }
 }
@@ -423,61 +513,92 @@ impl Default for HeaderBar {
 // === RENDERING ===
 impl<R> AsRenderElements<R> for HeaderBar
 where
-    R: Renderer,
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Texture + Clone + Send + 'static,
 {
-    type RenderElement = SolidColorRenderElement;
-    
+    type RenderElement = DecorationRenderElement<R>;
+
     fn render_elements<C: From<Self::RenderElement>>(
         &self,
-        _renderer: &mut R,
+        renderer: &mut R,
         location: Point<i32, smithay::utils::Physical>,
         scale: smithay::utils::Scale<f64>,
         alpha: f32,
     ) -> Vec<C> {
         let header_end_offset: Point<i32, Logical> = Point::from((self.width as i32, 0));
         let button_offset: Point<i32, Logical> = Point::from((BUTTON_WIDTH as i32, 0));
-        
-        vec![
-            // Background (drawn first so buttons are on top)
-            SolidColorRenderElement::from_buffer(
-                &self.background,
-                location,
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into(),
-            
-            // Minimize button (third from right) - NEW!
-            SolidColorRenderElement::from_buffer(
-                &self.minimize_button,
-                location + (header_end_offset - button_offset.upscale(3)).to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into(),
-            
-            // Maximize button (second from right)
-            SolidColorRenderElement::from_buffer(
+
+        let mut elements: Vec<C> = Vec::with_capacity(4);
+
+        // Smithay's damage renderer draws render-element lists in *reverse*
+        // (backend/renderer/damage/mod.rs: `render_elements.iter().rev()`),
+        // and culls each element's damage against the opaque regions of
+        // elements *earlier* in the list. So index 0 ends up drawn last (=
+        // topmost/frontmost on screen), and anything after it in the list is
+        // treated as sitting underneath it. Buttons must therefore come
+        // before the background here, or the (semi-opaque) background --
+        // being "in front" -- clips the buttons out entirely.
+
+        // Close button (rightmost) -- red circle.
+        let close_loc = location + (header_end_offset - button_offset).to_physical_precise_round(scale);
+        if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            close_loc.to_f64(),
+            &self.close_button,
+            Some(alpha),
+            None,
+            None,
+            Kind::Unspecified,
+        ) {
+            elements.push(DecorationRenderElement::from(el).into());
+        } else {
+            warn!("Failed to import close button texture");
+        }
+
+        // Maximize button (second from right) -- blue square, plain solid color.
+        elements.push(
+            DecorationRenderElement::from(SolidColorRenderElement::from_buffer(
                 &self.maximize_button,
                 location + (header_end_offset - button_offset.upscale(2)).to_physical_precise_round(scale),
                 scale,
                 alpha,
                 Kind::Unspecified,
-            )
+            ))
             .into(),
-            
-            // Close button (rightmost)
-            SolidColorRenderElement::from_buffer(
-                &self.close_button,
-                location + (header_end_offset - button_offset).to_physical_precise_round(scale),
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into(),
-        ]
+        );
+
+        // Minimize button (third from right) -- yellow triangle.
+        let minimize_loc = location + (header_end_offset - button_offset.upscale(3)).to_physical_precise_round(scale);
+        if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            minimize_loc.to_f64(),
+            &self.minimize_button,
+            Some(alpha),
+            None,
+            None,
+            Kind::Unspecified,
+        ) {
+            elements.push(DecorationRenderElement::from(el).into());
+        } else {
+            warn!("Failed to import minimize button texture");
+        }
+
+        // Background (drawn last so it sits behind the buttons) -- glassy rounded bar.
+        if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location.to_f64(),
+            &self.background,
+            Some(alpha),
+            None,
+            None,
+            Kind::Unspecified,
+        ) {
+            elements.push(DecorationRenderElement::from(el).into());
+        } else {
+            warn!("Failed to import header bar background texture");
+        }
+
+        elements
     }
 }
 

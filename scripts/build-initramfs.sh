@@ -34,16 +34,40 @@ log_success "Initramfs directory structure created"
 log_info "Building/installing BusyBox..."
 bash "$SCRIPT_DIR/busybox-install.sh"
 
-if [ ! -f "$ROOTFS/bin/busybox" ]; then
-    log_error "BusyBox was not installed to rootfs at $ROOTFS/bin/busybox"
+# Source the busybox binary directly from the build output
+# (target/build/busybox-build/busybox/busybox), NOT from
+# "$ROOTFS/bin/busybox" — busybox-install.sh no longer installs anything
+# into the shared rootfs at all (see that script's own comment: its
+# `make install` used to symlink every applet, including `setpriv`, over
+# whatever the real rootfs already had, which clobbered util-linux's real
+# `setpriv` the moment it ran a second time after apt packages were
+# already installed — a real regression found via an actual boot). That
+# fix broke THIS script in turn: it used to depend on that same `make
+# install` step to seed "$ROOTFS/bin/busybox" *before* create-rootfs.sh
+# (which runs after build-initramfs in the Makefile's dependency order,
+# so create-rootfs.sh's own stage_busybox_init had never populated that
+# path yet at this point) ever touched the rootfs — a fragile,
+# order-dependent coupling between two otherwise-independent scripts.
+# Reading the build artifact directly removes that coupling entirely, and
+# matches exactly what create-rootfs.sh's stage_busybox_init already does
+# for the same reason.
+BUSYBOX_BUILD_BIN="${PROJECT_ROOT}/target/build/busybox-build/busybox/busybox"
+if [ ! -f "$BUSYBOX_BUILD_BIN" ]; then
+    log_error "BusyBox build artifact not found at $BUSYBOX_BUILD_BIN"
     exit 1
 fi
 
-log_info "Copying BusyBox from rootfs into initramfs..."
-cp -a "$ROOTFS/bin/"*  "$INITRAMFS/bin/"
-cp -a "$ROOTFS/sbin/"* "$INITRAMFS/sbin/"
-if [ -d "$ROOTFS/usr/bin"  ]; then cp -a "$ROOTFS/usr/bin/"*  "$INITRAMFS/usr/bin/";  fi
-if [ -d "$ROOTFS/usr/sbin" ]; then cp -a "$ROOTFS/usr/sbin/"* "$INITRAMFS/usr/sbin/"; fi
+# Just the one static binary — busybox's own `--install -s` bootstrap
+# (see the init script below) creates every applet symlink (sh, mount,
+# blkid, mdev, modprobe, awk, grep, cut, ...) this init script needs
+# entirely from that single file at boot time. There is nothing else in
+# the real rootfs's /bin, /sbin, /usr/{bin,sbin} this minimal early-boot
+# environment actually calls — copying them in was dead weight (dynamically
+# linked Debian binaries with no matching /lib64/ld-linux.so.2 or shared
+# libraries staged into the initramfs to actually run them).
+log_info "Copying BusyBox build artifact into initramfs..."
+cp -a "$BUSYBOX_BUILD_BIN" "$INITRAMFS/bin/busybox"
+chmod 755 "$INITRAMFS/bin/busybox"
 
 if [ ! -f "$INITRAMFS/bin/busybox" ]; then
     log_error "BusyBox is NOT installed to initramfs at $INITRAMFS/bin/busybox"
@@ -162,8 +186,14 @@ resolve_root() {
         local dev="/dev/${devname}"
         [ -b "$dev" ] || continue
 
+        # BusyBox's blkid applet doesn't support util-linux's `-s TAG -o value`
+        # selector/output-format flags -- it always prints the full
+        # `DEVICE: TAG="val" TAG="val" ...` form. Extract the tag we want
+        # from that instead of relying on flags it silently doesn't honor.
+        # The leading [[:space:]] anchor keeps a UUID match from also
+        # matching inside PARTUUID="..." (which ends in "UUID=" too).
         local got
-        got="$(blkid -s "$tag" -o value "$dev" 2>/dev/null)" || continue
+        got="$(blkid "$dev" 2>/dev/null | grep -oE "[[:space:]]${tag}=\"[^\"]*\"" | cut -d'"' -f2)"
         if [ "$got" = "$value" ]; then
             echo "$dev"
             return

@@ -1,0 +1,37 @@
+# Not a full copy -- this is a diff note for the small, additive change made
+# to the real upstream file ipc/glue/BackgroundParentImpl.cpp (outside this
+# pyxis/ patch directory), pairing with the .h change described in
+# ipc/glue/BackgroundParentImpl.h.PYXIS_DIFF in this same directory.
+#
+# 1. Add one new #include, alongside the other mozilla/net/* includes near
+#    the top of the file (inserted right after the existing
+#    `#include "mozilla/net/HttpBackgroundChannelParent.h"` line):
+#
+#      #include "mozilla/net/BackgroundDataBridgeParent.h"
+#      #include "mozilla/net/HttpBackgroundChannelParent.h"
+#      #include "mozilla/net/PyxisChannelParent.h"
+#
+# 2. Add the AllocPPyxisChannelParent() implementation directly after the
+#    existing AllocPFetchParent() definition, before the closing
+#    `}  // namespace mozilla::ipc`:
+#
+#      already_AddRefed<dom::PFetchParent> BackgroundParentImpl::AllocPFetchParent() {
+#        return MakeAndAddRef<dom::FetchParent>();
+#      }
+#
+#      already_AddRefed<net::PPyxisChannelParent>
+#      BackgroundParentImpl::AllocPPyxisChannelParent() {
+#        // net::PyxisChannelParent (the hand-written concrete class) derives from
+#        // the generated net::PPyxisChannelParent base -- see
+#        // netwerk/protocol/pyxis/PyxisChannelParent.h. MakeAndAddRef returns
+#        // already_AddRefed<PyxisChannelParent>; the implicit upcast to
+#        // already_AddRefed<PPyxisChannelParent> here matches this override's
+#        // declared return type in BackgroundParentImpl.h (see that file's comment
+#        // on why the declared type must be the generated base, not the concrete
+#        // class).
+#        return MakeAndAddRef<net::PyxisChannelParent>();
+#      }
+#
+#      }  // namespace mozilla::ipc
+#
+# No other lines in this file were modified.

@@ -1,0 +1,43 @@
+Real, verified unified diff (git diff in target/gecko-src/gecko-dev,
+branch central-work @ 5836a062726f715fda621338a17b51aff30d0a8c) against
+the upstream file browser/components/nsIBrowserHandler.idl — apply with
+`git apply` or `patch -p1` from the checkout root.
+
+Adds a read-only pyxisAppId attribute to nsIBrowserHandler, mirroring
+the existing `kiosk` attribute on the same interface, so
+BrowserContentHandler.sys.mjs's new gPyxisAppId state (see
+BrowserContentHandler.sys.mjs.PYXIS_DIFF in the sibling directory) is
+reachable off Cc["@mozilla.org/browser/clh;1"].getService(Ci.nsIBrowserHandler)
+the same way BrowserHandler.kiosk already is.
+
+UPDATE (2026-07-06): the comment below now references `--pyxis-app`, not
+the original `--app` — see BrowserContentHandler.sys.mjs.PYXIS_DIFF's
+dated correction note for why (a real collision with Gecko's own native
+`-app <path>` startup flag, found via a real failed boot).
+
+diff --git a/browser/components/nsIBrowserHandler.idl b/browser/components/nsIBrowserHandler.idl
+index 8666f79e57e8..d9f0b01e4bb7 100644
+--- a/browser/components/nsIBrowserHandler.idl
++++ b/browser/components/nsIBrowserHandler.idl
+@@ -16,6 +16,21 @@ interface nsIBrowserHandler : nsISupports
+   attribute boolean majorUpgrade;
+   attribute boolean firstRunProfile;
+
++  /**
++   * PYXIS: the app id passed via `--pyxis-app=<id>`/PYXIS_APP_ID, or an
++   * empty string for a normal (non-pyxis-webapp) browser launch. Read-only
++   * from script; nsBrowserContentHandler sets its backing gPyxisAppId value
++   * internally when it recognizes `--pyxis-app` in bch_handle (see
++   * BrowserContentHandler.sys.mjs -- note the flag is `--pyxis-app`, NOT
++   * plain `--app`, which collides with a pre-existing native Gecko flag of
++   * the same name used for an unrelated alternate-application.ini feature;
++   * see BrowserContentHandler.sys.mjs's dated correction comment for the
++   * real failure this caused). Mirrors the existing `kiosk` attribute
++   * above, which is the real precedent for exposing command-line-derived
++   * launch-mode state through this interface.
++   */
++  readonly attribute AUTF8String pyxisAppId;
++
+   /**
+    * Extract the width and height specified on the command line, if present.
+    * @return A feature string with a prepended comma, e.g. ",width=500,height=400"

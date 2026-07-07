@@ -1,8 +1,8 @@
 [Unit]
 Description=GECKO Firefox/Gecko Integration
 Documentation=man:gecko(1)
-After=cronus.service echo.service
-Requires=cronus.service echo.service
+After=shift.service echo.service
+Requires=shift.service echo.service
 
 [Service]
 Type=simple

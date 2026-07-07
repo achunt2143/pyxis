@@ -10,9 +10,14 @@
 //! - **SurfaceManager**: Maps Gecko windows to Wayland surfaces
 //! - **InputEventRouter**: Routes events from compositor to correct window/app
 //! - **Window & Surface**: Domain models for window hierarchy and rendering
+//! - **gecko**: `vela` launch composition (Approach A launcher/
+//!   supervisor — see gecko/src/gecko.rs's own doc comment for the full
+//!   rationale; this crate no longer does libxul FFI embedding).
 
+pub mod gecko;
 pub mod window;
 
+pub use gecko::{compose_launch, ComposedLaunch, DisplayMode, LaunchEnvironment, WebAppLaunchSpec};
 pub use window::{Window, WindowConfig, WindowState};
 
 use anyhow::Result;

@@ -128,6 +128,10 @@ impl<BackendData: Backend> EvoState<BackendData> {
                 }
             }
 
+            KeyAction::RestoreMinimized => {
+                self.restore_last_minimized();
+            }
+
             _ => unreachable!(
                 "Common key action handler encountered backend specific action {:?}",
                 action
@@ -506,7 +510,8 @@ impl<BackendData: Backend> EvoState<BackendData> {
                     | KeyAction::Quit
                     | KeyAction::Run(_)
                     | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
+                    | KeyAction::ToggleDecorations
+                    | KeyAction::RestoreMinimized => self.process_common_key_action(action),
 
                     _ => tracing::warn!(
                         ?action,
@@ -721,7 +726,8 @@ impl EvoState<UdevData> {
                     | KeyAction::Quit
                     | KeyAction::Run(_)
                     | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
+                    | KeyAction::ToggleDecorations
+                    | KeyAction::RestoreMinimized => self.process_common_key_action(action),
 
                     _ => unreachable!(),
                 },
@@ -1292,6 +1298,9 @@ enum KeyAction {
     RotateOutput,
     ToggleTint,
     ToggleDecorations,
+    /// Re-map the most recently minimized window (there is no taskbar to
+    /// click yet, so this is the interim way to get a minimized window back).
+    RestoreMinimized,
     /// Do nothing more
     None,
 }
@@ -1324,6 +1333,8 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::ToggleTint)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::D {
         Some(KeyAction::ToggleDecorations)
+    } else if modifiers.logo && modifiers.shift && keysym == Keysym::U {
+        Some(KeyAction::RestoreMinimized)
     } else {
         None
     }

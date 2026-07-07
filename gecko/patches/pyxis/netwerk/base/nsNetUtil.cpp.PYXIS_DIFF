@@ -1,0 +1,110 @@
+Not a real file to add as-is — this is a diff note for a small addition to
+the upstream file netwerk/base/nsNetUtil.cpp (verified present at this path
+in the pinned tree, target/gecko-src/gecko-dev/, at the live-tested commit
+5836a062726f715fda621338a17b51aff30d0a8c on branch central-work).
+
+## Why this file is touched at all
+
+This is a genuine stock-file change, not a netwerk/protocol/pyxis/-local
+one — flagged explicitly per the project's "prefer components.conf-only
+fixes" discipline, because no components.conf-only fix exists for this bug.
+See BUILD_RUNBOOK.md's dated entry ("isSecureContext / null principal root
+cause") for the full investigation. Summary: `NS_NewURI` in this file picks
+the concrete C++ nsIURI implementation class via a hardcoded, scheme-by-
+scheme if/else chain — it does NOT consult the registered nsIProtocolHandler
+flags (components.conf's `protocol_config.flags`) to make that choice.
+`URI_STD` (value 0 in nsIProtocolHandler.idl) is documentary only. A scheme
+absent from this chain falls through to the `network.url.useDefaultURI`
+branch and gets a `DefaultURI` instance (netwerk/base/DefaultURI.h), which
+implements only nsIURI/nsISerializable/nsISizeOf — NOT nsIStandardURL.
+
+That silently broke pyxis:// content-principal creation end-to-end:
+`ContentPrincipal::GenerateOriginNoSuffixFromURI` (caps/ContentPrincipal.cpp)
+does a `do_QueryInterface` to nsIStandardURL and returns NS_ERROR_FAILURE if
+that fails, and `BasePrincipal::CreateContentPrincipal(nsIURI*, ...)`
+(caps/BasePrincipal.cpp) silently maps that failure to `NullPrincipal::
+Create()` — no error surfaced anywhere. This is exactly what was live-tested
+and observed: page content loaded correctly (registration/origin-resolution/
+path-confinement/serving all genuinely work), but
+`gBrowser.selectedBrowser.contentPrincipal.originNoSuffix` read
+"moz-nullprincipal:{uuid}" instead of "pyxis://testapp", and
+`window.isSecureContext` read false as a direct, correct consequence of
+having a null principal (null principals are never secure contexts,
+independent of the URI's own registered URI_IS_POTENTIALLY_TRUSTWORTHY flag,
+which IS correctly registered and IS correctly readable via
+URIChainHasFlags — that part was never the bug).
+
+moz-extension: avoids this failure mode because its hardcoded NS_NewURI case
+(a few lines below this insertion point) calls
+`ExtensionProtocolHandler::NewURI`, which is a `SubstitutingProtocolHandler`
+whose URI type, `SubstitutingURL` (netwerk/protocol/res/
+SubstitutingProtocolHandler.cpp), literally subclasses `nsStandardURL`.
+pyxis:// doesn't need moz-extension:'s substitution/resolution logic — it
+just needs to be constructed as a plain `nsStandardURL` instance, same as
+the existing indexeddb:/uuid: case immediately above the insertion point
+uses.
+
+## The change
+
+Insert a new scheme case in `NS_NewURI(nsIURI** aURI, const nsACString&
+aSpec, const char* aCharset, nsIURI* aBaseURI)`, immediately after the
+existing `indexeddb`/`uuid` case and immediately before the existing
+`moz-extension` case (all three are in the same hardcoded if/else chain).
+Exact insertion point — the existing code immediately before and after,
+unchanged, for anchoring:
+
+    if (scheme.EqualsLiteral("indexeddb") || scheme.EqualsLiteral("uuid")) {
+      return NS_MutateURI(new nsStandardURL::Mutator())
+          .Apply(&nsIStandardURLMutator::Init, nsIStandardURL::URLTYPE_AUTHORITY,
+                 0, aSpec, aCharset, aBaseURI, nullptr)
+          .Finalize(aURI);
+    }
+
+    // <-- NEW CODE INSERTED HERE, see below -->
+
+    if (scheme.EqualsLiteral("moz-extension")) {
+      RefPtr<mozilla::net::ExtensionProtocolHandler> handler =
+          mozilla::net::ExtensionProtocolHandler::GetSingleton();
+      if (!handler) {
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+      return handler->NewURI(aSpec, aCharset, aBaseURI, aURI);
+    }
+
+New code inserted at that point (see this directory's sibling file
+netwerk/protocol/pyxis/PyxisProtocolHandler.h for the point-5 SCAFFOLD
+NOTICE correction that explains, in the handler's own docs, why this was
+needed despite the handler having no custom NewURI override):
+
+    // Pyxis (GeckoOS): pyxis://<app-id>/<path> app-serving scheme. Registered
+    // with URI_STD in netwerk/protocol/pyxis/components.conf, but that flag
+    // alone only affects nsIProtocolHandler flag queries (URIChainHasFlags) --
+    // it does NOT influence which concrete nsIURI class gets instantiated here.
+    // Unless a scheme is one of the hardcoded cases in this function, unknown
+    // schemes fall through to DefaultURI (see the network.url.useDefaultURI
+    // branch below), which does not implement nsIStandardURL. That silently
+    // broke content-principal creation: ContentPrincipal::
+    // GenerateOriginNoSuffixFromURI (caps/ContentPrincipal.cpp) requires a
+    // do_QueryInterface to nsIStandardURL and fails closed (NS_ERROR_FAILURE)
+    // otherwise, which BasePrincipal::CreateContentPrincipal (caps/
+    // BasePrincipal.cpp) silently maps to a NullPrincipal -- reproducing the
+    // observed bug (window.isSecureContext false, contentPrincipal a
+    // moz-nullprincipal: instead of pyxis://<app-id>). moz-extension: avoids
+    // this via its own hardcoded case below, whose SubstitutingURL literally
+    // subclasses nsStandardURL. pyxis:// doesn't need substitution/resolution,
+    // just a real nsIStandardURL instance, so route it through the same
+    // nsStandardURL + URLTYPE_AUTHORITY construction used for indexeddb/uuid
+    // above (default_port -1 matches this scheme's components.conf entry).
+    if (scheme.EqualsLiteral("pyxis")) {
+      return NS_MutateURI(new nsStandardURL::Mutator())
+          .Apply(&nsIStandardURLMutator::Init, nsIStandardURL::URLTYPE_AUTHORITY,
+                 -1, aSpec, aCharset, aBaseURI, nullptr)
+          .Finalize(aURI);
+    }
+
+This has been applied to the live checkout at
+target/gecko-src/gecko-dev/netwerk/base/nsNetUtil.cpp (this mirror is a
+diff-note, not a full-file copy, matching the convention already used for
+toolkit/actors/ActorManagerParent.sys.mjs.PYXIS_DIFF in this same patch
+series — nsNetUtil.cpp is a large (~4200 line) stock file we don't own, so
+we track the delta here rather than a full duplicate).

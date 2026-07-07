@@ -14,7 +14,13 @@ TEMP_DIR="${BUILD_DIR}/temp"
 ROOTFS_DIR="${BUILD_DIR}/rootfs"
 IMAGE_DIR="${BUILD_DIR}/images"
 IMAGE_FILE="${IMAGE_DIR}/geckoOS.img"
-IMAGE_SIZE="${IMAGE_SIZE:-2048}" # MB
+# Bumped from 2048 (2026-07-05): the Debian base + Wayland/Mesa packages
+# alone were already a meaningful fraction of 2GB, and stage_gecko in
+# create-rootfs.sh now installs a real vela runtime tree (libxul.so
+# and friends, stripped but still several hundred MB) on top of that -- a
+# 2GB image left little to no headroom. Override via IMAGE_SIZE=<MB> if
+# this is still wrong for your build.
+IMAGE_SIZE="${IMAGE_SIZE:-6144}" # MB
 platform="$1"
 
 BOOT_FILES_DIR="${PROJECT_ROOT}/target/boot"
@@ -160,8 +166,23 @@ mkdir -p "$TEMP_DIR"
 # Check if image already exists
 if [ -f "$IMAGE_FILE" ]; then
     log_warn "Image already exists: $IMAGE_FILE"
-    read -p "Overwrite? (y/n) " -n 1 -r
-    echo
+    # `read -p` on a closed/non-tty stdin (any non-interactive invocation --
+    # backgrounded, CI, an agent's shell tool) returns non-zero on EOF
+    # immediately, and this script's `set -e` then aborts BEFORE ever
+    # reaching the "skip" fallback below -- found via a real non-interactive
+    # run, not by inspection (the previous stale small image just failed the
+    # whole script with no clear message). The disk image is a fully
+    # regenerable build artifact (deterministically rebuilt from the
+    # rootfs/kernel/initramfs every time), not user data, so default to
+    # overwriting it when there's no real terminal to prompt on -- keep the
+    # interactive confirmation for genuine manual/interactive use.
+    if [ -t 0 ]; then
+        read -p "Overwrite? (y/n) " -n 1 -r
+        echo
+    else
+        log_info "Non-interactive run: overwriting stale image automatically (it's a regenerable build artifact)"
+        REPLY="y"
+    fi
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         log_info "Skipping disk image creation"
     else
@@ -336,7 +357,17 @@ mount | grep -E "$ESP_MOUNT|$ROOT_MOUNT"
 log_section "Installing Rootfs"
 
 log_info "Copying rootfs to root partition..."
-if ! sudo cp -r "$ROOTFS_DIR"/* "$ROOT_MOUNT/" 2>&1; then
+# -a (archive), NOT plain -r: plain `cp -r` run as root does NOT preserve
+# source ownership -- new destination entries default to root:root, the
+# invoking user of this `cp`. That silently clobbered every 1000:1000
+# ownership create-rootfs.sh's Stage 11 (stage_permissions) had already set
+# on the source rootfs (most visibly /home/geckouser), so the packaged image
+# always had a root-owned home directory regardless of what the rootfs build
+# did -- found via a real boot: nsToolkitProfileService::Init() failing with
+# GetUserAppDataDirectory -> NS_ERROR_FAILURE, because vela (running
+# as uid 1000 via setpriv) couldn't create $HOME/.mozilla under a
+# root-owned, group/other-unwritable $HOME.
+if ! sudo cp -a "$ROOTFS_DIR"/* "$ROOT_MOUNT/" 2>&1; then
     log_error "Failed to copy rootfs"
     exit 1
 fi
@@ -407,7 +438,7 @@ sudo grub-install \
     --bootloader-id=GRUB \
     --no-nvram \
     --removable \
-    --modules="efi_gop efi_uga gfxterm gfxterm_background linux normal fat ext2 part_gpt part_msdos" \
+    --modules="efi_gop gfxterm gfxterm_background linux normal fat ext2 part_gpt part_msdos" \
     "$LOOP_DEV"
 
 # Verify bootloader was installed
@@ -543,6 +574,16 @@ rmdir "$ESP_MOUNT" 2>/dev/null || true
 rmdir "$ROOT_MOUNT" 2>/dev/null || true
 
 log_success "Disk image finalized"
+
+# If this script itself is running as root (e.g. invoked via a passwordless
+# `sudo scripts/package.sh` for faster iteration) the top-level dd/mkfs calls
+# above created $IMAGE_FILE as root:root, which then can't be opened by an
+# unprivileged `qemu-system-x86_64` (as run by `make run`/emulate.sh). Hand
+# the finished image back to the invoking user so it's runnable without sudo.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    chown "$SUDO_USER":"$SUDO_USER" "$IMAGE_FILE"
+    log_success "Image ownership handed back to $SUDO_USER"
+fi
 
 # ============================================================================
 # VERIFICATION AND SUMMARY

@@ -1,0 +1,51 @@
+# Not a full copy -- this is a diff note for the three small, additive
+# changes made to the real upstream file ipc/glue/PBackground.ipdl (outside
+# this pyxis/ patch directory) to register PPyxisChannel as a PBackground
+# managee.
+#
+# Context / why this file needed to change at all: see
+# netwerk/protocol/pyxis/PPyxisChannel.ipdl's own design note (mirrored at
+# gecko/patches/pyxis/netwerk/protocol/pyxis/PPyxisChannel.ipdl in this same
+# patch tree) for the full reasoning on why PyxisChannel's content-process ->
+# parent file-read brokering protocol is `manager PBackground` rather than
+# `manager PNecko` or a hand-rolled top-level protocol. Adding ANY new
+# manageable protocol to PBackground requires exactly these three additions
+# to this one shared file -- there's no way around touching it, but it's a
+# purely additive, low-risk change (three one-line insertions, no existing
+# lines modified).
+#
+# 1. Add an `include protocol PPyxisChannel;` line alongside the other
+#    `include protocol P*;` lines near the top of the file (inserted after
+#    the existing `include protocol PFetch;` / `include protocol
+#    PNotification;` lines):
+#
+#      include protocol PFetch;
+#      include protocol PNotification;
+#      include protocol PPyxisChannel;
+#
+# 2. Add a `manages PPyxisChannel;` line inside the `protocol PBackground {`
+#    block's manages-list (inserted right after the existing `manages
+#    PFetch;` line):
+#
+#      manages PUDPSocket;
+#      manages PVsync;
+#      manages PFetch;
+#      manages PPyxisChannel;
+#
+# 3. Add the `async PPyxisChannel();` constructor declaration inside the
+#    `parent:` section (inserted right after the existing `async PFetch();`
+#    line, before `async RequestCameraAccess(...)`):
+#
+#      async PFetch();
+#
+#      async PPyxisChannel();
+#
+#      async RequestCameraAccess(bool aAllowPermissionRequest) returns (CamerasAccessStatus rv);
+#
+# PPyxisChannel takes no constructor arguments (mirrors PFetch() above), so
+# no additional constructor-arg plumbing is needed here beyond these three
+# lines. The corresponding C++ wiring (AllocPPyxisChannelParent -- no
+# RecvPPyxisChannelConstructor override needed for a no-arg constructor,
+# matching AllocPFetchParent's own pattern) lives in
+# ipc/glue/BackgroundParentImpl.h/.cpp -- see the paired .PYXIS_DIFF notes
+# for those two files in this same directory.

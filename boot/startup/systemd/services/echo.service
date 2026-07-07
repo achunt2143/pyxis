@@ -1,9 +1,9 @@
 [Unit]
 Description=ECHO IPC Manager (DBus)
 Documentation=man:echo(1)
-After=cronus.service
-Requires=cronus.service
-Before=ouranos.service
+After=shift.service
+Requires=shift.service
+Before=evo.service
 
 [Service]
 Type=simple

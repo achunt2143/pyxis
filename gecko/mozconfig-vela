@@ -1,0 +1,117 @@
+# mozconfig for vela (the custom-built Gecko browser binary, formerly named
+# "pyxis-webapp" -- renamed 2026-07-07; see CLAUDE.md's component map. The
+# `pyxis://` scheme, PyxisProtocolHandler/PyxisBridgeChild/Parent classes,
+# and --pyxis-app/PYXIS_APP_ID flags are NOT part of this rename -- those are
+# tied to the Pyxis OS/product name, not this specific browser build.)
+#
+# Pinned against: Firefox/Gecko ESR 140 line, gecko-dev `release` branch,
+# commit c61a6579702f4c73ee99131bd5fa216ec8f7b72c (see gecko/GECKO_PIN).
+#
+# Usage: from the gecko-dev checkout root,
+#   MOZCONFIG=/home/andrew/geckos/geckos/gecko/mozconfig-vela ./mach build
+# (mach reads $MOZCONFIG, or ./mozconfig / ./.mozconfig in the srcdir by default —
+# an absolute path via the env var is used here so this file can live in the
+# Pyxis workspace rather than inside the (gitignored, huge) gecko-dev checkout.)
+#
+# Flag provenance: names below match pyxis-gecko-embedding-plan.md §2's
+# "representative mozconfig intent" almost verbatim. A few have been
+# validated/adjusted against what actually exists in a 140-era tree (see
+# inline notes) — re-validate the whole file again at pin-bump time by
+# grepping build/moz.configure and the top-level moz.configure for any
+# flag that fails with "unknown configure option" at `./mach configure` time.
+
+# --- Application shell ---
+# Reuse the full "browser" app (Firefox desktop shell) rather than inventing a
+# new toolkit app; per the kiosk plan (Part B1) we then strip chrome and add a
+# --app=<id> run mode on top of it, which is far less rebase-surface than a
+# bespoke XUL/Toolkit app target.
+ac_add_options --enable-application=browser
+
+# --with-app-name controls the installed binary name (vela instead of
+# firefox) and app data dir naming. Confirmed still valid as of 140-era trees
+# (browser/confvars.sh / toolkit moz.configure honor MOZ_APP_NAME derived from
+# this).
+ac_add_options --with-app-name=vela
+
+# Keep the objdir out of the source tree and named distinctly so it's easy to
+# find/clean and doesn't collide if this checkout is ever reused for a second
+# config (e.g. a debug build). NOT renamed to obj-vela alongside the app-name
+# change above (2026-07-07): MOZ_OBJDIR is just a build-output directory
+# name, unrelated to MOZ_APP_NAME/the binary's own name, and this objdir
+# already has a full prior build's worth of compiled objects in it --
+# renaming it would point `./mach build` at an empty directory and force a
+# full from-scratch rebuild (likely 1-3+ hours) for what is otherwise a
+# same-day, few-line rename. Left as obj-pyxis-webapp on purpose; the
+# directory name is not part of what "renaming the browser" means here.
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-pyxis-webapp
+
+# --- Toolkit / windowing ---
+# cairo-gtk3-wayland is the modern default-toolkit spelling for Linux desktop
+# Firefox builds with Wayland support; still current for 140-era trees. Being
+# explicit here (rather than relying on the platform default) documents the
+# Wayland requirement Pyxis actually depends on (Evo composites via Wayland,
+# not X11/XWayland, for native Gecko clients).
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland
+
+# --enable-webrender removed (2026-07-05): the trip-wire tripped, as
+# intended. Confirmed via a real build attempt (InvalidOptionError: Unknown
+# option) and via grep across build/moz.configure/*.configure turning up
+# zero references to "webrender" at all -- the option has been fully
+# removed from this tree, not just renamed. WebRender is unconditionally on;
+# there is nothing left to opt into.
+
+# --- Build type: real optimized build, not artifact ---
+# This MUST be a full local build, not an artifact build (`--enable-artifact-
+# builds` pulls prebuilt C++ from Mozilla's CI and is incompatible with
+# shipping our own C++ in netwerk/protocol/pyxis/ and the bridge JSActor).
+ac_add_options --enable-optimize
+ac_add_options --disable-debug
+
+# --- Strip things Pyxis doesn't want/need in a kiosk runtime ---
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+# --disable-maintenance-service removed (2026-07-05): that's Firefox's
+# Windows-only background updater service; the configure option isn't even
+# registered on Linux, so requesting it fails with "not available in this
+# configuration" rather than being a no-op. Confirmed via a real build
+# attempt, not just doc inspection.
+# Keep tests OFF for the release/shipping objdir; the plan explicitly calls
+# out keeping a *separate* test-enabled build/objdir for the gtest/xpcshell/
+# mochitest suites in pyxis-scheme-and-kiosk-plan.md §A6/§B5 — see
+# mozconfig-vela-tests below (not yet created; add when Phase 1
+# testing actually starts, so as not to speculatively fork configs before
+# they're needed).
+ac_add_options --disable-tests
+
+# --- Sandbox ---
+# Start with the content sandbox ON (the default for desktop Linux Firefox
+# builds already; stated explicitly here as a decision record, not a flag
+# this tree necessarily exposes directly). Do NOT disable the sandbox to make
+# the pyxis:// content-process file-brokering problem (embedding plan §8,
+# scheme plan §A4) "go away" — that is the actual hard problem to solve
+# properly (parent-brokered channel), not a config knob to defeat it.
+# ac_add_options --enable-content-sandbox   # left commented: verify this is
+#                                            # still the correct spelling at
+#                                            # the pin before enabling
+#                                            # explicitly; it may already be
+#                                            # unconditionally on for
+#                                            # linux-desktop tier-1 builds.
+
+# --- Explicitly NOT set here (decide at integration time, not blindly) ---
+# --enable-release           : leave unset for now (dev-cycle build); flip on
+#                               for the packaged/shipping build once the
+#                               patch series is stable.
+# --enable-bootstrap         : do NOT rely on `mach build` auto-bootstrapping;
+#                               `./mach bootstrap` must be run explicitly and
+#                               interactively first (see BUILD_RUNBOOK.md) —
+#                               this environment has no passwordless sudo, so
+#                               implicit bootstrap-on-build would hang/fail
+#                               non-interactively.
+
+# --- sccache ---
+# Strongly recommended per the embedding plan (§2: "set up CI with a warm
+# build cache early; this is the single biggest ergonomic risk"). Left
+# unconfigured here (not a mozconfig ac_add_options flag — sccache is wired
+# via environment variables CC/CXX wrappers or `mach bootstrap`'s toolchain
+# setup) — see BUILD_RUNBOOK.md for the exact `export CCACHE_*`/`RUSTC_WRAPPER`
+# setup to add once bootstrap has installed sccache.

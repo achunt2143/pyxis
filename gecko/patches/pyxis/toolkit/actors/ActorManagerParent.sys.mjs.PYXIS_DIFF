@@ -1,0 +1,87 @@
+Not a real file to add as-is — this is a diff note for the registration
+entry that must be added to the upstream file
+toolkit/modules/ActorManagerParent.sys.mjs (verified present at this path in
+the pinned ESR 140.0.5 tree, target/gecko-src/gecko-dev/).
+
+That file exports a single big object literal (JSWINDOWACTORS, consumed by
+ActorManagerParent.addJSWindowActors()) with one entry per registered actor
+pair — see the real "WebChannel" and "ViewSourcePage" entries already in
+that file for the two closest precedents (generic page<->chrome channel,
+and a custom-scheme `matches` pattern), both read directly from the pinned
+tree while writing this scaffold.
+
+Add a new entry (exact insertion point: anywhere in the JSWINDOWACTORS
+object literal, alphabetical-ish ordering is followed loosely by the
+existing file but not strictly enforced):
+
+    PyxisBridge: {
+      parent: {
+        esModuleURI: "resource://gre/actors/PyxisBridgeParent.sys.mjs",
+      },
+      child: {
+        esModuleURI: "resource://gre/actors/PyxisBridgeChild.sys.mjs",
+        // REAL BUG, found via a real boot (2026-07-06): without an `events`
+        // block here, `matches`/`allFrames` alone only gate an explicit
+        // `getActor()` call — they do NOT cause the actor to be created
+        // automatically. Nothing in this codebase ever calls
+        // `windowGlobal.getActor("PyxisBridge")` (window.geckoOS is meant to
+        // just be present, unconditionally), so the actor pair was NEVER
+        // instantiated for any pyxis:// document at all — confirmed by
+        // temporarily adding console.error to both PyxisBridgeChild's and
+        // PyxisBridgeParent's actorCreated() and observing neither ever
+        // fired, even though the document itself demonstrably loaded (a
+        // separate fprintf canary in PyxisProtocolHandler::NewChannel showed
+        // pyxis://bloom/index.html + its JS/CSS/favicon all being fetched
+        // normally). Real precedent for the fix, read directly from this
+        // same file: AboutTranslations uses exactly this
+        // `events: { DOMDocElementInserted: {} }` block under `child` to
+        // "run the actor before any content of the page appears to inject
+        // functions" — the identical requirement PyxisBridge has.
+        events: {
+          DOMDocElementInserted: {},
+        },
+      },
+
+      // Match every pyxis:// page, at document-start, in every frame —
+      // app content can embed pyxis:// iframes of the SAME app (cross-app
+      // iframes are cross-origin per PyxisProtocolHandler's design and
+      // would get their own actor instance anyway, which is correct: each
+      // origin's bridge call is independently capability-checked against
+      // that origin's own app-id, see PyxisBridgeParent.sys.mjs's
+      // _appIdForThisActor()).
+      matches: ["pyxis://*/*"],
+      allFrames: true,
+    },
+
+Also required, and CONFIRMED against the real file (toolkit/actors/moz.build
+in the pinned tree, verified directly this session): every actor .sys.mjs
+under toolkit/actors/ is listed in a `FINAL_TARGET_FILES.actors += [...]`
+block, which is what maps these source files to resource://gre/actors/*.sys.mjs
+URLs at build time. Real excerpt from the pinned tree:
+
+    FINAL_TARGET_FILES.actors += [
+        "AboutHttpsOnlyErrorChild.sys.mjs",
+        "AboutHttpsOnlyErrorParent.sys.mjs",
+        "AudioPlaybackChild.sys.mjs",
+        "AudioPlaybackParent.sys.mjs",
+        ... (alphabetical) ...
+    ]
+
+Add, in alphabetical position:
+
+    "PyxisBridgeChild.sys.mjs",
+    "PyxisBridgeParent.sys.mjs",
+
+Apply by placing gecko/patches/pyxis/toolkit/actors/PyxisBridgeChild.sys.mjs
+and PyxisBridgeParent.sys.mjs into toolkit/actors/ in the real checkout, and
+adding both filenames to the FINAL_TARGET_FILES.actors list in
+toolkit/actors/moz.build at the correct alphabetical position. Confirmed by
+direct inspection of the pinned tree's real ordering around there:
+
+    "PrintingSelectionChild.sys.mjs",
+    "PurgeSessionHistoryChild.sys.mjs",
+    "RemotePageChild.sys.mjs",
+
+"PyxisBridgeChild.sys.mjs" / "PyxisBridgeParent.sys.mjs" sort between
+"PurgeSessionHistoryChild.sys.mjs" and "RemotePageChild.sys.mjs" — insert
+there.

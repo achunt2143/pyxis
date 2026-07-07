@@ -1,0 +1,72 @@
+Real, verified unified diff (git diff in target/gecko-src/gecko-dev,
+branch central-work @ 5836a062726f715fda621338a17b51aff30d0a8c) against
+the upstream file browser/base/content/browser-init.js — apply with
+`git apply` or `patch -p1` from the checkout root.
+
+Implements pyxis-scheme-and-kiosk-plan.md Part B1 point 3 (WM_CLASS/
+title stamping for Evo's create/claim contract). Adapts the real,
+already-shipping `taskbartab` attribute-stamping block immediately
+above the inserted code (same function, onBeforeInitialXULLayout()) -
+see that block for the precedent this copies the shape of. Verified
+against the real tree that onBeforeInitialXULLayout() genuinely runs
+before AppWindow::SyncAttributesToWidget() reads windowclass/windowname:
+it's wired to the MozBeforeInitialXULLayout DOM event
+(browser/base/content/browser-main.js), which
+dom/prototype/PrototypeDocumentContentSink.cpp dispatches synchronously
+immediately before calling StartLayout() (line ~656-666), and
+StartLayout() is what eventually calls AppWindow::BeforeStartLayout()
+(via Document::SetMayStartLayout(), dom/base/Document.cpp:9821-9829).
+
+diff --git a/browser/base/content/browser-init.js b/browser/base/content/browser-init.js
+index c32b781be079..0d02b601ba65 100644
+--- a/browser/base/content/browser-init.js
++++ b/browser/base/content/browser-init.js
+@@ -114,6 +114,48 @@ var gBrowserInit = {
+           extraOptions.getPropertyAsAString("taskbartab")
+         );
+       }
++
++      // PYXIS: same shape as the taskbartab block directly above (real
++      // precedent this is adapted from) - openPyxisAppWindow() in
++      // BrowserContentHandler.sys.mjs stamps a "pyxisApp" key onto the
++      // same extraOptions property bag instead of "taskbartab". Setting
++      // `windowclass`/`windowname` here, BEFORE this window's initial XUL
++      // layout, is what makes AppWindow::SyncAttributesToWidget()
++      // (xpfe/appshell/AppWindow.cpp, called from BeforeStartLayout())
++      // pick them up and call nsWindow::SetWindowClass()
++      // (widget/gtk/nsWindow.cpp), which is the real mechanism that stamps
++      // WM_CLASS (X11) / the xdg-toplevel app_id (Wayland,
++      // gdk_wayland_window_set_application_id via RefreshWindowClass()) -
++      // see that function for why this must happen before first paint,
++      // not after. `pyxisapp` (lowercase, matching the `taskbartab`
++      // attribute's all-lowercase convention - XML/HTML attribute names
++      // are case-insensitive so this is also just a style match) drives
++      // any pyxis-specific CSS keyed off it, mirroring
++      // panelUI-shared.css's `:root[taskbartab]` selector.
++      if (
++        extraOptions instanceof Ci.nsIWritablePropertyBag2 &&
++        extraOptions.hasKey("pyxisApp")
++      ) {
++        let appId = extraOptions.getPropertyAsAString("pyxisApp");
++        let root = window.document.documentElement;
++        root.setAttribute("pyxisapp", appId);
++        // "windowclass"/"windowname" are read by
++        // AppWindow::SyncAttributesToWidget() via plain
++        // GetAttribute(u"windowclass"_ns, ...) / GetAttribute(u"windowname"_ns,
++        // ...) calls (NOT interned nsGkAtoms, so no atom-table change was
++        // needed for this patch) - see that function in AppWindow.cpp.
++        // nsWindow::SetWindowClass() then splits `windowclass` into
++        // res_name/res_class (X11 XClassHint) and uses `windowclass`
++        // as-is for the Wayland app_id. Evo's two-step
++        // create/claim contract (evo/src/enhancements/echo_ipc.rs)
++        // correlates on this app_id, so it must exactly equal
++        // PYXIS_APP_ID with no transformation - unlike the generic
++        // xulWinType-derived path in SetWindowClass (which uppercases the
++        // first letter and replaces non-alphanumeric characters), passing
++        // `windowclass` directly bypasses that transform entirely.
++        root.setAttribute("windowclass", appId);
++        root.setAttribute("windowname", appId);
++      }
+     }
+ 
+     // Run menubar initialization first, to avoid CustomTitlebar code picking

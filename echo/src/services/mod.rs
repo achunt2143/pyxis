@@ -6,20 +6,24 @@
 pub mod filesystem;
 pub mod appmanager;
 pub mod apphost;
+pub mod nova;
 pub mod power;
 pub mod settings;
 pub mod network;
 pub mod deviceinfo;
 pub mod notification;
 pub mod process;
+pub mod terminal;
 
 // Re-exports for convenience
 pub use filesystem::FilesystemService;
 pub use appmanager::AppManagerService;
 pub use apphost::{AppHost, AppManifest, AppSession, AppState, APPHOST_IFACE};
+pub use nova::{Nova, WebAppManifest, NOVA_IFACE};
 pub use power::PowerService;
 pub use settings::SettingsService;
 pub use network::NetworkService;
 pub use deviceinfo::DeviceInfoService;
 pub use notification::NotificationService;
 pub use process::ProcessService;
+pub use terminal::{TerminalService, TERMINAL_IFACE};

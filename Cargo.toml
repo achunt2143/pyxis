@@ -6,12 +6,12 @@
 [workspace]
 members = [
     "gecko",
-    "cronus",
+    "shift",
     "echo",
     "evo",
-    "kratos",
-    "persephone",
-    "gaia",
+    "vroom",
+    "rockhopper",
+    "puppis",
 ]
 
 resolver = "2"
@@ -152,7 +152,7 @@ debug = true
 description = "Firefox Gecko rendering engine integration"
 features = ["wayland", "gpu-rendering"]
 
-[workspace.metadata.cronus]
+[workspace.metadata.shift]
 description = "Process manager and lifecycle control"
 features = ["dbus", "signals"]
 
@@ -164,17 +164,17 @@ features = ["dbus", "unix-sockets"]
 description = "Wayland compositor (Smithay-based)"
 features = ["wayland", "drm", "libinput"]
 
-[workspace.metadata.kratos]
+[workspace.metadata.vroom]
 description = "Performance monitoring and optimization"
 features = ["gpu-monitoring", "profiling"]
 
-[workspace.metadata.persephone]
+[workspace.metadata.rockhopper]
 description = "Linux application compatibility layer"
 features = ["elf-loading", "wayland"]
 
-[workspace.metadata.gaia]
-description = "Desktop shell and UI framework"
-features = ["web-frontend", "rust-backend"]
+[workspace.metadata.puppis]
+description = "Gecko native-app lifecycle management (extracted from the old gaia crate)"
+features = ["gecko-app-launcher"]
 
 # Build settings for Gecko (special handling for C++ integration)
 [workspace.metadata.cargo-tarpaulin]

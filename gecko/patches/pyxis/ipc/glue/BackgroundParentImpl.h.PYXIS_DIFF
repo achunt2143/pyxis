@@ -1,0 +1,49 @@
+# Not a full copy -- this is a diff note for the small, additive change made
+# to the real upstream file ipc/glue/BackgroundParentImpl.h (outside this
+# pyxis/ patch directory) to provide the parent-side actor allocator for the
+# new PPyxisChannel protocol (see the paired ipc/glue/PBackground.ipdl.PYXIS_DIFF
+# note in this same directory for the .ipdl-side half of this wiring, and
+# netwerk/protocol/pyxis/PPyxisChannel.ipdl for the full protocol design).
+#
+# Change: one new method declaration added directly after the existing
+# `already_AddRefed<PFetchParent> AllocPFetchParent() override;` line, right
+# before the closing `};` of the `class BackgroundParentImpl : public
+# PBackgroundParent {` declaration:
+#
+#   already_AddRefed<PFetchParent> AllocPFetchParent() override;
+#
+#   // Pyxis (2026-07-05): see ipc/glue/PBackground.ipdl's PPyxisChannel()
+#   // constructor declaration and netwerk/protocol/pyxis/PPyxisChannel.ipdl
+#   // for the protocol this actor belongs to. No RecvPPyxisChannelConstructor
+#   // override needed -- PPyxisChannel(), like PFetch() above, takes no
+#   // constructor args, so IPDL's generated default constructor handler is
+#   // sufficient once Alloc is provided (matches AllocPFetchParent's own
+#   // lack of a paired Recv...Constructor override just above).
+#   //
+#   // Return type is the GENERATED actor base (net::PPyxisChannelParent), not
+#   // the hand-written concrete net::PyxisChannelParent -- matching
+#   // AllocPLockManagerParent/AllocPFetchParent's own pattern just above,
+#   // where the override's declared return type is always the IPDL-generated
+#   // P*Parent base (already_AddRefed<T> isn't a pointer/reference type, so
+#   // covariant-return-type relaxation doesn't apply here the way it would
+#   // for a raw T*/T& virtual override; the .cpp implementation upcasts the
+#   // concrete already_AddRefed<PyxisChannelParent> it constructs).
+#   already_AddRefed<net::PPyxisChannelParent> AllocPPyxisChannelParent()
+#       override;
+#
+# CORRECTION (2026-07-05): the first pass of this diff omitted `override` on
+# this declaration -- every other AllocP*Parent override in this file has
+# it (AllocPFetchParent, AllocPVsyncParent, AllocPQuotaParent, etc; verified
+# by grep), and its absence here was an inconsistency, not a deliberate
+# choice. `override` doesn't change behavior if the signature genuinely
+# matches the generated virtual (which it does), but omitting it removes a
+# compile-time check that would catch a silent method-hiding bug if the
+# signature ever drifts from the generated base -- added for consistency
+# and safety, matching every sibling declaration in this class.
+#
+# No other lines in this file were modified. `net::PPyxisChannelParent` is
+# forward-declared automatically by the generated PBackgroundParent.h once
+# PPyxisChannel.ipdl exists in the build (same mechanism that already
+# forward-declares e.g. dom::PFetchParent / dom::locks::PLockManagerParent
+# for the existing entries in this file, verified by inspection of the
+# generated header at obj-*/ipc/ipdl/_ipdlheaders/mozilla/ipc/PBackgroundParent.h).

@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 use tokio::net::unix::OwnedWriteHalf;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -234,6 +236,22 @@ pub struct GeckoEchoService {
     pub runtime_handle: tokio::runtime::Handle,
     // ✅ Change Box to Arc
     pub create_window_cb: Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
+
+    // ---- Real FPS tracking (see `record_frame`/`get_rendering_status`) ----
+    // Frames rendered since `fps_window_start` was last reset. Plain atomic,
+    // not RwLock, since this increments once per rendered frame — a hot
+    // path where lock overhead would actually matter, unlike the rest of
+    // this struct's fields.
+    frame_count: Arc<AtomicU64>,
+    // Instant (as nanos since an arbitrary epoch via `Instant::elapsed`) the
+    // current 1-second measurement window started. Stored as the actual
+    // `Instant` behind a lock rather than an atomic since `Instant` isn't
+    // atomically representable; contention is negligible (read/reset once
+    // per second, not once per frame).
+    fps_window_start: Arc<RwLock<Instant>>,
+    // Last computed FPS, cached so `get_rendering_status` never blocks on
+    // the render thread — it just reads whatever was last computed.
+    last_fps: Arc<AtomicU32>,
 }
 
 
@@ -290,6 +308,9 @@ impl GeckoEchoService {
         command_tx,
         runtime_handle,
         create_window_cb,
+        frame_count: Arc::new(AtomicU64::new(0)),
+        fps_window_start: Arc::new(RwLock::new(Instant::now())),
+        last_fps: Arc::new(AtomicU32::new(0)),
     })
 }
 
@@ -394,6 +415,21 @@ impl GeckoEchoService {
         &self.service_name
     }
 
+    /// Call once per frame actually rendered/presented (from
+    /// `udev.rs`'s render loop). Updates the cached FPS once per rolling
+    /// 1-second window rather than on every call, so this stays cheap on
+    /// the render hot path.
+    pub fn record_frame(&self) {
+        let count = self.frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let elapsed = self.fps_window_start.read().elapsed();
+        if elapsed.as_secs_f64() >= 1.0 {
+            let fps = (count as f64 / elapsed.as_secs_f64()).round() as u32;
+            self.last_fps.store(fps, Ordering::Relaxed);
+            self.frame_count.store(0, Ordering::Relaxed);
+            *self.fps_window_start.write() = Instant::now();
+        }
+    }
+
     /// Get rendering status (SYNC)
     pub fn get_rendering_status(&self) -> RenderingStatus {
         let ready = *self.ready.read();
@@ -401,8 +437,8 @@ impl GeckoEchoService {
         RenderingStatus {
             is_ready: ready,
             active_windows: windows.len(),
-            fps: 60, // TODO: Get actual FPS from render loop
-            memory_mb: 256, // TODO: Get actual memory usage
+            fps: self.last_fps.load(Ordering::Relaxed),
+            memory_mb: current_process_rss_mb(),
         }
     }
 
@@ -1388,6 +1424,9 @@ impl Clone for GeckoEchoService {
             command_tx: self.command_tx.clone(),
             runtime_handle: self.runtime_handle.clone(),
             create_window_cb: Arc::clone(&self.create_window_cb),
+            frame_count: Arc::clone(&self.frame_count),
+            fps_window_start: Arc::clone(&self.fps_window_start),
+            last_fps: Arc::clone(&self.last_fps),
         }
     }
 }
@@ -1407,6 +1446,28 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+/// Real resident-set size of this process in MB, read from
+/// `/proc/self/status`'s `VmRSS` line — the same value `ps`/`top` show.
+/// Replaces a previously hardcoded `256` in `get_rendering_status`. Falls
+/// back to 0 (rather than a fake constant) if `/proc` isn't readable, so a
+/// genuine failure is visibly "0", not silently indistinguishable from a
+/// real small-but-nonzero reading.
+fn current_process_rss_mb() -> u32 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            if let Some(kb_str) = rest.trim().split_whitespace().next() {
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    return (kb / 1024) as u32;
+                }
+            }
+        }
+    }
+    0
 }
 
 // ============================================================================

@@ -57,8 +57,13 @@ Thumbs.db
 *.dylib
 *.dll
 /build-logs/
+/target/
+target/
 
 # Documentation
 /docs/build/
+/docs/internal
 *.pdf
 boot/initramfs/initramfs-init
+*claude*
+*CLAUDE*

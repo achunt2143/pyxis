@@ -38,6 +38,23 @@ pub struct IPCBus {
     active_connections: Arc<DashMap<String, BusConnection>>,
     message_handlers: Arc<DashMap<String, Arc<HandlerFn>>>,
     connection_senders: Arc<DashMap<String, mpsc::Sender<ForwardRequest>>>,
+    // REAL GAP, found via a real report (2026-07-07): SignalBus::broadcast()
+    // (signals.rs) only invokes IN-PROCESS Rust callback subscribers
+    // (services statically linked into this same daemon binary, e.g. Evo's
+    // own nova-lifecycle subscription) -- it never writes anything to a
+    // remote socket client's connection at all. That left every JS bridge
+    // client (PyxisBridgeParent.sys.mjs's EchoConnection) with no way to
+    // ever receive a signal over the wire, even after correctly completing
+    // a method call (e.g. terminal.Open) and registering a subscription --
+    // confirmed by adding parent-side diagnostics and observing the
+    // subscription registered fine, but the signal-dispatch function was
+    // never even called, because nothing was pushing the SIGNAL message
+    // back out over any socket. `broadcast_senders` is a parallel,
+    // fire-and-forget analogue of `connection_senders` (which is a
+    // request/response mechanism via `ForwardRequest`'s mandatory
+    // `response_tx` -- signals have no reply, so reusing that would leak a
+    // pending_replies entry per signal with nothing to ever resolve it).
+    broadcast_senders: Arc<DashMap<String, mpsc::Sender<Message>>>,
     external_services: Arc<DashMap<String, String>>,
 }
 
@@ -94,6 +111,7 @@ impl IPCBus {
             message_handlers: Arc::new(DashMap::new()),
             external_services: Arc::new(DashMap::new()),
             connection_senders: Arc::new(DashMap::new()),
+            broadcast_senders: Arc::new(DashMap::new()),
         };
 
         tracing::info!("IPC Bus initialized successfully");
@@ -176,10 +194,31 @@ impl IPCBus {
         self.connection_senders.insert(id, tx);
     }
 
+    /// Register a fire-and-forget sender for a connection, used to push
+    /// SIGNAL messages out over that connection's socket (see this file's
+    /// `broadcast_senders` field doc comment for why this is separate from
+    /// `connection_senders`/`ForwardRequest`).
+    pub fn add_broadcast_sender(&self, id: String, tx: mpsc::Sender<Message>) {
+        self.broadcast_senders.insert(id, tx);
+    }
+
     pub fn remove_connection(&self, id: &str) {
         self.active_connections.remove(id);
         self.connection_senders.remove(id);
+        self.broadcast_senders.remove(id);
         self.external_services.retain(|_, conn_id| conn_id != id);
+    }
+
+    /// Pushes `message` out over every currently-connected socket client
+    /// (fire-and-forget, no reply expected) -- the real wire-level signal
+    /// delivery `SignalBus::broadcast()` alone does not provide. A send
+    /// failure just means that connection's task has already exited/is
+    /// backed up; harmless to ignore since `remove_connection` handles
+    /// actual cleanup when a connection closes.
+    pub async fn broadcast_to_all_connections(&self, message: &Message) {
+        for entry in self.broadcast_senders.iter() {
+            let _ = entry.value().send(message.clone()).await;
+        }
     }
 
     /// Forwarding logic: sends a request to the target connection's task
@@ -251,7 +290,15 @@ impl IPCBus {
     ) -> Result<()> {
         tracing::debug!("Emitting signal: {}.{}", interface, signal_name);
         let message = Message::signal(interface, signal_name, data)?;
-        self.signal_bus.broadcast(message).await?;
+        self.signal_bus.broadcast(message.clone()).await?;
+        // Real fix (2026-07-07): signal_bus().broadcast() alone only
+        // reaches in-process Rust subscribers -- this is the single
+        // shared entry point every in-process service (Terminal, etc.)
+        // calls to emit a signal, so this is where remote socket clients
+        // (the JS bridge's EchoConnection, in particular) need to get
+        // pushed the message too. See broadcast_to_all_connections's doc
+        // comment for the full story.
+        self.broadcast_to_all_connections(&message).await;
         Ok(())
     }
 

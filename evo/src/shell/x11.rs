@@ -1,7 +1,7 @@
 use std::{cell::RefCell, os::unix::io::OwnedFd};
 
 use smithay::{
-    desktop::{space::SpaceElement, Window},
+    desktop::{space::{RenderZindex, SpaceElement}, Window},
     input::pointer::Focus,
     utils::{Logical, Rectangle, SERIAL_COUNTER},
     wayland::{
@@ -29,21 +29,9 @@ use tracing::{error, trace};
 use crate::{focus::KeyboardFocusTarget, state::Backend, EvoState};
 
 use super::{
-    place_new_window, FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData,
-    ResizeState, SurfaceData, TouchMoveSurfaceGrab, WindowElement,
+    place_new_window, FullscreenSurface, OldGeometry, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab,
+    ResizeData, ResizeState, SurfaceData, TouchMoveSurfaceGrab, WindowElement,
 };
-
-#[derive(Debug, Default)]
-struct OldGeometry(RefCell<Option<Rectangle<i32, Logical>>>);
-impl OldGeometry {
-    pub fn save(&self, geo: Rectangle<i32, Logical>) {
-        *self.0.borrow_mut() = Some(geo);
-    }
-
-    pub fn restore(&self) -> Option<Rectangle<i32, Logical>> {
-        self.0.borrow_mut().take()
-    }
-}
 
 impl<BackendData: Backend> XWaylandShellHandler for EvoState<BackendData> {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
@@ -73,7 +61,22 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
         let location = window.geometry().loc;
-        let window = WindowElement(Window::new_x11_window(window));
+        let window = Window::new_x11_window(window);
+        // Real root cause of the "override-redirect ordering" gap (found via
+        // Smithay source, not guessed): `Window::new_x11_window` always
+        // initializes its z-index to `RenderZindex::Shell` regardless of
+        // override-redirect status — the underlying `X11Surface`'s own
+        // `SpaceElement::z_index()` impl DOES correctly return `Overlay` for
+        // override-redirect surfaces, but that impl is never actually
+        // consulted once wrapped in the generic `Window`, which stores its
+        // own independent z-index field instead of delegating. Override it
+        // explicitly so menus/tooltips/drag icons (what override-redirect
+        // actually means in X11 — never regular app windows) render above
+        // the normal shell stack instead of competing with it on raw
+        // insertion order, which is what caused "always mapped top, no
+        // regard for order relative to sibling shell windows."
+        window.override_z_index(RenderZindex::Overlay as u8);
+        let window = WindowElement(window);
         self.space.map_element(window, location, true);
     }
 
@@ -130,8 +133,21 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
             return;
         };
         self.space.map_element(elem, geometry.loc, false);
-        // TODO: We don't properly handle the order of override-redirect windows here,
-        //       they are always mapped top and then never reordered.
+        // The class-level ordering bug this used to describe (override-
+        // redirect windows sharing the same z-index tier as regular shell
+        // windows, so a plain app re-map could bury a menu/tooltip) is fixed
+        // by `mapped_override_redirect_window`'s `override_z_index` call —
+        // override-redirect windows now always sort into `RenderZindex::
+        // Overlay`, above every regular shell window regardless of map
+        // order. What's still not implemented is precise *relative* order
+        // among MULTIPLE simultaneous override-redirect siblings via the
+        // `_above` hint above (Smithay's `Space` only exposes push-to-top
+        // insertion within a z-index tier, not "insert directly above a
+        // named sibling") — in practice this call already re-inserts `elem`
+        // at the top of the Overlay tier on every reconfigure, so the most-
+        // recently-configured override-redirect window wins ties, which
+        // covers the common single-popup case even without honoring `_above`
+        // exactly.
     }
 
     fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -139,24 +155,7 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
     }
 
     fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        let Some(elem) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-            .cloned()
-        else {
-            return;
-        };
-
-        window.set_maximized(false).unwrap();
-        if let Some(old_geo) = window
-            .user_data()
-            .get::<OldGeometry>()
-            .and_then(|data| data.restore())
-        {
-            window.configure(old_geo).unwrap();
-            self.space.map_element(elem, old_geo.loc, false);
-        }
+        self.unmaximize_request_x11(&window);
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -347,6 +346,31 @@ impl<BackendData: Backend> EvoState<BackendData> {
         window.user_data().insert_if_missing(OldGeometry::default);
         window.user_data().get::<OldGeometry>().unwrap().save(old_geo);
         self.space.map_element(elem, geometry.loc, false);
+    }
+
+    /// Restores a window maximized via `maximize_request_x11` back to its
+    /// pre-maximize geometry. Used both by the client-requested XWM path
+    /// (`XwmHandler::unmaximize_request`) and by the SSD maximize button
+    /// toggling itself off.
+    pub fn unmaximize_request_x11(&mut self, window: &X11Surface) {
+        let Some(elem) = self
+            .space
+            .elements()
+            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window))
+            .cloned()
+        else {
+            return;
+        };
+
+        window.set_maximized(false).unwrap();
+        if let Some(old_geo) = window
+            .user_data()
+            .get::<OldGeometry>()
+            .and_then(|data| data.restore())
+        {
+            window.configure(old_geo).unwrap();
+            self.space.map_element(elem, old_geo.loc, false);
+        }
     }
 
     pub fn move_request_x11(&mut self, window: &X11Surface) {

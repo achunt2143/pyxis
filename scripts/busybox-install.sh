@@ -82,6 +82,14 @@ main() {
   # sysfs support (required by mdev -s)
   enable_config CONFIG_FEATURE_SYSFS     .config
 
+  # httpd — minimal static file server, used to serve Bloom's built dist/
+  # (started as "pyxis-static-server" from geckoOS-boot in create-rootfs.sh)
+  # until the real vela/Gecko kiosk build exists. defconfig usually
+  # enables this already; force it so we don't silently lose it if upstream
+  # defaults change.
+  enable_config CONFIG_HTTPD              .config
+  enable_config CONFIG_FEATURE_HTTPD_RANGES .config
+
   # Disable broken tc applet
   if grep -q '^CONFIG_TC=' .config; then
     sed -i 's/^CONFIG_TC=.*/CONFIG_TC=n/' .config
@@ -97,24 +105,41 @@ main() {
   make oldconfig < /dev/null
   make -j"$(nproc)"
 
-  # Install with sudo into rootfs
-  sudo mkdir -p "$ROOTFS_DIR"/{bin,sbin,usr/bin,usr/sbin}
-  sudo make CONFIG_PREFIX="$ROOTFS_DIR" install
-
-  sudo rm -f "$ROOTFS_DIR/linuxrc"
-  sudo ln -sf /bin/busybox "$ROOTFS_DIR/sbin/init"
-
-  if file "$ROOTFS_DIR/bin/busybox" | grep -q "statically linked"; then
-    size=$(du -h "$ROOTFS_DIR/bin/busybox" | cut -f1)
-    log_success "BusyBox installed statically ($size)"
+  # Deliberately NOT running `make CONFIG_PREFIX="$ROOTFS_DIR" install`
+  # here (found as a real, active bug via a real boot: "/usr/bin/setpriv:
+  # unrecognized option '--reuid=1000'" -- launch broke because `setpriv`
+  # resolved to BusyBox's own minimal applet instead of the real
+  # util-linux binary). BusyBox's `make install` unconditionally symlinks
+  # EVERY enabled applet -- including `setpriv`, `mount`, `login`, etc. --
+  # directly over whatever already exists at that path in $ROOTFS_DIR, with
+  # no awareness of (or respect for) files a Debian package already owns
+  # there. `create-rootfs.sh`'s own `stage_busybox_init` comment already
+  # warned about exactly this danger, which is why THAT stage only ever
+  # copies the single compiled binary to /bin/busybox + symlinks
+  # /sbin/init -- this script used to run its own conflicting `make
+  # install` into the SAME shared $ROOTFS_DIR on top of that, and whether
+  # it clobbers the real util-linux setpriv/mount/etc. depends entirely on
+  # ordering: harmless if this runs before `stage_install_base_packages`
+  # apt-installs util-linux (dpkg overwrites busybox's symlink back), but
+  # a real regression if this ever runs again afterward (e.g. busybox
+  # rebuilt after the rootfs already has real Debian utilities installed)
+  # -- exactly what happened here. The fix is to never install applets
+  # into the shared rootfs from this script at all; `stage_busybox_init`
+  # is the only place that should ever touch $ROOTFS_DIR for BusyBox, and
+  # it already does so surgically.
+  local built_bin="${BUSYBOX_BUILD}/busybox/busybox"
+  if file "$built_bin" | grep -q "statically linked"; then
+    size=$(du -h "$built_bin" | cut -f1)
+    log_success "BusyBox built statically ($size) at $built_bin"
   else
     log_error "BusyBox is not statically linked"
     exit 1
   fi
 
-  # Verify critical applets are present
-  for applet in blkid mdev; do
-    if "$ROOTFS_DIR/bin/busybox" --list 2>/dev/null | grep -q "^${applet}$"; then
+  # Verify critical applets are present in the BUILT binary (not a rootfs
+  # copy -- this script no longer installs anything into $ROOTFS_DIR).
+  for applet in blkid mdev httpd; do
+    if "$built_bin" --list 2>/dev/null | grep -q "^${applet}$"; then
       log_success "Applet present: ${applet}"
     else
       log_error "MISSING applet after build: ${applet} — check .config"

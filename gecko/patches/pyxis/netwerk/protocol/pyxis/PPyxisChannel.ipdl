@@ -1,0 +1,149 @@
+/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+/* vim: set sw=2 ts=8 et tw=80 ft=cpp : */
+
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+// DESIGN NOTE (Pyxis, 2026-07-05): this is the IPDL leg described in
+// PyxisChannel.h/.cpp's "STILL NOT SOLVED HERE" notices (see the large
+// comment blocks there for full background). Filling in the previously
+// commented-out `if (XRE_IsContentProcess())` branch in
+// PyxisChannel::OpenContentStream (and BeginAsyncRead -- see PyxisChannel.h)
+// required deciding where this protocol should be managed. Two real
+// precedents were read in full before choosing:
+//
+//  - netwerk/protocol/gio/PGIOChannel.ipdl: `manager PNecko`, a full
+//    remoted-nsIChildChannel actor (OnStartRequest/OnDataAvailable/
+//    OnStopRequest all forwarded over IPC, listener-diversion machinery,
+//    etc). This is the right shape when the *entire* channel needs to be a
+//    remote proxy of a parent-side channel (redirects, upload streams,
+//    suspend/resume across the wire, ...). PyxisChannel doesn't need any of
+//    that -- it's a single nsBaseChannel::OpenContentStream/BeginAsyncRead
+//    call that wants one stream back for one already-fully-specified
+//    request. Modeling it as a full remoted channel actor would duplicate a
+//    lot of machinery for no benefit.
+//  - netwerk/protocol/res/ExtensionProtocolHandler.{h,cpp}'s
+//    SubstituteRemoteFileChannel/NewFD + the PNecko-level
+//    GetExtensionStream/GetExtensionFD request/reply methods (see
+//    netwerk/ipc/PNecko.ipdl, netwerk/ipc/NeckoParent.cpp
+//    RecvGetExtensionStream/RecvGetExtensionFD): a single async
+//    "resolve+open, hand back a stream (or FD)" request/reply pair. This is
+//    the actually-matching shape for Pyxis. The one thing NOT copied
+//    verbatim from this precedent is *where* the methods live: moz-extension
+//    added them directly to the shared netwerk/ipc/PNecko.ipdl (and
+//    NeckoParent/NeckoChild), which was reasonable there (moz-extension:'s
+//    handler is core Necko) but would mean editing shared NeckoParent.h/.cpp
+//    + NeckoChild.h/.cpp for Pyxis, a much wider blast radius than this
+//    feature needs and explicitly out of scope per this task's constraints
+//    (kept to PyxisChannel.{h,cpp}, this new IPDL/actor code, and moz.build).
+//
+// The chosen middle ground: a small, Pyxis-owned protocol, `manager
+// PBackground` instead of `manager PNecko`. PBackground is the standard,
+// already-real mechanism for "a content process needs to ask the parent for
+// some self-contained async service" without hanging anything off PContent
+// or PNecko's per-tab/per-channel actor trees -- see e.g.
+// dom/locks/PLockManager.ipdl (`manager PBackground`, parent-side `Query()
+// returns (...)`, constructor takes real args) and
+// netwerk/protocol/http/PHttpBackgroundChannel.ipdl (same `manager
+// PBackground` pattern, and notably ALSO namespace mozilla::net, i.e. a
+// netwerk-owned protocol reusing the PBackground manager rather than
+// PNecko). Adding a PBackground managee is still a small, unavoidable touch
+// to shared files (ipc/glue/PBackground.ipdl's `include protocol
+// PPyxisChannel;`/`manages PPyxisChannel;`/`async PPyxisChannel();` trio, and
+// ipc/glue/BackgroundParentImpl.h/.cpp's Alloc/Recv overrides) -- there is no
+// way to add ANY new manageable top-level-reachable protocol without
+// registering it with *some* manager -- but it is meaningfully smaller than
+// PNecko's channel-actor boilerplate (no Dealloc override needed here since
+// this protocol doesn't request [ManualDealloc]; IPDL generates the trivial
+// default) and does not touch NeckoParent/NeckoChild at all.
+//
+// Shape of the actual request: PyxisChannelChild is constructed (one per
+// PyxisChannel::BeginAsyncRead call, i.e. one per content-process pyxis://
+// load) and immediately sends GetContent(appId, path); the parent-side
+// PyxisChannelParent (see PyxisChannelParent.h/.cpp) does the real
+// PyxisOriginMap::Resolve + path confinement + open (via the shared
+// PyxisChannelUtils, factored out of PyxisChannel.cpp specifically so this
+// parent-side actor and the parent-process-direct PyxisChannel::
+// OpenContentStream path share one implementation) and replies with either a
+// stream + metadata or a failure nsresult. nsIInputStream is used directly
+// (not wrapped in IPCStream) per ipc/glue/IPCStream.ipdlh's own comment:
+// "If you don't need to handle nsIInputStream serialization failure,
+// nsIInputStream may be used directly by IPDL protocols" -- Pyxis doesn't
+// need the extra Maybe<IPCStream>-style failure handling IPCStream exists
+// for, since a resolve/open failure is already communicated via the
+// `nsresult status` half of the tuple; nsIInputStream here is only ever
+// meaningful when status is NS_OK. This exactly matches how PNecko's own
+// `returns (nullable nsIInputStream stream)` for GetExtensionStream is
+// declared.
+
+include protocol PBackground;
+
+// Re-declaration of the same `using` already present in
+// netwerk/ipc/PNecko.ipdl (and dom/ipc/DOMTypes.ipdlh) -- confirmed safe/
+// intentional by reading ipc/ipdl/ipdl/type.py's visitUsingStmt: a `using`
+// for a type already declared elsewhere is accepted (and reuses the existing
+// symbol) as long as the [RefCounted]/[MoveOnly] attributes match exactly,
+// which they do here. Each standalone top-level .ipdl file that references
+// nsIInputStream directly needs its own `using` line; there's no implicit
+// visibility from PNecko.ipdl just because both end up compiled into the
+// same binary.
+[RefCounted] using class nsIInputStream from "mozilla/ipc/IPCStreamUtils.h";
+
+namespace mozilla {
+namespace net {
+
+// No [ChildImpl=virtual]/[ParentImpl=virtual] here, matching the other
+// PBackground-managed protocols with hand-written final actor classes (e.g.
+// dom/locks/PLockManager.ipdl) rather than PNecko's channel-actor style
+// (e.g. netwerk/protocol/gio/PGIOChannel.ipdl, netwerk/ipc/PFileChannel.ipdl)
+// which do use it. PyxisChannelChild/PyxisChannelParent below are final
+// classes directly implementing the generated PPyxisChannelChild/
+// PPyxisChannelParent base, not virtual-dispatch shims over a separate impl
+// class, so the attribute isn't needed.
+async protocol PPyxisChannel
+{
+  manager PBackground;
+
+parent:
+  // aAppId/aPath are the pyxis:// URI's raw host and filePath components
+  // (filePath still has its leading '/' at this point) -- see
+  // PyxisChannelChild::StartRequest for exactly how they're extracted from
+  // the URI. The leading-slash-stripping (and all other confinement logic)
+  // happens once, on the parent side, inside
+  // PyxisChannelUtils::ResolveAndConfinePath -- exactly the same code
+  // PyxisChannel::OpenContentStream's parent-direct path calls, per this
+  // file's design note above.
+  //
+  // On success: aStatus == NS_OK, aStream is a valid, unread input stream
+  // positioned at the start of the file, aMimeType is the inferred
+  // Content-Type, aContentLength is the file size in bytes.
+  //
+  // On failure (unknown app-id, path escapes webroot, file missing, I/O
+  // error, ...): aStatus is the specific failure code (matching exactly what
+  // PyxisChannel::OpenContentStream would have returned for the same
+  // request in the parent-direct path -- see PyxisChannelUtils.h), aStream
+  // is null, aMimeType/aContentLength are unspecified and must be ignored.
+  //
+  // CORRECTION (2026-07-05, found via a real failed build, not by
+  // inspection): aStream must be declared `nullable` -- without it, IPDL
+  // codegen wraps a `[RefCounted] using`-declared refcounted type in
+  // NotNull<> on both the resolver-construction side (parent:
+  // NotNull<nsIInputStream*>) and the deserialization side (child:
+  // NotNull<RefPtr<nsIInputStream>>), which cannot represent the "no
+  // stream, this request failed" case a plain nullptr/null RefPtr needs to
+  // express. Confirmed against the real precedent this design is modeled
+  // on: netwerk/ipc/PNecko.ipdl's `GetExtensionStream(nullable nsIURI uri)
+  // returns (nullable nsIInputStream stream)` -- its child-side consumer
+  // (ExtensionProtocolHandler.cpp) resolves it as a plain `const
+  // RefPtr<nsIInputStream>&`, never NotNull-wrapped, precisely because of
+  // this keyword.
+  async GetContent(nsCString aAppId, nsCString aPath)
+      returns (nsresult aStatus, nullable nsIInputStream aStream,
+               nsCString aMimeType, int64_t aContentLength);
+
+  async __delete__();
+};
+
+}  // namespace net
+}  // namespace mozilla

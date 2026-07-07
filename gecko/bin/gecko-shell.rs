@@ -1,94 +1,129 @@
-// GeckoOS Window Manager Daemon
-// File: geckoOS/bin/geckoOS-daemon.rs
-// Purpose: System daemon for window management
-// Managed by systemd - handles restarts, signal handling, lifecycle
+// gecko/bin/gecko-shell.rs
+//
+// Dev-time CLI for gecko::compose_launch (see gecko/src/gecko.rs's doc
+// comment for the full "why this crate no longer embeds libxul" rationale).
+//
+// REPURPOSED (2026-07-04): previously a near-total stub daemon ("logs ready
+// and idles; all real logic commented out", per this session's brief) that
+// pretended to initialize a "Gecko Window Manager" against the old
+// libxul-FFI GeckoInstance API. That API no longer exists (see gecko.rs).
+// This binary's new job: let a developer exercise the vela
+// launch-composition logic from a terminal, standing in for what Nova will
+// eventually do internally once nova/ is built
+// (nova-runtime-host-plan.md). It does NOT spawn vela itself in
+// this pass — Nova/appHost own actual process spawning
+// (echo/src/services/apphost.rs already does real spawn+supervise+reap);
+// this tool only prints/validates the composed command so the composition
+// logic is checkable standalone before Nova exists to call it for real.
+//
+// Usage:
+//   gecko-shell compose --app-id com.pyxis.app.files --entry index.html
+//   gecko-shell compose --app-id com.pyxis.app.files --entry index.html --exec-only
+//
+// Requires WAYLAND_DISPLAY to be set (see LaunchEnvironment::from_ambient_env
+// in gecko.rs) — run this from inside an active Evo/Wayland session, or set
+// WAYLAND_DISPLAY manually for a dry run against a not-yet-running
+// compositor (compose_launch does not verify the socket is live, only that
+// the env var is set).
 
-use anyhow::Result;
-// use signal_hook::consts::signal::*;
-// use signal_hook::iterator::Signals;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::time::Duration;
-use tracing::{info, error, warn};
+use anyhow::{Context, Result};
+use geckoOS_gecko_integration::{compose_launch, DisplayMode, LaunchEnvironment, WebAppLaunchSpec};
+use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging
+struct Args {
+    app_id: String,
+    entry: String,
+    display: DisplayMode,
+    background: bool,
+    exec_only: bool,
+}
+
+fn parse_args() -> Result<Args> {
+    let mut app_id = None;
+    let mut entry = "index.html".to_string();
+    let mut display = DisplayMode::Windowed;
+    let mut background = false;
+    let mut exec_only = false;
+
+    let mut argv = std::env::args().skip(1); // skip argv[0]
+    let subcommand = argv.next();
+    if subcommand.as_deref() != Some("compose") {
+        anyhow::bail!(
+            "usage: gecko-shell compose --app-id <id> [--entry <path>] \
+             [--display windowed|maximized|fullscreen] [--background] [--exec-only]"
+        );
+    }
+
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "--app-id" => {
+                app_id = Some(argv.next().context("--app-id needs a value")?);
+            }
+            "--entry" => {
+                entry = argv.next().context("--entry needs a value")?;
+            }
+            "--display" => {
+                let v = argv.next().context("--display needs a value")?;
+                display = match v.as_str() {
+                    "windowed" => DisplayMode::Windowed,
+                    "maximized" => DisplayMode::Maximized,
+                    "fullscreen" => DisplayMode::Fullscreen,
+                    other => anyhow::bail!("unknown --display value: {other}"),
+                };
+            }
+            "--background" => background = true,
+            "--exec-only" => exec_only = true,
+            other => anyhow::bail!("unknown argument: {other}"),
+        }
+    }
+
+    Ok(Args {
+        app_id: app_id.context("--app-id is required")?,
+        entry,
+        display,
+        background,
+        exec_only,
+    })
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    info!("=== GeckoOS Daemon Starting ===");
+    let args = parse_args()?;
 
-    let running = Arc::new(AtomicBool::new(true));
-    let running_signal = running.clone();
+    let spec = WebAppLaunchSpec {
+        app_id: args.app_id,
+        entry: args.entry,
+        display: args.display,
+        background: args.background,
+    };
 
-    // // Set up signal handling for graceful shutdown
-    // std::thread::spawn(move || {
-    //     match Signals::new(&[SIGTERM, SIGINT]) {
-    //         Ok(mut signals) => {
-    //             for sig in signals.forever() {
-    //                 match sig {
-    //                     SIGTERM => {
-    //                         info!("Received SIGTERM - shutting down gracefully");
-    //                         running_signal.store(false, Ordering::Relaxed);
-    //                     }
-    //                     SIGINT => {
-    //                         info!("Received SIGINT - shutting down gracefully");
-    //                         running_signal.store(false, Ordering::Relaxed);
-    //                     }
-    //                     _ => {}
-    //                 }
-    //             }
-    //         }
-    //         Err(e) => {
-    //             error!("Failed to set up signal handling: {}", e);
-    //         }
-    //     }
-    // });
+    let env = LaunchEnvironment::from_ambient_env()
+        .context("failed to build LaunchEnvironment from ambient environment")?;
 
-    // Initialize Gecko Window Manager
-    info!("Initializing Gecko Window Manager...");
-    
-    let wayland_socket = std::env::var("WAYLAND_DISPLAY")
-        .unwrap_or_else(|_| "wayland-0".to_string());
-    
-    let socket_path = format!("/run/user/{}",
-        // unsafe { libc::getuid() },
-        wayland_socket
-    );
+    info!("Composing vela launch for app_id={}", spec.app_id);
+    let composed = compose_launch(&spec, &env)?;
 
-    info!("Connecting to Wayland compositor: {}", socket_path);
+    if args.exec_only {
+        // Print a copy-pasteable shell command, e.g. for manually running
+        // the composed launch under `strace`/`gdb` during Phase 0/1
+        // bring-up (pyxis-gecko-embedding-plan.md §7's build-spike phase).
+        let env_prefix: Vec<String> = composed
+            .env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        println!(
+            "{} {} {}",
+            env_prefix.join(" "),
+            composed.exec,
+            composed.args.join(" ")
+        );
+    } else {
+        println!("{}", serde_json::to_string_pretty(&composed)?);
+    }
 
-    // let gecko = match  geckoOS_gecko_integration::initialize(&socket_path).await {
-    //     Ok(wm) => {
-    //         info!("✓ Gecko Window Manager initialized");
-    //         wm
-    //     }
-    //     Err(e) => {
-    //         error!("Failed to initialize Gecko: {}", e);
-    //         error!("Make sure OURANOS compositor is running");
-    //         std::process::exit(1);
-    //     }
-    // };
-
-    // Register signal handlers for window events
-    // (In production, these would receive events from compositor)
-    info!("Gecko Window Manager ready to accept connections");
-
-    // Keep daemon alive, checking for shutdown signal
-    // let mut check_interval = tokio::time::interval(Duration::from_secs(1));
-
-    // while running.load(Ordering::Relaxed) {
-    //     check_interval.tick().await;
-
-    //     // Optional: Log active windows periodically for debugging
-    //     // let windows = gecko.list_windows();
-    //     // if !windows.is_empty() {
-    //     //     tracing::trace!("Active windows: {}", windows.len());
-    //     // }
-    // }
-
-    info!("=== GeckoOS Daemon Shutting Down ===");
     Ok(())
 }

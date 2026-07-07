@@ -1,0 +1,298 @@
+This IS a real, verified unified diff (generated with `git diff` in the
+gitignored target/gecko-src/gecko-dev checkout, branch central-work @
+5836a062726f715fda621338a17b51aff30d0a8c) against the upstream file
+browser/components/BrowserContentHandler.sys.mjs — apply with `git apply`
+or `patch -p1` from the checkout root. Syntax-checked with `node --check`.
+
+Implements pyxis-scheme-and-kiosk-plan.md Part B1 points 1-3 (recognize
+`--pyxis-app=<id>`, read PYXIS_APP_ID/PYXIS_DISPLAY_MODE/PYXIS_BACKGROUND
+per gecko/src/gecko.rs's compose_launch contract, open a chromeless kiosk
+window). See gecko/BUILD_RUNBOOK.md's dated 2026-07-05 kiosk-mode section
+for the full design rationale and what is/isn't verified.
+
+UPDATE (2026-07-06, found via a real failed boot, not by inspection): the
+flag was originally named plain `--app`. That collides with a flag Gecko's
+OWN native startup code already recognizes for a completely different,
+pre-existing purpose — browser/app/nsBrowserApp.cpp:167 does
+`argc > 1 && IsArg(argv[1], "app")`; if argv[1] is `-app`/`--app`, it treats
+argv[2] as a PATH TO AN ALTERNATE application.ini file (an
+embedding/XULRunner-style feature), entirely BEFORE XPCOM/JS
+initializes — this JS handler never even runs. Invoking
+`pyxis-webapp --app testapp` printed "Error: unrecognized path: testapp"
+(toolkit/xre/nsAppRunner.cpp:5975) and exited immediately. Renamed to
+`--pyxis-app` here (and in gecko/src/gecko.rs's compose_launch and
+scripts/create-rootfs.sh's boot invocation) to stop colliding with argv[1]
+position-sensitive native parsing. The diff below already reflects this
+corrected name throughout (flag parsing, --help text, doc comments) — this
+is the current, post-correction state of the file, not the original
+kiosk-mode pass.
+
+diff --git a/browser/components/BrowserContentHandler.sys.mjs b/browser/components/BrowserContentHandler.sys.mjs
+index daaa2dae0015..5f157acb2202 100644
+--- a/browser/components/BrowserContentHandler.sys.mjs
++++ b/browser/components/BrowserContentHandler.sys.mjs
+@@ -101,6 +101,15 @@ let gMajorUpgrade = false;
+ let gFirstRunProfile = false;
+ var gFirstWindow = false;
+
++// PYXIS: set once `--app`/`-app` has been recognized on the command line, so
++// other code in this file (and callers of BrowserHandler) can tell a
++// pyxis-webapp kiosk launch apart from a normal browser launch. Mirrors the
++// existing `gKiosk`/`BrowserHandler.kiosk` pattern immediately above.
++// See pyxis-scheme-and-kiosk-plan.md Part B and gecko/src/gecko.rs's
++// `compose_launch` for the env-var contract this reads
++// (PYXIS_APP_ID/PYXIS_DISPLAY_MODE/PYXIS_BACKGROUND).
++let gPyxisAppId = null;
++
+ const OVERRIDE_NONE = 0;
+ const OVERRIDE_NEW_PROFILE = 1;
+ const OVERRIDE_NEW_MSTONE = 2;
+@@ -363,6 +372,110 @@ function openBrowserWindow(
+   });
+ }
+
++// PYXIS: window-features string for a `pyxis-webapp --app=<id>` kiosk
++// window. Modeled directly on
++// browser/components/taskbartabs/TaskbarTabsWindowManager.sys.mjs's
++// `kTaskbarTabsWindowFeatures` (the real, shipping precedent for a
++// single-site chromeless-ish browser window in this tree), but goes
++// further: TaskbarTabs keeps `toolbar`/`location` on (it wants a read-only
++// URL bar for user trust/anti-spoofing) and only turns off
++// `personalbar`/`menubar`. A pyxis-webapp kiosk window has no address bar
++// at all, so `toolbar`/`location` are also off here. `all=false` is passed
++// to BrowserWindowTracker.openWindow (see its `all` param a few files
++// up this call chain) so none of the "all" chrome bits get OR'd back in -
++// same reason TaskbarTabsWindowManager passes `all: false`.
++//
++// Turning off toolbar/location/menubar/personalbar/status here means
++// AppWindow::ApplyChromeFlags (xpfe/appshell/AppWindow.cpp) computes a
++// `chromehidden="menubar toolbar location directories status extrachrome"`
++// attribute on the root <html> element of browser.xhtml. VERIFIED (not
++// assumed) real, generic (non-Windows-specific, non-TaskbarTabs-specific)
++// CSS this drives, in toolkit/themes/shared/global-shared.css:180-188:
++//   :root[chromehidden~="menubar"] .chromeclass-menubar,
++//   :root[chromehidden~="directories"] .chromeclass-directories,
++//   :root[chromehidden~="status"] .chromeclass-status,
++//   :root[chromehidden~="extrachrome"] .chromeclass-extrachrome,
++//   :root[chromehidden~="location"] .chromeclass-location,
++//   :root[chromehidden~="location"][chromehidden~="toolbar"] .chromeclass-toolbar,
++//   :root[chromehidden~="toolbar"] .chromeclass-toolbar-additional { display: none; }
++// #nav-bar carries class="browser-toolbar chromeclass-location" and
++// #PersonalToolbar carries class="...chromeclass-directories" (see
++// browser/base/content/navigator-toolbox.inc.xhtml) - so with both
++// "location" and "toolbar" in chromehidden, #nav-bar (the URL bar /
++// hamburger-menu toolbar) and #PersonalToolbar (bookmarks toolbar) are
++// display:none. The menu bar is hidden the same way via chromeclass-menubar.
++// #TabsToolbar (the tab strip) does NOT carry a chromeclass-* class - it is
++// hidden separately, by `window.toolbar.visible === false` (from
++// `toolbar=no` above) making TabBarVisibility.update()
++// (browser/components/tabbrowser/content/tabbrowser.js) treat this window
++// as popup-like and toggle #navigator-toolbox's `tabs-hidden` attribute,
++// which IS the mechanism the (real, shipping) TaskbarTabs feature also
++// relies on for its own single-tab windows - see
++// TaskbarTabsUtils.isTaskbarTabWindow()/TabBarVisibility.update()'s
++// `isTaskbarTab` check. Net effect, verified against real CSS/JS rather
++// than assumed: a window showing only page content - no tabs, no URL bar,
++// no menu bar, no bookmarks toolbar.
++const kPyxisAppWindowFeatures =
++  "titlebar,close,toolbar=no,location=no,personalbar=no,status=no," +
++  "menubar=no,resizable,minimizable,scrollbars";
++
++/**
++ * PYXIS: open a chromeless `pyxis-webapp --app=<id>` kiosk window.
++ *
++ * Real precedent this adapts: `TaskbarTabsWindowManager.openWindow()` in
++ * browser/components/taskbartabs/TaskbarTabsWindowManager.sys.mjs (stamps a
++ * `taskbartab` id onto an nsIWritablePropertyBag2 "extra options" argument,
++ * then calls `BrowserWindowTracker.promiseOpenWindow`). This function does
++ * the same shape of thing for a `pyxisApp` key instead, which
++ * browser-init.js's `onBeforeInitialXULLayout()` reads (see the matching
++ * PYXIS block added next to its existing `taskbartab` handling) to stamp
++ * `windowclass`/`windowname`/`pyxisapp` attributes onto the root element
++ * BEFORE first layout - i.e. before AppWindow::SyncAttributesToWidget()
++ * (xpfe/appshell/AppWindow.cpp) reads `windowclass`/`windowname` and calls
++ * nsWindow::SetWindowClass(), which is what actually stamps WM_CLASS /
++ * the Wayland xdg-toplevel app_id (widget/gtk/nsWindow.cpp,
++ * RefreshWindowClass()).
++ *
++ * @param {nsICommandLine} cmdLine
++ * @param {string} appId - PYXIS_APP_ID; also the pyxis:// origin host.
++ * @param {string} entry - path portion resolved against pyxis://<appId>/.
++ * @returns {Promise<ChromeWindow>}
++ */
++function openPyxisAppWindow(cmdLine, appId, entry) {
++  // pyxis:// URIs are only resolvable once the PyxisProtocolHandler /
++  // PyxisOriginMap (netwerk/protocol/pyxis/, owned by a parallel
++  // workstream - not touched here) can map `appId` to a real webroot. This
++  // module doesn't depend on that component; it only needs to be able to
++  // build the URI string, which nsIStandardURL-backed schemes support
++  // without the handler having resolved anything yet (resolution happens
++  // at channel-open/navigation time, not URI-construction time).
++  let url = `pyxis://${appId}/${entry.replace(/^\/+/, "")}`;
++
++  let urlString = Cc["@mozilla.org/supports-string;1"].createInstance(
++    Ci.nsISupportsString
++  );
++  urlString.data = url;
++
++  // Stamp PYXIS_APP_ID onto the window via an extraOptions property bag,
++  // exactly like TaskbarTabsWindowManager.openWindow() stamps `taskbartab`
++  // (see kTaskbarTabsWindowFeatures's sibling code for the real precedent).
++  let extraOptions = Cc["@mozilla.org/hash-property-bag;1"].createInstance(
++    Ci.nsIWritablePropertyBag2
++  );
++  extraOptions.setPropertyAsAString("pyxisApp", appId);
++
++  let args = Cc["@mozilla.org/array;1"].createInstance(Ci.nsIMutableArray);
++  args.appendElement(urlString);
++  args.appendElement(extraOptions);
++
++  return lazy.BrowserWindowTracker.promiseOpenWindow({
++    args,
++    features: kPyxisAppWindowFeatures,
++    all: false,
++    private: false,
++  });
++}
++
+ function openPreferences(cmdLine) {
+   openBrowserWindow(cmdLine, lazy.gSystemPrincipal, "about:preferences");
+ }
+@@ -451,6 +564,102 @@ nsBrowserContentHandler.prototype = {
+       gKiosk = true;
+       Glean.browserStartup.kioskMode.set(true);
+     }
++
++    // PYXIS: `--pyxis-app=<id>` / `-pyxis-app <id>` kiosk run mode
++    // (pyxis-scheme-and-kiosk-plan.md Part B).
++    //
++    // CORRECTION (2026-07-06, found via a real failed boot, not by
++    // inspection): this flag was originally named plain `--app`, which
++    // collides with a flag Gecko's OWN native startup code (NOT this JS
++    // handler) already recognizes for a completely different, pre-existing
++    // purpose. browser/app/nsBrowserApp.cpp:167 does
++    // `argc > 1 && IsArg(argv[1], "app")` -- if argv[1] is `-app`/`--app`,
++    // it treats argv[2] as a PATH TO AN ALTERNATE application.ini file (an
++    // embedding/XULRunner-style feature) and calls XRE_GetFileFromPath on
++    // it, entirely BEFORE XPCOM/JS initializes -- this JS handler never
++    // even runs. Invoking `pyxis-webapp --app testapp` therefore printed
++    // "Error: unrecognized path: testapp" (toolkit/xre/nsAppRunner.cpp:5975)
++    // and exited immediately, since "testapp" isn't a valid application.ini
++    // path. Renamed to `--pyxis-app` (and gecko.rs's compose_launch /
++    // scripts/create-rootfs.sh's boot invocation updated to match) to stop
++    // colliding with argv[1] position-sensitive native parsing entirely,
++    // rather than relying on argument ordering to avoid the collision.
++    //
++    // `handleFlagWithParam` treats "--pyxis-app=<id>", "--pyxis-app <id>",
++    // and "-pyxis-app <id>" identically - on Linux/Mac, nsICommandLine.idl's
++    // own doc comment confirms "flags of the form --flag are normalized to
++    // -flag. --flag=param are normalized to the form -flag param" before a
++    // handler ever sees them, so there is no separate single-vs-double-dash
++    // case to handle here.
++    //
++    // The app id is also accepted via the PYXIS_APP_ID environment variable
++    // (set by gecko/src/gecko.rs's `compose_launch` - see
++    // ComposedLaunch::env in that file) so a real Nova/appHost launch,
++    // which execs `pyxis-webapp` with PYXIS_APP_ID/PYXIS_DISPLAY_MODE/
++    // PYXIS_BACKGROUND already set in the child's environment per that
++    // module's doc comment, doesn't strictly need the env var duplicated
++    // onto argv - but the flag is read first since an explicit command-line
++    // argument is more discoverable for manual testing (see
++    // gecko/BUILD_RUNBOOK.md's test instructions) and should win if both
++    // are somehow present.
++    var pyxisAppIdParam = cmdLine.handleFlagWithParam("pyxis-app", false);
++    if (!pyxisAppIdParam) {
++      pyxisAppIdParam = Services.env.exists("PYXIS_APP_ID")
++        ? Services.env.get("PYXIS_APP_ID")
++        : null;
++    }
++    if (pyxisAppIdParam) {
++      gPyxisAppId = pyxisAppIdParam;
++
++      // PYXIS_DISPLAY_MODE ("windowed" | "maximized" | "fullscreen") and
++      // PYXIS_BACKGROUND ("1" for headless/no-window apps) match
++      // gecko/src/gecko.rs's WebAppLaunchSpec::display /
++      // WebAppLaunchSpec::background field-for-field (see that file's
++      // DisplayMode enum and compose_launch's env-var-setting doc
++      // comment). Nova (not yet built) is the intended source of the real
++      // `entry` value from manifest.webapp; until it exists, an optional
++      // `--app-entry` argument (defaulting to "index.html") lets
++      // `gecko-shell compose --app-id <id> --entry <file> --exec-only`
++      // (gecko/bin/gecko-shell.rs) be used for real end-to-end testing
++      // without Nova - see gecko/BUILD_RUNBOOK.md's test instructions.
++      let entryParam = cmdLine.handleFlagWithParam("app-entry", false);
++      let entry = entryParam || "index.html";
++
++      let displayMode = Services.env.exists("PYXIS_DISPLAY_MODE")
++        ? Services.env.get("PYXIS_DISPLAY_MODE")
++        : "windowed";
++      let isBackground =
++        Services.env.exists("PYXIS_BACKGROUND") &&
++        Services.env.get("PYXIS_BACKGROUND") == "1";
++
++      if (isBackground) {
++        // webOS "noWindow" equivalent (pyxis-scheme-and-kiosk-plan.md §B1
++        // point 5): run the page without opening a Wayland toplevel at
++        // all. NOT YET IMPLEMENTED - see gecko/BUILD_RUNBOOK.md's PYXIS
++        // kiosk-mode section for why this is deliberately left as a
++        // documented gap rather than a guessed-at headless-window
++        // mechanism (HeadlessShell.sys.mjs, imported above for
++        // --headless, targets automation/testing, not a real "app has no
++        // UI" runtime mode, and repurposing it without verifying its
++        // behavior against the real tree would be exactly the kind of
++        // unverified claim this pass is trying to avoid).
++        console.error(
++          "pyxis-webapp: PYXIS_BACKGROUND=1 (headless apps) is not yet " +
++            "implemented; opening a normal window for app id " +
++            pyxisAppIdParam
++        );
++      }
++
++      openPyxisAppWindow(cmdLine, pyxisAppIdParam, entry).then(win => {
++        if (displayMode == "fullscreen") {
++          win.fullScreen = true;
++        } else if (displayMode == "maximized") {
++          win.document.documentElement.setAttribute("sizemode", "maximized");
++        }
++      }, console.error);
++      cmdLine.preventDefault = true;
++    }
++
+     if (cmdLine.handleFlag("disable-pinch", false)) {
+       let defaults = Services.prefs.getDefaultBranch(null);
+       defaults.setBoolPref("apz.allow_zooming", false);
+@@ -687,6 +896,12 @@ nsBrowserContentHandler.prototype = {
+       "  --kiosk-monitor <num> Place kiosk browser window on given monitor.\n";
+     info +=
+       "  --disable-pinch    Disable touch-screen and touch-pad pinch gestures.\n";
++    info +=
++      "  --pyxis-app <id>   [Pyxis] Launch a single pyxis:// web app in a " +
++      "chromeless kiosk window (also read from PYXIS_APP_ID env var).\n";
++    info +=
++      "  --app-entry <path> [Pyxis] Entry path under pyxis://<id>/ to " +
++      "load (default: index.html; Nova will own this once it exists).\n";
+     return info;
+   },
+
+@@ -1095,6 +1310,21 @@ nsBrowserContentHandler.prototype = {
+     return gKiosk;
+   },
+
++  // PYXIS: the app id from `--pyxis-app`/PYXIS_APP_ID, or "" for a normal
++  // browser launch ("" rather than null since nsIBrowserHandler.idl
++  // declares this as AUTF8String, not a nullable type - matching how
++  // `startPage`/`defaultArgs` on the same interface are always strings).
++  // Exposed the same way `kiosk` is (BrowserHandler.kiosk is consumed in
++  // several places - see browser-init.js, tabbrowser.js,
++  // browser-fullScreenAndPointerLock.js - via
++  // Cc["@mozilla.org/browser/clh;1"].getService(Ci.nsIBrowserHandler)) in
++  // case anything else needs to distinguish a pyxis app window from a
++  // normal one without re-deriving it from the `pyxisapp` DOM attribute
++  // browser-init.js sets (see that file's PYXIS block).
++  get pyxisAppId() {
++    return gPyxisAppId || "";
++  },
++
+   get majorUpgrade() {
+     return gMajorUpgrade;
+   },

@@ -12,8 +12,12 @@
 //! IPC surface keeps working for older clients while shells (Pyxis) move to
 //! the `appHost.*` interface.
 //!
+//! Wayland surface binding is real: `bind_surface`/`unbind_surface` (and
+//! their `BindSurface`/`UnbindSurface` IPC wrappers) track compositor
+//! surfaces per session, driven by evo's Echo connection
+//! (`evo/src/enhancements/echo_ipc.rs`) as toplevels are created/destroyed.
+//!
 //! Intentionally NOT in this MVP (tracked as TODOs):
-//!   - real Wayland surface registration (compositor work)
 //!   - sandboxing / cgroups / namespaces / portals
 //!   - permissions enforcement
 //!   - tarball signature verification
@@ -42,6 +46,12 @@ use uuid::Uuid;
 use crate::IPCBus;
 
 const APPS_ROOT: &str = "/usr/share/geckoOS/apps";
+/// User-installed (writable) app root, checked after `APPS_ROOT` for both
+/// manifest reads and directory scans, so apps Nova installs under
+/// `/var/lib/pyxis/apps/<id>/` (see `services::nova`) are launchable
+/// through this unchanged `AppHost::launch` path — "system-first-then-user"
+/// resolution, per `nova-runtime-host-plan.md` §4.
+const USER_APPS_ROOT: &str = "/var/lib/pyxis/apps";
 
 /// Interface name for app host IPC + signals.
 pub const APPHOST_IFACE: &str = "org.geckoOS.appHost";
@@ -78,6 +88,11 @@ pub struct AppManifest {
 pub enum AppState {
     Starting,
     Running,
+    /// Frozen via `SIGSTOP` — the webOS-style "card backgrounded" state
+    /// (see `suspend`/`resume`), driven by Nova reacting to Evo's
+    /// `WindowMinimized` signal. The process is alive but not scheduled;
+    /// distinct from `Stopped` (process gone, session draining).
+    Suspended,
     Stopped,
     Crashed,
 }
@@ -87,6 +102,7 @@ impl AppState {
         match self {
             AppState::Starting => "starting",
             AppState::Running => "running",
+            AppState::Suspended => "suspended",
             AppState::Stopped => "stopped",
             AppState::Crashed => "crashed",
         }
@@ -177,9 +193,24 @@ impl AppHost {
 
     // ---------- Manifest discovery ----------
 
+    /// Locate `<root>/<app_id>` across both the system and user app roots,
+    /// system first. Returns the containing root's app dir, not the
+    /// manifest file itself.
+    fn find_app_dir(app_id: &str) -> Option<PathBuf> {
+        for root in [Self::apps_root(), Self::user_apps_root()] {
+            let dir = root.join(app_id);
+            if dir.join("manifest.json").is_file() {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
     /// Read and validate a single app manifest by id.
     pub fn read_manifest(app_id: &str) -> Result<AppManifest> {
-        let path = Self::manifest_path(app_id);
+        let app_dir = Self::find_app_dir(app_id)
+            .ok_or_else(|| anyhow!("no manifest.json found for app '{}'", app_id))?;
+        let path = app_dir.join("manifest.json");
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("read manifest at {}", path.display()))?;
         let manifest: AppManifest = serde_json::from_str(&raw)
@@ -197,35 +228,41 @@ impl AppHost {
         Ok(manifest)
     }
 
-    /// Scan `/usr/share/geckoOS/apps/*/manifest.json` and return all valid
-    /// manifests. Invalid/missing manifests are silently skipped — the caller
-    /// gets the working subset.
+    /// Scan both `/usr/share/geckoOS/apps/*/manifest.json` (system) and
+    /// `/var/lib/pyxis/apps/*/manifest.json` (user-installed, e.g. by
+    /// Nova) and return all valid manifests, user entries overriding system
+    /// ones on id collision. Invalid/missing manifests are silently
+    /// skipped — the caller gets the working subset.
     pub fn list_apps(&self) -> Result<Vec<AppManifest>> {
-        let mut out = Vec::new();
-        let root = Self::apps_root();
-        if !root.exists() {
-            return Ok(out);
-        }
-        for entry in fs::read_dir(&root)
-            .with_context(|| format!("read_dir {}", root.display()))?
-        {
-            let entry = match entry {
+        let mut by_id: HashMap<String, AppManifest> = HashMap::new();
+        for root in [Self::apps_root(), Self::user_apps_root()] {
+            if !root.exists() {
+                continue;
+            }
+            let entries = match fs::read_dir(&root) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            let p = entry.path();
-            if !p.is_dir() {
-                continue;
-            }
-            let id = match p.file_name().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            if let Ok(m) = Self::read_manifest(&id) {
-                out.push(m);
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let id = match p.file_name().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                if let Ok(m) = Self::read_manifest(&id) {
+                    by_id.insert(id, m);
+                }
             }
         }
         // Stable ordering across calls — easier to consume in shells/tests.
+        let mut out: Vec<AppManifest> = by_id.into_values().collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
     }
@@ -236,7 +273,8 @@ impl AppHost {
     /// "raise existing" semantics should consult `find_session_by_app` first.
     pub fn launch(&self, app_id: &str, params: Option<Value>) -> Result<AppSession> {
         let manifest = Self::read_manifest(app_id)?;
-        let app_dir = Self::apps_root().join(&manifest.id);
+        let app_dir = Self::find_app_dir(&manifest.id)
+            .ok_or_else(|| anyhow!("no manifest.json found for app '{}'", manifest.id))?;
 
         // Resolve exec relative to the app directory when given as `./...`.
         let exec_path: PathBuf = if manifest.exec.starts_with("./") {
@@ -395,6 +433,56 @@ impl AppHost {
             }
         }
         Ok(crashed.unwrap_or(session))
+    }
+
+    /// Freeze a running session with `SIGSTOP` — the webOS "card
+    /// backgrounded" freeze/thaw model ported from `gaia`'s
+    /// `suspend_app`/`resume_app` (which only flipped an in-memory status
+    /// flag with no real process effect) into a genuine OS-level pause:
+    /// `SIGSTOP` halts all of the process's threads until `SIGCONT`, which
+    /// for a single-process Gecko instance (see `user.js`'s
+    /// `dom.ipc.processCount = 1` in `scripts/create-rootfs.sh`) means its
+    /// entire event loop, JS execution, and rendering genuinely stop
+    /// consuming CPU while backgrounded — real behavior, not a status label.
+    pub fn suspend(&self, session_id: &str) -> Result<AppSession> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .map(|s| s.clone())
+            .ok_or_else(|| anyhow!("session '{}' not found", session_id))?;
+        if session.state != AppState::Running {
+            return Err(anyhow!(
+                "cannot suspend session '{}' in state '{}'",
+                session_id,
+                session.state.as_str()
+            ));
+        }
+        if session.pid > 0 {
+            Self::send_signal(session.pid, Signal::SIGSTOP)?;
+        }
+        let suspended = self.transition(session_id, AppState::Suspended);
+        Ok(suspended.unwrap_or(session))
+    }
+
+    /// Thaw a suspended session with `SIGCONT`.
+    pub fn resume(&self, session_id: &str) -> Result<AppSession> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .map(|s| s.clone())
+            .ok_or_else(|| anyhow!("session '{}' not found", session_id))?;
+        if session.state != AppState::Suspended {
+            return Err(anyhow!(
+                "cannot resume session '{}' in state '{}'",
+                session_id,
+                session.state.as_str()
+            ));
+        }
+        if session.pid > 0 {
+            Self::send_signal(session.pid, Signal::SIGCONT)?;
+        }
+        let resumed = self.transition(session_id, AppState::Running);
+        Ok(resumed.unwrap_or(session))
     }
 
     /// Close + relaunch.
@@ -703,6 +791,7 @@ impl AppHost {
             let signal = match next {
                 AppState::Starting => "AppStarting",
                 AppState::Running => "AppRunning",
+                AppState::Suspended => "AppSuspended",
                 AppState::Stopped => "AppStopped",
                 AppState::Crashed => "AppCrashed",
             };
@@ -729,8 +818,8 @@ impl AppHost {
         PathBuf::from(APPS_ROOT)
     }
 
-    fn manifest_path(app_id: &str) -> PathBuf {
-        Self::apps_root().join(app_id).join("manifest.json")
+    fn user_apps_root() -> PathBuf {
+        PathBuf::from(USER_APPS_ROOT)
     }
 
     fn send_signal(pid: u32, signal: Signal) -> Result<()> {

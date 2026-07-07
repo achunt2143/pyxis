@@ -1,8 +1,8 @@
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, cell::RefCell, time::Duration};
 
 use smithay::{
     backend::renderer::{
-        element::{solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement, AsRenderElements},
+        element::{surface::WaylandSurfaceRenderElement, AsRenderElements},
         ImportAll, ImportMem, Renderer, Texture,
     },
     desktop::{
@@ -27,8 +27,25 @@ use smithay::{
     wayland::{compositor::SurfaceData as WlSurfaceData, dmabuf::DmabufFeedback, seat::WaylandFocus},
 };
 
-use super::ssd::HEADER_BAR_HEIGHT;
+use super::ssd::{DecorationRenderElement, HEADER_BAR_HEIGHT};
 use crate::{focus::PointerFocusTarget, state::Backend, EvoState};
+
+/// Geometry a window had before it was maximized (or minimized), stored in
+/// its user_data so the un-maximize/restore path can put it back. Shared
+/// between the XDG and X11 shell handlers and the SSD title-bar buttons so
+/// both window kinds and both trigger paths (client-requested vs.
+/// title-bar-clicked) agree on the same saved geometry.
+#[derive(Debug, Default)]
+pub(crate) struct OldGeometry(RefCell<Option<Rectangle<i32, Logical>>>);
+impl OldGeometry {
+    pub fn save(&self, geo: Rectangle<i32, Logical>) {
+        *self.0.borrow_mut() = Some(geo);
+    }
+
+    pub fn restore(&self) -> Option<Rectangle<i32, Logical>> {
+        self.0.borrow_mut().take()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 #[derive(Eq, Hash)]
@@ -401,7 +418,7 @@ impl SpaceElement for WindowElement {
 render_elements!(
     pub WindowRenderElement<R> where R: ImportAll + ImportMem;
     Window=WaylandSurfaceRenderElement<R>,
-    Decoration=SolidColorRenderElement,
+    Decoration=DecorationRenderElement<R>,
 );
 
 impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
@@ -417,7 +434,7 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
 impl<R> AsRenderElements<R> for WindowElement
 where
     R: Renderer + ImportAll + ImportMem,
-    R::TextureId: Clone + Texture + 'static,
+    R::TextureId: Clone + Texture + Send + 'static,
 {
     type RenderElement = WindowRenderElement<R>;
 

@@ -568,10 +568,29 @@ impl<BackendData: Backend> XdgActivationHandler for EvoState<BackendData> {
 delegate_xdg_activation!(@<BackendData: Backend + 'static> EvoState<BackendData>);
 
 impl<BackendData: Backend> XdgDecorationHandler for EvoState<BackendData> {
+    // Evo has full SSD rendering (evo/src/shell/ssd.rs's `HeaderBar`: the
+    // rasterized close/maximize/minimize buttons + glass title bar, real
+    // hit-testing, move/resize wiring) so its *preferred* mode is
+    // ServerSide, not ClientSide — found as a real bug via an actual boot:
+    // Firefox always drew its own title bar despite ssd.rs being fully
+    // implemented and wired, because `new_decoration`/`unset_mode` both
+    // unconditionally defaulted the negotiated mode to ClientSide. Per the
+    // xdg-decoration protocol, `new_decoration` sets the compositor's own
+    // pending default BEFORE the client has expressed any preference; a
+    // client that supports the protocol but never explicitly calls
+    // `set_client_side` (GTK/Firefox on Wayland do exactly this — they
+    // accept whatever the compositor offers unless they have a specific
+    // reason to override it) will simply keep whatever this handler
+    // defaults to. Defaulting to ClientSide here meant Evo was silently
+    // opting every window into CSD before the client ever got a say, which
+    // is what `xdg.rs`'s `is_ssd = configure.state.decoration_mode == ...
+    // ServerSide` read back as `false` on ack. `request_mode` (a client's
+    // EXPLICIT ask) is unaffected by this fix and still honors
+    // `ClientSide` if a client genuinely insists on drawing its own chrome.
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ClientSide);
+            state.decoration_mode = Some(Mode::ServerSide);
         });
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
@@ -579,8 +598,8 @@ impl<BackendData: Backend> XdgDecorationHandler for EvoState<BackendData> {
 
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(match mode {
-                DecorationMode::ServerSide => Mode::ServerSide,
-                _ => Mode::ClientSide,
+                DecorationMode::ClientSide => Mode::ClientSide,
+                _ => Mode::ServerSide,
             });
         });
 
@@ -591,7 +610,7 @@ impl<BackendData: Backend> XdgDecorationHandler for EvoState<BackendData> {
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ClientSide);
+            state.decoration_mode = Some(Mode::ServerSide);
         });
 
         if toplevel.is_initial_configure_sent() {
@@ -738,8 +757,40 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         let clock = Clock::new();
 
         let socket_name = if listen_on_socket {
-            let source = ListeningSocketSource::new_auto().unwrap();
+            // Bind the EXACT socket name Evo advertises via WAYLAND_DISPLAY
+            // (main.rs sets this env, defaulting to "wayland-0"), NOT
+            // new_auto(). new_auto() calls bind_auto("wayland", 1..33) whose
+            // range STARTS AT 1, so it can never produce wayland-0 -- it
+            // always yields wayland-1 (or higher). That desync -- Evo logging
+            // "Wayland socket: wayland-0" and setting WAYLAND_DISPLAY=wayland-0
+            // in its env, but actually binding wayland-1 -- is exactly why a
+            // client told WAYLAND_DISPLAY=wayland-0 (e.g. vela launched
+            // from geckoOS-boot) failed with "Failed to connect to Wayland
+            // display '/run/user/1000/wayland-0' ... No such file or
+            // directory". Found via a real boot's evo.log, not by inspection.
+            let desired =
+                std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
+            let source = match ListeningSocketSource::with_name(&desired) {
+                Ok(s) => s,
+                Err(err) => {
+                    // The requested name was somehow already taken (stale
+                    // socket, a second compositor, ...). Rather than hard-fail
+                    // startup, fall back to auto-naming -- but then update
+                    // WAYLAND_DISPLAY below so children still get the real
+                    // name.
+                    warn!(
+                        "Could not bind wayland socket '{}' ({}); falling back to auto-naming",
+                        desired, err
+                    );
+                    ListeningSocketSource::new_auto().unwrap()
+                }
+            };
             let socket_name = source.socket_name().to_string_lossy().into_owned();
+            // Keep this process's WAYLAND_DISPLAY in sync with the socket we
+            // ACTUALLY bound, so any child Evo spawns (XWayland, etc.) and
+            // anything else reading this env sees the real name even if the
+            // fallback above fired.
+            std::env::set_var("WAYLAND_DISPLAY", &socket_name);
             handle
                 .insert_source(source, |client_stream, _, data| {
                     if let Err(err) = data
@@ -1013,7 +1064,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         use smithay::wayland::compositor::CompositorHandler;
         use std::process::Stdio;
 
-        let (xwayland, client) = XWayland::spawn(
+        let (xwayland, client) = match XWayland::spawn(
             &self.display_handle,
             None,
             std::iter::empty::<(String, String)>(),
@@ -1021,8 +1072,16 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             Stdio::null(),
             Stdio::null(),
             |_| (),
-        )
-        .expect("failed to start XWayland");
+        ) {
+            Ok(pair) => pair,
+            Err(err) => {
+                // X11 app compatibility is optional -- losing it (e.g. no
+                // free X11 socket dir at boot) must never take down the
+                // Wayland compositor itself.
+                warn!(?err, "Failed to start XWayland; X11 app support will be unavailable");
+                return;
+            }
+        };
 
         let display_handle = self.display_handle.clone();
         let ret = self
@@ -1611,6 +1670,28 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                     info!("Unminimized window");
                 }
             }
+        }
+    }
+
+    /// Re-maps some currently-minimized window in the active workspace.
+    /// There's no taskbar to click a specific one back yet (see
+    /// `KeyAction::RestoreMinimized`, Logo+Shift+U), so this is an interim
+    /// stand-in -- once a real dock exists, it should call
+    /// `unminimize_window` directly for the window the user actually clicked.
+    pub fn restore_last_minimized(&mut self) {
+        let target = {
+            let workspace = self.workspace_manager.active_workspace();
+            workspace
+                .windows()
+                .iter()
+                .rev()
+                .find(|w| workspace.window_state(w).is_some_and(|s| s.minimized))
+                .cloned()
+        };
+        if let Some(window) = target {
+            self.unminimize_window(&window);
+        } else {
+            debug!("RestoreMinimized: no minimized windows in the active workspace");
         }
     }
 

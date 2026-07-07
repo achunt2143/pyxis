@@ -76,6 +76,39 @@ force_kconfig() {
   ensure_y CONFIG_FRAMEBUFFER_CONSOLE
 
   # -----------------------------------------------------------------------
+  # Serial console — QEMU's -serial mon:stdio exposes an ISA 16550-compatible
+  # UART (ttyS0). Without the 8250 driver there's no /dev/ttyS0 node at all,
+  # so `console=ttyS0,115200` on the kernel cmdline silently does nothing
+  # and anything (busybox init respawn, getty) that opens /dev/ttyS0 fails
+  # with "No such file or directory".
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_SERIAL_8250
+  ensure_y CONFIG_SERIAL_8250_CONSOLE
+  ensure_y CONFIG_SERIAL_CORE
+  ensure_y CONFIG_SERIAL_CORE_CONSOLE
+  # CONFIG_SERIAL_8250_NR_UARTS/RUNTIME_UARTS are integer-valued, not
+  # bool -- leave them to olddefconfig's defaults (4 UARTs) below.
+
+  # -----------------------------------------------------------------------
+  # Input devices -- emulate.sh attaches virtio-keyboard-pci,
+  # virtio-mouse-pci, and a USB usb-tablet. Without these, none of them
+  # produce a /dev/input/event* node, so libinput enumerates zero devices
+  # (it initializes fine, it just never sees anything) and the compositor
+  # renders but never receives motion/key events.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_INPUT_EVDEV
+  ensure_y CONFIG_INPUT_MOUSEDEV
+  ensure_y CONFIG_INPUT_KEYBOARD
+  ensure_y CONFIG_VIRTIO_INPUT
+  ensure_y CONFIG_USB
+  ensure_y CONFIG_HID
+  ensure_y CONFIG_USB_HID
+  ensure_y CONFIG_USB_XHCI_HCD
+  ensure_y CONFIG_USB_EHCI_HCD
+  ensure_y CONFIG_USB_UHCI_HCD
+  ensure_y CONFIG_USB_OHCI_HCD
+
+  # -----------------------------------------------------------------------
   # Device management
   # -----------------------------------------------------------------------
   ensure_y CONFIG_DEVTMPFS

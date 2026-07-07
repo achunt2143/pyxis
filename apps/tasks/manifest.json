@@ -1,0 +1,9 @@
+{
+  "id": "tasks",
+  "name": "Tasks",
+  "exec": "./launch",
+  "icon": "icon.png",
+  "version": "0.1.0",
+  "category": "pim",
+  "entry": "TasksApp"
+}

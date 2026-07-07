@@ -1,0 +1,19 @@
+#!/bin/sh
+# Placeholder launch script for the Browser app. See apps/terminal/launch
+# for a description of why this is a long-running shell stub: Bloom embeds
+# BrowserApp as an in-process React component for now, so this script only
+# exists to give AppHost a real PID to track for lifecycle/crash signals.
+#
+# Future work: once vela (the custom Gecko kiosk build) exists,
+# this should exec it with --pyxis-app=browser instead of stubbing (NOT
+# --app, which collides with Gecko's own native -app flag -- see
+# BrowserContentHandler.sys.mjs's dated correction comment).
+
+echo "[browser] starting (pid=$$)"
+trap 'echo "[browser] SIGTERM"; exit 0' TERM
+trap 'echo "[browser] SIGUSR1 (raise)"' USR1
+
+while :; do
+    sleep 60 &
+    wait $!
+done
