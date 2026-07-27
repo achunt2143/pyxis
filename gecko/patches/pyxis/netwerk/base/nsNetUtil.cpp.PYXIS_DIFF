@@ -108,3 +108,48 @@ diff-note, not a full-file copy, matching the convention already used for
 toolkit/actors/ActorManagerParent.sys.mjs.PYXIS_DIFF in this same patch
 series — nsNetUtil.cpp is a large (~4200 line) stock file we don't own, so
 we track the delta here rather than a full duplicate).
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/netwerk/base/nsNetUtil.cpp b/netwerk/base/nsNetUtil.cpp
+index 2074d7e305f2..759ad6b84812 100644
+--- a/netwerk/base/nsNetUtil.cpp
++++ b/netwerk/base/nsNetUtil.cpp
+@@ -1966,6 +1966,32 @@ nsresult NS_NewURI(nsIURI** aURI, const nsACString& aSpec,
+         .Finalize(aURI);
+   }
+ 
++  // Pyxis (GeckoOS): pyxis://<app-id>/<path> app-serving scheme. Registered
++  // with URI_STD in netwerk/protocol/pyxis/components.conf, but that flag
++  // alone only affects nsIProtocolHandler flag queries (URIChainHasFlags) --
++  // it does NOT influence which concrete nsIURI class gets instantiated here.
++  // Unless a scheme is one of the hardcoded cases in this function, unknown
++  // schemes fall through to DefaultURI (see the network.url.useDefaultURI
++  // branch below), which does not implement nsIStandardURL. That silently
++  // broke content-principal creation: ContentPrincipal::
++  // GenerateOriginNoSuffixFromURI (caps/ContentPrincipal.cpp) requires a
++  // do_QueryInterface to nsIStandardURL and fails closed (NS_ERROR_FAILURE)
++  // otherwise, which BasePrincipal::CreateContentPrincipal (caps/
++  // BasePrincipal.cpp) silently maps to a NullPrincipal -- reproducing the
++  // observed bug (window.isSecureContext false, contentPrincipal a
++  // moz-nullprincipal: instead of pyxis://<app-id>). moz-extension: avoids
++  // this via its own hardcoded case below, whose SubstitutingURL literally
++  // subclasses nsStandardURL. pyxis:// doesn't need substitution/resolution,
++  // just a real nsIStandardURL instance, so route it through the same
++  // nsStandardURL + URLTYPE_AUTHORITY construction used for indexeddb/uuid
++  // above (default_port -1 matches this scheme's components.conf entry).
++  if (scheme.EqualsLiteral("pyxis")) {
++    return NS_MutateURI(new nsStandardURL::Mutator())
++        .Apply(&nsIStandardURLMutator::Init, nsIStandardURL::URLTYPE_AUTHORITY,
++               -1, aSpec, aCharset, aBaseURI, nullptr)
++        .Finalize(aURI);
++  }
++
+   if (scheme.EqualsLiteral("moz-extension")) {
+     RefPtr<mozilla::net::ExtensionProtocolHandler> handler =
+         mozilla::net::ExtensionProtocolHandler::GetSingleton();

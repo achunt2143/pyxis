@@ -22,3 +22,32 @@ the top of the file, around the other atom-set definitions):
                            nsGkAtoms::pyxis);
 
 (just `nsGkAtoms::pyxis` appended to the existing argument list.)
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/toolkit/components/extensions/MatchPattern.cpp b/toolkit/components/extensions/MatchPattern.cpp
+index 2c028dd624aa..4ac961cc3b72 100644
+--- a/toolkit/components/extensions/MatchPattern.cpp
++++ b/toolkit/components/extensions/MatchPattern.cpp
+@@ -87,11 +87,15 @@ DEFINE_STATIC_ATOM_SET(PermittedSchemes, nsGkAtoms::http, nsGkAtoms::https,
+                        nsGkAtoms::ftp, nsGkAtoms::data);
+ 
+ // Known schemes that are followed by "://" instead of ":".
++// nsGkAtoms::pyxis: Pyxis's custom app-serving scheme (see StaticAtoms.py's
++// comment on that atom for the real bug this fixes — without it here,
++// JSWindowActor `matches: ["pyxis://*/*"]` patterns silently never matched).
+ DEFINE_STATIC_ATOM_SET(HostLocatorSchemes, nsGkAtoms::http, nsGkAtoms::https,
+                        nsGkAtoms::ws, nsGkAtoms::wss, nsGkAtoms::file,
+                        nsGkAtoms::ftp, nsGkAtoms::moz_extension,
+                        nsGkAtoms::chrome, nsGkAtoms::resource, nsGkAtoms::moz,
+-                       nsGkAtoms::moz_icon, nsGkAtoms::moz_gio);
++                       nsGkAtoms::moz_icon, nsGkAtoms::moz_gio,
++                       nsGkAtoms::pyxis);
+ 
+ DEFINE_STATIC_ATOM_SET(WildcardSchemes, nsGkAtoms::http, nsGkAtoms::https,
+                        nsGkAtoms::ws, nsGkAtoms::wss);

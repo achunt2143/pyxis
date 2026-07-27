@@ -15,6 +15,13 @@ the original `--app` — see BrowserContentHandler.sys.mjs.PYXIS_DIFF's
 dated correction note for why (a real collision with Gecko's own native
 `-app <path>` startup flag, found via a real failed boot).
 
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
 diff --git a/browser/components/nsIBrowserHandler.idl b/browser/components/nsIBrowserHandler.idl
 index 8666f79e57e8..d9f0b01e4bb7 100644
 --- a/browser/components/nsIBrowserHandler.idl
@@ -22,7 +29,7 @@ index 8666f79e57e8..d9f0b01e4bb7 100644
 @@ -16,6 +16,21 @@ interface nsIBrowserHandler : nsISupports
    attribute boolean majorUpgrade;
    attribute boolean firstRunProfile;
-
+ 
 +  /**
 +   * PYXIS: the app id passed via `--pyxis-app=<id>`/PYXIS_APP_ID, or an
 +   * empty string for a normal (non-pyxis-webapp) browser launch. Read-only

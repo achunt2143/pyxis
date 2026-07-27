@@ -1,0 +1,34 @@
+Registers the two Pyxis bridge JSWindowActor files with the toolkit actors
+packaging list so they are actually shipped in the build.
+
+This is small but load-bearing, and its absence fails SILENTLY: without these
+two entries the actor .sys.mjs files compile and are referenced by
+ActorManagerParent's PyxisBridge registration, but never get copied into
+dist/bin/actors/, so the bridge simply never instantiates at runtime and
+`window.geckoOS` is undefined with no error anywhere. Same failure shape as
+the MatchPattern/StaticAtoms bug documented in those two notes.
+
+Companion to the new (verbatim, non-diff) files
+gecko/patches/pyxis/toolkit/actors/PyxisBridge{Child,Parent}.sys.mjs and to
+toolkit/modules/ActorManagerParent.sys.mjs.PYXIS_DIFF.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/toolkit/actors/moz.build b/toolkit/actors/moz.build
+index 9b5d83e11a23..3e93b7ec6b88 100644
+--- a/toolkit/actors/moz.build
++++ b/toolkit/actors/moz.build
+@@ -64,6 +64,8 @@ FINAL_TARGET_FILES.actors += [
+     "PrintingParent.sys.mjs",
+     "PrintingSelectionChild.sys.mjs",
+     "PurgeSessionHistoryChild.sys.mjs",
++    "PyxisBridgeChild.sys.mjs",
++    "PyxisBridgeParent.sys.mjs",
+     "RemotePageChild.sys.mjs",
+     "SelectChild.sys.mjs",
+     "SelectParent.sys.mjs",

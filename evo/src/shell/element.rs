@@ -23,11 +23,19 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     render_elements,
-    utils::{user_data::UserDataMap, IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial},
-    wayland::{compositor::SurfaceData as WlSurfaceData, dmabuf::DmabufFeedback, seat::WaylandFocus},
+    utils::{
+        user_data::UserDataMap, IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, Size,
+    },
+    wayland::{
+        compositor::{with_states, SurfaceData as WlSurfaceData},
+        dmabuf::DmabufFeedback,
+        seat::WaylandFocus,
+        shell::xdg::XdgToplevelSurfaceData,
+    },
 };
 
 use super::ssd::{DecorationRenderElement, HEADER_BAR_HEIGHT};
+use super::xdg::SHELL_APP_ID;
 use crate::{focus::PointerFocusTarget, state::Backend, EvoState};
 
 /// Geometry a window had before it was maximized (or minimized), stored in
@@ -52,16 +60,103 @@ impl OldGeometry {
 pub struct WindowElement(pub Window);
 
 impl WindowElement {
+    /// The SSD header bar's rect, in the coordinate space that smithay hands
+    /// us for both rendering and hit-testing.
+    ///
+    /// That space is anchored at the element's *render origin*, which
+    /// `Space` defines as `location - geometry().loc` — the top-left of the
+    /// client's own buffer, i.e. the outer corner of its CSD **shadow
+    /// margin**, not the top-left of the window you can actually see. GTK
+    /// clients routinely set a non-zero window geometry for exactly that
+    /// reason (a plain GTK dialog reports `set_window_geometry(22, 22, …)`).
+    ///
+    /// Everything SSD-related therefore has to be offset by `geometry().loc`,
+    /// or the header bar renders up-and-left of the window it belongs to and
+    /// its hit-testing lands on the shadow instead of the buttons. Returns
+    /// `None` when this window isn't server-decorated.
+    fn ssd_header_rect(&self) -> Option<Rectangle<i32, Logical>> {
+        if !self.decoration_state().is_ssd {
+            return None;
+        }
+        let geo = SpaceElement::geometry(&self.0);
+        Some(Rectangle::new(
+            geo.loc,
+            Size::from((geo.size.w, HEADER_BAR_HEIGHT)),
+        ))
+    }
+
+    /// The window's human-readable title for the SSD title bar: the
+    /// xdg_toplevel title (X11 WM title), falling back to the app_id/class when
+    /// the client hasn't set a title (so e.g. a web app that never set
+    /// document.title still shows its id rather than a blank bar). Empty only
+    /// when neither is set.
+    fn window_title(&self) -> String {
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => with_states(toplevel.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|d| {
+                        d.lock().ok().and_then(|g| {
+                            g.title
+                                .clone()
+                                .filter(|t| !t.trim().is_empty())
+                                .or_else(|| g.app_id.clone())
+                        })
+                    })
+                    .unwrap_or_default()
+            }),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(s) => {
+                let title = s.title();
+                if title.trim().is_empty() {
+                    s.class()
+                } else {
+                    title
+                }
+            }
+        }
+    }
+
+    /// Whether this window is the desktop shell (Bloom), identified by
+    /// app_id / X11 class. Used to pin it beneath app windows in the z-order.
+    pub(crate) fn is_shell(&self) -> bool {
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => with_states(toplevel.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|d| d.lock().ok().and_then(|g| g.app_id.clone()))
+                    .as_deref()
+                    == Some(SHELL_APP_ID)
+            }),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(s) => s.class() == SHELL_APP_ID,
+        }
+    }
+
     pub fn surface_under(
         &self,
         location: Point<f64, Logical>,
         window_type: WindowSurfaceType,
     ) -> Option<(PointerFocusTarget, Point<i32, Logical>)> {
-        let state = self.decoration_state();
-        if state.is_ssd && location.y < HEADER_BAR_HEIGHT as f64 {
-            return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
+        // Read `is_ssd` out and let the borrow end with this statement --
+        // holding a `RefMut` across the `ssd_header_rect()` call below (which
+        // re-borrows the same RefCell) is an instant `BorrowMutError` panic.
+        let is_ssd = self.decoration_state().is_ssd;
+        if let Some(header) = self.ssd_header_rect() {
+            if header.to_f64().contains(location) {
+                // Report the header's own top-left as the focus location, not
+                // `Point::default()`. Smithay makes pointer events
+                // focus-relative via `event.location - loc`, and
+                // `HeaderBar::clicked`/`redraw` interpret `pointer_loc` as
+                // header-relative (they compare `loc.x` against
+                // `self.width`). Handing back the render origin here shifted
+                // every button hit-test by the shadow margin.
+                return Some((PointerFocusTarget::SSD(SSD(self.clone())), header.loc));
+            }
         }
-        let offset = if state.is_ssd {
+        let offset = if is_ssd {
             Point::from((0, HEADER_BAR_HEIGHT))
         } else {
             Point::default()
@@ -386,8 +481,11 @@ impl SpaceElement for WindowElement {
         bbox
     }
     fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
-        if self.decoration_state().is_ssd {
-            point.y < HEADER_BAR_HEIGHT as f64
+        // Same render-origin caveat as `ssd_header_rect`: `point` is relative
+        // to the buffer/shadow origin, so the header occupies
+        // `geometry().loc.y ..= +HEADER_BAR_HEIGHT`, not `0 ..= HEADER_BAR_HEIGHT`.
+        if let Some(header) = self.ssd_header_rect() {
+            header.to_f64().contains(*point)
                 || SpaceElement::is_in_input_region(
                     &self.0,
                     &(*point - Point::from((0.0, HEADER_BAR_HEIGHT as f64))),
@@ -397,7 +495,17 @@ impl SpaceElement for WindowElement {
         }
     }
     fn z_index(&self) -> u8 {
-        SpaceElement::z_index(&self.0)
+        if self.is_shell() {
+            // Bloom is the desktop backdrop (wallpaper + shell): pin it beneath
+            // every app window so click-to-focus (or any raise) can never bring
+            // it over them. Apps keep smithay's default (RenderZindex::Shell =
+            // 30); popups and layer-shell overlays sort above via their own
+            // higher z-index. This is what makes the "wallpaper < shell <
+            // windows < popups" layering hold regardless of stacking order.
+            smithay::desktop::space::RenderZindex::Background as u8
+        } else {
+            SpaceElement::z_index(&self.0)
+        }
     }
 
     fn set_activate(&self, activated: bool) {
@@ -450,13 +558,28 @@ where
         if self.decoration_state().is_ssd && !window_bbox.is_empty() {
             let window_geo = SpaceElement::geometry(&self.0);
 
+            // Draw the header at the window's *visible* top-left. `location`
+            // is the render origin (= buffer origin), so for a client with a
+            // CSD shadow margin it sits `window_geo.loc` up-and-left of the
+            // window -- which is exactly the offset that made the SSD look
+            // detached from its window. See `ssd_header_rect`.
+            let header_loc = location + window_geo.loc.to_physical_precise_round(scale);
+
+            // Title + full visible height (header + client) — the SSD title
+            // text and the side borders both need these. Computed before the
+            // decoration_state borrow (window_title reads the surface, not the
+            // decoration state).
+            let title = self.window_title();
+            let full_height =
+                (HEADER_BAR_HEIGHT + window_geo.size.h).max(HEADER_BAR_HEIGHT) as u32;
+
             let mut state = self.decoration_state();
             let width = window_geo.size.w;
-            state.header_bar.redraw(width as u32);
+            state.header_bar.redraw(width as u32, full_height, &title);
             let mut vec = AsRenderElements::<R>::render_elements::<WindowRenderElement<R>>(
                 &state.header_bar,
                 renderer,
-                location,
+                header_loc,
                 scale,
                 alpha,
             );

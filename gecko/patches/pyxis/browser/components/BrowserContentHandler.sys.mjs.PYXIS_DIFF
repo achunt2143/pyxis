@@ -27,14 +27,35 @@ corrected name throughout (flag parsing, --help text, doc comments) — this
 is the current, post-correction state of the file, not the original
 kiosk-mode pass.
 
+UPDATE (2026-07-08, final after live QEMU debugging): decoration model is
+"GTK owns app-window titlebars; the shell is chromeless". Verified live that
+MOZ_GTK_TITLEBAR_DECORATION=none does NOT chromeless a Wayland window (it only
+stops Firefox's CSD; GTK still draws its default titlebar -- see the
+vela-gtk-titlebar-decoration notes). So app windows keep GTK's own working
+titlebar and Evo draws no SSD. The desktop shell (Bloom) is made chromeless
+by launching its vela with `--kiosk` (scripts/create-rootfs.sh) -> native
+gKioskMode -> gtk_window_set_decorated(false)+gtk_window_fullscreen() at
+widget-creation time; Evo composites that fullscreen NON-exclusively
+(evo/src/shell/xdg.rs SHELL_APP_ID) so apps stack on top. This diff therefore
+does NOT set window.fullScreen/sizemode from the opener callback (that raced
+the widget realize and was silently lost); openPyxisAppWindow just opens the
+window. See evo-firefox-decoration-arch.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
 diff --git a/browser/components/BrowserContentHandler.sys.mjs b/browser/components/BrowserContentHandler.sys.mjs
-index daaa2dae0015..5f157acb2202 100644
+index daaa2dae0015..bb560202fa29 100644
 --- a/browser/components/BrowserContentHandler.sys.mjs
 +++ b/browser/components/BrowserContentHandler.sys.mjs
 @@ -101,6 +101,15 @@ let gMajorUpgrade = false;
  let gFirstRunProfile = false;
  var gFirstWindow = false;
-
+ 
 +// PYXIS: set once `--app`/`-app` has been recognized on the command line, so
 +// other code in this file (and callers of BrowserHandler) can tell a
 +// pyxis-webapp kiosk launch apart from a normal browser launch. Mirrors the
@@ -50,7 +71,7 @@ index daaa2dae0015..5f157acb2202 100644
 @@ -363,6 +372,110 @@ function openBrowserWindow(
    });
  }
-
+ 
 +// PYXIS: window-features string for a `pyxis-webapp --app=<id>` kiosk
 +// window. Modeled directly on
 +// browser/components/taskbartabs/TaskbarTabsWindowManager.sys.mjs's
@@ -158,7 +179,7 @@ index daaa2dae0015..5f157acb2202 100644
  function openPreferences(cmdLine) {
    openBrowserWindow(cmdLine, lazy.gSystemPrincipal, "about:preferences");
  }
-@@ -451,6 +564,102 @@ nsBrowserContentHandler.prototype = {
+@@ -451,6 +564,106 @@ nsBrowserContentHandler.prototype = {
        gKiosk = true;
        Glean.browserStartup.kioskMode.set(true);
      }
@@ -248,20 +269,24 @@ index daaa2dae0015..5f157acb2202 100644
 +        );
 +      }
 +
-+      openPyxisAppWindow(cmdLine, pyxisAppIdParam, entry).then(win => {
-+        if (displayMode == "fullscreen") {
-+          win.fullScreen = true;
-+        } else if (displayMode == "maximized") {
-+          win.document.documentElement.setAttribute("sizemode", "maximized");
-+        }
-+      }, console.error);
++      // Decoration/size mode is applied from the NEW window's own delayed
++      // startup in browser-init.js's PYXIS block, NOT here. Setting
++      // `win.fullScreen`/sizemode on the freshly-resolved window from this
++      // opener callback runs before the window's widget is realized and is
++      // silently lost (verified live: the shell stayed a normal GTK-decorated
++      // window). browser-init.js reads PYXIS_DISPLAY_MODE at the right time --
++      // the same place kiosk mode sets fullscreen -- so the shell
++      // (PYXIS_DISPLAY_MODE=fullscreen) actually goes chromeless-fullscreen.
++      // `displayMode`/`isBackground` are still read above for validation and
++      // the background-app warning. See evo-firefox-decoration-arch.
++      openPyxisAppWindow(cmdLine, pyxisAppIdParam, entry).then(() => {}, console.error);
 +      cmdLine.preventDefault = true;
 +    }
 +
      if (cmdLine.handleFlag("disable-pinch", false)) {
        let defaults = Services.prefs.getDefaultBranch(null);
        defaults.setBoolPref("apz.allow_zooming", false);
-@@ -687,6 +896,12 @@ nsBrowserContentHandler.prototype = {
+@@ -687,6 +900,12 @@ nsBrowserContentHandler.prototype = {
        "  --kiosk-monitor <num> Place kiosk browser window on given monitor.\n";
      info +=
        "  --disable-pinch    Disable touch-screen and touch-pad pinch gestures.\n";
@@ -273,11 +298,11 @@ index daaa2dae0015..5f157acb2202 100644
 +      "load (default: index.html; Nova will own this once it exists).\n";
      return info;
    },
-
-@@ -1095,6 +1310,21 @@ nsBrowserContentHandler.prototype = {
+ 
+@@ -1095,6 +1314,21 @@ nsBrowserContentHandler.prototype = {
      return gKiosk;
    },
-
+ 
 +  // PYXIS: the app id from `--pyxis-app`/PYXIS_APP_ID, or "" for a normal
 +  // browser launch ("" rather than null since nsIBrowserHandler.idl
 +  // declares this as AUTF8String, not a nullable type - matching how

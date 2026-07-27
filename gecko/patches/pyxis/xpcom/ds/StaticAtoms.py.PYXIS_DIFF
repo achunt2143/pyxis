@@ -35,3 +35,37 @@ placed directly after:
 
 (inside the `# WebExtensions` section of the big Atom(...) list — exact line
 number drifts across pulls, search for `moz_extension` to find it).
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/xpcom/ds/StaticAtoms.py b/xpcom/ds/StaticAtoms.py
+index f1d8fef04552..a15427adeb4b 100644
+--- a/xpcom/ds/StaticAtoms.py
++++ b/xpcom/ds/StaticAtoms.py
+@@ -2022,6 +2022,21 @@ STATIC_ATOMS = [
+     Atom("onbeforetoggle", "onbeforetoggle"),
+     # WebExtensions
+     Atom("moz_extension", "moz-extension"),
++    # Pyxis: custom app-serving scheme (netwerk/protocol/pyxis/), needs its
++    # own atom so MatchPattern.cpp's HostLocatorSchemes() (toolkit/components/
++    # extensions/MatchPattern.cpp) can recognize "pyxis://host/path" as a
++    # host-locator scheme. Real bug found via a real boot (2026-07-06):
++    # without this, MatchPatternCore treated "pyxis" as an "unrecognized
++    # scheme" (MatchPattern.cpp's requireHostLocatorScheme fallback, the same
++    # bucket about:/data: URIs fall into) and tried to match the ENTIRE
++    # "//*/*" tail as a literal path — which can never match a real
++    # pyxis://<app>/<path> URI's actual path component (which never starts
++    # with "//"). This silently broke JSWindowActor `matches: ["pyxis://*/*"]`
++    # patterns (toolkit/modules/ActorManagerParent.sys.mjs's PyxisBridge
++    # entry) with no error at all — the pattern just never matched, so
++    # PyxisBridgeChild/Parent's actorCreated() never fired for any pyxis://
++    # document, even though the document itself loaded fine.
++    Atom("pyxis", "pyxis"),
+     Atom("all_urlsPermission", "<all_urls>"),
+     Atom("clipboardRead", "clipboardRead"),
+     Atom("clipboardWrite", "clipboardWrite"),

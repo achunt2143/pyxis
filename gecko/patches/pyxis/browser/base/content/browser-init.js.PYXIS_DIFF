@@ -17,8 +17,25 @@ immediately before calling StartLayout() (line ~656-666), and
 StartLayout() is what eventually calls AppWindow::BeforeStartLayout()
 (via Document::SetMayStartLayout(), dom/base/Document.cpp:9821-9829).
 
+UPDATE (2026-07-08): added a PYXIS block in delayed startup that sets
+window.fullScreen for a PYXIS_DISPLAY_MODE=fullscreen pyxis window (the
+shell). NOTE: this is belt-and-suspenders only -- verified live it does NOT
+by itself fullscreen the shell (the chromeless/popup-like pyxis window
+ignores it). The shell is actually made chromeless+fullscreen by (a) --kiosk
+on its vela launch (native gtk_window_set_decorated(false)) and (b) Evo
+initiating the fullscreen compositor-side (evo/src/shell/xdg.rs ack_configure
+SHELL_APP_ID). Kept because it's harmless and documents intent. See
+evo-firefox-decoration-arch.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
 diff --git a/browser/base/content/browser-init.js b/browser/base/content/browser-init.js
-index c32b781be079..0d02b601ba65 100644
+index c32b781be079..9e978a8101fe 100644
 --- a/browser/base/content/browser-init.js
 +++ b/browser/base/content/browser-init.js
 @@ -114,6 +114,48 @@ var gBrowserInit = {
@@ -70,3 +87,38 @@ index c32b781be079..0d02b601ba65 100644
      }
  
      // Run menubar initialization first, to avoid CustomTitlebar code picking
+@@ -524,6 +566,34 @@ var gBrowserInit = {
+       }
+     }
+ 
++    // PYXIS: the desktop shell (Bloom, PYXIS_DISPLAY_MODE=fullscreen) must
++    // open chromeless. Setting `window.fullScreen` HERE -- from the window's
++    // own delayed startup, exactly where/when kiosk mode does it above -- is
++    // what actually issues the Wayland xdg set_fullscreen. Doing it from the
++    // opener's `window.open(...).then(win => win.fullScreen = true)` callback
++    // (BrowserContentHandler.sys.mjs's openPyxisAppWindow) runs BEFORE this
++    // window's widget is realized, so it was silently lost and the shell
++    // stayed a normal, GTK-decorated window. Real fullscreen is the only
++    // reliable way to drop GTK's own titlebar on Wayland (see the
++    // vela-gtk-titlebar-decoration analysis: MOZ_GTK_TITLEBAR_DECORATION only
++    // stops Firefox's CSD, not GTK's default decoration). Evo composites the
++    // shell's fullscreen NON-exclusively (evo/src/shell/xdg.rs's SHELL_APP_ID
++    // branch in fullscreen_request), so ordinary app windows still stack on
++    // top of it. Guarded by the `pyxisapp` attribute (set in the PYXIS block
++    // of onBeforeInitialXULLayout above) so only the real pyxis-app toplevel
++    // -- not some popup in the same process -- is affected.
++    try {
++      if (
++        document.documentElement.hasAttribute("pyxisapp") &&
++        Services.env.exists("PYXIS_DISPLAY_MODE") &&
++        Services.env.get("PYXIS_DISPLAY_MODE") == "fullscreen"
++      ) {
++        window.fullScreen = true;
++      }
++    } catch (e) {
++      console.error("pyxis: fullscreen init failed", e);
++    }
++
+     if (Services.policies.status === Services.policies.ACTIVE) {
+       if (!Services.policies.isAllowed("hideShowMenuBar")) {
+         document

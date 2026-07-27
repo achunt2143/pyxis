@@ -70,10 +70,26 @@ force_kconfig() {
   # -----------------------------------------------------------------------
   # Display / GPU
   # -----------------------------------------------------------------------
+  # CONFIG_DRM_FBDEV_EMULATION is the one that actually controls console
+  # resolution. CONFIG_FB + CONFIG_FRAMEBUFFER_CONSOLE alone give you fbcon,
+  # but a KMS driver like virtio-gpu registers NO fbdev without the emulation
+  # layer -- so fbcon stays bound to whatever early framebuffer the firmware
+  # left behind (OVMF's 800x600 GOP) and the console never picks up the mode
+  # QEMU advertises over EDID, even though Wayland/Evo on /dev/dri/card0 does.
   ensure_y CONFIG_DRM
   ensure_y CONFIG_DRM_VIRTIO_GPU
+  ensure_y CONFIG_DRM_FBDEV_EMULATION
   ensure_y CONFIG_FB
   ensure_y CONFIG_FRAMEBUFFER_CONSOLE
+  # simpledrm takes over the UEFI GOP framebuffer as a real DRM device, then
+  # hands the aperture off to virtio-gpu when it probes. Without a DRM-based
+  # early console the handoff is a plain efifb teardown, which is what leaves
+  # the console stranded at the firmware mode.
+  ensure_y CONFIG_SYSFB_SIMPLEFB
+  ensure_y CONFIG_DRM_SIMPLEDRM
+  # Bind fbcon to the primary (virtio-gpu) device rather than the first one
+  # registered, which is the firmware framebuffer.
+  ensure_y CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY
 
   # -----------------------------------------------------------------------
   # Serial console — QEMU's -serial mon:stdio exposes an ISA 16550-compatible
@@ -90,8 +106,8 @@ force_kconfig() {
   # bool -- leave them to olddefconfig's defaults (4 UARTs) below.
 
   # -----------------------------------------------------------------------
-  # Input devices -- emulate.sh attaches virtio-keyboard-pci,
-  # virtio-mouse-pci, and a USB usb-tablet. Without these, none of them
+  # Input devices -- emulate.sh attaches virtio-keyboard-pci and a USB
+  # usb-tablet (absolute pointer). Without these, none of them
   # produce a /dev/input/event* node, so libinput enumerates zero devices
   # (it initializes fine, it just never sees anything) and the compositor
   # renders but never receives motion/key events.
@@ -165,6 +181,18 @@ force_kconfig() {
   ensure_y CONFIG_EPOLL
   ensure_y CONFIG_UNIX       # AF_UNIX sockets (dbus, systemd socket activation)
   ensure_y CONFIG_NET        # base networking (AF_UNIX depends on this)
+
+  # -----------------------------------------------------------------------
+  # NIC driver — emulate.sh attaches `-device e1000,netdev=net0`. Found live
+  # (booted the packaged image under QEMU): CONFIG_NET was enough for the
+  # network *stack*, but with no matching NIC driver the e1000 PCI device
+  # never gets a netdev at all -- `ip addr show` listed only lo/dummy0/sit0
+  # (CONFIG_DUMMY's own always-there interface, plus the sit tunnel driver),
+  # nothing hardware-backed for busybox udhcpc to request a lease on.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_NET_VENDOR_INTEL
+  ensure_y CONFIG_E1000
+  ensure_y CONFIG_E1000E
 }
 
 main() {

@@ -25,3 +25,21 @@
 # then verify by hand (sed one-liners against upstream files are worth a
 # manual diff check after every ESR rebase, since the exact line contents
 # may shift).
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/netwerk/protocol/moz.build b/netwerk/protocol/moz.build
+index aa3200c856e5..b58929a7945e 100644
+--- a/netwerk/protocol/moz.build
++++ b/netwerk/protocol/moz.build
+@@ -7,4 +7,4 @@
+ DIRS += ["about", "data", "file"]
+ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "gtk":
+     DIRS += ["gio"]
+-DIRS += ["http", "res", "viewsource", "websocket", "webtransport"]
++DIRS += ["http", "pyxis", "res", "viewsource", "websocket", "webtransport"]

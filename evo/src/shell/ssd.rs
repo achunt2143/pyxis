@@ -23,8 +23,10 @@ use smithay::{
     utils::{Logical, Point, Serial, Transform},
     wayland::shell::xdg::XdgShellHandler,
 };
+use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
 use std::cell::{RefCell, RefMut};
-use tracing::{debug, warn};
+use std::sync::OnceLock;
+use tracing::{debug, info, warn};
 
 use crate::{state::Backend, EvoState};
 use super::WindowElement;
@@ -41,6 +43,106 @@ const MINIMIZE_RGB: [u8; 3] = [0xFF, 0xC1, 0x07];
 const MINIMIZE_HOVER_RGB: [u8; 3] = [0xFF, 0xB3, 0x00];
 const GLASS_RGBA: [u8; 4] = [0xFF, 0xFF, 0xFF, 0x33];
 const GLASS_CORNER_RADIUS: f32 = 16.0;
+
+// === WINDOW BORDER (item #8: see overlapping windows) ===
+// Evo draws no drop shadow, so a thin outer border is the only edge cue when
+// windows overlap. Pure black keeps it premultiplied-safe (premult == straight
+// for black), so it blends correctly whatever the renderer's alpha convention.
+const BORDER_THICKNESS: i32 = 1;
+const BORDER_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
+/// Straight-alpha byte form of BORDER_COLOR for the rasterized corner arcs
+/// (0.55 * 255 ≈ 140). Black stays premultiply-safe.
+const BORDER_ALPHA_U8: u8 = 140;
+/// Corner-arc buffer size — matches the glass bar's top-corner radius so the
+/// border follows the same rounding.
+const BORDER_CORNER_SIZE: u32 = GLASS_CORNER_RADIUS as u32;
+
+// === TITLE TEXT (item #9: show the app name in the title bar) ===
+const TITLE_RGB: [u8; 3] = [0x1a, 0x1a, 0x1a];
+const TITLE_PX: f32 = 14.0;
+const TITLE_PAD_LEFT: u32 = 10;
+const TITLE_GAP_BEFORE_BUTTONS: u32 = 10;
+/// Font shipped by create-rootfs.sh's `fonts-dejavu-core` package.
+const DEJAVU_SANS_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+/// The title-bar font, loaded once from the rootfs. `None` (missing/unparseable
+/// font) degrades to a title bar without text rather than failing — Evo must
+/// never panic over a cosmetic decoration.
+fn title_font() -> Option<&'static FontVec> {
+    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+    FONT.get_or_init(|| match std::fs::read(DEJAVU_SANS_PATH) {
+        Ok(bytes) => match FontVec::try_from_vec(bytes) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!("SSD: failed to parse title font {}: {}", DEJAVU_SANS_PATH, e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("SSD: title font {} unavailable: {}", DEJAVU_SANS_PATH, e);
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// Rasterize `text` into a straight-alpha ARGB8888 buffer (matching the glass
+/// bar's convention — see `put_pixel`), left-to-right, clipped to `max_width`
+/// pixels (trailing glyphs are dropped rather than squeezed). Returns
+/// `(width, height, pixels)` or `None` when there's no font or nothing to draw.
+fn rasterize_text(text: &str, max_width: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let text = text.trim();
+    if text.is_empty() || max_width == 0 {
+        return None;
+    }
+    let font = title_font()?;
+    let scale = PxScale::from(TITLE_PX);
+    let scaled = font.as_scaled(scale);
+    let ascent = scaled.ascent();
+    let line_h = (scaled.ascent() - scaled.descent()).ceil().max(1.0) as u32;
+
+    let mut positioned = Vec::new();
+    let mut caret = 0.0f32;
+    let mut prev = None;
+    for c in text.chars() {
+        let gid = font.glyph_id(c);
+        if let Some(p) = prev {
+            caret += scaled.kern(p, gid);
+        }
+        let advance = scaled.h_advance(gid);
+        if !positioned.is_empty() && (caret + advance).ceil() as u32 > max_width {
+            break;
+        }
+        positioned.push(gid.with_scale_and_position(scale, point(caret, ascent)));
+        caret += advance;
+        prev = Some(gid);
+    }
+
+    let width = (caret.ceil() as u32).clamp(1, max_width);
+    let mut buf = vec![0u8; (width * line_h * 4) as usize];
+    for glyph in positioned {
+        if let Some(outline) = font.outline_glyph(glyph) {
+            let bounds = outline.px_bounds();
+            outline.draw(|gx, gy, coverage| {
+                let px = bounds.min.x as i32 + gx as i32;
+                let py = bounds.min.y as i32 + gy as i32;
+                if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < line_h {
+                    let a = (coverage * 255.0).round() as u8;
+                    if a > 0 {
+                        put_pixel(
+                            &mut buf,
+                            width,
+                            px as u32,
+                            py as u32,
+                            [TITLE_RGB[0], TITLE_RGB[1], TITLE_RGB[2], a],
+                        );
+                    }
+                }
+            });
+        }
+    }
+    Some((width, line_h, buf))
+}
 
 /// Writes one BGRA8888-in-memory pixel (matching `Fourcc::Argb8888`'s byte
 /// order) into `buf` at `(x, y)` for a buffer `stride` pixels wide.
@@ -125,6 +227,29 @@ fn rasterize_glass_bar(width: u32, height: u32, radius: f32, rgba: [u8; 4]) -> V
     buf
 }
 
+/// Rasterize a ~1px rounded-corner arc (transparent everywhere else) at the
+/// glass bar's corner radius, so the window border follows the rounding rather
+/// than squaring off the top corners. `center` is the arc's center of curvature
+/// within the `size`×`size` buffer (top-left corner: `(radius, radius)`;
+/// top-right: `(0, radius)`).
+fn rasterize_corner(size: u32, radius: f32, center: (f32, f32), rgba: [u8; 4]) -> Vec<u8> {
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    // Slightly thicker than the 1px straight edges so the diagonal arc has no
+    // gaps; still reads as a hairline.
+    let thickness = (BORDER_THICKNESS as f32).max(1.0) + 0.75;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - center.0;
+            let dy = y as f32 + 0.5 - center.1;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= radius && dist >= radius - thickness {
+                put_pixel(&mut buf, size, x, y, rgba);
+            }
+        }
+    }
+    buf
+}
+
 fn memory_buffer(width: u32, height: u32, pixels: Vec<u8>) -> MemoryRenderBuffer {
     MemoryRenderBuffer::from_slice(
         &pixels,
@@ -184,7 +309,25 @@ pub struct HeaderBar {
     pub close_button: MemoryRenderBuffer,
     pub maximize_button: SolidColorBuffer,
     pub minimize_button: MemoryRenderBuffer,
-    
+
+    // Full visible window height (header + client), needed to size the side
+    // borders (which extend the whole window, unlike the header-only widgets).
+    pub window_height: u32,
+    // Rounded top corners (constant arcs); straight edges run between/below them.
+    pub border_corner_tl: MemoryRenderBuffer,
+    pub border_corner_tr: MemoryRenderBuffer,
+    pub border_top: SolidColorBuffer,
+    pub border_bottom: SolidColorBuffer,
+    pub border_left: SolidColorBuffer,
+    pub border_right: SolidColorBuffer,
+
+    // Title text (app name). Re-rasterized only when the title or the space
+    // available for it changes.
+    pub title: String,
+    pub title_buffer: Option<MemoryRenderBuffer>,
+    pub title_px_w: u32,
+    pub title_px_h: u32,
+
     // Theme support
     #[cfg(feature = "decorations")]
     pub theme: Theme,
@@ -218,6 +361,35 @@ impl HeaderBar {
                 BUTTON_HEIGHT,
                 rasterize_triangle_down(BUTTON_WIDTH, MINIMIZE_RGB),
             ),
+            window_height: 0,
+            border_corner_tl: memory_buffer(
+                BORDER_CORNER_SIZE,
+                BORDER_CORNER_SIZE,
+                rasterize_corner(
+                    BORDER_CORNER_SIZE,
+                    GLASS_CORNER_RADIUS,
+                    (GLASS_CORNER_RADIUS, GLASS_CORNER_RADIUS),
+                    [0, 0, 0, BORDER_ALPHA_U8],
+                ),
+            ),
+            border_corner_tr: memory_buffer(
+                BORDER_CORNER_SIZE,
+                BORDER_CORNER_SIZE,
+                rasterize_corner(
+                    BORDER_CORNER_SIZE,
+                    GLASS_CORNER_RADIUS,
+                    (0.0, GLASS_CORNER_RADIUS),
+                    [0, 0, 0, BORDER_ALPHA_U8],
+                ),
+            ),
+            border_top: SolidColorBuffer::default(),
+            border_bottom: SolidColorBuffer::default(),
+            border_left: SolidColorBuffer::default(),
+            border_right: SolidColorBuffer::default(),
+            title: String::new(),
+            title_buffer: None,
+            title_px_w: 0,
+            title_px_h: 0,
             #[cfg(feature = "decorations")]
             theme: Theme::default(),
         }
@@ -228,7 +400,7 @@ impl HeaderBar {
     pub fn set_theme(&mut self, theme: Theme) {
         debug!("Setting header bar theme");
         self.theme = theme;
-        self.redraw(self.width);
+        self.redraw(self.width, self.window_height, &self.title.clone());
     }
     
     /// Update pointer location
@@ -295,30 +467,43 @@ impl HeaderBar {
         window: &WindowElement,
         serial: Serial,
     ) {
+        // Diagnostic: which button a titlebar click resolves to, with the
+        // coordinates that decided it. If "maximize closes the app" is really
+        // a hit-test overshoot (the maximize/close buttons sit adjacent at the
+        // screen corner once maximized), this log shows "close" firing when
+        // the user aimed for maximize.
+        info!(
+            "SSD titlebar click: loc_x={:?} width={} (close>={}, max>={}, min>={})",
+            self.pointer_loc.as_ref().map(|l| l.x),
+            self.width,
+            self.width.saturating_sub(BUTTON_WIDTH),
+            self.width.saturating_sub(BUTTON_WIDTH * 2),
+            self.width.saturating_sub(BUTTON_WIDTH * 3),
+        );
         match self.pointer_loc.as_ref() {
             // Close button (rightmost)
             Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {
-                debug!("Close button clicked");
+                info!("Close button clicked");
                 self.handle_close(window);
             }
-            
+
             // Maximize button (second from right)
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
-                debug!("Maximize button clicked");
+                info!("Maximize button clicked");
                 self.handle_maximize(state, window);
             }
-            
+
             // Minimize button (third from right)
             Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
-                debug!("Minimize button clicked");
+                info!("Minimize button clicked");
                 self.handle_minimize(state, window);
             }
-            
+
             // Title bar drag area
             Some(_) => {
                 self.handle_move(seat, state, window, serial);
             }
-            
+
             _ => {}
         }
     }
@@ -340,13 +525,38 @@ impl HeaderBar {
     fn handle_maximize<B: Backend>(&self, state: &mut EvoState<B>, window: &WindowElement) {
         match window.0.underlying_surface() {
             WindowSurface::Wayland(w) => {
+                // Defer to an idle callback (matching the X11 branch below and
+                // `handle_move`) instead of calling (un)maximize_request
+                // inline. This handler runs while the SSD button click is
+                // STILL holding a RefMut borrow of this window's
+                // decoration_state -- see element.rs's
+                // `PointerTarget::button` -> `HeaderBar::clicked` ->
+                // here -- and `maximize_request`/`unmaximize_request` call
+                // `Space::map_element`, which re-reads the SAME
+                // decoration_state through `SpaceElement::geometry`/`bbox`
+                // (both do `self.decoration_state()`, i.e. `borrow_mut()`).
+                // Two live borrows of one RefCell => `already borrowed:
+                // BorrowMutError` panic that took down the whole compositor
+                // on every maximize click (a Rust panic, which is why no
+                // segfault ever showed in dmesg). `insert_idle` runs the
+                // request after input dispatch returns and the borrow is
+                // released. Minimize/close don't hit this: neither re-borrows
+                // decoration_state.
                 let is_maximized =
                     w.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Maximized));
-                if is_maximized {
-                    state.unmaximize_request(w.clone());
-                } else {
-                    state.maximize_request(w.clone());
-                }
+                info!(
+                    "SSD maximize button: pending_maximized={} -> deferring {}",
+                    is_maximized,
+                    if is_maximized { "unmaximize_request" } else { "maximize_request" }
+                );
+                let surface = w.clone();
+                state.handle.insert_idle(move |data| {
+                    if is_maximized {
+                        data.unmaximize_request(surface);
+                    } else {
+                        data.maximize_request(surface);
+                    }
+                });
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(w) => {
@@ -441,7 +651,7 @@ impl HeaderBar {
     }
     
     /// Redraw header bar with theme support
-    pub fn redraw(&mut self, width: u32) {
+    pub fn redraw(&mut self, width: u32, window_height: u32, title: &str) {
         if width == 0 {
             self.width = 0;
             return;
@@ -457,6 +667,47 @@ impl HeaderBar {
                 HEADER_BAR_HEIGHT as u32,
                 rasterize_glass_bar(width, HEADER_BAR_HEIGHT as u32, GLASS_CORNER_RADIUS, GLASS_RGBA),
             );
+        }
+
+        // === BORDERS === sized to the full window (width x window_height, and
+        // the thin side strips down the whole height). Re-created only on a
+        // real size change so damage tracking sees stable buffers otherwise.
+        if needs_redraw_buttons || window_height != self.window_height {
+            self.window_height = window_height;
+            let r = GLASS_CORNER_RADIUS as i32;
+            let w = width as i32;
+            let h = window_height.max(1) as i32;
+            // Top edge runs BETWEEN the two rounded top corners; the side edges
+            // start BELOW them. The bottom corners are square (the client
+            // content isn't rounded there), so the bottom edge spans the full
+            // width and the sides run all the way down.
+            self.border_top
+                .update(((w - 2 * r).max(0), BORDER_THICKNESS), BORDER_COLOR);
+            self.border_bottom.update((w, BORDER_THICKNESS), BORDER_COLOR);
+            self.border_left
+                .update((BORDER_THICKNESS, (h - r).max(0)), BORDER_COLOR);
+            self.border_right
+                .update((BORDER_THICKNESS, (h - r).max(0)), BORDER_COLOR);
+        }
+
+        // === TITLE === re-rasterize only when the text or the space available
+        // for it (window width minus the three right-hand buttons) changes.
+        if needs_redraw_buttons || title != self.title {
+            self.title = title.to_string();
+            let reserved = BUTTON_WIDTH * 3 + TITLE_PAD_LEFT + TITLE_GAP_BEFORE_BUTTONS;
+            let avail = width.saturating_sub(reserved);
+            match rasterize_text(&self.title, avail) {
+                Some((tw, th, px)) => {
+                    self.title_px_w = tw;
+                    self.title_px_h = th;
+                    self.title_buffer = Some(memory_buffer(tw, th, px));
+                }
+                None => {
+                    self.title_buffer = None;
+                    self.title_px_w = 0;
+                    self.title_px_h = 0;
+                }
+            }
         }
 
         // === CLOSE BUTTON (rightmost) ===
@@ -528,7 +779,53 @@ where
         let header_end_offset: Point<i32, Logical> = Point::from((self.width as i32, 0));
         let button_offset: Point<i32, Logical> = Point::from((BUTTON_WIDTH as i32, 0));
 
-        let mut elements: Vec<C> = Vec::with_capacity(4);
+        let mut elements: Vec<C> = Vec::with_capacity(12);
+
+        // --- Window border (item #8). Pushed first == frontmost (see the
+        // reverse-draw note below), so it frames over the client's own edge
+        // pixels. The side/bottom borders run the FULL window height, past the
+        // header, which is why the HeaderBar tracks window_height. Rounded top
+        // corners follow the glass bar's radius; straight edges run
+        // between/below them.
+        let full_h = self.window_height.max(HEADER_BAR_HEIGHT as u32) as i32;
+        let w_i = self.width as i32;
+        let r_i = GLASS_CORNER_RADIUS as i32;
+        for (buf, off) in [
+            (&self.border_top, Point::<i32, Logical>::from((r_i, 0))),
+            (&self.border_bottom, Point::from((0, full_h - BORDER_THICKNESS))),
+            (&self.border_left, Point::from((0, r_i))),
+            (&self.border_right, Point::from((w_i - BORDER_THICKNESS, r_i))),
+        ] {
+            elements.push(
+                DecorationRenderElement::from(SolidColorRenderElement::from_buffer(
+                    buf,
+                    location + off.to_physical_precise_round(scale),
+                    scale,
+                    alpha,
+                    Kind::Unspecified,
+                ))
+                .into(),
+            );
+        }
+        // Rounded top corners (arcs matching the glass radius).
+        for (corner, off) in [
+            (&self.border_corner_tl, Point::<i32, Logical>::from((0, 0))),
+            (&self.border_corner_tr, Point::from((w_i - r_i, 0))),
+        ] {
+            if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                (location + off.to_physical_precise_round(scale)).to_f64(),
+                corner,
+                Some(alpha),
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                elements.push(DecorationRenderElement::from(el).into());
+            } else {
+                warn!("Failed to import border corner texture");
+            }
+        }
 
         // Smithay's damage renderer draws render-element lists in *reverse*
         // (backend/renderer/damage/mod.rs: `render_elements.iter().rev()`),
@@ -581,6 +878,27 @@ where
             elements.push(DecorationRenderElement::from(el).into());
         } else {
             warn!("Failed to import minimize button texture");
+        }
+
+        // Title text (item #9) -- over the glass, left-aligned, vertically
+        // centered. Pushed before the background so the (semi-opaque) glass
+        // doesn't clip it, same as the buttons.
+        if let Some(title_buf) = self.title_buffer.as_ref() {
+            let ty = (HEADER_BAR_HEIGHT as u32).saturating_sub(self.title_px_h) as i32 / 2;
+            let title_off: Point<i32, Logical> = Point::from((TITLE_PAD_LEFT as i32, ty));
+            if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                (location + title_off.to_physical_precise_round(scale)).to_f64(),
+                title_buf,
+                Some(alpha),
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                elements.push(DecorationRenderElement::from(el).into());
+            } else {
+                warn!("Failed to import title text texture");
+            }
         }
 
         // Background (drawn last so it sits behind the buttons) -- glassy rounded bar.

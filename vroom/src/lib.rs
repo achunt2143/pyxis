@@ -1,218 +1,217 @@
-pub mod rendering_pipeline;
-pub mod gpu_acceleration;
-pub mod performance_monitor;
-pub mod caching;
-pub mod optimization;
-pub mod echo_ipc;
+//! Vroom — the Pyxis SDK/PDK packaging toolchain.
+//!
+//! One app model, one manifest model, one package model, one installation
+//! story across the web (SDK) and native (PDK) runtimes. See
+//! docs/pyxis-sdk-pdk-spec.md for the full specification; the shared
+//! pipeline here backs all three CLIs (`pyxis`, `pyxis-sdk`, `pyxis-pdk`).
 
-pub use rendering_pipeline::RenderingPipeline;
-pub use gpu_acceleration::GPUAccelerator;
-pub use performance_monitor::PerformanceMonitor;
-pub use caching::LRUCache;
-pub use optimization::OptimizationEngine;
-pub use echo_ipc::VroomEchoService;
+pub mod builder;
+pub mod config;
+pub mod control;
+pub mod device;
+pub mod error;
+pub mod ipk;
+pub mod manifest;
+pub mod stage;
+pub mod template;
 
-use anyhow::Result;
-use std::{sync::Arc};
-use parking_lot::RwLock;
-use tracing;
+use std::path::{Path, PathBuf};
 
-/// Performance optimization layer for GeckoOS
-/// Handles rendering pipeline optimization, GPU acceleration, and system tuning
-pub struct PerformanceLayer<T> {
-    rendering_pipeline: Arc<RenderingPipeline>,
-    gpu_accelerator: Arc<GPUAccelerator>,
-    performance_monitor: Arc<PerformanceMonitor>,
-    cache_manager: Arc<LRUCache<T>>,
-    optimization_engine: Arc<OptimizationEngine>,
-    state: Arc<RwLock<PerformanceState>>,
+use config::{Project, Runtime};
+use error::{PyxisError, Result};
+
+/// `pyxis build`
+pub fn op_build(project_dir: &Path) -> Result<()> {
+    let project = Project::load(project_dir)?;
+    builder::build(&project)?;
+    eprintln!("[pyxis] build OK ({})", project.config.runtime);
+    Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub struct PerformanceState {
-    pub gpu_enabled: bool,
-    pub pipeline_optimized: bool,
-    pub fps_target: u32,
-    pub current_fps: f64,
-    pub memory_usage_mb: u64,
-    pub gpu_utilization: f32,
+/// `pyxis package` — unified pipeline stages 1–9 (spec §16.1), minus the
+/// payload build which is `pyxis build`'s job.
+pub fn op_package(project_dir: &Path) -> Result<PathBuf> {
+    let project = Project::load(project_dir)?;
+    let appinfo = stage::stage(&project)?;
+    let artifact = ipk::build_ipk(&project)?;
+    // Artifact metadata (spec §16.2)
+    let meta = serde_json::json!({
+        "id": project.config.id,
+        "version": project.config.version,
+        "runtime": project.config.runtime,
+        "architecture": project.config.package.architecture,
+        "appRoot": project.app_root(),
+        "entrypoint": appinfo.main,
+        "packageFile": artifact.to_string_lossy(),
+    });
+    std::fs::write(
+        project.work_dir().join("artifact.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .map_err(|e| PyxisError::Package(format!("writing artifact metadata: {e}")))?;
+    eprintln!("[pyxis] created {}", artifact.display());
+    Ok(artifact)
 }
 
-/// Configuration for performance layer
-#[derive(Debug, Clone)]
-pub struct PerformanceConfig {
-    pub enable_gpu: bool,
-    pub gpu_backend: GPUBackend,
-    pub target_fps: u32,
-    pub vsync_enabled: bool,
-    pub cache_size_mb: u64,
-    pub buffer_pool_size: usize,
-    pub thread_count: usize,
+/// `pyxis install [--device <name>]` — packages if needed, then runs the
+/// device install sequence (spec §17.2).
+pub fn op_install(project_dir: &Path, device_name: Option<&str>) -> Result<()> {
+    let project = Project::load(project_dir)?;
+    let artifact = project.dist_dir().join(project.artifact_name());
+    let artifact = if artifact.is_file() {
+        artifact
+    } else {
+        op_package(project_dir)?
+    };
+    let device = device::resolve_device(device_name)?;
+    device::install(&device, &artifact)?;
+    eprintln!("[pyxis] installed {} on {}", project.config.id, device.host);
+    Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum GPUBackend {
-    Vulkan,
-    Metal,
-    DirectX12,
-    WebGPU,
-    Auto,
+/// `pyxis run [--device <name>]` — install, then launch.
+pub fn op_run(project_dir: &Path, device_name: Option<&str>) -> Result<()> {
+    let project = Project::load(project_dir)?;
+    op_install(project_dir, device_name)?;
+    let device = device::resolve_device(device_name)?;
+    device::launch(&device, &project.config.id)
 }
 
-impl Default for PerformanceConfig {
-    fn default() -> Self {
-        PerformanceConfig {
-            enable_gpu: true,
-            gpu_backend: GPUBackend::Auto,
-            target_fps: 60,
-            vsync_enabled: true,
-            cache_size_mb: 256,
-            buffer_pool_size: 1024,
-            thread_count: num_cpus::get(),
+/// `pyxis lint` — full config + composed-manifest validation without building.
+pub fn op_lint(project_dir: &Path) -> Result<()> {
+    let project = Project::load(project_dir)?; // validates pyxis.json
+    let appinfo = manifest::AppInfo::from_project(&project)?; // validates manifest rules
+    eprintln!(
+        "[pyxis] lint OK: {} {} ({}, arch {})",
+        appinfo.id, appinfo.version, appinfo.app_type, project.config.package.architecture
+    );
+    Ok(())
+}
+
+/// `pyxis doctor` — report host toolchain availability.
+pub fn op_doctor(project_dir: &Path) -> Result<()> {
+    let mut missing_required = false;
+
+    let mut check = |name: &str, required: bool, why: &str| {
+        match which::which(name) {
+            Ok(path) => println!("  ok       {name:<12} {}", path.display()),
+            Err(_) if required => {
+                println!("  MISSING  {name:<12} ({why})");
+                missing_required = true;
+            }
+            Err(_) => println!("  missing  {name:<12} optional: {why}"),
         }
+    };
+
+    println!("host toolchain:");
+    check("tar", true, "package assembly");
+    check("opkg-build", false, "preferred IPK packager; built-in writer used otherwise");
+    check("ssh", false, "device install");
+    check("scp", false, "device install");
+
+    // Project-specific checks when run inside a project.
+    if let Ok(project) = Project::load(project_dir) {
+        println!("project {} ({}):", project.config.id, project.config.runtime);
+        match project.config.runtime {
+            Runtime::Web => {
+                check("node", false, "web builders (vite/esbuild/webpack)");
+                check("npm", false, "web builders (vite/esbuild/webpack)");
+            }
+            Runtime::Native => {
+                if let Some(pdk) = &project.config.pdk {
+                    let tool = match pdk.builder {
+                        config::NativeBuilder::Cmake => "cmake",
+                        config::NativeBuilder::Meson => "meson",
+                        config::NativeBuilder::Cargo => "cargo",
+                        config::NativeBuilder::Make => "make",
+                        config::NativeBuilder::Qmake => "qmake",
+                    };
+                    check(tool, true, "configured pdk.builder");
+                }
+                check("gdb", false, "pyxis-pdk gdb");
+                check("nm", false, "pyxis-pdk symbols");
+            }
+        }
+    } else {
+        println!("(not inside a pyxis project; skipping project checks)");
     }
-}
 
-impl<T: Clone> PerformanceLayer<T> {
-    /// Initialize performance layer
-    pub async fn new(config: PerformanceConfig) -> Result<Self> {
-        tracing::info!("Initializing Performance Layer");
-
-        let rendering_pipeline = Arc::new(RenderingPipeline::new(&config).await?);
-        let gpu_accelerator = Arc::new(GPUAccelerator::new(&config).await?);
-        let performance_monitor = Arc::new(PerformanceMonitor::new(config.buffer_pool_size).await);
-        let cache_manager = Arc::new(LRUCache::new(config.cache_size_mb as usize).await.unwrap());
-        let optimization_engine = Arc::new(OptimizationEngine::new().await);
-
-        let state = Arc::new(RwLock::new(PerformanceState {
-            gpu_enabled: config.enable_gpu,
-            pipeline_optimized: false,
-            fps_target: config.target_fps,
-            current_fps: 0.0,
-            memory_usage_mb: 0,
-            gpu_utilization: 0.0,
-        }));
-
-        let layer = PerformanceLayer {
-            rendering_pipeline,
-            gpu_accelerator,
-            performance_monitor,
-            cache_manager,
-            optimization_engine,
-            state,
-        };
-
-        tracing::info!("Performance Layer initialized successfully");
-        Ok(layer)
+    let devices = device::devices_path();
+    if devices.is_file() {
+        println!("  ok       devices      {}", devices.display());
+    } else {
+        println!("  missing  devices      {} (needed for install/run)", devices.display());
     }
 
-    /// Optimize rendering pipeline
-    pub async fn optimize_pipeline(&self) -> Result<()> {
-        tracing::info!("Optimizing rendering pipeline");
-        // Analyze current state
-        let metrics = self.optimization_engine.get_metrics();
-
-        // Optimize based on metrics
-        self.rendering_pipeline.optimize(&metrics).await?;
-
-        // Mark as optimized
-        let mut state = self.state.write();
-        state.pipeline_optimized = true;
-
+    if missing_required {
+        Err(PyxisError::Config("required host tools are missing".into()))
+    } else {
         Ok(())
     }
-
-    /// Enable GPU acceleration
-    pub async fn enable_gpu(&self) -> Result<()> {
-        tracing::info!("Enabling GPU acceleration");
-
-        self.gpu_accelerator.initialize().await?;
-
-        let mut state = self.state.write();
-        state.gpu_enabled = true;
-
-        Ok(())
-    }
-
-    /// Get current performance metrics
-    pub async fn get_performance_metrics(&self) -> Result<PerformanceMetrics> {
-        let mut state = self.state.write();
-        
-        let metrics = self.optimization_engine.get_metrics();
-        state.current_fps = metrics.fps;
-        state.memory_usage_mb = metrics.memory_usage_mb;
-        state.gpu_utilization = metrics.gpu_utilization;
-
-        Ok(metrics)
-    }
-
-    /// Get rendering pipeline
-    pub fn rendering_pipeline(&self) -> Arc<RenderingPipeline> {
-        self.rendering_pipeline.clone()
-    }
-
-    /// Get GPU accelerator
-    pub fn gpu_accelerator(&self) -> Arc<GPUAccelerator> {
-        self.gpu_accelerator.clone()
-    }
-
-    /// Get performance monitor
-    pub fn performance_monitor(&self) -> Arc<PerformanceMonitor> {
-        self.performance_monitor.clone()
-    }
-
-    /// Get cache manager
-    pub fn cache_manager(&self) -> Arc<LRUCache<T>> {
-        self.cache_manager.clone()
-    }
-
-    /// Get optimization engine
-    pub fn optimization_engine(&self) -> Arc<OptimizationEngine> {
-        self.optimization_engine.clone()
-    }
-
-    /// Get state
-    pub fn state(&self) -> Arc<RwLock<PerformanceState>> {
-        self.state.clone()
-    }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PerformanceMetrics {
-    pub fps: f64,
-    pub frame_time_ms: f64,
-    pub memory_usage_mb: u64,
-    pub gpu_utilization: f32,
-    pub cpu_utilization: f32,
-    pub cache_hit_rate: f32,
-    pub render_passes: u32,
-    pub draw_calls: u32,
+/// `pyxis new <web|native> <dir>`
+pub fn op_new(
+    dir: &Path,
+    runtime: Runtime,
+    id: Option<String>,
+    title: Option<String>,
+    vendor: Option<String>,
+) -> Result<()> {
+    let dir_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("app")
+        .to_lowercase()
+        .replace([' ', '_'], "-");
+    let spec = template::NewProject {
+        dir,
+        runtime,
+        id: id.unwrap_or_else(|| format!("com.example.app.{}", dir_name.replace('-', ""))),
+        title: title.unwrap_or_else(|| dir_name.clone()),
+        vendor: vendor.unwrap_or_else(|| "Example Corp".into()),
+    };
+    template::scaffold(&spec)?;
+    eprintln!(
+        "[pyxis] created {} project `{}` at {}",
+        runtime,
+        spec.id,
+        dir.display()
+    );
+    Ok(())
 }
 
-impl Default for PerformanceMetrics {
-    fn default() -> Self {
-        PerformanceMetrics {
-            fps: 0.0,
-            frame_time_ms: 0.0,
-            memory_usage_mb: 0,
-            gpu_utilization: 0.0,
-            cpu_utilization: 0.0,
-            cache_hit_rate: 0.0,
-            render_passes: 0,
-            draw_calls: 0
-        }
+/// `pyxis-sdk inspect` — resolved project summary.
+pub fn op_inspect(project_dir: &Path) -> Result<()> {
+    let project = Project::load(project_dir)?;
+    let appinfo = manifest::AppInfo::from_project(&project)?;
+    println!("project root:  {}", project.root.display());
+    println!("runtime:       {}", project.config.runtime);
+    println!("app root:      {}", project.app_root());
+    println!("artifact:      dist/{}", project.artifact_name());
+    if project.config.runtime == Runtime::Web {
+        println!("web payload:   {}", project.web_out_dir().display());
+    } else {
+        println!("build dir:     {}", project.build_dir().display());
+        println!("entrypoint:    {}", appinfo.main);
     }
+    println!("appinfo.json:\n{}", appinfo.to_json());
+    println!("CONTROL/control:\n{}", control::render_control(&project));
+    Ok(())
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     #[tokio::test]
-//     async fn test_performance_layer_init() {
-//         let config = PerformanceConfig::default();
-//         let layer = PerformanceLayer::new(config).await.unwrap();
-//         let state = layer.state.read();
-//         assert_eq!(state.fps_target, 60);
-//     }
-// }
+/// Load + assert the project matches the CLI's runtime (for pyxis-sdk/-pdk).
+pub fn assert_runtime(project_dir: &Path, expected: Runtime) -> Result<Project> {
+    let project = Project::load(project_dir)?;
+    if project.config.runtime != expected {
+        return Err(PyxisError::Config(format!(
+            "this project is runtime `{}`; use {} instead",
+            project.config.runtime,
+            match expected {
+                Runtime::Web => "pyxis-pdk (or the umbrella `pyxis`)",
+                Runtime::Native => "pyxis-sdk (or the umbrella `pyxis`)",
+            }
+        )));
+    }
+    Ok(project)
+}

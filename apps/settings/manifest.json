@@ -1,9 +1,0 @@
-{
-  "id": "settings",
-  "name": "Settings",
-  "exec": "./launch",
-  "icon": "icon.png",
-  "version": "0.1.0",
-  "category": "system",
-  "entry": "SettingsApp"
-}

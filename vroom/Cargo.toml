@@ -1,62 +1,39 @@
+# Vroom — the Pyxis SDK/PDK packaging toolchain.
+#
+# Builds, packages, installs, and debugs Pyxis applications:
+#   - SDK  (web apps:    HTML/CSS/JS/TS, `runtime = "web"`)
+#   - PDK  (native apps: C/C++/Rust/etc, `runtime = "native"`)
+#
+# One package format (.ipk), one app manifest (appinfo.json), one project
+# file (pyxis.json). Spec: docs/pyxis-sdk-pdk-spec.md, schemas: schemas/.
+
 [package]
 name = "geckoOS-vroom"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Async runtime
-tokio = { workspace = true, features = ["full"] }
-# Echo (renamed IPC Bus)
-geckoOS-echo = { path = "../echo" }
-# GPU acceleration
-wgpu = { workspace = true, features = ["webgpu", "metal", "vulkan", "dx12"] }
-wgpu-hal = { workspace = true }
-# Rendering optimization
-naga = { workspace = true }
-# Performance monitoring
-metrics = { workspace = true }
-prometheus = { workspace = true }
-# Profiling
-pprof = { workspace = true, features = ["flamegraph", "criterion"] }
-# Benchmarking
-criterion = { workspace = true }
-# Caching
-lru = { workspace = true }
-parking_lot = { workspace = true }
-# Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-# Errors
-anyhow = { workspace = true }
 thiserror = { workspace = true }
-# Logging
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
-# Data structures
-dashmap = { workspace = true }
-# Concurrency
-crossbeam = { workspace = true }
-rayon = { workspace = true }
-# Time
-chrono = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
-num_cpus = { workspace = true }
-goblin = { workspace = true }
+regex = { workspace = true }
+which = { workspace = true }
 clap = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
 
 [lib]
 name = "geckoOS_vroom"
 path = "src/lib.rs"
 
 [[bin]]
-name = "performance-tuner"
-path = "bin/tuner.rs"
+name = "pyxis"
+path = "bin/pyxis.rs"
 
 [[bin]]
-name = "gpu-accelerator"
-path = "bin/accelerator.rs"
+name = "pyxis-sdk"
+path = "bin/sdk.rs"
 
 [[bin]]
-name = "performance-monitor"
-path = "bin/monitor.rs"
-
+name = "pyxis-pdk"
+path = "bin/pdk.rs"

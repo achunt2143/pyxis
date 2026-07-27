@@ -1,0 +1,38 @@
+#!/bin/bash
+# Verify the Gecko patch series still reproduces the vela fork.
+#
+# Install with: make install-hooks
+#
+# Why this exists: target/gecko-src/gecko-dev is gitignored, so a change made
+# directly in that checkout is invisible to git. It builds fine, ships fine,
+# and is silently lost -- gecko/patches/pyxis/ is the only durable copy. An
+# audit found one such change (toolkit/actors/moz.build) already in that state.
+#
+# Skips cleanly when there's no Gecko checkout, so it costs nothing for people
+# who never touch the fork.
+set -u
+
+REPO=$(git rev-parse --show-toplevel)
+[ -x "$REPO/scripts/regen-gecko-patches.sh" ] || exit 0
+
+out=$("$REPO/scripts/regen-gecko-patches.sh" --check 2>&1)
+rc=$?
+
+[ $rc -eq 2 ] && exit 0   # no checkout -- nothing to verify
+[ $rc -eq 0 ] && exit 0
+
+echo "$out"
+cat <<'EOF'
+
+pre-commit: gecko/patches/pyxis/ is out of sync with the Gecko checkout.
+
+A Gecko source change exists only in target/gecko-src/gecko-dev (which is
+gitignored) and is not captured in the patch series. Committing now would
+lose it.
+
+  make gecko-patches-regen     # rewrite the series from the checkout
+  git add gecko/patches
+
+Bypass with --no-verify only if you know the drift is intentional.
+EOF
+exit 1

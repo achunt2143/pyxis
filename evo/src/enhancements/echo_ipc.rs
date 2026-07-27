@@ -92,6 +92,27 @@ pub struct RenderingStatus {
     pub memory_mb: u32,
 }
 
+/// A window-stacking/focus action requested by an incoming Echo IPC method
+/// (`FocusWindow`/`MinimizeWindow`/`RestoreWindow`). Applying these touches
+/// `Space`/`Seat`, which live on Evo's calloop thread, not the broker's
+/// tokio thread -- so `handle_incoming_message` only enqueues the request
+/// here and answers the IPC call immediately; `EvoState::
+/// process_pending_window_actions` (driven once per event-loop iteration by
+/// each backend) drains the queue and does the actual raise/minimize/
+/// restore via the same machinery the internal minimize keybinding uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAction {
+    Focus,
+    Minimize,
+    Restore,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingWindowAction {
+    pub window_id: u32,
+    pub action: WindowAction,
+}
+
 // ============================================================================
 // ECHO PROTOCOL INTERNALS
 // ============================================================================
@@ -237,6 +258,10 @@ pub struct GeckoEchoService {
     // ✅ Change Box to Arc
     pub create_window_cb: Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
 
+    /// Queue of FocusWindow/MinimizeWindow/RestoreWindow requests received
+    /// over Echo IPC, awaiting pickup by `EvoState::process_pending_window_actions`.
+    pending_window_actions: Arc<RwLock<Vec<PendingWindowAction>>>,
+
     // ---- Real FPS tracking (see `record_frame`/`get_rendering_status`) ----
     // Frames rendered since `fps_window_start` was last reset. Plain atomic,
     // not RwLock, since this increments once per rendered frame — a hot
@@ -274,6 +299,7 @@ impl GeckoEchoService {
     let create_window_cb = Arc::new(RwLock::new(None));
     let windows = Arc::new(RwLock::new(HashMap::new()));
     let next_window_id = Arc::new(RwLock::new(1));
+    let pending_window_actions = Arc::new(RwLock::new(Vec::new()));
 
     let (command_tx, command_rx) = mpsc::channel::<EchoCommand>(32);
 
@@ -281,6 +307,7 @@ impl GeckoEchoService {
     let windows_clone = Arc::clone(&windows);
     let next_window_id_clone = Arc::clone(&next_window_id);
     let create_window_cb_clone = Arc::clone(&create_window_cb);
+    let pending_window_actions_clone = Arc::clone(&pending_window_actions);
 
     let socket_path = Self::echo_socket_path();
 
@@ -292,6 +319,7 @@ impl GeckoEchoService {
             windows_clone,
             next_window_id_clone,
             create_window_cb_clone,
+            pending_window_actions_clone,
         )
         .await;
     });
@@ -308,6 +336,7 @@ impl GeckoEchoService {
         command_tx,
         runtime_handle,
         create_window_cb,
+        pending_window_actions,
         frame_count: Arc::new(AtomicU64::new(0)),
         fps_window_start: Arc::new(RwLock::new(Instant::now())),
         last_fps: Arc::new(AtomicU32::new(0)),
@@ -702,6 +731,13 @@ impl GeckoEchoService {
         })
     }
 
+    /// Drain and return all pending FocusWindow/MinimizeWindow/RestoreWindow
+    /// requests queued since the last call (SYNC). Meant to be polled once
+    /// per event-loop iteration from `EvoState::process_pending_window_actions`.
+    pub fn take_pending_window_actions(&self) -> Vec<PendingWindowAction> {
+        std::mem::take(&mut *self.pending_window_actions.write())
+    }
+
     /// Register a handler for window creation requests from Echo
     /// 
     /// Handler should:
@@ -726,6 +762,7 @@ impl GeckoEchoService {
     next_window_id: Arc<RwLock<u32>>,
     // ✅ Arc instead of Box
     create_window_cb: Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
+    pending_window_actions: Arc<RwLock<Vec<PendingWindowAction>>>,
 ) {
     loop {
         match UnixStream::connect(&socket_path).await {
@@ -769,6 +806,7 @@ impl GeckoEchoService {
                                         &windows,
                                         &next_window_id,
                                         &create_window_cb,
+                                        &pending_window_actions,
                                     )
                                     .await
                                     {
@@ -815,6 +853,7 @@ impl GeckoEchoService {
     windows: &Arc<RwLock<HashMap<u32, WindowInfo>>>,
     next_window_id: &Arc<RwLock<u32>>,
     create_window_cb: &Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
+    pending_window_actions: &Arc<RwLock<Vec<PendingWindowAction>>>,
 ) -> Result<()> {
         // Only handle METHOD_CALL messages
         if msg.header.message_type != "METHOD_CALL" {
@@ -947,6 +986,60 @@ impl GeckoEchoService {
                 EchoMessage::method_return(
                     message_id,
                     json!({ "success": true, "workspace_id": workspace_id }),
+                )
+            }
+
+            "FocusWindow" => {
+                let window_id = msg
+                    .body
+                    .get("window_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+
+                pending_window_actions.write().push(PendingWindowAction {
+                    window_id,
+                    action: WindowAction::Focus,
+                });
+                info!("Queued FocusWindow request for window {}", window_id);
+                EchoMessage::method_return(
+                    message_id,
+                    json!({ "success": true, "window_id": window_id }),
+                )
+            }
+
+            "MinimizeWindow" => {
+                let window_id = msg
+                    .body
+                    .get("window_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+
+                pending_window_actions.write().push(PendingWindowAction {
+                    window_id,
+                    action: WindowAction::Minimize,
+                });
+                info!("Queued MinimizeWindow request for window {}", window_id);
+                EchoMessage::method_return(
+                    message_id,
+                    json!({ "success": true, "window_id": window_id }),
+                )
+            }
+
+            "RestoreWindow" => {
+                let window_id = msg
+                    .body
+                    .get("window_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+
+                pending_window_actions.write().push(PendingWindowAction {
+                    window_id,
+                    action: WindowAction::Restore,
+                });
+                info!("Queued RestoreWindow request for window {}", window_id);
+                EchoMessage::method_return(
+                    message_id,
+                    json!({ "success": true, "window_id": window_id }),
                 )
             }
 
@@ -1200,6 +1293,39 @@ impl GeckoEchoService {
                         arg_type: "u".to_string(),
                     }],
                 },
+                MethodDefinition {
+                    name: "FocusWindow".to_string(),
+                    input_args: vec![ArgumentDefinition {
+                        name: "window_id".to_string(),
+                        arg_type: "u".to_string(),
+                    }],
+                    output_args: vec![ArgumentDefinition {
+                        name: "success".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "MinimizeWindow".to_string(),
+                    input_args: vec![ArgumentDefinition {
+                        name: "window_id".to_string(),
+                        arg_type: "u".to_string(),
+                    }],
+                    output_args: vec![ArgumentDefinition {
+                        name: "success".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "RestoreWindow".to_string(),
+                    input_args: vec![ArgumentDefinition {
+                        name: "window_id".to_string(),
+                        arg_type: "u".to_string(),
+                    }],
+                    output_args: vec![ArgumentDefinition {
+                        name: "success".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
             ],
             signals: vec![
                 SignalDefinition {
@@ -1424,6 +1550,7 @@ impl Clone for GeckoEchoService {
             command_tx: self.command_tx.clone(),
             runtime_handle: self.runtime_handle.clone(),
             create_window_cb: Arc::clone(&self.create_window_cb),
+            pending_window_actions: Arc::clone(&self.pending_window_actions),
             frame_count: Arc::clone(&self.frame_count),
             fps_window_start: Arc::clone(&self.fps_window_start),
             last_fps: Arc::clone(&self.last_fps),

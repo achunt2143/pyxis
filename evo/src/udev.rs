@@ -538,6 +538,8 @@ pub fn run_udev() {
         } else {
             state.space.refresh();
             state.popups.cleanup();
+            #[cfg(feature = "echo-ipc")]
+            state.process_pending_window_actions();
             display_handle.flush_clients().unwrap();
         }
     }
@@ -946,14 +948,45 @@ impl EvoState<UdevData> {
                 );
             }
         } else {
+            // Found live (QEMU window opened at a tiny resolution despite
+            // scripts/emulate.sh's `-device virtio-vga-gl,xres=1920,yres=1080`):
+            // virtio-gpu's mode list under QEMU doesn't reliably flag any
+            // mode PREFERRED the way a real monitor's EDID does, so this
+            // silently fell back to index 0 -- whatever the driver happened
+            // to enumerate first, not the largest mode and not what
+            // xres/yres actually requested. Falling back to the
+            // largest-area mode instead of index 0 fixes that without
+            // touching real-display behavior (this branch only runs when
+            // the PREFERRED flag is genuinely absent).
             let mode_id = connector
                 .modes()
                 .iter()
                 .position(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-                .unwrap_or(0);
+                .unwrap_or_else(|| {
+                    connector
+                        .modes()
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, mode)| {
+                            let (w, h) = mode.size();
+                            w as u32 * h as u32
+                        })
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0)
+                });
 
             let drm_mode = connector.modes()[mode_id];
             let wl_mode = WlMode::from(drm_mode);
+            info!(
+                "Output {} selected mode {}x{} @ {}mHz (of {} available, index {}, preferred={})",
+                output_name,
+                drm_mode.size().0,
+                drm_mode.size().1,
+                drm_mode.vrefresh(),
+                connector.modes().len(),
+                mode_id,
+                drm_mode.mode_type().contains(ModeTypeFlags::PREFERRED),
+            );
 
             let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
             let output = Output::new(

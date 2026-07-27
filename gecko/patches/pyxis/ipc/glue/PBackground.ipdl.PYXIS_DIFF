@@ -49,3 +49,46 @@
 # matching AllocPFetchParent's own pattern) lives in
 # ipc/glue/BackgroundParentImpl.h/.cpp -- see the paired .PYXIS_DIFF notes
 # for those two files in this same directory.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/ipc/glue/PBackground.ipdl b/ipc/glue/PBackground.ipdl
+index d2f6713d8653..0b2bd7cd5c11 100644
+--- a/ipc/glue/PBackground.ipdl
++++ b/ipc/glue/PBackground.ipdl
+@@ -49,6 +49,7 @@ include protocol PRemoteMediaManager;
+ include protocol PWebTransport;
+ include protocol PFetch;
+ include protocol PNotification;
++include protocol PPyxisChannel;
+ 
+ include ClientIPCTypes;
+ include DOMTypes;
+@@ -121,6 +122,7 @@ sync protocol PBackground
+   manages PUDPSocket;
+   manages PVsync;
+   manages PFetch;
++  manages PPyxisChannel;
+ 
+ parent:
+   // Only called at startup during mochitests to check the basic infrastructure.
+@@ -296,6 +298,14 @@ parent:
+ 
+   async PFetch();
+ 
++  // Pyxis (2026-07-05): PyxisChannelChild's constructor, used to broker
++  // pyxis:// content reads for a content-process channel through the
++  // parent -- see netwerk/protocol/pyxis/PPyxisChannel.ipdl for the full
++  // protocol definition and design rationale, and
++  // netwerk/protocol/pyxis/PyxisChannelChild.h/PyxisChannelParent.h for the
++  // actor classes.
++  async PPyxisChannel();
++
+   async RequestCameraAccess(bool aAllowPermissionRequest) returns (CamerasAccessStatus rv);
+ 
+ child:

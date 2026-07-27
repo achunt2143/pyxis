@@ -138,11 +138,28 @@ main() {
 
   # Verify critical applets are present in the BUILT binary (not a rootfs
   # copy -- this script no longer installs anything into $ROOTFS_DIR).
-  for applet in blkid mdev httpd; do
+  # udhcpc (defconfig already enables it, unlike blkid/mdev/httpd above --
+  # verified here rather than force-enabled, just to catch a future upstream
+  # default change) is what create-rootfs.sh's geckoOS-boot invokes to bring
+  # up the guest NIC; see its default.script for the other half.
+  for applet in blkid mdev httpd udhcpc; do
     if "$built_bin" --list 2>/dev/null | grep -q "^${applet}$"; then
       log_success "Applet present: ${applet}"
     else
-      log_error "MISSING applet after build: ${applet} — check .config"
+      # Dump the state that decides this rather than just saying "check
+      # .config": this fired once for httpd and then would not reproduce
+      # from a clean distclean+defconfig build, so the evidence has to be
+      # captured at failure time or it is gone. Three things can drop an
+      # applet -- the symbol never got set, `make oldconfig` silently
+      # dropped it for an unmet dependency, or the binary being checked is
+      # stale relative to .config (mtimes distinguish that last one).
+      local sym="CONFIG_$(echo "$applet" | tr '[:lower:]' '[:upper:]')"
+      log_error "MISSING applet after build: ${applet}"
+      grep -E "^(# )?${sym}\b" .config >&2 \
+        || log_error "  ${sym} absent from .config entirely"
+      log_error "  .config mtime: $(stat -c %y .config 2>/dev/null)"
+      log_error "  binary mtime:  $(stat -c %y "$built_bin" 2>/dev/null)"
+      log_error "  applets built: $("$built_bin" --list 2>/dev/null | wc -l)"
       exit 1
     fi
   done

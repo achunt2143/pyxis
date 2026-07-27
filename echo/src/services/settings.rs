@@ -9,12 +9,24 @@ use std::path::PathBuf;
 
 pub struct SettingsService;
 
-// Settings file location
+// Settings file location.
+//
+// Persistent, HOME-independent state under the writable data root Nova already
+// uses (/var/lib/pyxis). The echo-daemon runs as root, so keying settings off
+// $HOME was fragile: whatever HOME the daemon inherited decided where they
+// landed, and an unset HOME sent them to /tmp — a tmpfs wiped on every reboot,
+// which is exactly the "settings don't persist" symptom. An absolute state
+// path removes that coupling. `PYXIS_SETTINGS_DIR` overrides it (dev/tests on
+// a normal box where /var/lib/pyxis isn't writable).
+//
+// NOTE: this only survives reboots of the *same* image — if the rootfs is
+// rebuilt between runs, nothing under it persists without a separate data
+// partition/overlay (tracked separately).
 fn get_settings_file() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".config/geckoos")
-        .join("settings.json")
+    if let Ok(dir) = std::env::var("PYXIS_SETTINGS_DIR") {
+        return PathBuf::from(dir).join("settings.json");
+    }
+    PathBuf::from("/var/lib/pyxis/settings.json")
 }
 
 fn load_settings() -> Result<Map<String, Value>> {

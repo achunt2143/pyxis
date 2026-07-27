@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pyxis.dev/schemas/pyxis.schema.json",
+  "title": "Pyxis Project Configuration",
+  "type": "object",
+  "required": ["id", "title", "vendor", "version", "runtime", "icon", "package"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9_-]+)*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "vendor": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([.-][A-Za-z0-9]+)?$"
+    },
+    "runtime": {
+      "type": "string",
+      "enum": ["web", "native"]
+    },
+    "sourceDir": {
+      "type": "string",
+      "default": "src"
+    },
+    "publicDir": {
+      "type": "string",
+      "default": "public"
+    },
+    "buildDir": {
+      "type": "string",
+      "default": "build"
+    },
+    "entry": {
+      "type": "string"
+    },
+    "icon": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sdk": {
+      "type": "object",
+      "properties": {
+        "builder": {
+          "type": "string",
+          "enum": ["vite", "esbuild", "webpack", "static"]
+        },
+        "outDir": {
+          "type": "string",
+          "default": "dist"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pdk": {
+      "type": "object",
+      "properties": {
+        "builder": {
+          "type": "string",
+          "enum": ["cmake", "meson", "cargo", "make", "qmake"]
+        },
+        "binaryName": {
+          "type": "string"
+        },
+        "installMode": {
+          "type": "string",
+          "enum": ["bundled-app", "system-bin"]
+        },
+        "bundleLibraries": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "unit"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9_-]+)*$"
+          },
+          "unit": {
+            "type": "string",
+            "pattern": "\\.service$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "description": "Requested app permissions (spec §19.1). `appmanager.install` and `appmanager.manage` are privileged: any app may declare them, but they are granted only to apps on the platform trust list (spec §19.2).",
+      "items": {
+        "type": "string",
+        "enum": [
+          "network",
+          "notifications",
+          "camera",
+          "microphone",
+          "location",
+          "bluetooth",
+          "filesystem.read",
+          "filesystem.write",
+          "ipc",
+          "background",
+          "power",
+          "appmanager.install",
+          "appmanager.manage"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "package": {
+      "type": "object",
+      "required": ["section", "priority", "architecture"],
+      "properties": {
+        "section": {
+          "type": "string",
+          "default": "applications"
+        },
+        "priority": {
+          "type": "string",
+          "default": "optional"
+        },
+        "architecture": {
+          "type": "string"
+        },
+        "depends": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "maintainerEmail": {
+          "type": "string",
+          "format": "email"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "runtime": { "const": "web" } }
+      },
+      "then": {
+        "required": ["entry", "sdk"],
+        "properties": {
+          "package": {
+            "properties": {
+              "architecture": { "const": "all" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "runtime": { "const": "native" } }
+      },
+      "then": {
+        "required": ["pdk"],
+        "properties": {
+          "package": {
+            "properties": {
+              "architecture": {
+                "not": { "const": "all" }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

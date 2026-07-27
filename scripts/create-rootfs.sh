@@ -17,18 +17,61 @@ DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian/}"
 GECKO_PREBUILT=${GECKO_PREBUILT:-0}
 KERNEL_PREBUILT=${KERNEL_PREBUILT:-0}
 FORCE_REBUILD=${FORCE_REBUILD:-0}
+# Which staged pyxis:// app vela launches into at boot. Both "terminal" and
+# "bloom" are always staged (stage_terminal_app / stage_bloom_app run
+# unconditionally below) -- this only picks which one the boot script
+# actually execs, baked into the generated /usr/sbin/geckoOS-boot via the
+# @@BOOT_APP@@ placeholder substitution in stage_services().
+#
+# Default is "bloom" (2026-07-08): "terminal" was a deliberate MVP
+# simplification (see stage_terminal_app's comment) while Bloom's own
+# window.geckoOS bridge calls were being debugged -- that's since been
+# verified working end-to-end (real PTY, real Echo calls), so the real
+# desktop shell is now what a plain `make build-release` boots into.
+# Terminal/browser/files/notes/contacts/tasks/settings stay reachable the
+# normal way: launched FROM Bloom's dock/launcher via Nova, each in its own
+# chromeless kiosk window per its own manifest.webapp `display` field.
+BOOT_APP=${BOOT_APP:-bloom}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gecko-prebuilt) GECKO_PREBUILT=1; shift ;;
         --kernel-prebuilt) KERNEL_PREBUILT=1; shift ;;
         --force) FORCE_REBUILD=1; shift ;;
+        --boot-app=*) BOOT_APP="${1#*=}"; shift ;;
+        --boot-app) BOOT_APP="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1" >&2
             exit 1
             ;;
     esac
 done
+
+case "$BOOT_APP" in
+    # Terminal used to build as a second Rollup input (terminal.html)
+    # sharing Bloom's own dist/; it's now its own independent
+    # npm-workspace package (pyxis-experience/packages/apps/terminal/)
+    # that builds a plain index.html at its own dist root, same as every
+    # other extracted app -- see stage_terminal_app.
+    #
+    # BOOT_DISPLAY_MODE picks the PYXIS_DISPLAY_MODE the boot-launched app
+    # gets (see gecko/src/gecko.rs's DisplayMode / the
+    # BrowserContentHandler.sys.mjs patch): Bloom is the desktop shell
+    # itself, so it gets real "fullscreen" (win.fullScreen = true -- no
+    # Evo SSD title bar, edge-to-edge) rather than "maximized" (still a
+    # normal decorated window, just sized to fill the screen). Every OTHER
+    # app -- whether boot-launched here in single-app MVP mode or launched
+    # normally from within Bloom via Nova -- keeps the chromeless "kiosk"
+    # window style (no URL bar/tabs/menu, per kPyxisAppWindowFeatures) that
+    # ALL `--pyxis-app` launches already get regardless of display mode;
+    # "maximized" is just this script's boot-time default for that case.
+    terminal) BOOT_APP_ENTRY=index.html; BOOT_DISPLAY_MODE=maximized ;;
+    bloom) BOOT_APP_ENTRY=index.html; BOOT_DISPLAY_MODE=fullscreen ;;
+    *)
+        echo "Unknown --boot-app: ${BOOT_APP} (expected 'terminal' or 'bloom')" >&2
+        exit 1
+        ;;
+esac
 
 log_info()    { echo "[INFO] $*"; }
 log_success() { echo "[✓] $*"; }
@@ -177,6 +220,38 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt update
 
+# Prune stale dpkg statoverride entries (2026-07-08, found live): a
+# statoverride can reference a system user/group that has since been
+# removed from the rootfs (seen: dbus's `root messagebus 4754
+# /usr/lib/dbus-1.0/dbus-daemon-launch-helper` override outliving the
+# `messagebus` group in /etc/group). dpkg validates the ENTIRE
+# statoverride file up front on every operation, so one dangling entry
+# makes every subsequent `apt install`/dpkg action abort with
+# "unknown system group '<g>' in statoverride file" before doing any
+# work -- which is exactly how adding `nano` to a reused rootfs blew up.
+# dpkg itself points at `dpkg-statoverride --remove` as the recovery, so
+# prune any override whose owning user OR group no longer resolves in
+# this rootfs's own /etc/passwd//etc/group (checked directly rather than
+# via getent, which needs nss wiring a minimal chroot may lack). Read the
+# whole file first, THEN remove, so rewriting the file mid-iteration
+# can't drop entries. No-op on a clean rootfs (no file / nothing stale).
+if [ -f /var/lib/dpkg/statoverride ]; then
+  stale_paths=""
+  while read -r so_user so_group so_mode so_path; do
+    [ -n "${so_path:-}" ] || continue
+    if ! grep -q "^${so_user}:" /etc/passwd 2>/dev/null \
+       || ! grep -q "^${so_group}:" /etc/group 2>/dev/null; then
+      stale_paths="${stale_paths}${so_path}
+"
+    fi
+  done < /var/lib/dpkg/statoverride
+  printf '%s' "$stale_paths" | while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    echo "[rootfs] pruning stale dpkg statoverride: $sp"
+    dpkg-statoverride --remove "$sp" 2>/dev/null || true
+  done
+fi
+
 DISPLAY_INFO_PKG=""
 if apt-cache show libdisplay-info3 >/dev/null 2>&1; then
   DISPLAY_INFO_PKG="libdisplay-info3"
@@ -217,7 +292,8 @@ done
 apt install -y --no-install-recommends \
   apt-utils ca-certificates locales tzdata \
   bash coreutils findutils grep sed gawk diffutils \
-  file less procps psmisc util-linux kmod udev \
+  ncurses-base ncurses-term bash-completion \
+  file less procps psmisc util-linux kmod udev nano \
   iproute2 iputils-ping netbase ifupdown \
   mount passwd login \
   libdrm2 libgbm1 libinput10 libxkbcommon0 libwayland-client0 libwayland-server0 \
@@ -476,9 +552,71 @@ echo "rcS: Startup complete."
 EOF
     sudo chmod 755 "${ROOTFS_DIR}/etc/init.d/rcS"
 
+    # busybox udhcpc has no built-in network-config logic of its own -- on
+    # every deconfig/bound/renew event it just execs whatever script lives at
+    # this fixed, compiled-in path (unless overridden via udhcpc's own -s)
+    # with the negotiated lease passed in environment variables ($interface,
+    # $ip, $subnet, $router, $dns, ...). Without this script present,
+    # geckoOS-boot's udhcpc call below would successfully negotiate a lease
+    # and then do nothing with it: no address, no default route, no
+    # resolv.conf. Written with `ip` (iproute2) rather than ifconfig/route
+    # (net-tools), since only iproute2 is in this rootfs's package list.
+    write_rootfs_file "${ROOTFS_DIR}/usr/share/udhcpc/default.script" <<'EOF'
+#!/bin/bash
+set -u
+
+RESOLV_CONF=/etc/resolv.conf
+
+# Converts a dotted-quad netmask (e.g. 255.255.255.0) to its CIDR prefix
+# length (e.g. 24) -- `ip addr add` wants a prefix length, but udhcpc only
+# hands back a dotted mask via $subnet.
+netmask_to_prefix() {
+    local mask="$1" prefix=0 octet
+    for octet in ${mask//./ }; do
+        case "$octet" in
+            255) prefix=$((prefix + 8)) ;;
+            254) prefix=$((prefix + 7)) ;;
+            252) prefix=$((prefix + 6)) ;;
+            248) prefix=$((prefix + 5)) ;;
+            240) prefix=$((prefix + 4)) ;;
+            224) prefix=$((prefix + 3)) ;;
+            192) prefix=$((prefix + 2)) ;;
+            128) prefix=$((prefix + 1)) ;;
+        esac
+    done
+    echo "$prefix"
+}
+
+case "${1:-}" in
+    deconfig)
+        ip addr flush dev "$interface" 2>/dev/null || true
+        ip link set dev "$interface" up
+        ;;
+    bound|renew)
+        prefix=$(netmask_to_prefix "${subnet:-255.255.255.0}")
+        ip addr flush dev "$interface" 2>/dev/null || true
+        ip addr add "${ip}/${prefix}" dev "$interface"
+        ip link set dev "$interface" up
+
+        if [ -n "${router:-}" ]; then
+            ip route replace default via "${router%% *}" dev "$interface"
+        fi
+
+        {
+            for ns in ${dns:-}; do
+                echo "nameserver $ns"
+            done
+        } > "$RESOLV_CONF"
+        ;;
+esac
+
+exit 0
+EOF
+    sudo chmod 755 "${ROOTFS_DIR}/usr/share/udhcpc/default.script"
+
     # Sequential service startup, mirroring the dependency order already
     # expressed in boot/startup/systemd/services/*.service (shift -> echo ->
-    # evo -> {gecko, rockhopper, vroom}) — those unit files aren't consumed
+    # evo -> {gecko, rockhopper}) — those unit files aren't consumed
     # by BusyBox init, so this script is the authoritative boot order for now.
     write_rootfs_file "${ROOTFS_DIR}/usr/sbin/geckoOS-boot" <<'EOF'
 #!/bin/bash
@@ -534,6 +672,40 @@ else
     echo "[boot] WARN: systemd-udevd not found, relying on initramfs mdev device nodes only"
 fi
 
+# Networking: bring up the first real NIC via DHCP. Nothing in this rootfs
+# runs a DHCP client by default -- iproute2 and busybox's udhcpc applet are
+# both present, but without this the guest NIC (QEMU's e1000, see
+# scripts/emulate.sh's -netdev user/-device e1000) sits administratively
+# down with no address, even though QEMU's own SLIRP/usermode backend is
+# already serving DHCP on the other end. The interface name isn't hardcoded
+# ("eth0") since systemd-udevd (just started above, for Evo's own device
+# enumeration) applies predictable-network-interface-naming rules that can
+# rename it (e.g. ens3/enp0s3) depending on the PCI topology.
+#
+# Found live (booted the packaged image under QEMU): naively picking
+# "first non-lo interface alphabetically" picks "dummy0" every time, not
+# the real NIC -- this kernel's CONFIG_DUMMY always creates a dummy0
+# interface (and CONFIG_IPV6_SIT a sit0 tunnel one), and "dummy0"/"sit0"
+# both sort before any real predictable-named NIC ("ens*"/"enp*"/"eth*").
+# Only an interface with a real backing device -- a /sys/class/net/*/device
+# symlink to its PCI/USB parent, which synthetic interfaces (dummy, sit,
+# lo, ...) never have -- can actually reach QEMU's DHCP server.
+NET_IFACE=""
+for candidate in $(ls /sys/class/net 2>/dev/null); do
+    [ -e "/sys/class/net/${candidate}/device" ] && NET_IFACE="$candidate" && break
+done
+if [ -n "$NET_IFACE" ]; then
+    ip link set dev "$NET_IFACE" up 2>/dev/null || true
+    # -b: fork to background even if a lease isn't obtained immediately,
+    # so a slow/absent DHCP server can never block the rest of boot --
+    # it just keeps retrying (and renewing) in the background via
+    # /usr/share/udhcpc/default.script.
+    start_daemon network /bin/busybox udhcpc -i "$NET_IFACE" -b
+    echo "[boot] requesting DHCP lease on ${NET_IFACE}"
+else
+    echo "[boot] WARN: no network interface found under /sys/class/net, skipping DHCP"
+fi
+
 start_daemon shift /usr/bin/shift-daemon
 sleep 1
 
@@ -570,7 +742,13 @@ fi
 # logind backend would fail on connect anyway, but being explicit removes
 # any ambiguity about which backend libseat tries first.
 export LIBSEAT_BACKEND=seatd
-start_daemon evo /usr/bin/evo --tty-udev
+# RUST_BACKTRACE=full scoped to just this invocation (not exported
+# globally): evo has died silently mid-session with zero panic message and
+# no kernel-logged segfault in /var/log/evo.log -- if it IS a Rust panic
+# rather than a native abort (e.g. from Mesa/virgl hitting an assertion on
+# the abrupt full-output resize maximize_request does), this is what would
+# finally surface it there instead of the process just going quiet.
+RUST_BACKTRACE=full start_daemon evo /usr/bin/evo --tty-udev
 # NOT just `sleep 1` (found via a real boot: vela raced ahead of
 # Evo and failed with "Failed to connect to Wayland display ... No such
 # file or directory") -- Evo's own compositor init (DRM/GPU probing, seat
@@ -629,7 +807,14 @@ fi
 # overwrites the whole file from its own registry, so whichever one runs
 # last wins, and there is no reason for this script to race it.
 VELA_BIN=/usr/lib/pyxis-gecko/vela
-if [ -x "$VELA_BIN" ] && [ -d /usr/share/geckoOS/apps/terminal/webroot ]; then
+# @@BOOT_APP@@ / @@BOOT_APP_ENTRY@@ are literal placeholder tokens, not shell
+# variables -- this whole block is inside a quoted heredoc (<<'EOF' above), so
+# nothing in it is expanded when create-rootfs.sh generates this file. The
+# outer script substitutes these two tokens with the build's --boot-app
+# choice via `sed` right after the heredoc is written (see stage_services()),
+# baking the chosen boot target into this exact image rather than deciding it
+# at guest boot time.
+if [ -x "$VELA_BIN" ] && [ -d /usr/share/geckoOS/apps/@@BOOT_APP@@/webroot ]; then
     # rm -rf before mkdir -p (real bug found via a real report, 2026-07-07):
     # the disk image is a plain QEMU `if=virtio` drive with no `-snapshot`
     # flag (scripts/emulate.sh), so writes -- including anything under
@@ -646,10 +831,10 @@ if [ -x "$VELA_BIN" ] && [ -d /usr/share/geckoOS/apps/terminal/webroot ]; then
     # app (no bookmarks/history/logins), so the simplest correct fix is to
     # never trust cross-boot profile state at all: wipe it before every
     # single boot, unconditionally.
-    rm -rf /var/lib/pyxis/profiles/terminal
-    mkdir -p /var/lib/pyxis/profiles/terminal
-    chown 1000:1000 /var/lib/pyxis/profiles/terminal
-    chmod 700 /var/lib/pyxis/profiles/terminal
+    rm -rf /var/lib/pyxis/profiles/@@BOOT_APP@@
+    mkdir -p /var/lib/pyxis/profiles/@@BOOT_APP@@
+    chown 1000:1000 /var/lib/pyxis/profiles/@@BOOT_APP@@
+    chmod 700 /var/lib/pyxis/profiles/@@BOOT_APP@@
 
     # Rendering prefs via user.js in the profile dir (found via a real boot:
     # the profile now LOADS -- fix #9's -profile worked, proven because the
@@ -667,7 +852,7 @@ if [ -x "$VELA_BIN" ] && [ -d /usr/share/geckoOS/apps/terminal/webroot ]; then
     # (applied every startup, unlike prefs.js) owned by geckouser so the
     # unprivileged app can read it. If hardware WebRender still can't init,
     # the fallback pref set keeps it from hard-failing on the SWGL path.
-    cat > /var/lib/pyxis/profiles/terminal/user.js <<'PREFS'
+    cat > /var/lib/pyxis/profiles/@@BOOT_APP@@/user.js <<'PREFS'
 // Pyxis shell rendering prefs -- see scripts/create-rootfs.sh.
 user_pref("gfx.webrender.all", true);
 user_pref("gfx.webrender.software", false);
@@ -679,8 +864,13 @@ user_pref("dom.ipc.processCount", 1);
 user_pref("browser.tabs.remote.autostart", false);
 // Quiet non-fatal a11y/dbus autolaunch noise seen in the boot log.
 user_pref("accessibility.force_disabled", 1);
+// Single-purpose app window: never crash-restore a prior session as a normal
+// browser window (kept in lockstep with nova.rs's write_profile_prefs).
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.sessionstore.max_resumed_crashes", 0);
+user_pref("browser.startup.page", 0);
 PREFS
-    chown 1000:1000 /var/lib/pyxis/profiles/terminal/user.js
+    chown 1000:1000 /var/lib/pyxis/profiles/@@BOOT_APP@@/user.js
 
     # geckouser's cache/config dirs (found via a real boot: "Fontconfig
     # error: No writable cache directories" for /home/geckouser/.cache/
@@ -747,45 +937,81 @@ PREFS
     # This is also the per-app storage isolation the pyxis:// origin model
     # wants (each app gets its own profile), so it's the right thing, not
     # just a workaround.
-    # PYXIS_DISPLAY_MODE=maximized (not "windowed", the smoketest's choice):
-    # boots straight into a fullscreen terminal (2026-07-06 simplified MVP
-    # boot target -- see stage_terminal_app's comment above for why Bloom's
-    # full shell chrome was swapped out for this minimal single-purpose app
-    # while its own dock/launcher/window-manager overhead gets debugged
-    # separately). Evo's own SSD title bar still wraps it for now (no
-    # borderless/undecorated window hint wired up yet -- a real but
-    # low-priority cosmetic gap for a first alpha, not a functional one).
+    # PYXIS_DISPLAY_MODE=@@BOOT_DISPLAY_MODE@@ (see the BOOT_DISPLAY_MODE
+    # comment above the BOOT_APP case statement): "fullscreen" for Bloom
+    # (the desktop shell should own the whole screen, no Evo SSD title bar),
+    # "maximized" for the standalone-terminal MVP boot target (Evo's own SSD
+    # title bar still wraps it there -- no borderless/undecorated window
+    # hint wired up for that path, a real but low-priority cosmetic gap).
     #
-    # --app-entry terminal.html is NOT optional here (real bug hit on the
-    # first try at this simplification): BrowserContentHandler.sys.mjs's
-    # `--pyxis-app <id>` only sets the app-id/origin -- the entry PATH
-    # defaults to "index.html" unless `--app-entry` says otherwise. Because
-    # stage_terminal_app's webroot is a full copy of pyxis-experience's
-    # shared `dist/` (same assets/ as Bloom's vite multi-page build), it
-    # ALSO contains Bloom's own index.html -- so without this flag,
-    # `pyxis://terminal/index.html` would silently load the FULL Bloom
-    # shell (still working fine per the earlier fix, just not the minimal
-    # terminal-only surface this stage exists to provide).
+    # --app-entry is passed explicitly (now BOOT_APP_ENTRY=index.html for
+    # both terminal and bloom, see the BOOT_APP case above) even though it
+    # now matches BrowserContentHandler.sys.mjs's own "index.html" default
+    # for `--pyxis-app <id>` with no `--app-entry` override. It used to be
+    # load-bearing: terminal's webroot was a full copy of Bloom's shared
+    # multi-page `dist/` (so it ALSO contained Bloom's own index.html, and
+    # omitting the flag would silently boot the full Bloom shell instead).
+    # Terminal is now its own independent package with its own isolated
+    # dist/ (see stage_terminal_app), so that collision can't happen
+    # anymore -- kept explicit anyway since relying on an unstated default
+    # is exactly the kind of thing that bites you the next time this
+    # bootstrapping mechanism changes.
+    # MOZ_GTK_TITLEBAR_DECORATION=none + GTK_CSD=0 make vela defer window
+    # decorations to Evo's server-side title bar (shell/ssd.rs's HeaderBar)
+    # instead of drawing Firefox's own client-side (CSD) titlebar. On
+    # Wayland, Firefox hardcodes CSD (widget/gtk/nsWindow.cpp
+    # GetSystemGtkWindowDecoration returns GTK_DECORATION_CLIENT) unless
+    # WINDOW DECORATION MODEL (revised 2026-07-08 after live QEMU debugging;
+    # supersedes the earlier "Evo draws the one SSD title bar" note here):
+    # on Wayland, GTK draws its OWN default titlebar on any decorated
+    # toplevel, and MOZ_GTK_TITLEBAR_DECORATION=none only suppresses
+    # Firefox's *CSD*, not that GTK titlebar (verified live -- see
+    # evo/src/shell/xdg.rs's ack_configure comment and the
+    # vela-gtk-titlebar-decoration notes). So the model is now: ordinary app
+    # windows keep GTK's own working titlebar and Evo draws no SSD; the
+    # desktop SHELL (Bloom) must instead be fully chromeless.
+    #
+    # --kiosk (added below, only for the fullscreen/shell boot mode) is what
+    # makes the shell chromeless: it sets nsAppRunner's native gKioskMode,
+    # which makes IsAlwaysUndecoratedWindow() true -> gtk_window_set_decorated
+    # (false) AND gtk_window_fullscreen() at WIDGET-creation time
+    # (widget/gtk/nsWindow.cpp) -- deterministic, unlike setting
+    # window.fullScreen from JS after open (which raced the widget realize and
+    # was silently lost). Evo composites the shell's resulting fullscreen
+    # NON-exclusively (xdg.rs's SHELL_APP_ID branch), so app windows launched
+    # from the dock still stack on top. --kiosk affects ONLY this boot vela;
+    # Nova-launched apps have their own command lines (no --kiosk) and stay
+    # decorated. MOZ_GTK_TITLEBAR_DECORATION=none/GTK_CSD=0 are kept (they
+    # still suppress Firefox's redundant CSD on the app windows).
+    KIOSK_FLAG=""
+    if [ "@@BOOT_DISPLAY_MODE@@" = "fullscreen" ]; then
+        KIOSK_FLAG="--kiosk"
+    fi
     start_daemon vela /usr/bin/setpriv --reuid=1000 --regid=1000 --groups video,render \
-        /usr/bin/env MOZ_ENABLE_WAYLAND=1 PYXIS_APP_ID=terminal \
-        PYXIS_PROFILE_DIR=/var/lib/pyxis/profiles/terminal \
-        PYXIS_DISPLAY_MODE=maximized XDG_RUNTIME_DIR=/run/user/1000 \
+        /usr/bin/env MOZ_ENABLE_WAYLAND=1 PYXIS_APP_ID=@@BOOT_APP@@ \
+        PYXIS_PROFILE_DIR=/var/lib/pyxis/profiles/@@BOOT_APP@@ \
+        PYXIS_DISPLAY_MODE=@@BOOT_DISPLAY_MODE@@ XDG_RUNTIME_DIR=/run/user/1000 \
         WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=wayland \
+        MOZ_GTK_TITLEBAR_DECORATION=none GTK_CSD=0 \
         HOME=/home/geckouser \
-        "$VELA_BIN" --profile /var/lib/pyxis/profiles/terminal \
-        --pyxis-app terminal --app-entry terminal.html
+        "$VELA_BIN" $KIOSK_FLAG --profile /var/lib/pyxis/profiles/@@BOOT_APP@@ \
+        --pyxis-app @@BOOT_APP@@ --app-entry @@BOOT_APP_ENTRY@@
 else
-    echo "[boot] SKIP vela: binary (${VELA_BIN}) or Terminal app not staged"
+    echo "[boot] SKIP vela: binary (${VELA_BIN}) or @@BOOT_APP@@ app not staged"
 fi
 
 start_daemon rockhopper /usr/bin/rockhopper-daemon
-start_daemon vroom-monitor /usr/bin/performance-monitor
 
 echo "=== GeckoOS boot sequence complete ==="
 EOF
+    # Bake this build's boot-target choice into the generated script (see the
+    # @@BOOT_APP@@ placeholder comment above the vela launch block).
+    sudo sed -i \
+        "s|@@BOOT_APP_ENTRY@@|${BOOT_APP_ENTRY}|g; s|@@BOOT_DISPLAY_MODE@@|${BOOT_DISPLAY_MODE}|g; s|@@BOOT_APP@@|${BOOT_APP}|g" \
+        "${ROOTFS_DIR}/usr/sbin/geckoOS-boot"
     sudo chmod 755 "${ROOTFS_DIR}/usr/sbin/geckoOS-boot"
 
-    log_success "Init and service scripts created"
+    log_success "Init and service scripts created (boot target: ${BOOT_APP})"
 }
 
 stage_binaries() {
@@ -803,12 +1029,10 @@ stage_binaries() {
         shift-daemon
         evo
         gecko-shell
-        gpu-accelerator
         rockhopper-daemon
         rockhopper-compat
-        performance-monitor
-        performance-tuner
         pyxis
+        pyxis-appctl
     )
 
     for bin in "${bins[@]}"; do
@@ -976,7 +1200,7 @@ stage_bloom_app() {
   "entry": "index.html",
   "category": "system",
   "singleInstance": true,
-  "display": "maximized",
+  "display": "fullscreen",
   "permissions": [
     "filesystem:read",
     "filesystem:write",
@@ -1008,41 +1232,148 @@ stage_terminal_app() {
     # verifying the real PTY-backed terminal works from an actual
     # interactive session.
     #
-    # Reuses pyxis-experience's SAME `dist/` build (vite.config.ts now
-    # builds terminal.html as a second Rollup input alongside index.html,
-    # sharing the same assets/ output) -- just points entry at
-    # "terminal.html" instead of "index.html". Bloom stays staged
+    # Terminal is now its own independent npm-workspace package in
+    # pyxis-experience (packages/apps/terminal/), not a second Rollup input
+    # sharing Bloom's own dist/ -- it builds a plain index.html at its own
+    # dist root, same as every other extracted app. Bloom stays staged
     # separately (stage_bloom_app, above) for later use once the shell
     # chrome itself gets debugged; this is a boot-target swap, not a
     # removal.
-    local src="${PROJECT_ROOT}/../pyxis-experience/dist"
+    local src="${PROJECT_ROOT}/../pyxis-experience/packages/apps/terminal/dist"
     local app_dir="${ROOTFS_DIR}/usr/share/geckoOS/apps/terminal"
 
     if [[ ! -d "$src" ]]; then
-        log_info "No pyxis-experience build at ${src} -- run 'npm run build' in pyxis-experience/ first, skipping"
-        return
-    fi
-    if [[ ! -f "${src}/terminal.html" ]]; then
-        log_info "No terminal.html in ${src} -- rebuild pyxis-experience with the terminal.html Rollup input, skipping"
+        log_info "No terminal build at ${src} -- run 'npm run build' in pyxis-experience/packages/apps/terminal first, skipping"
         return
     fi
 
     sudo mkdir -p "${app_dir}/webroot"
     sudo rsync -a --delete "${src}/" "${app_dir}/webroot/"
-    write_rootfs_file "${app_dir}/manifest.webapp" <<'EOF'
+    # Prefer the app package's own manifest.webapp (source of truth); fall
+    # back to the embedded one so an older checkout without it still boots.
+    # (Boot-as-terminal still gets PYXIS_DISPLAY_MODE=maximized from the boot
+    # script's env regardless of the manifest's display field.)
+    local pkg="${PROJECT_ROOT}/../pyxis-experience/packages/apps/terminal"
+    if [[ -f "${pkg}/manifest.webapp" ]]; then
+        sudo cp "${pkg}/manifest.webapp" "${app_dir}/manifest.webapp"
+    else
+        write_rootfs_file "${app_dir}/manifest.webapp" <<'EOF'
 {
   "id": "terminal",
   "name": "Terminal",
   "version": "0.1.0",
   "type": "web",
-  "entry": "terminal.html",
+  "entry": "index.html",
   "category": "utilities",
   "singleInstance": true,
   "display": "maximized",
   "permissions": []
 }
 EOF
+    fi
     log_success "Standalone Terminal app (app-id 'terminal') installed at ${app_dir}"
+}
+
+# Shared body for the six remaining pyxis-experience apps (browser, files,
+# notes, contacts, tasks, settings) -- each is its own independent
+# npm-workspace package (pyxis-experience/packages/apps/<id>/) that builds a
+# plain index.html + dist/, same shape stage_terminal_app already stages.
+# One tiny wrapper per app (below) just supplies id/name/category/
+# permissions/display and calls this with them, rather than repeating the
+# rsync/manifest boilerplate six times.
+_stage_pyxis_app() {
+    local id="$1" name="$2" category="$3" permissions="$4" display="$5"
+    local pkg="${PROJECT_ROOT}/../pyxis-experience/packages/apps/${id}"
+    local src="${pkg}/dist"
+    local app_dir="${ROOTFS_DIR}/usr/share/geckoOS/apps/${id}"
+
+    if [[ ! -d "$src" ]]; then
+        log_info "No ${id} build at ${src} -- run 'npm run build' in pyxis-experience/packages/apps/${id} first, skipping"
+        return
+    fi
+
+    sudo mkdir -p "${app_dir}/webroot"
+    sudo rsync -a --delete "${src}/" "${app_dir}/webroot/"
+
+    # Source of truth for the manifest is the app package's OWN
+    # manifest.webapp (it ships with the app, author-controlled -- like a real
+    # web-app package). Copy it when present; only fall back to generating one
+    # from the id/name/category/permissions/display args if the package
+    # doesn't carry its own, so the build still works during the transition.
+    if [[ -f "${pkg}/manifest.webapp" ]]; then
+        sudo cp "${pkg}/manifest.webapp" "${app_dir}/manifest.webapp"
+    else
+        write_rootfs_file "${app_dir}/manifest.webapp" <<EOF
+{
+  "id": "${id}",
+  "name": "${name}",
+  "version": "0.1.0",
+  "type": "web",
+  "entry": "index.html",
+  "category": "${category}",
+  "singleInstance": true,
+  "display": "${display}",
+  "permissions": [${permissions}]
+}
+EOF
+    fi
+    log_success "Standalone ${name} app (app-id '${id}') installed at ${app_dir}"
+}
+
+stage_browser_app() {
+    log_section "Stage 8e: standalone Browser app"
+    # No filesystem/power/notification calls (BrowserApp.tsx only reads
+    # network status), so no declared permissions needed.
+    _stage_pyxis_app "browser" "Browser" "system" "" "windowed"
+}
+
+stage_files_app() {
+    log_section "Stage 8f: standalone Files app"
+    # Real directory browsing via org.geckoOS.filesystem's readDirectory.
+    _stage_pyxis_app "files" "File Manager" "system" \
+        '"filesystem:read","filesystem:write"' "windowed"
+}
+
+stage_notes_app() {
+    log_section "Stage 8g: standalone Notes app"
+    # Persists JSON docs through org.geckoOS.filesystem (see
+    # @pyxis/app-sdk's appStorage.ts).
+    _stage_pyxis_app "notes" "Notes" "pim" \
+        '"filesystem:read","filesystem:write"' "windowed"
+}
+
+stage_contacts_app() {
+    log_section "Stage 8h: standalone Contacts app"
+    _stage_pyxis_app "contacts" "Contacts" "pim" \
+        '"filesystem:read","filesystem:write"' "windowed"
+}
+
+stage_tasks_app() {
+    log_section "Stage 8i: standalone Tasks app"
+    _stage_pyxis_app "tasks" "Tasks" "pim" \
+        '"filesystem:read","filesystem:write"' "windowed"
+}
+
+stage_settings_app() {
+    log_section "Stage 8j: standalone Settings app"
+    # Theme/wallpaper go through org.geckoOS.settings, which isn't in
+    # nova.rs's KNOWN_CAPABILITIES gated vocabulary -- no permissions to
+    # declare.
+    _stage_pyxis_app "settings" "Settings" "system" "" "windowed"
+}
+
+stage_installer_app() {
+    log_section "Stage 8k: standalone App Installer"
+    # Drives org.geckoOS.installer (opkg .ipk install/remove), which then
+    # refreshes Nova's registry. appManager:* are the two KNOWN_CAPABILITIES
+    # entries covering install/manage rights.
+    _stage_pyxis_app "installer" "App Installer" "system" \
+        '"appManager:install","appManager:manage"' "windowed"
+
+    # Drop directory the installer scans first (see installer.rs's
+    # PACKAGE_SEARCH_ROOTS). Created here so the app has a stable,
+    # writable place to find packages on a fresh image.
+    sudo mkdir -p "${ROOTFS_DIR}/var/lib/pyxis/incoming"
 }
 
 stage_boot_assets() {
@@ -1076,12 +1407,56 @@ stage_userspace_apps() {
     # window.geckoOS bridge.
     sudo mkdir -p "${ROOTFS_DIR}/usr/share/geckoOS/apps"
 
+    # Only stage real pyxis:// apps -- an app dir is one carrying a
+    # manifest.webapp (Nova's input; its webroot/ is served over pyxis://).
+    # The repo's apps/ ALSO still contains legacy "app host MVP" stub apps
+    # (native manifest.json + a sleep-loop `launch` script, entry:
+    # <ComponentName> from the retired in-DOM app model). Those are vestigial:
+    # blindly rsync'ing all of apps/ used to (a) inject fake apps into
+    # AppHost.ListApps -- their `launch` stub just sleeps, it's not a real app
+    # -- polluting the shell's launcher, (b) make Nova log "skipping invalid
+    # app" for each (no manifest.webapp), and (c) splat a stale manifest.json
+    # + launch over the REAL terminal app dir (stage_terminal_app stages the
+    # pyxis:// terminal to the same path). Filtering on manifest.webapp keeps
+    # any real pyxis:// app in apps/ working while ignoring the stubs. The
+    # apps/ stub dirs are safe to delete from the repo entirely.
     if [[ -d "${PROJECT_ROOT}/apps" ]]; then
-        sudo rsync -a "${PROJECT_ROOT}/apps/" "${ROOTFS_DIR}/usr/share/geckoOS/apps/"
-        sudo find "${ROOTFS_DIR}/usr/share/geckoOS/apps" -name launch -type f -exec chmod 0755 {} +
-        log_success "Sample app manifests copied to /usr/share/geckoOS/apps/"
+        local staged=0
+        for app_dir in "${PROJECT_ROOT}/apps"/*/; do
+            [[ -f "${app_dir}manifest.webapp" ]] || continue
+            sudo rsync -a "${app_dir}" \
+                "${ROOTFS_DIR}/usr/share/geckoOS/apps/$(basename "$app_dir")/"
+            staged=$((staged + 1))
+        done
+        sudo find "${ROOTFS_DIR}/usr/share/geckoOS/apps" -name launch -type f \
+            -exec chmod 0755 {} + 2>/dev/null || true
+        if [[ ${staged} -gt 0 ]]; then
+            log_success "Staged ${staged} pyxis:// app(s) from apps/ (manifest.webapp-bearing)"
+        else
+            log_info "No pyxis:// apps in apps/ (legacy stubs skipped)"
+        fi
     else
         log_info "No apps/ directory found at project root; skipping app manifest stage"
+    fi
+
+    # Prune stale non-pyxis app dirs from the target. The rootfs dir is reused
+    # across incremental builds, so a legacy stub app staged by an OLDER build
+    # (before the manifest.webapp filter above) would otherwise persist and
+    # keep polluting AppHost.ListApps / triggering Nova "skipping invalid app"
+    # warnings even after this script stopped staging it. By this point the
+    # real pyxis:// apps (testapp/bloom/terminal) are already staged WITH a
+    # manifest.webapp by their own stages, so any app dir lacking one is stale
+    # and safe to remove.
+    local pruned=0
+    for target_dir in "${ROOTFS_DIR}/usr/share/geckoOS/apps"/*/; do
+        [[ -d "$target_dir" ]] || continue
+        if [[ ! -f "${target_dir}manifest.webapp" ]]; then
+            sudo rm -rf "$target_dir"
+            pruned=$((pruned + 1))
+        fi
+    done
+    if [[ ${pruned} -gt 0 ]]; then
+        log_info "Pruned ${pruned} stale non-pyxis app dir(s) from target"
     fi
 }
 
@@ -1121,6 +1496,13 @@ main() {
     stage_pyxis_smoketest_app
     stage_bloom_app
     stage_terminal_app
+    stage_browser_app
+    stage_files_app
+    stage_notes_app
+    stage_contacts_app
+    stage_tasks_app
+    stage_settings_app
+    stage_installer_app
     stage_boot_assets
     stage_userspace_apps
     stage_permissions

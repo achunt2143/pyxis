@@ -47,3 +47,41 @@
 # forward-declares e.g. dom::PFetchParent / dom::locks::PLockManagerParent
 # for the existing entries in this file, verified by inspection of the
 # generated header at obj-*/ipc/ipdl/_ipdlheaders/mozilla/ipc/PBackgroundParent.h).
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/ipc/glue/BackgroundParentImpl.h b/ipc/glue/BackgroundParentImpl.h
+index ff3f78c6468d..23aa31359680 100644
+--- a/ipc/glue/BackgroundParentImpl.h
++++ b/ipc/glue/BackgroundParentImpl.h
+@@ -358,6 +358,25 @@ class BackgroundParentImpl : public PBackgroundParent {
+       NotNull<nsIPrincipal*> aPrincipal, const Maybe<nsID>& aClientId) final;
+ 
+   already_AddRefed<PFetchParent> AllocPFetchParent() override;
++
++  // Pyxis (2026-07-05): see ipc/glue/PBackground.ipdl's PPyxisChannel()
++  // constructor declaration and netwerk/protocol/pyxis/PPyxisChannel.ipdl
++  // for the protocol this actor belongs to. No RecvPPyxisChannelConstructor
++  // override needed -- PPyxisChannel(), like PFetch() above, takes no
++  // constructor args, so IPDL's generated default constructor handler is
++  // sufficient once Alloc is provided (matches AllocPFetchParent's own
++  // lack of a paired Recv...Constructor override just above).
++  //
++  // Return type is the GENERATED actor base (net::PPyxisChannelParent), not
++  // the hand-written concrete net::PyxisChannelParent -- matching
++  // AllocPLockManagerParent/AllocPFetchParent's own pattern just above,
++  // where the override's declared return type is always the IPDL-generated
++  // P*Parent base (already_AddRefed<T> isn't a pointer/reference type, so
++  // covariant-return-type relaxation doesn't apply here the way it would
++  // for a raw T*/T& virtual override; the .cpp implementation upcasts the
++  // concrete already_AddRefed<PyxisChannelParent> it constructs).
++  already_AddRefed<net::PPyxisChannelParent> AllocPPyxisChannelParent()
++      override;
+ };
+ 
+ }  // namespace mozilla::ipc

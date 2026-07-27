@@ -35,3 +35,43 @@
 #      }  // namespace mozilla::ipc
 #
 # No other lines in this file were modified.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/ipc/glue/BackgroundParentImpl.cpp b/ipc/glue/BackgroundParentImpl.cpp
+index 38382142108f..baa4531179c9 100644
+--- a/ipc/glue/BackgroundParentImpl.cpp
++++ b/ipc/glue/BackgroundParentImpl.cpp
+@@ -67,6 +67,7 @@
+ #include "mozilla/ipc/PBackgroundTestParent.h"
+ #include "mozilla/net/BackgroundDataBridgeParent.h"
+ #include "mozilla/net/HttpBackgroundChannelParent.h"
++#include "mozilla/net/PyxisChannelParent.h"
+ #include "nsIHttpChannelInternal.h"
+ #include "nsIPrincipal.h"
+ #include "nsProxyRelease.h"
+@@ -1473,6 +1474,19 @@ already_AddRefed<dom::PFetchParent> BackgroundParentImpl::AllocPFetchParent() {
+   return MakeAndAddRef<dom::FetchParent>();
+ }
+ 
++already_AddRefed<net::PPyxisChannelParent>
++BackgroundParentImpl::AllocPPyxisChannelParent() {
++  // net::PyxisChannelParent (the hand-written concrete class) derives from
++  // the generated net::PPyxisChannelParent base -- see
++  // netwerk/protocol/pyxis/PyxisChannelParent.h. MakeAndAddRef returns
++  // already_AddRefed<PyxisChannelParent>; the implicit upcast to
++  // already_AddRefed<PPyxisChannelParent> here matches this override's
++  // declared return type in BackgroundParentImpl.h (see that file's comment
++  // on why the declared type must be the generated base, not the concrete
++  // class).
++  return MakeAndAddRef<net::PyxisChannelParent>();
++}
++
+ }  // namespace mozilla::ipc
+ 
+ void TestParent::ActorDestroy(ActorDestroyReason aWhy) {

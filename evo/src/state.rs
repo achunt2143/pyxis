@@ -26,8 +26,8 @@ use smithay::{
     delegate_layer_shell, delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
     delegate_presentation, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
     delegate_security_context, delegate_shm, delegate_tablet_manager, delegate_text_input_manager,
-    delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_kde_decoration, delegate_viewporter, delegate_virtual_keyboard_manager,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         space::SpaceElement,
         utils::{
@@ -50,13 +50,19 @@ use smithay::{
             self as xdg_decoration,
             zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
         },
+        wayland_protocols_misc::server_decoration::server::{
+            org_kde_kwin_server_decoration::{
+                Mode as KdeDecorationMode, OrgKdeKwinServerDecoration,
+            },
+            org_kde_kwin_server_decoration_manager::Mode as KdeDefaultMode,
+        },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
             Client, Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Time},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Time, SERIAL_COUNTER},
     wayland::{
         commit_timing::{CommitTimerBarrierStateUserData, CommitTimingManagerState},
         compositor::{
@@ -97,6 +103,7 @@ use smithay::{
             SelectionHandler,
         },
         shell::{
+            kde::decoration::{KdeDecorationHandler, KdeDecorationState},
             wlr_layer::{
                 Anchor, Layer, LayerSurfaceAttributes, LayerSurfaceData, WlrLayerShellState,
             },
@@ -138,7 +145,7 @@ use smithay::{
 };
 
 #[cfg(feature = "echo-ipc")]
-use crate::enhancements::echo_ipc::GeckoEchoService;
+use crate::enhancements::echo_ipc::{GeckoEchoService, WindowAction};
 #[cfg(feature = "hotplug")]
 use crate::enhancements::hotplug::HotPlugManager;
 #[cfg(feature = "screencopy")]
@@ -186,6 +193,14 @@ pub struct EvoState<BackendData: Backend + 'static> {
     pub viewporter_state: ViewporterState,
     pub xdg_activation_state: XdgActivationState,
     pub xdg_decoration_state: XdgDecorationState,
+    /// KDE's legacy server-decoration protocol. Carried *in addition to*
+    /// `xdg_decoration_state` because GTK3 — and therefore vela — only ever
+    /// binds this one; GDK has no `zxdg_decoration_manager_v1` support at all
+    /// (verified: `org_kde_kwin_server_decoration_manager` is the sole
+    /// decoration global in libgdk-3, and libgtk-3 imports
+    /// `gdk_wayland_display_prefers_ssd`, which is driven purely by this
+    /// protocol's `default_mode` event).
+    pub kde_decoration_state: KdeDecorationState,
     pub xdg_shell_state: XdgShellState,
     pub presentation_state: PresentationState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
@@ -589,9 +604,29 @@ impl<BackendData: Backend> XdgDecorationHandler for EvoState<BackendData> {
     // `ClientSide` if a client genuinely insists on drawing its own chrome.
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        debug!(
+            "xdg new_decoration: client bound zxdg_toplevel_decoration_v1, defaulting to ServerSide"
+        );
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(Mode::ServerSide);
         });
+
+        // Real bug found via a real boot (2026-07-08): every ack_configure
+        // was observed logging `decoration_mode=None`, meaning the pending
+        // ServerSide default set above never actually reached the client in
+        // a configure event -- unlike `request_mode`/`unset_mode` just
+        // below, this handler was missing the matching
+        // `send_pending_configure()` call. If the client creates its
+        // zxdg_toplevel_decoration_v1 object AFTER the initial configure
+        // already went out (a legitimate ordering the protocol allows),
+        // the pending value above just sits unflushed forever with no
+        // further configure to carry it, so the client never learns the
+        // compositor's ServerSide default and neither side's decoration
+        // state (Evo's is_ssd nor GTK's own CSD suppression) is properly
+        // negotiated.
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
@@ -619,6 +654,78 @@ impl<BackendData: Backend> XdgDecorationHandler for EvoState<BackendData> {
     }
 }
 delegate_xdg_decoration!(@<BackendData: Backend + 'static> EvoState<BackendData>);
+
+/// The decoration mode last negotiated over KDE's server-decoration protocol,
+/// stashed in the surface's data map.
+///
+/// Needed because that protocol is entirely separate from xdg-shell: the mode
+/// is agreed on the `org_kde_kwin_server_decoration` object, but the place
+/// that has to *act* on it is `xdg.rs::ack_configure`, which only sees the
+/// `WlSurface`. `None` means the client never negotiated (so: no SSD).
+#[derive(Debug, Default)]
+pub struct KdeDecorationUserData(pub std::sync::Mutex<Option<KdeDecorationMode>>);
+
+/// Reads back what [`KdeDecorationUserData`] recorded for `surface`.
+pub fn kde_decoration_mode(surface: &WlSurface) -> Option<KdeDecorationMode> {
+    smithay::wayland::compositor::with_states(surface, |states| {
+        states
+            .data_map
+            .get::<KdeDecorationUserData>()
+            .and_then(|d| *d.0.lock().unwrap())
+    })
+}
+
+// The decoration protocol vela actually speaks. See `kde_decoration_state`'s
+// field doc: the `XdgDecorationHandler` above is dead code for any GTK client,
+// because GDK never binds `zxdg_decoration_manager_v1`.
+impl<BackendData: Backend> KdeDecorationHandler for EvoState<BackendData> {
+    fn kde_decoration_state(&self) -> &KdeDecorationState {
+        &self.kde_decoration_state
+    }
+
+    fn new_decoration(&mut self, surface: &WlSurface, _decoration: &OrgKdeKwinServerDecoration) {
+        // Deliberately does NOT announce a mode here. The manager's
+        // `default_mode` event (sent eagerly on bind) has already told the
+        // client we prefer Server, and GDK only creates this object *after*
+        // it has made up its mind — it follows `create` immediately with its
+        // own `request_mode`. Answering here races that request and loses:
+        // observed live as a Server/Client ping-pong
+        // (`request_mode(1)` -> `mode(2)` -> `request_mode(1)` -> `mode(1)`)
+        // before settling. Let `request_mode` be the only place a mode is
+        // ever sent.
+        debug!(
+            ?surface,
+            "kde new_decoration: client created org_kde_kwin_server_decoration"
+        );
+    }
+
+    fn request_mode(
+        &mut self,
+        surface: &WlSurface,
+        decoration: &OrgKdeKwinServerDecoration,
+        mode: smithay::reexports::wayland_server::WEnum<KdeDecorationMode>,
+    ) {
+        use smithay::reexports::wayland_server::WEnum;
+        debug!(?surface, ?mode, "kde request_mode");
+
+        // Echo back exactly what the client asked for, per the protocol's
+        // "compositor must prevent feedback loops" note — do NOT re-assert
+        // Server here, or a client that insists on Client mode will ping-pong
+        // with us forever.
+        if let WEnum::Value(mode) = mode {
+            decoration.mode(mode);
+            smithay::wayland::compositor::with_states(surface, |states| {
+                *states
+                    .data_map
+                    .get_or_insert_threadsafe(KdeDecorationUserData::default)
+                    .0
+                    .lock()
+                    .unwrap() = Some(mode);
+            });
+        }
+    }
+}
+delegate_kde_decoration!(@<BackendData: Backend + 'static> EvoState<BackendData>);
 
 delegate_xdg_shell!(@<BackendData: Backend + 'static> EvoState<BackendData>);
 delegate_layer_shell!(@<BackendData: Backend + 'static> EvoState<BackendData>);
@@ -831,6 +938,12 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        // `Server` is what makes GDK's `gdk_wayland_display_prefers_ssd()`
+        // return true, which in turn makes `gtk_window_should_use_csd()`
+        // false — i.e. this is the one lever that stops GTK adding its own
+        // titlebar widget to a vela toplevel. Smithay sends `default_mode`
+        // eagerly on bind, so the client learns it before it maps anything.
+        let kde_decoration_state = KdeDecorationState::new::<Self>(&dh, KdeDefaultMode::Server);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
@@ -1008,6 +1121,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             viewporter_state,
             xdg_activation_state,
             xdg_decoration_state,
+            kde_decoration_state,
             xdg_shell_state,
             presentation_state,
             fractional_scale_manager_state,
@@ -1649,6 +1763,25 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     }
 
     pub fn raise_window(&mut self, window: &WindowElement) {
+        // A minimized window was unmapped from `self.space` entirely (see
+        // `minimize_window`), so `space.raise_element` below -- which only
+        // reorders elements the space already knows about -- is a silent
+        // no-op on it. Found via a real report: clicking a minimized app's
+        // dock icon (Bloom -> Nova.Focus -> this, via `FocusWindow`'s
+        // `WindowAction::Focus` handling in `process_pending_window_actions`)
+        // never brought the window back at all. Restoring first means every
+        // caller of `raise_window` -- dock clicks, click-to-focus, whatever
+        // else raises a window -- can't hit this, rather than special-casing
+        // it only in the one call site that happened to surface it.
+        let is_minimized = self
+            .workspace_manager
+            .workspace_for_window(window)
+            .and_then(|ws_id| self.workspace_manager.workspace(ws_id))
+            .and_then(|ws| ws.window_state(window))
+            .is_some_and(|s| s.minimized);
+        if is_minimized {
+            self.unminimize_window(window);
+        }
         self.workspace_manager.raise_window(window);
         self.space.raise_element(window, true);
         debug!("Raised window to top");
@@ -1658,6 +1791,11 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         self.workspace_manager.minimize_window(window);
         self.space.unmap_elem(window);
         info!("Minimized window");
+
+        #[cfg(feature = "echo-ipc")]
+        if let Some(id) = self.window_id_for(window) {
+            let _ = self.echo_service.read().emit_window_minimized(id, true);
+        }
     }
 
     pub fn unminimize_window(&mut self, window: &WindowElement) {
@@ -1670,6 +1808,11 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                     info!("Unminimized window");
                 }
             }
+        }
+
+        #[cfg(feature = "echo-ipc")]
+        if let Some(id) = self.window_id_for(window) {
+            let _ = self.echo_service.read().emit_window_minimized(id, false);
         }
     }
 
@@ -1692,6 +1835,39 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             self.unminimize_window(&window);
         } else {
             debug!("RestoreMinimized: no minimized windows in the active workspace");
+        }
+    }
+
+    /// Drains FocusWindow/MinimizeWindow/RestoreWindow requests queued by
+    /// Echo IPC (see `echo_ipc.rs`'s `handle_incoming_message`) and applies
+    /// them through the same `raise_window`/`minimize_window`/
+    /// `unminimize_window` machinery the internal minimize keybinding and
+    /// click-to-focus input handling already use. Called once per
+    /// event-loop iteration by each backend (winit/udev/x11), since the
+    /// broker that receives these IPC requests runs on a separate tokio
+    /// thread with no direct access to `Space`/`Seat`.
+    #[cfg(feature = "echo-ipc")]
+    pub fn process_pending_window_actions(&mut self) {
+        let actions = self.echo_service.read().take_pending_window_actions();
+        for pending in actions {
+            let Some(window) = self.windows_by_id.get(&pending.window_id).cloned() else {
+                warn!(
+                    "Ignoring {:?} for unknown window {}",
+                    pending.action, pending.window_id
+                );
+                continue;
+            };
+            match pending.action {
+                WindowAction::Focus => {
+                    self.raise_window(&window);
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        let serial = SERIAL_COUNTER.next_serial();
+                        keyboard.set_focus(self, Some(window.into()), serial);
+                    }
+                }
+                WindowAction::Minimize => self.minimize_window(&window),
+                WindowAction::Restore => self.unminimize_window(&window),
+            }
         }
     }
 

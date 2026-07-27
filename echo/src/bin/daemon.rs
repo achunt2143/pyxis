@@ -573,6 +573,9 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
     // ==================== NOVA SERVICE (web-app runtime host) ====================
     register_nova_handlers(bus).await?;
 
+    // ==================== INSTALLER SERVICE (.ipk / opkg) ====================
+    register_installer_handlers(bus).await?;
+
     // ==================== TERMINAL SERVICE (real PTY-backed shell) ====================
     register_terminal_handlers(bus).await?;
 
@@ -2016,6 +2019,43 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
         .into(),
     );
 
+    // Focus(appId) -> { appId, sessionId, windowId } — raise + give keyboard
+    // focus to an already-running app's real compositor window (see
+    // Nova::focus's doc comment for why this exists alongside Launch/Close).
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "Focus",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                match services::Nova::global().focus(app_id).await {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // OpenExternalBrowser(url) -> { sessionId, appId, url } — real vela
+    // window for an arbitrary external URL, bypassing Bloom's iframe-based
+    // BrowserApp (which real sites' X-Frame-Options/CSP block). See
+    // Nova::open_external_browser's doc comment for the full rationale.
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "OpenExternalBrowser",
+        handler(move |msg| {
+            Box::pin(async move {
+                let url = msg.body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                match services::Nova::global().open_external_browser(url) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
     // List() -> { apps: [...] }
     bus.router().register_handler(
         "org.geckoOS.nova",
@@ -2107,6 +2147,130 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
     );
 
     info!("✓ Nova service handlers registered");
+    Ok(())
+}
+
+// ==================== INSTALLER SERVICE HANDLERS ====================
+// `.ipk`/opkg package installation. Owns the package layer only — every
+// mutation ends by refreshing Nova's registry so the launcher stays in
+// sync (see services/installer.rs's module doc for that split).
+async fn register_installer_handlers(
+    bus: &Arc<IPCBus>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Registering Installer service handlers");
+
+    services::InstallerService::global().set_bus(bus.clone());
+
+    // ListAvailable(dir?) -> { packages: [...], count }
+    bus.router().register_handler(
+        "org.geckoOS.installer",
+        "ListAvailable",
+        handler(move |msg| {
+            Box::pin(async move {
+                let dir = msg.body.get("dir").and_then(|v| v.as_str());
+                match services::InstallerService::global().list_available(dir) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Inspect(packagePath) -> package metadata (no install)
+    bus.router().register_handler(
+        "org.geckoOS.installer",
+        "Inspect",
+        handler(move |msg| {
+            Box::pin(async move {
+                let path = msg
+                    .body
+                    .get("packagePath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::InstallerService::global().inspect(path) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Install(packagePath, force?) -> { package, version, launchable, ... }
+    bus.router().register_handler(
+        "org.geckoOS.installer",
+        "Install",
+        handler(move |msg| {
+            Box::pin(async move {
+                let path = msg
+                    .body
+                    .get("packagePath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let force = msg
+                    .body
+                    .get("force")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match services::InstallerService::global()
+                    .install(&path, force)
+                    .await
+                {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // Remove(package, purge?) -> { package, registeredApps }
+    bus.router().register_handler(
+        "org.geckoOS.installer",
+        "Remove",
+        handler(move |msg| {
+            Box::pin(async move {
+                let package = msg
+                    .body
+                    .get("package")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let purge = msg
+                    .body
+                    .get("purge")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match services::InstallerService::global()
+                    .remove(&package, purge)
+                    .await
+                {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // ListInstalled() -> { packages: [...], count }
+    bus.router().register_handler(
+        "org.geckoOS.installer",
+        "ListInstalled",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::InstallerService::global().list_installed() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Installer service handlers registered");
     Ok(())
 }
 

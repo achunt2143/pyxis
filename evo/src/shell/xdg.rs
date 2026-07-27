@@ -37,6 +37,22 @@ use super::{
     fullscreen_output_geometry, place_new_window, FullscreenSurface, OldGeometry, PointerMoveSurfaceGrab,
     PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState, SurfaceData, WindowElement,
 };
+use super::ssd::HEADER_BAR_HEIGHT;
+
+/// Wayland `xdg_toplevel` app_id of the desktop shell (Bloom), stamped by
+/// `browser-init.js`'s PYXIS block via `gdk_wayland_window_set_application_id`
+/// to exactly equal `PYXIS_APP_ID` (see that file's comment) -- so this is a
+/// real, already-plumbed identity channel, not a guess. Used in
+/// `fullscreen_request` to give the shell a NON-exclusive fullscreen (full
+/// output size + chromeless, but composited under app windows) instead of the
+/// exclusive single-surface scanout an ordinary fullscreen app gets, and in
+/// `ack_configure` to *initiate* that fullscreen from the compositor side.
+pub(crate) const SHELL_APP_ID: &str = "bloom";
+
+/// Marker stored in a shell window's `user_data` once Evo has issued its
+/// one compositor-initiated fullscreen for it (see `ack_configure`), so the
+/// trigger fires exactly once rather than on every configure ack.
+struct ShellFullscreenedMarker;
 
 impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -60,6 +76,11 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         surface.wl_surface(),
         |state, _, surface| {
             handle_toplevel_commit(&mut state.space, surface);
+            // Also (re)check whether this is the shell that needs its
+            // compositor-driven fullscreen -- app_id is often set AFTER the
+            // initial configures, so ack_configure alone can miss it; commits
+            // keep coming, so this catches it whenever set_app_id lands.
+            state.maybe_init_shell_fullscreen(surface);
         },
     );
 }
@@ -246,15 +267,62 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                 .space
                 .elements()
                 .find(|element| element.wl_surface().as_deref() == Some(&surface));
-            if let Some(window) = window {
+            if let Some(window) = window.cloned() {
                 use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-                let is_ssd = configure
-                    .state
-                    .decoration_mode
-                    .map(|mode| mode == Mode::ServerSide)
-                    .unwrap_or(false);
+                use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode as KdeMode;
+
+                // A client is server-decorated if it negotiated ServerSide on
+                // *either* decoration protocol. In practice the two are
+                // mutually exclusive by toolkit: xdg-decoration is what
+                // non-GTK clients use, and the KDE one is the only one GTK3
+                // (and therefore vela) ever binds -- GDK has no
+                // zxdg_decoration_manager_v1 support at all, which is why the
+                // xdg branch alone read `decoration_mode=None` forever and no
+                // vela window was ever server-decorated.
+                //
+                // Neither path is a compositor-side default: both require the
+                // client to actually ask. vela only asks for Server when
+                // MOZ_GTK_TITLEBAR_DECORATION is set (the rootfs sets `none`);
+                // without it Firefox forces its own CSD, requests Client, and
+                // keeps drawing its own titlebar -- which is correct, and is
+                // what stops the double-decoration this used to produce.
+                let xdg_ssd = configure.state.decoration_mode == Some(Mode::ServerSide);
+                let kde_mode = crate::state::kde_decoration_mode(&surface);
+
+                let app_id = with_states(&surface, |states| {
+                    use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|d| d.lock().unwrap().app_id.clone())
+                });
+
+                // The shell is never decorated, by anyone. Bloom is the
+                // desktop itself -- a titlebar on it is always wrong.
+                //
+                // This has to be an explicit exemption rather than something
+                // the negotiation falls out of: bloom is launched with the
+                // same `MOZ_GTK_TITLEBAR_DECORATION=none` as every app
+                // (create-rootfs.sh), so it asks for Server just like they
+                // do. Only `--kiosk` makes it ask for Client instead
+                // (gKioskMode -> gtk_window_set_decorated(false) at widget
+                // creation), and create-rootfs.sh only passes --kiosk when
+                // BOOT_DISPLAY_MODE=fullscreen -- so without this guard a
+                // windowed-mode boot would put an Evo header bar across the
+                // top of the desktop.
+                let is_shell = app_id.as_deref() == Some(SHELL_APP_ID);
+                let is_ssd = !is_shell && (xdg_ssd || kde_mode == Some(KdeMode::Server));
+
+                tracing::debug!(
+                    "xdg ack_configure: app_id={:?} xdg_decoration={:?} kde_decoration={:?} -> is_ssd={}",
+                    app_id,
+                    configure.state.decoration_mode,
+                    kde_mode,
+                    is_ssd
+                );
                 window.set_ssd(is_ssd);
             }
+            self.maybe_init_shell_fullscreen(&surface);
         }
     }
 
@@ -280,6 +348,8 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             for output in output.client_outputs(&client) {
                 wl_output = Some(output);
             }
+            // Clone out of the space so the immutable `elements()` borrow is
+            // released before the `map_element` below needs `&mut self.space`.
             let window = self
                 .space
                 .elements()
@@ -289,6 +359,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                         .map(|s| &*s == wl_surface)
                         .unwrap_or(false)
                 })
+                .cloned()
                 .unwrap();
 
             surface.with_pending_state(|state| {
@@ -296,15 +367,43 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                 state.size = Some(geometry.size);
                 state.fullscreen_output = wl_output;
             });
-            output
-                .user_data()
-                .insert_if_missing(FullscreenSurface::default);
-            output
-                .user_data()
-                .get::<FullscreenSurface>()
-                .unwrap()
-                .set(window.clone());
-            trace!("Fullscreening: {:?}", window);
+
+            // The desktop shell (Bloom) is launched PYXIS_DISPLAY_MODE=
+            // fullscreen purely so GTK drops its titlebar (a Wayland toplevel
+            // is only chromeless when fullscreen/kiosk/undecorated -- see
+            // vela-gtk-titlebar-decoration). But unlike a real fullscreen app
+            // the shell must sit BEHIND ordinary app windows, not take over
+            // the output. Evo's exclusive-fullscreen render path (render.rs's
+            // FullscreenSurface) draws ONLY that one surface, which is exactly
+            // what made every app launched from the shell invisible. So for
+            // the shell we still send the fullscreen state+size above (that's
+            // what makes Firefox undecorate), but instead of registering it as
+            // the output's exclusive FullscreenSurface we map it at the output
+            // origin as an ordinary bottom-of-stack space window
+            // (activate=false, so app windows raised later stay on top).
+            // Real fullscreen apps (anything that isn't the shell) keep the
+            // exclusive scanout path. See evo-firefox-decoration-arch.
+            let app_id = with_states(wl_surface, |states| {
+                use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|data| data.lock().unwrap().app_id.clone())
+            });
+            if app_id.as_deref() == Some(SHELL_APP_ID) {
+                self.space.map_element(window.clone(), geometry.loc, false);
+                trace!("Shell fullscreen (non-exclusive): {:?}", window);
+            } else {
+                output
+                    .user_data()
+                    .insert_if_missing(FullscreenSurface::default);
+                output
+                    .user_data()
+                    .get::<FullscreenSurface>()
+                    .unwrap()
+                    .set(window.clone());
+                trace!("Fullscreening: {:?}", window);
+            }
         }
 
         if surface.is_initial_configure_sent() {
@@ -333,27 +432,59 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        let window = self
-            .window_for_surface(surface.wl_surface().clone())
-            .unwrap();
+        // Defensive: a compositor must never panic on a maximize (it takes
+        // down every client with it -- "dumps you to a shell"). Every lookup
+        // here is a graceful early-return instead of unwrap()/expect(). This
+        // is the path GTK's own titlebar maximize button drives (apps use
+        // that now, since Evo draws no SSD -- see ack_configure); it must be
+        // bulletproof.
+        let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+            return;
+        };
         let outputs_for_window = self.space.outputs_for_element(&window);
-        let output = outputs_for_window
+        let Some(output) = outputs_for_window
             .first()
-            .or_else(|| self.space.outputs().next())
-            .expect("No outputs found");
-        let geometry = self.space.output_geometry(output).unwrap();
+            .cloned()
+            .or_else(|| self.space.outputs().next().cloned())
+        else {
+            return;
+        };
+        let Some(geometry) = self.space.output_geometry(&output) else {
+            return;
+        };
 
-        // Remember pre-maximize geometry so unmaximize_request (whether
-        // client-requested or triggered by clicking the SSD maximize button
-        // again) can put the window back where/how big it was.
+        // Remember pre-maximize geometry so unmaximize_request can put the
+        // window back where it was.
         if let Some(old_geo) = self.space.element_bbox(&window) {
             window.user_data().insert_if_missing(OldGeometry::default);
-            window.user_data().get::<OldGeometry>().unwrap().save(old_geo);
+            if let Some(saved) = window.user_data().get::<OldGeometry>() {
+                saved.save(old_geo);
+            }
         }
+
+        // A server-decorated window's client area sits BELOW Evo's
+        // HEADER_BAR_HEIGHT-tall title bar (element.rs's SpaceElement
+        // geometry/bbox add it to the element height; the render path pushes
+        // the client down by it). So the client must be configured that much
+        // SHORTER than the output, or header + client together overflow the
+        // screen (the client's bottom rows fall off). Read is_ssd into a local
+        // so the RefMut is dropped before map_element re-borrows
+        // decoration_state.
+        let is_ssd = window.decoration_state().is_ssd;
+        let mut client_size = geometry.size;
+        if is_ssd {
+            client_size.h = (client_size.h - HEADER_BAR_HEIGHT).max(1);
+        }
+        tracing::info!(
+            "maximize_request: output_size={:?} is_ssd={} client_size={:?}",
+            geometry.size,
+            is_ssd,
+            client_size
+        );
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
-            state.size = Some(geometry.size);
+            state.size = Some(client_size);
         });
         self.space.map_element(window, geometry.loc, true);
 
@@ -363,17 +494,33 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        let window = self
-            .window_for_surface(surface.wl_surface().clone())
-            .unwrap();
+        // Defensive early-return (see maximize_request): never panic here.
+        let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+            return;
+        };
         let restored = window
             .user_data()
             .get::<OldGeometry>()
             .and_then(|data| data.restore());
 
+        // Send size = None, NOT the saved geometry's size. The saved rect is
+        // the compositor-space BBOX -- it includes the CSD shadow margin and
+        // Evo's SSD header, which is not the xdg_toplevel window-geometry size
+        // the client expects. Handing that back configured the client too
+        // large and mismatched what it could actually produce; size=None is
+        // the standard "you choose" unmaximize configure (what smithay's anvil
+        // does), and a client that remembers its own last floating size
+        // (Firefox/GTK does) restores exactly that. The saved LOCATION is
+        // still used to place it back.
+        tracing::info!(
+            "unmaximize_request: restored_loc={:?} had_saved_geo={}",
+            restored.map(|g| g.loc),
+            restored.is_some()
+        );
+
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = restored.map(|geo| geo.size);
+            state.size = None;
         });
 
         if let Some(old_geo) = restored {
@@ -383,6 +530,21 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        // Defensive early-return (see maximize_request): never panic here.
+        // This is the path a *client-decorated* window's own titlebar
+        // minimize button drives (GTK sends xdg_toplevel.set_minimized); the
+        // SSD header bar's minimize button goes through
+        // `HeaderBar::handle_minimize` instead. Both still end up in
+        // `minimize_window`. Without this override smithay's default no-op
+        // `minimize_request` swallows the CSD click and the window never
+        // hides.
+        let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+            return;
+        };
+        self.minimize_window(&window);
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
@@ -434,6 +596,48 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
 }
 
 impl<BackendData: Backend> EvoState<BackendData> {
+    /// If `surface` belongs to the desktop shell (Bloom) and Evo hasn't yet
+    /// issued its one compositor-driven fullscreen for it, do so now
+    /// (deferred to an idle callback). The shell is opened popup-like, so it
+    /// won't fullscreen itself; Evo drives it so Firefox drops its GTK
+    /// titlebar and fills the output. Called from both `ack_configure` and
+    /// the per-commit hook because the client's `set_app_id` often lands
+    /// AFTER the initial configures -- checking on every commit guarantees we
+    /// see it. The `ShellFullscreenedMarker` in the window's user_data makes
+    /// this a one-shot. See the SHELL_APP_ID branch of `fullscreen_request`.
+    fn maybe_init_shell_fullscreen(&mut self, surface: &WlSurface) {
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|e| e.wl_surface().as_deref() == Some(surface))
+            .cloned()
+        else {
+            return;
+        };
+        if window.user_data().get::<ShellFullscreenedMarker>().is_some() {
+            return;
+        }
+        let app_id = with_states(surface, |states| {
+            use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().unwrap().app_id.clone())
+        });
+        if app_id.as_deref() != Some(SHELL_APP_ID) {
+            return;
+        }
+        window
+            .user_data()
+            .insert_if_missing(|| ShellFullscreenedMarker);
+        if let Some(toplevel) = window.0.toplevel().cloned() {
+            tracing::info!("Initiating compositor-driven fullscreen for shell");
+            self.handle.insert_idle(move |data| {
+                data.fullscreen_request(toplevel, None);
+            });
+        }
+    }
+
     pub fn move_request_xdg(
         &mut self,
         surface: &ToplevelSurface,

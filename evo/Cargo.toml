@@ -42,6 +42,10 @@ profiling = { workspace = true }
 xcursor = {version = "0.3.3", optional = true}
 rand = "0.8"
 
+# Font rasterization for SSD title-bar text (title/app-name rendering). Pure
+# Rust, already present transitively in the workspace lock -- no new fetch.
+ab_glyph = "0.2"
+
 # Time
 chrono = "0.4"
 

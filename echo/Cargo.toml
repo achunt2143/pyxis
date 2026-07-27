@@ -52,3 +52,10 @@ path = "src/bin/daemon.rs"
 [[bin]]
 name = "echo-cli"
 path = "src/bin/client.rs"
+
+# Device-side launcher/registry control for ipk-packaged apps — thin Echo
+# client over org.geckoOS.nova (see src/bin/appctl.rs's doc comment for why
+# this is not a standalone registry daemon).
+[[bin]]
+name = "pyxis-appctl"
+path = "src/bin/appctl.rs"

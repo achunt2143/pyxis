@@ -52,6 +52,11 @@ const APPS_ROOT: &str = "/usr/share/geckoOS/apps";
 /// through this unchanged `AppHost::launch` path — "system-first-then-user"
 /// resolution, per `nova-runtime-host-plan.md` §4.
 const USER_APPS_ROOT: &str = "/var/lib/pyxis/apps";
+/// Nova-derived manifests for opkg/ipk-installed apps (appinfo.json under
+/// /usr/pyxis/applications — see `services::nova::NOVA_NATIVE_ROOT`'s doc
+/// comment for why those manifests can't live in the app dir itself).
+/// Checked last: system, then user, then ipk-derived.
+const NOVA_NATIVE_ROOT: &str = "/var/lib/pyxis/nova/native";
 
 /// Interface name for app host IPC + signals.
 pub const APPHOST_IFACE: &str = "org.geckoOS.appHost";
@@ -197,7 +202,11 @@ impl AppHost {
     /// system first. Returns the containing root's app dir, not the
     /// manifest file itself.
     fn find_app_dir(app_id: &str) -> Option<PathBuf> {
-        for root in [Self::apps_root(), Self::user_apps_root()] {
+        for root in [
+            Self::apps_root(),
+            Self::user_apps_root(),
+            Self::nova_native_root(),
+        ] {
             let dir = root.join(app_id);
             if dir.join("manifest.json").is_file() {
                 return Some(dir);
@@ -235,7 +244,11 @@ impl AppHost {
     /// skipped — the caller gets the working subset.
     pub fn list_apps(&self) -> Result<Vec<AppManifest>> {
         let mut by_id: HashMap<String, AppManifest> = HashMap::new();
-        for root in [Self::apps_root(), Self::user_apps_root()] {
+        for root in [
+            Self::apps_root(),
+            Self::user_apps_root(),
+            Self::nova_native_root(),
+        ] {
             if !root.exists() {
                 continue;
             }
@@ -285,6 +298,51 @@ impl AppHost {
             app_dir.join(&manifest.exec)
         };
 
+        let mut cmd = Command::new(&exec_path);
+        cmd.current_dir(&app_dir);
+        if let Some(args) = manifest.args.as_ref() {
+            cmd.args(args);
+        }
+        if let Some(env) = manifest.env.as_ref() {
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+        }
+        // `params` is forwarded as JSON in GECKOOS_LAUNCH_PARAMS so apps that
+        // care can read it; most placeholders ignore it.
+        if let Some(p) = params.as_ref() {
+            cmd.env("GECKOOS_LAUNCH_PARAMS", p.to_string());
+        }
+
+        self.spawn_and_track(app_id, cmd)
+    }
+
+    /// Spawn an already-installed app with no `manifest.json` involved —
+    /// for a process whose command line is composed ad hoc by the caller
+    /// (e.g. Nova's external-browser launch: a real `vela <url>` window
+    /// with no fixed app registry entry to read `exec`/`args`/`env` from).
+    /// Tracked as a real session (PID, lifecycle signals, surface binding)
+    /// exactly like `launch`, via the same `spawn_and_track` this delegates
+    /// to — just skips the manifest-file read `launch` otherwise requires.
+    pub fn launch_raw(
+        &self,
+        app_id: &str,
+        exec_path: &Path,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<AppSession> {
+        let mut cmd = Command::new(exec_path);
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        self.spawn_and_track(app_id, cmd)
+    }
+
+    /// Shared by `launch` and `launch_raw`: spawn `cmd`, register it as a
+    /// new session for `app_id`, and emit the usual Starting/Running/
+    /// Crashed lifecycle signals.
+    fn spawn_and_track(&self, app_id: &str, mut cmd: Command) -> Result<AppSession> {
         let session_id = Uuid::new_v4().to_string();
         let started_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -304,22 +362,6 @@ impl AppHost {
         self.sessions.insert(session_id.clone(), starting.clone());
         self.emit_lifecycle("AppStarting", &starting);
 
-        let mut cmd = Command::new(&exec_path);
-        cmd.current_dir(&app_dir);
-        if let Some(args) = manifest.args.as_ref() {
-            cmd.args(args);
-        }
-        if let Some(env) = manifest.env.as_ref() {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
-        }
-        // `params` is forwarded as JSON in GECKOOS_LAUNCH_PARAMS so apps that
-        // care can read it; most placeholders ignore it.
-        if let Some(p) = params.as_ref() {
-            cmd.env("GECKOOS_LAUNCH_PARAMS", p.to_string());
-        }
-
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -332,7 +374,7 @@ impl AppHost {
                 self.sessions.remove(&session_id);
                 return Err(anyhow!(
                     "spawn '{}' for app '{}' failed: {}",
-                    exec_path.display(),
+                    cmd.get_program().to_string_lossy(),
                     app_id,
                     e
                 ));
@@ -820,6 +862,10 @@ impl AppHost {
 
     fn user_apps_root() -> PathBuf {
         PathBuf::from(USER_APPS_ROOT)
+    }
+
+    fn nova_native_root() -> PathBuf {
+        PathBuf::from(NOVA_NATIVE_ROOT)
     }
 
     fn send_signal(pid: u32, signal: Signal) -> Result<()> {
