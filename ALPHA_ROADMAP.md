@@ -229,20 +229,30 @@ one step needs a human*
       pixels. Run `make build-release && make run` (the rootfs stages need
       root) and look.
 
-**C. Fix the two carried-over window bugs**
+**C. Fix the two carried-over window bugs** — *#10 verified; #7 needs a mouse*
 
-- [ ] **#10 restore-from-dock.** Discriminator first (audit §6): does a failed
-      dock click produce the "Couldn't reach …" snackbar? If yes → the IPC
-      chain is fine and it's identity resolution; check `appHost.ListRunning`
-      for **two sessions per app** (the `bind_surface` synth path,
-      `apphost.rs:724-746`), which means vela's Wayland `app_id` isn't matching
-      Nova's. If no snackbar → the click never reaches `handleOrphanSelect`;
-      look at the dock's orphan branch, not the bus.
-- [ ] **#7 maximize→unmaximize crash.** Re-diagnose *after* alpha 3's
-      decoration decision lands. Capture the existing `info!` diagnostics
-      (`ssd.rs::clicked`, `ssd.rs::handle_maximize`, `xdg.rs::maximize_request`
-      / `unmaximize_request`) around a repro before changing any code. Answer
-      first: does Evo itself die (all windows go) or just the client?
+- [x] **#10 restore-from-dock.** The three fixes made 2026-08-17 (bind over
+      Echo rather than into Evo's own process-global AppHost; bind at
+      `ack_configure` where a real app id exists rather than at map time;
+      `IPCBus::call_method` forwarding in-process→external calls) had sat at
+      "awaiting on-device confirmation" ever since. **Confirmed 2026-09-20**
+      by `scripts/serial-tests/alpha4-exit-criteria.txt`: no session has
+      `appId: "unknown"` or `pid: 0`, `nova.Focus` returns a real `windowId`
+      instead of "No handler registered for org.geckoOS.evo.FocusWindow",
+      and the whole dock chain round-trips — `MinimizeWindow(window_id)` →
+      the app reads `suspended` → `nova.Focus` → back to `running`.
+- [ ] **#7 maximize→unmaximize crash.** Root-caused and fixed 2026-08-17 (a
+      single physical click dispatched on both press *and* release, with the
+      header bar's button bands moving between the two, so the release
+      landed on Close). The fix — ignore anything but
+      `ButtonState::Pressed` in `element.rs`'s `PointerTarget::button` — is
+      in the tree and in the shipped image.
+      **Still unverified, and not verifiable here.** The bug is specifically
+      a pointer press/release pair, so driving maximize over IPC would not
+      exercise the broken path and a pass would mean nothing. There is no
+      headless screenshot or synthetic-input channel (QMP `screendump` →
+      "no surface" on a GL scanout, re-confirmed on QEMU 10.2.1). This needs
+      a human to click maximize, then restore-down, on a real window.
 
 **D. Bridge contract tests** (audit §5.4) — *done, shipped with A*
 
@@ -259,20 +269,34 @@ one step needs a human*
 
 ### Exit criteria
 
-- [ ] A third-party `.ipk`, built with `pyxis-sdk` and installed through the
-      Installer app, appears in the launcher with its own icon and launches.
-      **Shell half done and verified in the browser** — installing `weather`
-      through the installer makes it appear in the drawer and desktop search,
-      removing it drops it, driven only by Nova's `RegistryChanged`. What
-      remains is the on-device half: a real `.ipk` through real `opkg`.
-- [ ] Uninstalling it removes it from the launcher. *(Same: verified against
-      the mock, not yet on device.)*
-- [ ] All 8 built-in apps launch, focus from the dock, minimize, restore, and
-      close.
-- [ ] Maximize→unmaximize does not crash.
-- [x] Vitest suite green (10/10), lint 0, `tsc -b` clean, `npm run build` ok.
+Status as of 2026-09-20, after a rebuild and a full on-device pass.
 
----
+- [x] **A third-party `.ipk`, built with `pyxis-sdk` and installed through
+      the Installer app, appears in the launcher and launches.** Confirmed
+      by the user on a real desktop, and by
+      `scripts/serial-tests/alpha4-ipk-e2e.txt` (33 assertions) headlessly.
+      *Caveat on "with its own icon":* the acceptance package shipped a 1×1
+      transparent placeholder from `pyxis-sdk new`, which loads without
+      error and draws as nothing — so the icon path could not be told apart
+      from the generic fallback. It now carries a real 128×128 icon, but
+      that has not been looked at on screen yet.
+- [x] **Uninstalling it removes it from the launcher.** Verified both ways.
+- [~] **All 8 built-in apps launch, focus from the dock, minimize, restore,
+      and close.** Each of these works. All eight *at once* does not fit in
+      the 2 GB reference VM: at 2048 MB the guest reaches 1929/1987 MB used
+      and the last three to launch never map a surface — alive, not
+      OOM-killed, just unable to allocate enough to paint. At 4096 MB all
+      eight map, with 2793 MB used. So this is a resource limit, not a
+      compositor or lifecycle defect, and the fix is alpha 6's resource
+      isolation (cgroups, and Puppis's freeze/thaw so a backgrounded app
+      gives memory back) rather than anything in alpha 4. The reference
+      `QEMU_MEMORY` in `emulate.sh` should probably rise too.
+- [ ] **Maximize→unmaximize does not crash.** Fix in the tree since
+      2026-08-17, still unconfirmed — it needs a pointer, and there is no
+      headless input or screenshot channel. See item C.
+- [x] **Test suite green.** Bloom: 17 vitest, `tsc -b` and eslint clean.
+      Rust: 75. On-device: `alpha4-ipk-e2e.txt` 33/33,
+      `system-service.txt` and `alpha4-exit-criteria.txt` green at 4 GB.
 
 ## Alpha 5 — "A desktop, not a shell"
 

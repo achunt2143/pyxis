@@ -49,10 +49,10 @@ to-do, not "in progress."
 | 4 | Settings persistence | ✅ verified on-device | `settings.rs` |
 | 5 | Kiosk-first / regular-window-after | ✅ verified on-device | `nova.rs` |
 | 6 | Rebrand Firefox → Vela | 📋 to-do (needs vela rebuild) — not attempted this cycle | `gecko/` |
-| 7 | **Unmaximize** (restore-down) closes app — maximize itself now works | 📋 **to-do — still crashes.** The SSD-size + `size=None` fix from this cycle did NOT resolve it; needs re-diagnosis with the added `info!` logging (see Evo section) | `evo/shell/xdg.rs`, `ssd.rs` |
+| 7 | **Unmaximize** (restore-down) closes app | 🟢 root-caused + fixed 2026-08-17 (click dispatched on press *and* release; the button bands move between the two, so the release hit Close). Fix is in the shipped image. **Unverifiable headlessly** — it is a pointer press/release bug, and there is no synthetic-input or screenshot channel. Needs a human to click maximize then restore-down | `evo/shell/element.rs` |
 | 8 | Thin window border (+ follows rounding) | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD (see decoration decision below) | `evo/shell/ssd.rs` |
 | 9 | Title bar shows app name | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD | `evo/shell/ssd.rs`, `element.rs` |
-| 10 | Restore from dock | 📋 **to-do — still does not work.** The `suspended`-state dock fix didn't resolve it; needs re-diagnosis (see Evo/Bloom sections) | Bloom `BottomDock.tsx`, `useEcho.ts` |
+| 10 | Restore from dock | ✅ **verified on-device 2026-09-20.** The three 2026-08-17 fixes had sat unconfirmed for a month; `alpha4-exit-criteria.txt` now round-trips the whole chain — no `appId: "unknown"`/`pid: 0` sessions, `nova.Focus` returns a real windowId, minimize → `suspended` → focus → `running` | `evo/state.rs`, `evo/shell/xdg.rs`, `echo/lib.rs` |
 | 11 | **Window resizing** (new, found in testing) | 📋 **to-do** — not implemented at all; windows currently only have two fixed sizes (maximized / restored-default). No user-driven resize (edge/corner drag) exists yet | `evo/shell/grabs.rs`, `xdg.rs` |
 | 12 | **General visual enhancements** (new, found in testing) | 📋 to-do — umbrella item, scope TBD next pass (title bar/border legibility, spacing, etc.) | Evo SSD / Bloom |
 | — | Window layering (shell below apps) | ✅ verified on-device | `evo/shell/element.rs` |
@@ -677,6 +677,60 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### Alpha4 close-out — rebuild, retest, and an honest exit-criteria pass (2026-09-20)
+
+Rebuilt with the merged `org.geckoOS.system` service and ran everything
+again. What this pass actually established, and what it did not.
+
+**Merged:** `claude/system-service-3c6704` (the bridge's `getSystemInfo()`/
+`listServices()` made real). It was finished but sitting **uncommitted in a
+worktree** — `release/alpha3` had none of it. Rust-only, so a rootfs rebuild
+picked it up without a Gecko build. Verified on device: the third-party
+app's own bridge probe now records `getSystemInfo=ok` where it recorded
+`FAILED ... Service not registered` this morning, and
+`system.listServices` reports **16** services where `Echo.ListServices`
+reports **3** — the registry-vs-router split the service exists to fix.
+
+**#10 restore-from-dock: confirmed, finally.** Its three fixes had read
+"awaiting on-device confirmation" since 2026-08-17. The whole dock chain now
+round-trips on a real boot: no `appId: "unknown"` or `pid: 0` sessions,
+`nova.Focus` returns a real `windowId` rather than "No handler registered
+for org.geckoOS.evo.FocusWindow", and minimize → `suspended` → focus →
+`running` works. Nova's WindowMinimized→suspend path fires.
+
+**#7 maximize→unmaximize: still unconfirmed, and not confirmable here.** The
+fix is in the tree and in the image. The bug is a pointer press/release
+pair, so driving maximize over IPC would not touch the broken path — a pass
+would be meaningless. No synthetic input, no screenshots. A human has to
+click it.
+
+**All 8 built-ins: a resource limit, not a defect.** Every app launches,
+focuses, minimizes, restores and closes. All eight *simultaneously* do not
+fit in the 2 GB reference VM — at 2048 MB the guest hits 1929/1987 MB used
+and the last three to launch never map a surface. They are **alive and not
+OOM-killed**, just unable to allocate enough to paint; `dmesg` shows no
+oom-kill at all. At 4096 MB all eight map, 2793 MB used. So the answer is
+alpha 6's resource isolation (cgroups; Puppis freeze/thaw so a backgrounded
+app returns memory), plus probably a higher default `QEMU_MEMORY`. Nothing
+to fix in alpha 4.
+
+**Two of my own test bugs, both worth recording** because each produced a
+*passing* run that proved nothing:
+- The alpha4 suite hardcoded the package version. When the package went
+  0.1.0 → 0.2.0 every step failed on a missing file and the run still
+  exited 0, because the harness only counted timeouts as failures. Suites
+  now support `#!must` / `#!must-not` assertions that fail the run, and the
+  package path comes from a glob.
+- The exit-criteria suite called `evo.MinimizeWindow` with `appId`. It takes
+  `window_id`, so it minimized window 0 — a no-op that still answers
+  `{"success": true}` (the wart already flagged under #10). The test
+  "passed" while testing nothing. It now resolves a real window id first.
+
+**Also:** the acceptance package shipped a 1×1 transparent icon from
+`pyxis-sdk new`, which loads fine and draws as nothing — so "appears with
+its own icon" was untestable. It now has a real 128×128 one.
+
 
 ### `org.geckoOS.system` — the bridge's last two dead methods (2026-09-20)
 

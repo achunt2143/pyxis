@@ -137,16 +137,30 @@ on QEMU 10.2.1 with `device`/`head` variants; it is not stale tooling).
 ```bash
 scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt
 scripts/serial-test.py -c 'opkg list-installed' --keep-running
+scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha4-exit-criteria.txt
 ```
+
+Suites assert: a `#!must <text>` / `#!must-not <text>` line applies to the
+next command and fails the run. Without them a suite only *prints*, and a
+run in which every step errored still exits 0 — which has happened, twice.
+The three suites live in `scripts/serial-tests/`.
 
 It runs on a qcow2 overlay, so the image is never mutated and each run
 starts clean, and it can `--push` a file in by chunked base64 (sha256
 verified) when there is no other way to get one into the guest. The script's
 docstring carries the serial gotchas that have each cost hours.
 
-**What it cannot do is look at the screen.** Anything whose acceptance is
-visual still needs `make build-release && make run` and a human. Note the
-rootfs stages need root, so a build cannot be fully automated either.
+**What it cannot do is look at the screen, or move the mouse.** Anything
+whose acceptance is visual — or that is *about* pointer input, like bug #7's
+press/release double-dispatch — needs `make build-release && make run` and a
+human. Note the rootfs stages need root, so a build cannot be fully
+automated either.
+
+**The 2 GB reference VM will not run all 8 built-in apps at once.** At the
+`emulate.sh` default the guest saturates (1929/1987 MB) and the last apps to
+launch stay alive but never map a surface, with no OOM kill to explain it —
+which reads exactly like a compositor bug and is not one. Pass
+`--memory 4096` when a suite runs more than about five apps.
 
 ## Source documents
 

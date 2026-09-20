@@ -1,0 +1,109 @@
+# Alpha 4 exit criteria, as far as a headless run can check them.
+#
+#   scripts/serial-test.py --script scripts/serial-tests/alpha4-exit-criteria.txt
+#
+# What this CANNOT check: anything that needs a pointer. #7
+# (maximize -> unmaximize) is specifically a double-dispatch on pointer
+# press+release, so driving maximize over IPC would not exercise the broken
+# path at all and a pass here would be meaningless. That one needs a human
+# with a mouse. Everything else below is real.
+
+# ---------- every built-in launches ----------
+# The criterion is "all 8 built-in apps launch". One at a time, so a
+# failure names the app.
+
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -E 'sessionId|Error'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"browser"}' | grep -E 'sessionId|Error'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"contacts"}' | grep -E 'sessionId|Error'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"tasks"}' | grep -E 'sessionId|Error'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"settings"}' | grep -E 'sessionId|Error'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"installer"}' | grep -E 'sessionId|Error'
+
+# vela takes ~15s from spawn to first paint, so surfaces must be checked
+# after a real settle, not right after the last launch. An earlier version
+# of this waited 7s and saw 5 of 8 bound, which looks like a compositor
+# bug and is only impatience.
+sleep 40
+#!must "count": 8
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep count
+#!must-not "surfaces": []
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -A2 surfaces
+
+# ---------- #10 fix parts 1+2: surfaces bind to the RIGHT session ----------
+# The bug was that Evo bound surfaces into its own process-local AppHost, and
+# later into a synthesized "unknown"/pid-0 session. Both show up here as a
+# session whose appId is literally "unknown", or as real apps with surfaces:[].
+#!must-not "appId": "unknown"
+#!must-not "pid": 0
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -E 'appId|pid|surfaces'
+#!must-not "surfaces": []
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -A2 surfaces
+
+# ---------- #10 fix part 3: in-process -> external calls ----------
+# nova.Focus reaches Evo's FocusWindow. This is the call that failed with
+# "No handler registered for org.geckoOS.evo.FocusWindow" because
+# IPCBus::call_method only consulted the in-process router, and Evo is a
+# socket client. It is the dock's restore path.
+#!must windowId
+#!must-not Error
+echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"files"}'
+#!must windowId
+#!must-not Error
+echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"terminal"}'
+
+# ---------- minimize / restore, the rest of the dock path ----------
+# Mind the signatures: evo's MinimizeWindow/RestoreWindow take `window_id`,
+# and appHost's GetAppState takes `sessionId` — NOT `appId`. Passing appId
+# to MinimizeWindow minimizes window 0, which is a silent no-op that still
+# answers {"success": true} (a known wart, see PROJECT_STATUS #10), so a
+# test written that way passes while testing nothing.
+WID=$(echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"windowId": [0-9]*' | grep -o '[0-9]*'); echo "WID=$WID"
+SID=$(echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"sessionId": "[^"]*"' | cut -d'"' -f4); echo "SID=$SID"
+#!must-not WID=$
+echo "WID=$WID"
+
+#!must "success": true
+echo-cli call org.geckoOS.evo MinimizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$WID}"
+sleep 4
+# Nova drives appHost.suspend off Evo's WindowMinimized signal, so a
+# minimized app should read as suspended rather than vanishing from the dock.
+#!must suspended
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -E '"state"' | sort | uniq -c
+
+# Restore is what the dock click does: nova.Focus -> evo.FocusWindow.
+#!must windowId
+echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"files"}'
+sleep 4
+#!must running
+echo-cli call org.geckoOS.appHost GetAppState --interface org.geckoOS.appHost --args "{\"sessionId\":\"$SID\"}"
+
+# ---------- and they all close cleanly ----------
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -E 'sessionId|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"browser"}' | grep -E 'sessionId|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"contacts"}' | grep -E 'sessionId|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"tasks"}' | grep -E 'sessionId|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"settings"}' | grep -E 'sessionId|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"installer"}' | grep -E 'sessionId|Error'
+sleep 8
+#!must "count": 0
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep count
+
+# ---------- a crash in an app must not take the shell or compositor ----------
+#!must 1
+pgrep -cf '[-]-pyxis-app bloom'
+#!must 1
+pgrep -c '[e]vo'
+#!must-not panicked
+grep -aiE 'panic|SIGSEGV' /var/log/evo.log /var/log/echo.log | tail -5
