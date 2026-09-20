@@ -49,9 +49,13 @@ bash scripts/create-rootfs.sh --kernel-prebuilt
 # Order matters: the package has to be in the rootfs BEFORE the image is
 # built from it, or the Installer app comes up with nothing to install.
 sudo install -Dm644 "$IPK" "target/build/rootfs/var/lib/pyxis/incoming/$(basename "$IPK")"
-# `yes` answers package.sh's overwrite prompt, which otherwise waits on a
-# question that is invisible when the script's output is redirected.
-yes | bash scripts/package.sh --x86_64-efi
+# stdin from /dev/null, NOT `yes |`. package.sh already checks `[ -t 0 ]`
+# and overwrites automatically when stdin is not a terminal, so the pipe was
+# never needed — and it actively broke this script: `yes` dies of SIGPIPE
+# when package.sh exits, and with `pipefail` that non-zero status tripped
+# `set -e`, so the run ended after the image was built and never reached the
+# test suites. Silently, because the image itself was fine.
+bash scripts/package.sh --x86_64-efi < /dev/null
 ok "target/build/images/geckoOS.img"
 
 if [ "$SKIP_TESTS" = "1" ]; then
