@@ -30,6 +30,11 @@ Suites may assert. A `#!must <text>` or `#!must-not <text>` line applies to
 the next command and fails the run (non-zero exit) if unmet — otherwise a
 suite only prints, and a run where every step errored still exits 0.
 
+Matching is a plain SUBSTRING test, not a regex: `#!must-not ^[0-4]$` looks
+for those literal characters, never matches, and so passes vacuously. To
+assert a numeric condition, make the command say it in words —
+`test $(...) -gt 10 && echo MANY || echo TOO-FEW` with `#!must MANY`.
+
 Usage:
     scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt
     scripts/serial-test.py -c 'uname -a' -c 'opkg list-installed | head'
@@ -182,6 +187,14 @@ class Guest:
         command's output.
         """
         text = ANSI_RE.sub("", raw)
+        # The console echoes the command back, and WRAPS it at the terminal
+        # width — so the echo arrives as several lines, none of which equals
+        # the command. Comparing whole lines therefore leaves fragments in
+        # the "output", which breaks any assertion whose text also appears
+        # in the command itself (asserting `must-not unavailable` on a
+        # `grep unavailable ...` line was the case that found this).
+        # Matching on the whitespace-stripped command handles the wrap.
+        flat_cmd = "".join(command.split())
         lines: list[str] = []
         for ln in text.splitlines():
             ln = ln.rstrip("\r").rstrip()
@@ -189,6 +202,12 @@ class Guest:
                 continue
             # 'root@(none):/# uname -a' — prompt plus the echoed command.
             if PROMPT_RE.match(ln):
+                continue
+            flat = "".join(ln.split())
+            # A whole echo, or any wrapped fragment of one. Guard on length
+            # so a genuinely short line of output ("16") is not mistaken for
+            # a fragment that happens to occur in the command.
+            if flat and len(flat) >= 8 and flat in flat_cmd:
                 continue
             if ln.strip() == command.strip():
                 continue

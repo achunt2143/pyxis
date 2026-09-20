@@ -10,11 +10,17 @@
 # existed.
 
 # ---------- the service is on the bus at all ----------
+#!must "pong": true
 echo-cli call org.geckoOS.system ping --interface org.geckoOS.system --args '{}'
+#!must "uptime"
+#!must "kernel"
+#!must "load"
+#!must-not Error
 echo-cli call org.geckoOS.system getInfo --interface org.geckoOS.system --args '{}'
 
 # `unavailable` is present only when a sub-fact failed, so an empty grep here
 # is the good outcome — and any hit names what could not be read.
+#!must-not unavailable
 echo-cli call org.geckoOS.system getInfo --interface org.geckoOS.system --args '{}' | grep -A6 unavailable
 
 # ---------- listServices sees in-process services, which the old one did not ----------
@@ -22,14 +28,31 @@ echo-cli call org.geckoOS.system getInfo --interface org.geckoOS.system --args '
 # "(no services registered)" on a booted device. Both are run here so the
 # difference is on the record rather than asserted.
 echo-cli call org.geckoOS.Echo ListServices --interface Bus --args '{}' | head -12
-echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -c '"destination"'
+# The whole reason this service exists: the old handler sees only what
+# registered over the wire, and answers in single digits; this one sees the
+# router too. Phrased as a word because assertions are substring matches,
+# not regexes — `#!must-not ^[0-4]$` would pass vacuously.
+#!must SEES-IN-PROCESS-SERVICES
+test $(echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -c '"destination"') -gt 8 && echo SEES-IN-PROCESS-SERVICES || echo TOO-FEW-SERVICES
+#!must org.geckoOS.nova
+#!must org.geckoOS.filesystem
+#!must org.geckoOS.installer
+#!must org.geckoOS.system
+#!must org.geckoOS.evo
 echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -o '"destination": "[^"]*"' | sort
+# Both kinds must be represented: builtin (router handlers) and external
+# (socket clients like Evo). Only one would mean a source was missed.
+#!must builtin
+#!must external
 echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -o '"kind": "[^"]*"' | sort | uniq -c
 echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -c '"reachable": true'
 
 # ---------- the repointed CLI subcommands ----------
+#!must Total:
+#!must reachable
 echo-cli services 2>&1 | tail -12
 echo-cli status 2>&1 | tail -8
+#!must Pong
 echo-cli ping 2>&1 | tail -4
 
 # ---------- the actual acceptance test: a third-party app calling it ----------
@@ -38,8 +61,14 @@ echo-cli ping 2>&1 | tail -4
 #   getSystemInfo=FAILED Error: Method failed: Service not registered: org.geckoOS.system
 rm -f /tmp/pyxis-hello-proof.txt
 echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args '{"packagePath":"/var/lib/pyxis/incoming/com.pyxis.hello_0.2.0_all.ipk"}' | grep -E 'registeredApps|launchable'
+#!must sessionId
 echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep sessionId
 sleep 15
+# The acceptance check: a THIRD-PARTY app calling the new service through
+# the bridge. This line read "getSystemInfo=FAILED ... Service not
+# registered: org.geckoOS.system" before the service existed.
+#!must getSystemInfo=ok
+#!must bridge=present
 cat /tmp/pyxis-hello-proof.txt 2>&1
 
 # ---------- clean up so the image is left as it was ----------
