@@ -8,7 +8,16 @@ IMAGE_DIR="${BUILD_DIR}/images"
 IMAGE_FILE="${IMAGE_DIR}/geckoOS.img"
 
 RELEASE_MODE="${1:-debug}"
-QEMU_MEMORY="${QEMU_MEMORY:-2048}"
+# 2048 was the default through alpha 3 and is not enough for the desktop as
+# it now stands: every app is its own vela (a full Gecko), and eight of them
+# plus the shell saturate a 2 GB guest at ~1929/1987 MB. The apps that lose
+# the race stay ALIVE — no oom-kill in dmesg — they just never allocate
+# enough to map a surface, which presents as "the compositor didn't draw my
+# window" and cost a real debugging detour. Measured 2026-09-20: all eight
+# built-ins map at 4096 MB, using ~2793 MB. Until alpha 6 lands cgroups and
+# Puppis freeze/thaw (so a backgrounded app gives memory back), headroom is
+# the fix.
+QEMU_MEMORY="${QEMU_MEMORY:-4096}"
 QEMU_CPUS="${QEMU_CPUS:-4}"
 QEMU_DISPLAY="${QEMU_DISPLAY:-gtk}"
 # Default to 1600x900, NOT the host's full 1920x1080. QEMU sizes its window to

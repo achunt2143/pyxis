@@ -795,6 +795,53 @@ impl GeckoEchoService {
 
     /// Drain and return all pending FocusWindow/MinimizeWindow/RestoreWindow
     /// requests queued since the last call (SYNC). Meant to be polled once
+    /// Validate the `window_id` argument of a window action.
+    ///
+    /// These three methods used to do `.unwrap_or(0)` and answer
+    /// `{"success": true, "window_id": 0}` regardless, then log "Ignoring
+    /// Minimize for unknown window 0" a moment later where no caller would
+    /// ever see it. A caller passing `appId` instead — the natural mistake,
+    /// since every *Nova* method is keyed by app id — got a success reply
+    /// for a no-op. An alpha 4 test did exactly that and "passed" while
+    /// exercising nothing. Reporting success for work that will not happen
+    /// is the failure mode alpha 3 was about.
+    ///
+    /// **This validates the argument, not the window.** It deliberately does
+    /// not check that the id names a live window, because the map reachable
+    /// from here is the wrong one: `EchoIpcService::windows` is populated
+    /// only by `track_window`, i.e. windows Evo *creates* through the
+    /// two-step create/claim contract. Ordinary client toplevels — every
+    /// Nova-launched app — live in `EvoState::windows_by_id` over in
+    /// `state.rs`, which this async broker task cannot reach. Checking the
+    /// wrong map rejected every real window and broke `nova.Focus`
+    /// outright (caught on-device 2026-09-20, fixed by deleting the check).
+    ///
+    /// Existence is therefore still resolved where the action is applied, in
+    /// `process_pending_window_actions`. Surfacing *that* outcome in the
+    /// reply would mean plumbing a response channel back through the queue —
+    /// worth doing, but a bigger change than this.
+    fn resolve_window_arg(msg: &EchoMessage) -> std::result::Result<u32, String> {
+        let raw = msg.body.get("window_id").ok_or_else(|| {
+            // Name the likely mistake rather than just the missing key.
+            let got: Vec<&str> = msg.body.as_object()
+                .map(|o| o.keys().map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            format!(
+                "missing required argument 'window_id' (got: [{}]). Note this \
+                 method is keyed by compositor window id, not app id — use \
+                 nova.Focus to act on an app.",
+                got.join(", ")
+            )
+        })?;
+
+        let window_id = raw
+            .as_u64()
+            .ok_or_else(|| format!("'window_id' must be a number, got {}", raw))?
+            as u32;
+
+        Ok(window_id)
+    }
+
     /// per event-loop iteration from `EvoState::process_pending_window_actions`.
     pub fn take_pending_window_actions(&self) -> Vec<PendingWindowAction> {
         std::mem::take(&mut *self.pending_window_actions.write())
@@ -1052,57 +1099,63 @@ impl GeckoEchoService {
             }
 
             "FocusWindow" => {
-                let window_id = msg
-                    .body
-                    .get("window_id")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-
-                pending_window_actions.write().push(PendingWindowAction {
-                    window_id,
-                    action: WindowAction::Focus,
-                });
-                info!("Queued FocusWindow request for window {}", window_id);
-                EchoMessage::method_return(
-                    message_id,
-                    json!({ "success": true, "window_id": window_id }),
-                )
+                match Self::resolve_window_arg(&msg) {
+                    Ok(window_id) => {
+                        pending_window_actions.write().push(PendingWindowAction {
+                            window_id,
+                            action: WindowAction::Focus,
+                        });
+                        info!("Queued FocusWindow request for window {}", window_id);
+                        EchoMessage::method_return(
+                            message_id,
+                            json!({ "success": true, "window_id": window_id }),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("FocusWindow: {}", e);
+                        EchoMessage::method_error(message_id, &e)
+                    }
+                }
             }
 
             "MinimizeWindow" => {
-                let window_id = msg
-                    .body
-                    .get("window_id")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-
-                pending_window_actions.write().push(PendingWindowAction {
-                    window_id,
-                    action: WindowAction::Minimize,
-                });
-                info!("Queued MinimizeWindow request for window {}", window_id);
-                EchoMessage::method_return(
-                    message_id,
-                    json!({ "success": true, "window_id": window_id }),
-                )
+                match Self::resolve_window_arg(&msg) {
+                    Ok(window_id) => {
+                        pending_window_actions.write().push(PendingWindowAction {
+                            window_id,
+                            action: WindowAction::Minimize,
+                        });
+                        info!("Queued MinimizeWindow request for window {}", window_id);
+                        EchoMessage::method_return(
+                            message_id,
+                            json!({ "success": true, "window_id": window_id }),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("MinimizeWindow: {}", e);
+                        EchoMessage::method_error(message_id, &e)
+                    }
+                }
             }
 
             "RestoreWindow" => {
-                let window_id = msg
-                    .body
-                    .get("window_id")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-
-                pending_window_actions.write().push(PendingWindowAction {
-                    window_id,
-                    action: WindowAction::Restore,
-                });
-                info!("Queued RestoreWindow request for window {}", window_id);
-                EchoMessage::method_return(
-                    message_id,
-                    json!({ "success": true, "window_id": window_id }),
-                )
+                match Self::resolve_window_arg(&msg) {
+                    Ok(window_id) => {
+                        pending_window_actions.write().push(PendingWindowAction {
+                            window_id,
+                            action: WindowAction::Restore,
+                        });
+                        info!("Queued RestoreWindow request for window {}", window_id);
+                        EchoMessage::method_return(
+                            message_id,
+                            json!({ "success": true, "window_id": window_id }),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("RestoreWindow: {}", e);
+                        EchoMessage::method_error(message_id, &e)
+                    }
+                }
             }
 
             "CreateWorkspace" => {

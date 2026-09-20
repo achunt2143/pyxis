@@ -303,10 +303,10 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=60, help="per-command timeout")
     ap.add_argument("--settle", type=int, default=25,
                     help="seconds to wait after the shell appears, for daemons to come up")
-    ap.add_argument("--memory", type=int, default=2048,
-                    help="guest RAM in MB. The default matches emulate.sh's "
-                         "reference config; 8 concurrent vela apps do not fit "
-                         "in it (see PROJECT_STATUS alpha 4 exit criteria).")
+    ap.add_argument("--memory", type=int, default=4096,
+                    help="guest RAM in MB, matching emulate.sh's default. "
+                         "Eight concurrent vela apps need ~2.8GB; at 2048 the "
+                         "late ones stay alive but never map a surface.")
     ap.add_argument("--no-overlay", action="store_true",
                     help="write directly to the image instead of a qcow2 overlay")
     ap.add_argument("--transcript", type=Path, help="write the raw serial log here")

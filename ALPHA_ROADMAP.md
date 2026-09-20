@@ -241,18 +241,17 @@ one step needs a human*
       instead of "No handler registered for org.geckoOS.evo.FocusWindow",
       and the whole dock chain round-trips — `MinimizeWindow(window_id)` →
       the app reads `suspended` → `nova.Focus` → back to `running`.
-- [ ] **#7 maximize→unmaximize crash.** Root-caused and fixed 2026-08-17 (a
+- [x] **#7 maximize→unmaximize crash.** Root-caused and fixed 2026-08-17 (a
       single physical click dispatched on both press *and* release, with the
       header bar's button bands moving between the two, so the release
-      landed on Close). The fix — ignore anything but
-      `ButtonState::Pressed` in `element.rs`'s `PointerTarget::button` — is
-      in the tree and in the shipped image.
-      **Still unverified, and not verifiable here.** The bug is specifically
-      a pointer press/release pair, so driving maximize over IPC would not
-      exercise the broken path and a pass would mean nothing. There is no
-      headless screenshot or synthetic-input channel (QMP `screendump` →
-      "no surface" on a GL scanout, re-confirmed on QEMU 10.2.1). This needs
-      a human to click maximize, then restore-down, on a real window.
+      landed on Close). The fix — ignore anything but `ButtonState::Pressed`
+      in `element.rs`'s `PointerTarget::button`.
+      **Confirmed by the user on the rebuilt image, 2026-09-20:** maximize
+      then restore-down, no crash. It could not be checked any other way —
+      the bug is a pointer press/release pair, so driving maximize over IPC
+      would not exercise the broken path, and there is no synthetic-input or
+      screenshot channel (QMP `screendump` → "no surface" on a GL scanout,
+      re-confirmed on QEMU 10.2.1).
 
 **D. Bridge contract tests** (audit §5.4) — *done, shipped with A*
 
@@ -281,19 +280,19 @@ Status as of 2026-09-20, after a rebuild and a full on-device pass.
       from the generic fallback. It now carries a real 128×128 icon, but
       that has not been looked at on screen yet.
 - [x] **Uninstalling it removes it from the launcher.** Verified both ways.
-- [~] **All 8 built-in apps launch, focus from the dock, minimize, restore,
-      and close.** Each of these works. All eight *at once* does not fit in
-      the 2 GB reference VM: at 2048 MB the guest reaches 1929/1987 MB used
-      and the last three to launch never map a surface — alive, not
-      OOM-killed, just unable to allocate enough to paint. At 4096 MB all
-      eight map, with 2793 MB used. So this is a resource limit, not a
-      compositor or lifecycle defect, and the fix is alpha 6's resource
-      isolation (cgroups, and Puppis's freeze/thaw so a backgrounded app
-      gives memory back) rather than anything in alpha 4. The reference
-      `QEMU_MEMORY` in `emulate.sh` should probably rise too.
-- [ ] **Maximize→unmaximize does not crash.** Fix in the tree since
-      2026-08-17, still unconfirmed — it needs a pointer, and there is no
-      headless input or screenshot channel. See item C.
+- [x] **All 8 built-in apps launch, focus from the dock, minimize, restore,
+      and close.** All eight at once did not fit the old 2 GB reference VM:
+      at 2048 MB the guest reached 1929/1987 MB and the last three to launch
+      never mapped a surface — alive, not OOM-killed (no oom-kill in
+      `dmesg` at all), just unable to allocate enough to paint, which
+      presents as a compositor fault and is not one. Measured at 4096 MB all
+      eight map, using ~2793 MB, so **`emulate.sh`'s `QEMU_MEMORY` default
+      is now 4096** and `serial-test.py` matches it. Giving a backgrounded
+      app its memory back is still alpha 6's job (cgroups, Puppis
+      freeze/thaw); this is headroom, not a fix for the underlying
+      appetite.
+- [x] **Maximize→unmaximize does not crash.** Confirmed by the user on the
+      rebuilt image. See item C for why this one could not be automated.
 - [x] **Test suite green.** Bloom: 17 vitest, `tsc -b` and eslint clean.
       Rust: 75. On-device: `alpha4-ipk-e2e.txt` 33/33,
       `system-service.txt` and `alpha4-exit-criteria.txt` green at 4 GB.

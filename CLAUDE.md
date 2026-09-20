@@ -150,6 +150,12 @@ starts clean, and it can `--push` a file in by chunked base64 (sha256
 verified) when there is no other way to get one into the guest. The script's
 docstring carries the serial gotchas that have each cost hours.
 
+A full rebuild + verify is one command, `bash scripts/rebuild-and-verify.sh`
+— it does the no-root work first, keeps the two root steps together, stages
+the acceptance package into the rootfs *before* the image is built from it
+(getting that order wrong yields an image that looks fine and has nothing to
+install), and then runs all three suites.
+
 **What it cannot do is look at the screen, or move the mouse.** Anything
 whose acceptance is visual — or that is *about* pointer input, like bug #7's
 press/release double-dispatch — needs `make build-release && make run` and a

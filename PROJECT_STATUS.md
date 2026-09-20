@@ -49,7 +49,7 @@ to-do, not "in progress."
 | 4 | Settings persistence | ✅ verified on-device | `settings.rs` |
 | 5 | Kiosk-first / regular-window-after | ✅ verified on-device | `nova.rs` |
 | 6 | Rebrand Firefox → Vela | 📋 to-do (needs vela rebuild) — not attempted this cycle | `gecko/` |
-| 7 | **Unmaximize** (restore-down) closes app | 🟢 root-caused + fixed 2026-08-17 (click dispatched on press *and* release; the button bands move between the two, so the release hit Close). Fix is in the shipped image. **Unverifiable headlessly** — it is a pointer press/release bug, and there is no synthetic-input or screenshot channel. Needs a human to click maximize then restore-down | `evo/shell/element.rs` |
+| 7 | **Unmaximize** (restore-down) closes app | ✅ **verified by the user 2026-09-20** on the rebuilt image — maximize then restore-down, no crash. Root cause was a click dispatched on press *and* release, with the header bar's button bands moving between the two so the release hit Close; fixed by ignoring anything but `ButtonState::Pressed`. Could not be automated: no synthetic-input channel, and an IPC-driven maximize would not touch the pointer path | `evo/shell/element.rs` |
 | 8 | Thin window border (+ follows rounding) | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD (see decoration decision below) | `evo/shell/ssd.rs` |
 | 9 | Title bar shows app name | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD | `evo/shell/ssd.rs`, `element.rs` |
 | 10 | Restore from dock | ✅ **verified on-device 2026-09-20.** The three 2026-08-17 fixes had sat unconfirmed for a month; `alpha4-exit-criteria.txt` now round-trips the whole chain — no `appId: "unknown"`/`pid: 0` sessions, `nova.Focus` returns a real windowId, minimize → `suspended` → focus → `running` | `evo/state.rs`, `evo/shell/xdg.rs`, `echo/lib.rs` |
@@ -262,11 +262,17 @@ exists. This affects every in-process -> external call, not just Focus, so
 minimize/restore driven from the shell go through the same repaired path.
 **Awaiting on-device confirmation.**
 
-Also seen and worth fixing separately: `evo.MinimizeWindow` accepts an
+~~Also seen and worth fixing separately: `evo.MinimizeWindow` accepts an
 `app_id` argument, silently ignores it, and returns
-`{"success": true, "window_id": 0}` before warning
-"Ignoring Minimize for unknown window 0". It should reject an unknown/absent
-window instead of reporting success.
+`{"success": true, "window_id": 0}`...~~ ✅ **fixed 2026-09-20.**
+`FocusWindow`/`MinimizeWindow`/`RestoreWindow` all shared it — each did
+`.unwrap_or(0)` and answered success regardless, then logged "Ignoring
+Minimize for unknown window 0" where no caller would see it. They now go
+through `resolve_window_arg`, which errors on a missing, non-numeric, or
+unknown `window_id`; the missing-argument message names the likely mistake
+(passing `appId`, the natural error given every *Nova* method is keyed that
+way). This was not hypothetical: an alpha 4 test of mine passed `appId`,
+got `success: true`, and "passed" while minimizing nothing.
 
 ⚠️ **Caveat to revisit:** both helpers do a blocking round-trip
 (`block_on` + await the METHOD_RETURN) from the compositor's map path. That
@@ -677,6 +683,45 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### Alpha4 fixes — memory ceiling, window-action validation (2026-09-20)
+
+**`QEMU_MEMORY` default 2048 → 4096** in `emulate.sh`, matched by
+`serial-test.py --memory`. Not a preference: at 2048 the guest saturates at
+~1929/1987 MB with eight apps and the late ones stay alive but never map a
+surface, with no oom-kill to explain it. That presents as a compositor fault
+and is not one. Measured: all eight map at 4096, using ~2793 MB. Giving a
+backgrounded app its memory back is still alpha 6's job.
+
+**`evo.FocusWindow`/`MinimizeWindow`/`RestoreWindow` validate their
+argument.** All three did `.unwrap_or(0)` on `window_id` and answered
+`{"success": true, "window_id": 0}` for anything, including the natural
+mistake of passing `appId` (every *Nova* method is keyed that way). They now
+reject a missing or non-numeric id, and the missing-argument message names
+that likely mistake.
+
+⚠️ **A regression I caused and caught on-device — do not re-add it.** The
+first version of that fix also checked the id against
+`EchoIpcService::windows`, which rejected *every real window* and broke
+`nova.Focus` outright. Evo has **two** window registries and they hold
+different things:
+
+| map | holds | reachable from |
+|---|---|---|
+| `EvoState::windows_by_id` (`state.rs`) | every live toplevel, via `register_window` on map | the compositor event loop |
+| `EchoIpcService::windows` (`echo_ipc.rs`) | only windows Evo *created* itself via the two-step create/claim contract, via `track_window` | the async Echo broker task |
+
+Nova-launched apps are in the first and never the second, and the async
+broker cannot reach the first. So the IPC reply fundamentally cannot confirm
+a window exists — it is sent when the action is *queued*, and existence is
+resolved later in `process_pending_window_actions`. Doing better means
+plumbing a response channel back through the queue. The suite now asserts
+this limit (a well-formed id for a nonexistent window returns success) so it
+is recorded rather than rediscovered.
+
+**`scripts/rebuild-and-verify.sh`** — the rebuild is four steps, two needing
+root, and the ordering is load-bearing (the acceptance package must reach
+the rootfs before the image is built from it). One command now.
 
 ### Alpha4 close-out — rebuild, retest, and an honest exit-criteria pass (2026-09-20)
 

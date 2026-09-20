@@ -87,6 +87,24 @@ sleep 4
 #!must running
 echo-cli call org.geckoOS.appHost GetAppState --interface org.geckoOS.appHost --args "{\"sessionId\":\"$SID\"}"
 
+# ---------- window actions reject a bad argument instead of faking success --
+# These three used to `.unwrap_or(0)` the window_id and answer
+# {"success": true, "window_id": 0} for anything — including the natural
+# mistake of passing appId, since every *Nova* method is keyed that way.
+# A test of mine did exactly that and "passed" while doing nothing.
+#!must-not "success": true
+#!must window_id
+echo-cli call org.geckoOS.evo MinimizeWindow --interface org.geckoOS.evo --args '{"appId":"files"}'
+#!must-not "success": true
+#!must must be a number
+echo-cli call org.geckoOS.evo RestoreWindow --interface org.geckoOS.evo --args '{"window_id":"three"}'
+# A well-formed id for a window that does not exist still answers success:
+# the reply is sent when the action is QUEUED, and existence is resolved
+# later in process_pending_window_actions, which has no way back to this
+# reply. Asserted so the limit is recorded rather than rediscovered.
+#!must "success": true
+echo-cli call org.geckoOS.evo FocusWindow --interface org.geckoOS.evo --args '{"window_id":99999}'
+
 # ---------- and they all close cleanly ----------
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -E 'sessionId|Error'
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"browser"}' | grep -E 'sessionId|Error'
