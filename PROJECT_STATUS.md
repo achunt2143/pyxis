@@ -684,6 +684,41 @@ Condensed from CLAUDE.md, updated with this session's progress.
 
 ## Change log
 
+### Alpha4 fixes — error reporting, log volume (2026-09-20)
+
+Found by running the suites against the rebuilt image.
+
+**Evo's errors all said "Unknown error".** `method_error` wrote
+`body["error"]`; Echo's own `Message::error` writes `body["message"]`, and
+that is what `IPCBus::call_method` reads. So the real text of every error
+Evo ever returned was dropped on the wire. Fixed both sides — Evo writes
+the canonical field, and the client reads `message` falling back to
+`error`, so the next service to get it wrong degrades to a wrong-looking
+field rather than to no information. ✅ verified on device: the
+exit-criteria suite asserts `must-not Unknown error` and passes.
+
+**The daemon flattened anyhow's cause chain.** All 92 handler error paths
+in `bin/daemon.rs` did `Message::error(id, &e.to_string())`, which prints
+only the outermost context. A real failure surfaced as
+`Error: invoke opkg remove com.pyxis.hello` — the context, with the actual
+OS error it was wrapping thrown away. Now `format!("{e:#}")` throughout.
+
+⚠️ **Open, intermittent, not reproduced:** one `installer.Remove` failed
+with exactly that message during a suite run, *after* the app had been
+launched and closed; the package was nevertheless gone afterwards. A clean
+run (install → remove, no launch in between) succeeds, and a manual
+`opkg remove` after it reports "No packages removed", so opkg itself is
+fine. The error comes from `cmd.output().await` — the *spawn*, not opkg's
+exit status — which points at a transient fork/pipe failure rather than
+anything in the package layer. Deliberately not chased further: seen once,
+not reproducible, and the message was uninformative by construction. The
+error-chain fix above is what makes the next occurrence diagnosable.
+
+**`routing.rs` logged a ~100-entry handler dump at INFO on every message**,
+plus the full message body — kilobytes per call, on the hot path, burying
+everything else in echo.log. Demoted to debug/trace (the dump is genuinely
+useful for a "No handler registered", just not ninety times a second).
+
 ### Alpha4 fixes — memory ceiling, window-action validation (2026-09-20)
 
 **`QEMU_MEMORY` default 2048 → 4096** in `emulate.sh`, matched by

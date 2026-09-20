@@ -41,10 +41,19 @@ impl MessageRouter {
         match message.header.message_type {
             MessageType::MethodCall | MessageType::EchoServiceCall | MessageType::EchoSubscribe | MessageType::EchoUnsubscribe | MessageType::GeckoosPBridgeEvent | MessageType::Ping | MessageType::Status => {
                 let handler_key = format!("{}.{}", message.header.destination, message.header.method);
-                info!("handler key {} and message {:?}", handler_key, message.clone());
-                info!("All handlers: {:?}", 
-    self.handlers.iter().map(|e| e.key().clone()).collect::<Vec<_>>()
-);
+                // These were at INFO, which meant every single message wrote
+                // the full body AND a ~100-entry dump of every registered
+                // handler key into echo.log — kilobytes per call, on the hot
+                // path, drowning the lines that matter. Kept at debug/trace
+                // because the handler dump is genuinely useful when a call
+                // gets "No handler registered", just not 90 times a second.
+                debug!("handler key {} and message {:?}", handler_key, message);
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    trace!(
+                        "All handlers: {:?}",
+                        self.handlers.iter().map(|e| e.key().clone()).collect::<Vec<_>>()
+                    );
+                }
 
                 if let Some(handler) = self.handlers.get(&handler_key) {
                     match handler(message.clone()).await {

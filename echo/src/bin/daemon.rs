@@ -617,7 +617,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("/");
                 match services::filesystem::FilesystemService::read_directory(path) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -639,7 +639,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let max_bytes = msg.body.get("maxBytes").and_then(|v| v.as_u64());
                 match services::filesystem::FilesystemService::read_file(path, encoding, max_bytes) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -665,7 +665,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .unwrap_or("utf-8");
                 match services::filesystem::FilesystemService::write_file(path, content, encoding) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -692,7 +692,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 match services::filesystem::FilesystemService::append_file(path, content, encoding)
                 {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -708,7 +708,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 match services::filesystem::FilesystemService::delete_file(path) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -729,7 +729,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .unwrap_or(false);
                 match services::filesystem::FilesystemService::delete_directory(path, recursive) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -750,7 +750,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .map(|m| m as u32);
                 match services::filesystem::FilesystemService::create_directory(path, mode) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -766,7 +766,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 match services::filesystem::FilesystemService::exists(path) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -782,7 +782,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 match services::filesystem::FilesystemService::stat(path) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -807,7 +807,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .unwrap_or("");
                 match services::filesystem::FilesystemService::copy(source, destination) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -832,7 +832,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .unwrap_or("");
                 match services::filesystem::FilesystemService::move_file(source, destination) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -853,7 +853,7 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .unwrap_or(0o755) as u32;
                 match services::filesystem::FilesystemService::chmod(path, mode) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -877,7 +877,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
                 let delay = msg.body.get("delay").and_then(|v| v.as_u64());
                 match services::power::PowerService::shutdown(delay) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -893,7 +893,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
                 let delay = msg.body.get("delay").and_then(|v| v.as_u64());
                 match services::power::PowerService::reboot(delay) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -908,7 +908,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
             Box::pin(async move {
                 match services::power::PowerService::sleep() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -923,7 +923,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
             Box::pin(async move {
                 match services::power::PowerService::wake() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -938,7 +938,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
             Box::pin(async move {
                 match services::power::PowerService::get_battery_status() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -958,7 +958,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
                     .unwrap_or(50) as u32;
                 match services::power::PowerService::set_screen_brightness(brightness) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -973,7 +973,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
             Box::pin(async move {
                 match services::power::PowerService::get_screen_brightness() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -993,7 +993,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
                     .unwrap_or(300);
                 match services::power::PowerService::set_screen_timeout(timeout) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1008,7 +1008,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
             Box::pin(async move {
                 match services::power::PowerService::get_screen_timeout() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1031,7 +1031,7 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
                 let key = msg.body.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 match services::settings::SettingsService::get(key) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1047,7 +1047,7 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
                 let value = msg.body.get("value").cloned().unwrap_or_default();
                 match services::settings::SettingsService::set(key, value) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1061,7 +1061,7 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
             Box::pin(async move {
                 match services::settings::SettingsService::get_all() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1076,7 +1076,7 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
                 let key = msg.body.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 match services::settings::SettingsService::delete(key) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1090,7 +1090,7 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
             Box::pin(async move {
                 match services::settings::SettingsService::clear() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1104,7 +1104,7 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
             Box::pin(async move {
                 match services::settings::SettingsService::reset() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1126,7 +1126,7 @@ async fn register_network_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::network::NetworkService::get_status() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1140,7 +1140,7 @@ async fn register_network_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::network::NetworkService::get_type() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1154,7 +1154,7 @@ async fn register_network_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::network::NetworkService::get_interfaces() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1169,7 +1169,7 @@ async fn register_network_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                 let iface = msg.body.get("interface").and_then(|v| v.as_str());
                 match services::network::NetworkService::get_ip_address(iface) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1183,7 +1183,7 @@ async fn register_network_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::network::NetworkService::get_gateway() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1197,7 +1197,7 @@ async fn register_network_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::network::NetworkService::get_dns() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1219,7 +1219,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_os() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1233,7 +1233,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_kernel() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1247,7 +1247,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_model() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1261,7 +1261,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_manufacturer() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1275,7 +1275,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_serial() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1289,7 +1289,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_hardware() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1303,7 +1303,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_uuid() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1317,7 +1317,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_hostname() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1331,7 +1331,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_memory_info() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1346,7 +1346,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let mount = msg.body.get("mount").and_then(|v| v.as_str());
                 match services::deviceinfo::DeviceInfoService::get_storage_info(mount) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1360,7 +1360,7 @@ async fn register_deviceinfo_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::deviceinfo::DeviceInfoService::get_cpu_info() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1390,7 +1390,7 @@ async fn register_notification_handlers(
                 let options = msg.body.get("options").cloned();
                 match services::notification::NotificationService::show(title, options) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1409,7 +1409,7 @@ async fn register_notification_handlers(
                     .unwrap_or("");
                 match services::notification::NotificationService::close(notif_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1423,7 +1423,7 @@ async fn register_notification_handlers(
             Box::pin(async move {
                 match services::notification::NotificationService::close_all() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1457,7 +1457,7 @@ async fn register_process_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                 let options = msg.body.get("options").cloned();
                 match services::process::ProcessService::spawn(command, args, options) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1473,7 +1473,7 @@ async fn register_process_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                 let signal = msg.body.get("signal").and_then(|v| v.as_str());
                 match services::process::ProcessService::kill(pid, signal) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1489,7 +1489,7 @@ async fn register_process_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                 let signal = msg.body.get("signal").and_then(|v| v.as_str());
                 match services::process::ProcessService::kill_group(pgid, signal) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1503,7 +1503,7 @@ async fn register_process_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::process::ProcessService::list() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1518,7 +1518,7 @@ async fn register_process_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                 let pid = msg.body.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 match services::process::ProcessService::get_info(pid) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1551,7 +1551,7 @@ async fn register_system_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::
             Box::pin(async move {
                 match services::system::SystemService::get_info() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1584,7 +1584,7 @@ async fn register_system_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::
             Box::pin(async move {
                 match services::system::SystemService::list_services(&bus).await {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1608,7 +1608,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let params = msg.body.get("params").cloned();
                 match services::appmanager::AppManagerService::launch(app_id, params) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1623,7 +1623,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::appmanager::AppManagerService::close(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1637,7 +1637,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::appmanager::AppManagerService::list() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1652,7 +1652,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::appmanager::AppManagerService::get_info(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1671,7 +1671,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .unwrap_or("");
                 match services::appmanager::AppManagerService::install(app_path) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1686,7 +1686,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::appmanager::AppManagerService::uninstall(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1701,7 +1701,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::appmanager::AppManagerService::kill(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1716,7 +1716,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::appmanager::AppManagerService::restart(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1731,7 +1731,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::appmanager::AppManagerService::set_active(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1745,7 +1745,7 @@ async fn register_appmanager_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
             Box::pin(async move {
                 match services::appmanager::AppManagerService::get_active() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1777,7 +1777,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                 let params = msg.body.get("params").cloned();
                 match services::AppHost::global().launch_json(app_id, params) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1797,7 +1797,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                     .unwrap_or("");
                 match services::AppHost::global().close_json(sid) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1817,7 +1817,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                     .unwrap_or("");
                 match services::AppHost::global().kill_json(sid) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1837,7 +1837,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                     .unwrap_or("");
                 match services::AppHost::global().restart_json(sid) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1852,7 +1852,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::AppHost::global().list_apps_json() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1867,7 +1867,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::AppHost::global().list_running_json() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1887,7 +1887,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                     .unwrap_or("");
                 match services::AppHost::global().get_state_json(sid) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1918,7 +1918,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                     .bind_surface_json(app_id, surface_id, session_id, pid)
                 {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1939,7 +1939,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
                     .unwrap_or(0);
                 match services::AppHost::global().unbind_surface_json(surface_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -1958,7 +1958,7 @@ async fn register_apphost_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
             Box::pin(async move {
                 match services::AppHost::global().list_surface_sessions_json() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2063,7 +2063,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                 let params = msg.body.get("params").cloned();
                 match services::Nova::global().launch(app_id, params) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2079,7 +2079,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::Nova::global().close(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2097,7 +2097,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::Nova::global().focus(app_id).await {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2116,7 +2116,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                 let url = msg.body.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 match services::Nova::global().open_external_browser(url) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2131,7 +2131,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
             Box::pin(async move {
                 match services::Nova::global().list() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2147,7 +2147,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::Nova::global().get_info(app_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2167,7 +2167,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                     .unwrap_or("");
                 match services::Nova::global().install(package_path) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2188,7 +2188,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                     .unwrap_or(false);
                 match services::Nova::global().uninstall(app_id, purge) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2206,7 +2206,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
                         msg.header.message_id,
                         json!({ "count": count }),
                     )),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2237,7 +2237,7 @@ async fn register_installer_handlers(
                 let dir = msg.body.get("dir").and_then(|v| v.as_str());
                 match services::InstallerService::global().list_available(dir) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2257,7 +2257,7 @@ async fn register_installer_handlers(
                     .unwrap_or("");
                 match services::InstallerService::global().inspect(path) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2286,7 +2286,7 @@ async fn register_installer_handlers(
                     .await
                 {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2315,7 +2315,7 @@ async fn register_installer_handlers(
                     .await
                 {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2330,7 +2330,7 @@ async fn register_installer_handlers(
             Box::pin(async move {
                 match services::InstallerService::global().list_installed() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2357,7 +2357,7 @@ async fn register_terminal_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
                 let rows = msg.body.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
                 match services::TerminalService::global().open_json(cols, rows) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2378,7 +2378,7 @@ async fn register_terminal_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
                 let data = msg.body.get("data").and_then(|v| v.as_str()).unwrap_or("");
                 match services::TerminalService::global().write_json(terminal_id, data) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2400,7 +2400,7 @@ async fn register_terminal_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
                 let rows = msg.body.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
                 match services::TerminalService::global().resize_json(terminal_id, cols, rows) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })
@@ -2420,7 +2420,7 @@ async fn register_terminal_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
                     .unwrap_or("");
                 match services::TerminalService::global().close_json(terminal_id) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
             })
         })

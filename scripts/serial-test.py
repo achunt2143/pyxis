@@ -196,24 +196,33 @@ class Guest:
         # Matching on the whitespace-stripped command handles the wrap.
         flat_cmd = "".join(command.split())
         lines: list[str] = []
+        # The echo is always at the HEAD of the stream, so only strip there.
+        # Matching echo fragments anywhere ate real output: a command like
+        # `... && echo SEES-IN-PROCESS-SERVICES` has its own result as a
+        # substring of itself, so the result vanished and the assertion
+        # failed on a command that had worked. Once a line is not part of
+        # the echo, everything after it is output, verbatim.
+        in_echo = True
         for ln in text.splitlines():
             ln = ln.rstrip("\r").rstrip()
             if not ln:
                 continue
-            # 'root@(none):/# uname -a' — prompt plus the echoed command.
-            if PROMPT_RE.match(ln):
-                continue
-            flat = "".join(ln.split())
-            # A whole echo, or any wrapped fragment of one. Guard on length
-            # so a genuinely short line of output ("16") is not mistaken for
-            # a fragment that happens to occur in the command.
-            if flat and len(flat) >= 8 and flat in flat_cmd:
-                continue
-            if ln.strip() == command.strip():
-                continue
-            # The split-marker echo, e.g. "echo PYX''END".
+            # The split-marker echo, e.g. "echo PYX''END" — these bracket
+            # the command and can appear at either end.
             if "''" in ln:
                 continue
+            if in_echo:
+                # 'root@(none):/# uname -a' — prompt plus the echoed command.
+                if PROMPT_RE.match(ln):
+                    continue
+                flat = "".join(ln.split())
+                # A whole echo, or a wrapped fragment of one. Length guard
+                # so a short genuine result ("16") is not eaten.
+                if flat and len(flat) >= 8 and flat in flat_cmd:
+                    continue
+                if ln.strip() == command.strip():
+                    continue
+                in_echo = False
             lines.append(ln)
         return "\n".join(lines).strip()
 
