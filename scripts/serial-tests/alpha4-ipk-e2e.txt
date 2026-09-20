@@ -1,75 +1,110 @@
 # Alpha 4 acceptance test — a third-party .ipk, end to end.
 #
-# Run with:
-#   scripts/serial-test.py \
-#     --push <pkg>.ipk:/var/lib/pyxis/incoming/<pkg>.ipk \
-#     --script testing/alpha4-ipk-e2e.txt
+#   scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt
 #
-# The flow this proves (ALPHA_ROADMAP.md alpha 4 item B): build a package with
-# pyxis-sdk, discover it, install it through the *installer service* (not raw
-# opkg — the service path is what the Installer app uses), see Nova pick it up
-# as an opkg-tier app, launch it, and remove it again.
+# Assumes the package is already in the image at /var/lib/pyxis/incoming
+# (staged by the build; see scripts/serial-tests/hello-pyxis/README.md).
+# Pass --push <local>:/var/lib/pyxis/incoming/<name>.ipk if it is not.
 #
-# echo-cli needs the FULL destination name; the short form returns
-# "Service not registered", which reads like the daemon is down.
+# The flow this proves (ALPHA_ROADMAP.md alpha 4 item B): build a package
+# with pyxis-sdk, discover it, install it through the *installer service*
+# (not raw opkg — the service path is what the Installer app uses), see Nova
+# pick it up as an opkg-tier app, launch it, and remove it again.
+#
+# Two things that have bitten this suite, both now guarded:
+#   * echo-cli needs the FULL destination name; the short form returns
+#     "Service not registered", which reads like the daemon is down.
+#   * The package version is NOT hardcoded. It was, and when the package went
+#     0.1.0 -> 0.2.0 every step failed on a missing file while the run still
+#     exited 0. Hence $PKG below, and the `#!must` assertions throughout.
 
 # ---------- preconditions ----------
+#!must echo-daemon
 pgrep -a echo-daemon | head -1
+#!must evo
 pgrep -a evo | head -1
-opkg list-installed | wc -l
-ls /usr/pyxis/applications/ 2>&1 | head
+PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+#!must .ipk
+echo "$PKG"
+#!must-not com.pyxis.hello
+opkg list-installed
+#!must bloom
 echo-cli call org.geckoOS.nova List --interface org.geckoOS.nova --args '{}' | grep -o '"id": "[^"]*"' | sort
 
 # ---------- discovery, before installing ----------
-ls -l /var/lib/pyxis/incoming/
+#!must com.pyxis.hello
 echo-cli call org.geckoOS.installer ListAvailable --interface org.geckoOS.installer --args '{}'
-echo-cli call org.geckoOS.installer Inspect --interface org.geckoOS.installer --args '{"packagePath":"/var/lib/pyxis/incoming/com.pyxis.hello_0.1.0_all.ipk"}'
+#!must "installed": false
+echo-cli call org.geckoOS.installer Inspect --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}"
 
 # ---------- install ----------
-echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args '{"packagePath":"/var/lib/pyxis/incoming/com.pyxis.hello_0.1.0_all.ipk"}'
+#!must launchable
+#!must-not Error
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}"
 
 # ---------- did opkg actually place the files ----------
+#!must com.pyxis.hello
 opkg list-installed
+#!must appinfo.json
 ls -la /usr/pyxis/applications/com.pyxis.hello/
 cat /usr/pyxis/applications/com.pyxis.hello/appinfo.json
 
-# ---------- did Nova index it ----------
+# ---------- did Nova index it, with the right provenance ----------
+#!must com.pyxis.hello
 echo-cli call org.geckoOS.nova List --interface org.geckoOS.nova --args '{}' | grep -o '"id": "[^"]*"' | sort
+#!must "tier": "opkg"
+#!must "source": "appinfo.json"
+#!must "removable": false
+#!must-not /usr/pyxis/applications/com.pyxis.hello/icon.png
 echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}'
 
 # ---------- the derived artefacts Nova owns ----------
-ls -la /var/lib/pyxis/nova/native/
+#!must setpriv
 cat /var/lib/pyxis/nova/native/com.pyxis.hello/manifest.json 2>&1
+#!must com.pyxis.hello
 grep com.pyxis.hello /run/pyxis/nova/origins.map 2>&1
 
 # ---------- can AppHost see it ----------
+#!must com.pyxis.hello
 echo-cli call org.geckoOS.appHost ListApps --interface org.geckoOS.appHost --args '{}' | grep -o '"id": "[^"]*"' | sort
+#!must Hello Pyxis
 pyxis-appctl list 2>&1 | head -20
 
 # ---------- launch ----------
+rm -f /tmp/pyxis-hello-proof.txt
+#!must sessionId
 echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}'
-sleep 6
-pgrep -af vela | head -5
+sleep 15
+#!must "state": "running"
+#!must surfaces
 echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}'
-# Did the document actually load and run? The test page sets document.title
-# from whether window.geckoOS attached, and Evo logs every title it is told.
-# A mapped surface only proves a window exists; this proves the pyxis://
-# origin served the file, the script ran, and whether a *third-party* app
-# gets the bridge (Nova maps appinfo permissions deny-by-default, so a
-# built-in proving the bridge says nothing about a packaged one).
-grep -a 'Hello Pyxis' /var/log/evo.log | tail -3
-grep -a 'com.pyxis.hello' /var/log/evo.log | grep -ai 'title\|commit\|map' | tail -5
-grep -ai 'com.pyxis.hello' /var/log/vela.log | tail -5
+
+# The app really ran, not just opened a window: it probes the bridge on load
+# and writes the result. A mapped surface alone proves neither that the
+# pyxis:// origin served the document nor that a third-party app gets the
+# bridge and its declared capabilities.
+#!must bridge=present
+#!must secureContext=true
+#!must getSystemInfo=ok
+cat /tmp/pyxis-hello-proof.txt 2>&1
+
+#!must is_ssd=true
+grep -a 'com.pyxis.hello' /var/log/evo.log | tail -2
 
 # ---------- close ----------
+#!must sessionId
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}'
 
 # ---------- the tier split: Nova must refuse an opkg-owned app ----------
+#!must installed via opkg
 echo-cli call org.geckoOS.nova Uninstall --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}'
 
 # ---------- remove through the installer, which owns the package layer ----------
+#!must registeredApps
 echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}'
+#!must-not com.pyxis.hello
 opkg list-installed
-ls /usr/pyxis/applications/ 2>&1 | head
+#!must-not com.pyxis.hello
 echo-cli call org.geckoOS.nova List --interface org.geckoOS.nova --args '{}' | grep -o '"id": "[^"]*"' | sort
+#!must-not com.pyxis.hello
 ls /var/lib/pyxis/nova/native/ 2>&1

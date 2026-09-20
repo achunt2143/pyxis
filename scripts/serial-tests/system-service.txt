@@ -1,0 +1,47 @@
+# org.geckoOS.system — the service behind the bridge's getSystemInfo()/
+# listServices(), added 2026-09-20.
+#
+#   scripts/serial-test.py --script scripts/serial-tests/system-service.txt
+#
+# The point of the service is that an app can call those two methods and get
+# an answer, so the check that matters is not "echo-cli prints something" —
+# it is the third-party app's own probe (see hello-pyxis/README.md), which
+# recorded `getSystemInfo=FAILED ... Service not registered` before this
+# existed.
+
+# ---------- the service is on the bus at all ----------
+echo-cli call org.geckoOS.system ping --interface org.geckoOS.system --args '{}'
+echo-cli call org.geckoOS.system getInfo --interface org.geckoOS.system --args '{}'
+
+# `unavailable` is present only when a sub-fact failed, so an empty grep here
+# is the good outcome — and any hit names what could not be read.
+echo-cli call org.geckoOS.system getInfo --interface org.geckoOS.system --args '{}' | grep -A6 unavailable
+
+# ---------- listServices sees in-process services, which the old one did not ----------
+# org.geckoOS.Echo's ListServices reads ServiceRegistry alone and answers
+# "(no services registered)" on a booted device. Both are run here so the
+# difference is on the record rather than asserted.
+echo-cli call org.geckoOS.Echo ListServices --interface Bus --args '{}' | head -12
+echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -c '"destination"'
+echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -o '"destination": "[^"]*"' | sort
+echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -o '"kind": "[^"]*"' | sort | uniq -c
+echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -c '"reachable": true'
+
+# ---------- the repointed CLI subcommands ----------
+echo-cli services 2>&1 | tail -12
+echo-cli status 2>&1 | tail -8
+echo-cli ping 2>&1 | tail -4
+
+# ---------- the actual acceptance test: a third-party app calling it ----------
+# hello-pyxis probes the bridge on load and writes the result to a file.
+# Before this service existed the probe recorded
+#   getSystemInfo=FAILED Error: Method failed: Service not registered: org.geckoOS.system
+rm -f /tmp/pyxis-hello-proof.txt
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args '{"packagePath":"/var/lib/pyxis/incoming/com.pyxis.hello_0.2.0_all.ipk"}' | grep -E 'registeredApps|launchable'
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep sessionId
+sleep 15
+cat /tmp/pyxis-hello-proof.txt 2>&1
+
+# ---------- clean up so the image is left as it was ----------
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep appId
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' | grep registeredApps

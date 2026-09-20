@@ -26,6 +26,10 @@ By default the guest runs on a qcow2 overlay, so the pristine image is never
 mutated and every run starts from the same state. Pass --no-overlay to write
 through to the real image.
 
+Suites may assert. A `#!must <text>` or `#!must-not <text>` line applies to
+the next command and fails the run (non-zero exit) if unmet — otherwise a
+suite only prints, and a run where every step errored still exits 0.
+
 Usage:
     scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt
     scripts/serial-test.py -c 'uname -a' -c 'opkg list-installed | head'
@@ -156,7 +160,7 @@ class Guest:
                 sys.exit("[fail] QEMU exited during boot — see the transcript above")
         sys.exit(f"[fail] no serial shell within {timeout}s")
 
-    def run(self, command: str, timeout: int = 60) -> str:
+    def run(self, command: str, timeout: int = 60) -> str:  # noqa: D401
         """Run one command, return everything it printed."""
         assert self.child is not None
         self.child.sendline(f"echo {BEGIN[:3]}''{BEGIN[3:]}")
@@ -315,7 +319,11 @@ def main() -> int:
     if args.script:
         for line in args.script.read_text().splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
+            # `#!must <text>` / `#!must-not <text>` assert on the NEXT
+            # command's output; every other `#` line is a comment.
+            if line.startswith("#!"):
+                commands.append(line)
+            elif line and not line.startswith("#"):
                 commands.append(line)
     if not commands and not args.keep_running:
         sys.exit("nothing to do: pass -c/--script (or --keep-running)")
@@ -334,12 +342,32 @@ def main() -> int:
             local, _, remote = spec.partition(":")
             print(f"[push] {guest.push(Path(local), remote, chunk=args.chunk)}")
 
+        # Directives accumulated from `#!must` / `#!must-not` comment lines,
+        # applied to the next real command. Without them these suites only
+        # *print* — a run where every step errored still exited 0, which is
+        # how a stale hardcoded filename in a suite went unnoticed.
+        pending: list[tuple[str, str]] = []
         for cmd in commands:
+            if cmd.startswith("#!"):
+                kind, _, needle = cmd[2:].partition(" ")
+                pending.append((kind.strip(), needle.strip()))
+                continue
+
             print(f"\n\033[1m$ {cmd}\033[0m")
             out = guest.run(cmd, timeout=args.timeout)
             print(out if out else "(no output)")
             if "<TIMEOUT" in out:
                 failures += 1
+
+            for kind, needle in pending:
+                hit = needle in out
+                ok = hit if kind == "must" else not hit
+                if ok:
+                    print(f"  \033[32m✓ {kind}: {needle}\033[0m")
+                else:
+                    print(f"  \033[31m✗ {kind}: {needle}\033[0m")
+                    failures += 1
+            pending = []
 
         if args.screenshot:
             print(f"\n[shot] {guest.screenshot(args.screenshot)}")
