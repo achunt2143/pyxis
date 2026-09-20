@@ -65,3 +65,4 @@ target/
 /docs/internal
 *.pdf
 boot/initramfs/initramfs-init
+scripts/serial-tests/**/dist/

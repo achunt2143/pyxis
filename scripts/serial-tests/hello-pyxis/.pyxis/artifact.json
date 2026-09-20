@@ -1,0 +1,9 @@
+{
+  "appRoot": "/usr/pyxis/applications/com.pyxis.hello",
+  "architecture": "all",
+  "entrypoint": "index.html",
+  "id": "com.pyxis.hello",
+  "packageFile": "/home/andrew/geckos/geckos/scripts/serial-tests/hello-pyxis/dist/com.pyxis.hello_0.2.0_all.ipk",
+  "runtime": "web",
+  "version": "0.2.0"
+}

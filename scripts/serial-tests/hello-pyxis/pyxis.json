@@ -1,0 +1,22 @@
+{
+  "entry": "index.html",
+  "icon": "assets/icon.png",
+  "id": "com.pyxis.hello",
+  "package": {
+    "architecture": "all",
+    "priority": "optional",
+    "section": "applications"
+  },
+  "publicDir": "public",
+  "runtime": "web",
+  "sdk": {
+    "builder": "static"
+  },
+  "title": "Hello Pyxis",
+  "vendor": "Pyxis Project",
+  "version": "0.2.0",
+  "permissions": [
+    "filesystem.read",
+    "filesystem.write"
+  ]
+}

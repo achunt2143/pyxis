@@ -1,0 +1,7 @@
+Package: com.pyxis.hello
+Version: 0.2.0
+Architecture: all
+Section: applications
+Priority: optional
+Maintainer: Pyxis Project <devnull@example.invalid>
+Description: Hello Pyxis
