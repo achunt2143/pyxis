@@ -532,10 +532,38 @@ impl RegistryEntry {
         self.native_main.is_some()
     }
 
+    /// Icon paths as a `pyxis://` client can actually use them: relative to
+    /// the app's own origin root.
+    ///
+    /// The two consumers of `manifest.icons` want different things.
+    /// `native_manifest_json` needs an absolute filesystem path, because
+    /// AppHost reads it off disk — which is why `load_one_appinfo` joins
+    /// `app_dir` onto appinfo's `icon`. But `info_json` goes over the bridge
+    /// to a web app, where an absolute host path resolves against the origin
+    /// root and 404s (`pyxis://<id>/usr/pyxis/applications/<id>/icon.png`),
+    /// besides needlessly telling the app where it lives on disk.
+    ///
+    /// manifest.webapp apps already store relative paths, so they pass
+    /// through untouched.
+    fn web_icons(&self) -> HashMap<String, String> {
+        self.manifest
+            .icons
+            .iter()
+            .map(|(size, path)| {
+                let rel = Path::new(path)
+                    .strip_prefix(&self.app_dir)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.clone());
+                (size.clone(), rel)
+            })
+            .collect()
+    }
+
     /// Manifest projection for List/GetInfo, decorated with the
     /// registry-level fields the plain `WebAppManifest` doesn't carry.
     fn info_json(&self) -> Value {
         let mut info = self.manifest.to_info_json(true);
+        info["icons"] = json!(self.web_icons());
         info["source"] = json!(match self.source() {
             ManifestSource::WebApp => "manifest.webapp",
             ManifestSource::AppInfo => "appinfo.json",
@@ -1928,5 +1956,71 @@ mod tests {
         }"#;
         let info = AppInfoManifest::parse(raw, "installer").unwrap();
         assert_eq!(info.required_permissions.len(), 2);
+    }
+
+    /// Build a minimal registry entry for projection tests.
+    fn entry_with_icon(app_dir: &str, icon: &str, tier: AppTier) -> RegistryEntry {
+        let mut icons = HashMap::new();
+        icons.insert("64".to_string(), icon.to_string());
+        RegistryEntry {
+            manifest: WebAppManifest {
+                id: "com.example.app".to_string(),
+                name: "Example".to_string(),
+                version: "1.0.0".to_string(),
+                r#type: "web".to_string(),
+                entry: "index.html".to_string(),
+                icons,
+                category: None,
+                single_instance: true,
+                display: "windowed".to_string(),
+                background: false,
+                permissions: vec![],
+                integrity: None,
+            },
+            webroot: PathBuf::from(app_dir),
+            app_dir: PathBuf::from(app_dir),
+            tier,
+            native_main: None,
+            entry_args: vec![],
+            raw_permissions: vec![],
+        }
+    }
+
+    #[test]
+    fn info_json_icons_are_relative_to_the_app_origin() {
+        // Found on device: an ipk app's GetInfo returned
+        // icons["64"] = "/usr/pyxis/applications/<id>/icon.png", because
+        // load_one_appinfo joins app_dir so the derived NATIVE manifest has
+        // an absolute path AppHost can read. Handing that same value to a
+        // pyxis:// client resolves against the origin root and 404s.
+        let dir = "/usr/pyxis/applications/com.example.app";
+        let e = entry_with_icon(dir, &format!("{dir}/icon.png"), AppTier::Opkg);
+        assert_eq!(e.info_json()["icons"]["64"], "icon.png");
+        // The native manifest keeps the absolute path it needs.
+        assert_eq!(e.manifest.icons["64"], format!("{dir}/icon.png"));
+    }
+
+    #[test]
+    fn info_json_leaves_relative_icons_alone() {
+        // manifest.webapp apps already store relative paths.
+        let e = entry_with_icon(
+            "/usr/share/geckoOS/apps/files",
+            "icons/128.png",
+            AppTier::System,
+        );
+        assert_eq!(e.info_json()["icons"]["64"], "icons/128.png");
+    }
+
+    #[test]
+    fn info_json_passes_through_an_unrelated_absolute_path() {
+        // Malformed rather than merely absolute: not under the app dir, so
+        // there is no relative form to recover. Pass it through unchanged
+        // rather than inventing one — the client's icon fallback handles it.
+        let e = entry_with_icon(
+            "/usr/pyxis/applications/com.example.app",
+            "/opt/somewhere/else.png",
+            AppTier::Opkg,
+        );
+        assert_eq!(e.info_json()["icons"]["64"], "/opt/somewhere/else.png");
     }
 }
