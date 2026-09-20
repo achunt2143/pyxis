@@ -108,14 +108,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Calls `org.geckoOS.system.listServices`, not `org.geckoOS.Echo`'s
+/// `ListServices`.
+///
+/// The latter reads `ServiceRegistry` alone, and nothing but an over-the-wire
+/// `RegisterService` call ever writes to it -- so on a booted device this
+/// printed "(no services registered)" while a dozen in-process services were
+/// live and answering. `system.listServices` merges the router's handler
+/// table with the registry, which is why the keys read here are `name`/
+/// `destination`/`serviceId`/`registeredAt` and not the registry's
+/// `service_name`/`service_id`/`registered_at`.
 async fn list_services(client: &EchoClient) -> Result<(), Box<dyn Error>> {
-    println!("Echo IPC Registered Services:");
+    println!("Echo IPC Services:");
     println!();
 
     let result = client.call_method(
-        "org.geckoOS.Echo",
-        "Bus",
-        "ListServices",
+        "org.geckoOS.system",
+        "org.geckoOS.system",
+        "listServices",
         serde_json::json!({}),
     ).await?;
 
@@ -123,21 +133,61 @@ async fn list_services(client: &EchoClient) -> Result<(), Box<dyn Error>> {
         .ok_or("Invalid response format")?;
 
     if services.is_empty() {
-        println!("  (no services registered)");
-    } else {
-        for service in services {
-            let name = service["service_name"].as_str().unwrap_or("unknown");
-            let id = service["service_id"].as_str().unwrap_or("unknown");
-            let registered_at = service["registered_at"].as_str().unwrap_or("unknown");
-            
-            println!("📦 {}", name);
-            println!("   ID: {}", id);
-            println!("   Registered: {}", registered_at);
-            println!();
-        }
+        println!("  (no services on the bus)");
+        return Ok(());
     }
 
-    println!("Total: {} services", services.len());
+    let mut reachable_count = 0usize;
+
+    for service in services {
+        let name = service["name"].as_str().unwrap_or("unknown");
+        let destination = service["destination"].as_str().unwrap_or("unknown");
+        let kind = service["kind"].as_str().unwrap_or("unknown");
+        let reachable = service["reachable"].as_bool().unwrap_or(false);
+        let methods = service["methods"].as_array().map_or(0, |m| m.len());
+        let declared = service["declaredMethods"].as_array().map_or(0, |m| m.len());
+
+        if reachable {
+            reachable_count += 1;
+        }
+
+        // The registry is never pruned on disconnect, so a service that
+        // registered and then died is still listed. Making that visible is
+        // the point of this command, so it goes on the headline rather than
+        // being left for the reader to infer from a missing field.
+        println!(
+            "{} {}  [{}]{}",
+            if reachable { "📦" } else { "💀" },
+            name,
+            kind,
+            if reachable { "" } else { "  <- registered but NOT reachable" },
+        );
+        println!("   Destination: {}", destination);
+
+        // Two different facts, two different lines: `methods` is what the
+        // router will dispatch right now; `declaredMethods` is only what an
+        // external client claimed in its RegisterService interface.
+        if methods > 0 {
+            println!("   Methods: {} dispatchable", methods);
+        }
+        if declared > 0 {
+            println!("   Declared: {} (from its RegisterService interface)", declared);
+        }
+        if let Some(id) = service["serviceId"].as_str() {
+            println!("   ID: {}", id);
+        }
+        if let Some(registered_at) = service["registeredAt"].as_str() {
+            println!("   Registered: {}", registered_at);
+        }
+        println!();
+    }
+
+    println!(
+        "Total: {} services ({} reachable, {} unreachable)",
+        services.len(),
+        reachable_count,
+        services.len() - reachable_count,
+    );
     Ok(())
 }
 
@@ -228,28 +278,52 @@ async fn emit_signal(
 
 async fn show_status(client: &EchoClient) -> Result<(), Box<dyn Error>> {
     let services_result = client.call_method(
-        "org.geckoOS.Echo",
-        "Bus",
-        "ListServices",
+        "org.geckoOS.system",
+        "org.geckoOS.system",
+        "listServices",
         serde_json::json!({}),
     ).await?;
 
-    let service_count = services_result["count"].as_u64().unwrap_or(0);
+    let empty = Vec::new();
+    let services = services_result["services"].as_array().unwrap_or(&empty);
+    let total = services.len();
+    let reachable: Vec<&serde_json::Value> = services
+        .iter()
+        .filter(|s| s["reachable"].as_bool().unwrap_or(false))
+        .collect();
 
     println!("Echo IPC Bus Status");
     println!("═══════════════════════════════════════");
     println!("Status: Running ✓");
-    println!("Registered Services: {}", service_count);
+    // Deliberately two numbers rather than one "Registered Services: N".
+    // "Registered" used to mean the registry alone, and a single count cannot
+    // distinguish a live service from one whose registry entry outlived its
+    // connection -- so name both and let the difference show.
+    println!("Services: {} on the bus, {} reachable", total, reachable.len());
     println!();
 
-    if service_count > 0 {
-        println!("Active Services:");
-        if let Some(services) = services_result["services"].as_array() {
-            for service in services {
-                let name = service["service_name"].as_str().unwrap_or("unknown");
-                println!("  • {}", name);
-            }
+    if !reachable.is_empty() {
+        println!("Reachable:");
+        for service in &reachable {
+            let name = service["name"].as_str().unwrap_or("unknown");
+            let kind = service["kind"].as_str().unwrap_or("unknown");
+            let methods = service["methods"].as_array().map_or(0, |m| m.len());
+            println!("  • {} [{}], {} methods", name, kind, methods);
         }
+        println!();
+    }
+
+    if total > reachable.len() {
+        println!("Registered but NOT reachable:");
+        for service in services {
+            if service["reachable"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let name = service["name"].as_str().unwrap_or("unknown");
+            let registered_at = service["registeredAt"].as_str().unwrap_or("unknown");
+            println!("  ✗ {} (registered {})", name, registered_at);
+        }
+        println!();
     }
 
     Ok(())
@@ -303,16 +377,22 @@ async fn register_service(client: &EchoClient, name: &str) -> Result<(), Box<dyn
     Ok(())
 }
 
+/// A round-trip timing, so it calls the one method with no work behind it.
+///
+/// This used to call `ListServices` "as a ping", which timed a registry walk;
+/// pointing it at `system.listServices` would have been worse still, timing a
+/// scan of every handler on the bus plus a connection lookup per external
+/// service. Neither is the daemon responsiveness the printed number claims to
+/// report, so `system.ping` exists to be the cheap thing.
 async fn ping(client: &EchoClient) -> Result<(), Box<dyn Error>> {
     println!("Pinging Echo daemon...");
 
     let start = std::time::Instant::now();
-    
-    // Try to list services as a ping
+
     let _ = client.call_method(
-        "org.geckoOS.Echo",
-        "Bus",
-        "ListServices",
+        "org.geckoOS.system",
+        "org.geckoOS.system",
+        "ping",
         serde_json::json!({}),
     ).await?;
 

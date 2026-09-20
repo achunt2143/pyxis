@@ -492,8 +492,28 @@ on-device confirmation.**
   | notification | `services/notification.rs` | 🚧 |
   | deviceinfo | `services/deviceinfo.rs` | 🚧 |
   | process | `services/process.rs` | 🚧 |
+  | system | `services/system.rs` | ✅ added 2026-09-20 — backs the bridge's `getSystemInfo()`/`listServices()`, which had been advertised with no service behind them. `getInfo` composes `deviceinfo.rs` + `/proc` runtime state (uptime/boot time/load); `listServices` merges the router's handler table with the registry; `ping` is a deliberate no-op round trip for liveness timing |
   | appmanager | `services/appmanager.rs` | ⚰️ superseded by Nova; ⚠️ `:102` extracts tarballs with no sig check |
 - **Known issues:** ⚠️ `dbus.rs:637-640` unit test uses `todo!()` (panics if run).
+  ⚠️ `org.geckoOS.Echo`'s own `ListServices` still reads **only**
+  `ServiceRegistry`, which nothing but the over-the-wire `RegisterService` call
+  ever writes to — so on a booted device with no external clients it answers
+  "(no services registered)" while a dozen in-process services are live. That
+  handler is left alone deliberately (external clients may depend on its
+  `service_name`/`service_id`/`registered_at` shape), so treat it as a trap for
+  new code, not a bug to fix: call `org.geckoOS.system.listServices` instead.
+  ✅ `echo-cli services`/`status` were repointed at it 2026-09-20 and now print
+  each entry's `kind` (`builtin`/`external`/`builtin+external`), its `reachable`
+  state and its method count, with `status` reporting "N on the bus, M
+  reachable" rather than one ambiguous "Registered Services" number. Verified
+  against a live daemon: 14 services / 98 methods listed where the old command
+  printed "(no services registered)", and a registered-then-disconnected client
+  renders as 💀 unreachable while the reachable count drops. `echo-cli ping`
+  no longer times a service walk — it calls `system.ping`, a handler with no
+  work behind it, so the printed latency is the bus round trip it claims to be.
+  ⚠️ Still open: `IPCBus::remove_connection` never prunes the registry, so a
+  crashed client keeps its registry entry forever; the listing now marks it
+  unreachable rather than dropping it.
 - **Backlog:** 🗄️ extract Nova to a standalone crate (deliberately in-process for now).
 
 ### Nova — app runtime host (headline component, lives in Echo)
@@ -657,6 +677,71 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### `org.geckoOS.system` — the bridge's last two dead methods (2026-09-20)
+
+`window.geckoOS.getSystemInfo()` and `.listServices()` have been in the API
+surface every pyxis:// app sees (`Object.keys(window.geckoOS)`) since the
+compiled-in bridge was written, pointing at an `org.geckoOS.system` service
+that was never registered anywhere. On device they returned
+`Error: Method failed: Service not registered: org.geckoOS.system` while every
+other namespace on that object worked — the exact "looks supported, isn't"
+shape alpha 3 was about. Fixed by building the service, not by deleting the
+methods: `listServices` is genuinely useful and the data already existed.
+
+**Rust-only — no Gecko rebuild.** The bridge already sends
+`("system", "getInfo")` / `("system", "listServices")`; nothing in
+`gecko/patches/pyxis` changed, so this needs a rootfs rebuild only.
+
+- ✅ `echo/src/services/system.rs` — new service, registered from
+  `bin/daemon.rs`'s `register_all_services` as `register_system_handlers`.
+  Method names are camelCase to match what the bridge sends (`getInfo`,
+  `listServices`), not nova's PascalCase.
+- ✅ `getInfo` **composes rather than duplicates**. OS/kernel/hostname/memory/
+  CPU are already implemented in `services/deviceinfo.rs`; re-parsing `/proc`
+  for them would have created a second source of truth for the same facts, so
+  it calls that code. What it adds is what nothing else on the bus reports:
+  uptime, boot time (`/proc/stat`'s `btime`, not now-minus-uptime, which
+  drifts across suspend), load average and task counts.
+- ✅ A failing sub-fact yields `null` plus an entry in `unavailable` saying
+  why, instead of failing the whole snapshot — one missing `uname` shouldn't
+  cost a caller the other six fields.
+- ✅ `listServices` reads **both** of Echo's disjoint notions of "a service
+  exists": `MessageRouter`'s handler table (every in-process service) and
+  `ServiceRegistry` (external clients that called `RegisterService`). Nothing
+  writes to both, which is why the pre-existing `Echo.ListServices` reports
+  none of the in-process ones. Needed one new accessor,
+  `MessageRouter::handler_entries()`.
+- ✅ Each entry carries `reachable`, resolved live against the forwarding
+  table rather than restated from the registry — `remove_connection` drops a
+  dead client from `external_services` but leaves it in the registry, so a
+  registered-then-crashed service lingers there and would otherwise be
+  reported as live.
+- ✅ 3 tests in `services/system.rs` (72 pass in `cargo test -p geckoOS-echo
+  --lib`). The `listServices` one pins the actual regression: reading the
+  registry alone reports zero in-process services.
+- ✅ `echo-cli services`/`status` repointed at `system.listServices` in the
+  same session, so the CLI stopped reporting "(no services registered)" on a
+  live bus; they now show each entry's `kind`, `reachable` state and method
+  count. `echo-cli ping` stopped using a service listing altogether and calls
+  a new no-op `system.ping`, so its latency number is the round trip and not
+  the cost of enumerating the bus.
+
+**Verified locally against a real `echo-daemon`** (not yet on device):
+`echo-cli call org.geckoOS.system getInfo` returns a full snapshot;
+`listServices` returns 14 services / 98 methods, where the registry-only
+`org.geckoOS.Echo` `ListServices` reports only whatever external clients had
+registered (zero on a fresh daemon). Registering a test service and letting
+the client exit produces `kind: external, reachable: false, methods: []` with
+its declared method still listed under `declaredMethods`; holding the
+connection open instead flips the same entry to `reachable: true`.
+
+**Not done:** `getInfo`/`listServices` are ungated by
+`PyxisBridgeParent.sys.mjs`'s `_capabilityFor` table (read-only introspection,
+which that table's comment names as the no-capability case). That is
+consistent with `deviceInfo`, which is entirely ungated today including
+`getSerial`/`getUUID` — gating system-info reads is one decision for roadmap
+item 6, not a thing to do piecemeal here.
 
 ### Alpha4 A+D — dynamic app registry + first test suite (2026-09-20)
 

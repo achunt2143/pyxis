@@ -87,6 +87,22 @@ decision — the decision is above.
 - `echo/src/services/appmanager.rs:102` — no signature verification before tarball extraction (Nova's install plan formalizes the fix; not yet implemented). `appmanager` is superseded by Nova and should probably just be deleted.
 - `evo` TODOs: HiDPI scale not read from render surface (`udev.rs`), hardcoded fps/memory in the `GetRenderingStatus` **IPC method** (the signal path is real), X11 override-redirect ordering (`shell/x11.rs`).
 - `evo` open bugs: maximize→unmaximize crashes the client (alpha2 #7), restore-from-dock doesn't work (#10), no user-driven window resize (#11). See `PROJECT_STATUS.md` for the diagnostic state of each.
+- `echo`'s `org.geckoOS.Echo` `ListServices` reads only `ServiceRegistry`, which
+  is written solely by the over-the-wire `RegisterService` call — never by the
+  in-process services `daemon.rs` installs via `register_handler`, so it answers
+  "(no services registered)" on a booted device. **It is kept that way on
+  purpose** (external clients may depend on its `service_name`/`service_id`/
+  `registered_at` shape), which makes it a trap for new code rather than a bug
+  to fix: to find out what is actually on the bus, call
+  `org.geckoOS.system.listServices` (`echo/src/services/system.rs`, added
+  2026-09-20), which merges the router's handler table with the registry and
+  resolves `reachable` per entry against the live connection table. `echo-cli
+  services`/`status` were repointed at it 2026-09-20 and now print
+  `kind`/`reachable`/method counts; `echo-cli ping` no longer times a service
+  listing at all, it calls the no-op `system.ping`. Still open: the registry is
+  never pruned on disconnect, so a registered-then-crashed client keeps its
+  entry forever — the listing now shows it as unreachable instead of implying
+  it is running.
 - No permission/capability model is *enforced* anywhere yet — Nova has the vocabulary, nothing checks it at the bridge. See next section.
 - `pyxis-experience`'s README is still the stock Vite template. Test coverage is no longer zero — Vitest is wired up (`npm test`), with `src/hooks/__tests__/novaContract.test.ts` asserting the mock's `nova.List` shape against fields **parsed out of `nova.rs` itself**, so adding a field to `to_info_json` without teaching the mock fails at the desk. That suite is the pattern to extend; it is still the only one.
 - **remochi's `Toggle` types don't match its runtime**: `index.d.ts` declares a `checked` prop, but the exported component reads `value` and calls `onChange({ value })`. Passing `checked` type-checks and is silently ignored. Bloom bridges this with a locally-typed `Switch` cast in `QuickSettingsMenu.tsx` and `SettingsApp.tsx` — check for that trap before adding a new `Toggle`.
