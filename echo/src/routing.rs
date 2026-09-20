@@ -107,6 +107,31 @@ impl MessageRouter {
         self.handlers.len()
     }
 
+    /// Every registered handler, as `(destination, method)` pairs.
+    ///
+    /// This is the only complete view of what the bus can actually answer.
+    /// `ServiceRegistry` (registry.rs) holds *only* services that called the
+    /// `RegisterService` method over the wire -- the in-process services
+    /// echo-daemon installs at startup (filesystem, power, nova, ...) go
+    /// straight into `self.handlers` via `register_handler` and never appear
+    /// there. Anything reporting "what services exist" therefore has to read
+    /// this table, not just the registry. See
+    /// `services::system::SystemService::list_services`.
+    ///
+    /// Handler keys are stored as `"{destination}.{method}"` and destinations
+    /// themselves contain dots (`org.geckoOS.filesystem`), so the split is on
+    /// the LAST dot, not the first.
+    pub fn handler_entries(&self) -> Vec<(String, String)> {
+        self.handlers
+            .iter()
+            .filter_map(|entry| {
+                let key = entry.key();
+                key.rsplit_once('.')
+                    .map(|(dest, method)| (dest.to_string(), method.to_string()))
+            })
+            .collect()
+    }
+
     // --- ROUTES MANAGEMENT ---
     
     /// Add a route pattern for a destination

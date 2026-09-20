@@ -14,6 +14,7 @@ pub mod network;
 pub mod deviceinfo;
 pub mod notification;
 pub mod process;
+pub mod system;
 pub mod terminal;
 
 // Re-exports for convenience
@@ -28,4 +29,5 @@ pub use network::NetworkService;
 pub use deviceinfo::DeviceInfoService;
 pub use notification::NotificationService;
 pub use process::ProcessService;
+pub use system::SystemService;
 pub use terminal::{TerminalService, TERMINAL_IFACE};

@@ -597,6 +597,9 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
     // ==================== PROCESS SERVICE ====================
     register_process_handlers(bus).await?;
 
+    // ==================== SYSTEM SERVICE ====================
+    register_system_handlers(bus).await?;
+
     info!("✓ All services registered successfully");
     Ok(())
 }
@@ -1523,6 +1526,72 @@ async fn register_process_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
     );
 
     info!("✓ Process service handlers registered");
+    Ok(())
+}
+
+// ==================== SYSTEM SERVICE HANDLERS ====================
+//
+// `org.geckoOS.system` is the destination the compiled-in Gecko bridge has
+// always pointed its two top-level methods at --
+// `window.geckoOS.getSystemInfo()` and `.listServices()`, see
+// gecko/patches/pyxis/toolkit/actors/PyxisBridgeChild.sys.mjs -- with
+// nothing registered here to answer them, so both failed with
+// "Service not registered: org.geckoOS.system" while every other namespace
+// on that object worked. The method names below are spelled exactly as the
+// bridge sends them (camelCase, matching filesystem/power/deviceInfo rather
+// than nova's PascalCase); changing their case here silently breaks the
+// bridge again.
+async fn register_system_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Registering system service handlers");
+
+    bus.router().register_handler(
+        "org.geckoOS.system",
+        "getInfo",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::system::SystemService::get_info() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        "org.geckoOS.system",
+        "ping",
+        handler(move |msg| {
+            Box::pin(async move {
+                Ok(Message::method_return(
+                    msg.header.message_id,
+                    services::system::SystemService::ping(),
+                ))
+            })
+        })
+        .into(),
+    );
+
+    // Unlike every other handler in this file, listServices has to read bus
+    // state (the router's handler table plus the registry), so it captures
+    // the bus the way register_internal_handlers' ListServices does.
+    let bus_for_list = bus.clone();
+    bus.router().register_handler(
+        "org.geckoOS.system",
+        "listServices",
+        handler(move |msg| {
+            let bus = bus_for_list.clone();
+            Box::pin(async move {
+                match services::system::SystemService::list_services(&bus).await {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
+                }
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ System service handlers registered");
     Ok(())
 }
 
