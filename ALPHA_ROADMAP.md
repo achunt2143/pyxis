@@ -190,13 +190,44 @@ on alpha 3's opkg fix, and its debugging depends on alpha 3's honesty fixes.
       wrong for a dev build run on device. `DesktopWindowType.entryHtml` is
       renamed `entryUrl` to match.
 
-**B. Installer end-to-end** (audit §1.1)
+**B. Installer end-to-end** (audit §1.1) — *service layer done on device;
+one step needs a human*
 
-- [ ] Build a `.ipk` with `pyxis-sdk`, drop it in `/var/lib/pyxis/incoming`,
-      install it from the Installer app, and launch it from the launcher.
-      This single flow is the alpha 4 acceptance test.
-- [ ] Verify the uninstall split holds: `installer.Remove` → `opkg remove` →
-      Nova refresh; `nova.Uninstall` correctly refuses opkg-owned apps.
+- [x] Build a `.ipk` with `pyxis-sdk`, drop it in `/var/lib/pyxis/incoming`,
+      install it, and launch it. **Verified on a real boot 2026-09-20** with
+      `scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt`:
+      `pyxis-sdk new/package` → `installer.ListAvailable` discovers it →
+      `installer.Inspect` reads metadata without installing →
+      `installer.Install` → `opkg install` → `registry reloaded: 11 apps` →
+      files at `/usr/pyxis/applications/<id>/` → Nova indexes it
+      (tier `opkg`, source `appinfo.json`, `removable: false`) → derived
+      native manifest written to `/var/lib/pyxis/nova/native/<id>/` →
+      `origins.map` updated → `appHost.ListApps` and `pyxis-appctl list` see
+      it → `nova.Launch` spawns vela → **AppHost reports a live session with
+      a mapped compositor surface**, and Evo negotiates SSD for it
+      (`app_id=Some("com.pyxis.hello") kde_decoration=Some(Server)`).
+- [x] The app really runs, not just opens a window: the test app writes a
+      probe file through the bridge, and on device it reported
+      `origin=pyxis://com.pyxis.hello`, `secureContext=true`,
+      `bridge=present`, `initialized=true` — and the write itself succeeded,
+      which proves Nova's appinfo→capability mapping
+      (`filesystem.write` → `filesystem:write`) grants a *third-party* opkg
+      app a real capability.
+- [x] Verify the uninstall split holds. `nova.Uninstall` refuses with
+      "app '<id>' was installed via opkg; use `opkg remove <id>` instead";
+      `installer.Remove` succeeds, files go, Nova drops the app and cleans
+      up its derived manifest.
+- [x] The shell's half, on device: Bloom drives its launcher from the real
+      bus. echo.log shows exactly one `nova.List` per shell start, rising on
+      each install and each removal — so `useApps`'s `RegistryChanged`
+      subscription works against real Echo, not just the mock.
+- [ ] **Needs a human at the screen:** confirm the app *appears* in the
+      launcher and launches from a click. Headless screenshots are
+      impossible here — QMP `screendump` reports "no surface" on a GL
+      scanout, re-confirmed on QEMU 10.2.1, so this is not stale tooling.
+      Everything behind the pixels is verified; what is unverified is the
+      pixels. Run `make build-release && make run` (the rootfs stages need
+      root) and look.
 
 **C. Fix the two carried-over window bugs**
 

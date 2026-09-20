@@ -111,6 +111,27 @@ webOS's LS2 bus enforced a **JSON role-file allow-list per identity** at the bus
 7. **Finish Evo's rough edges** — minimize, HiDPI scale, real fps/memory stats, X11 ordering.
 8. **Housekeeping** — update the architecture recap for Vroom's new SDK/PDK role; decide `pyxis-evo`'s fate (archive recommended); extend Bloom test coverage beyond alpha 4's Nova contract suite; replace Bloom's stock-Vite README. (Resolved: `gaia/` retired 2026-07-07; the `dbus.rs` test, `ouranos.service`, `apphost.rs`'s doc comment, and Bloom's dead code/lint errors/phantom entries are all done — see "Corrected 2026-08-16" above.)
 
+## On-device verification
+
+`scripts/serial-test.py` boots the image headless and drives it over the
+serial console — the project's only verification channel, since Evo needs
+virgl and QMP `screendump` reports "no surface" on a GL scanout (re-checked
+on QEMU 10.2.1 with `device`/`head` variants; it is not stale tooling).
+
+```bash
+scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt
+scripts/serial-test.py -c 'opkg list-installed' --keep-running
+```
+
+It runs on a qcow2 overlay, so the image is never mutated and each run
+starts clean, and it can `--push` a file in by chunked base64 (sha256
+verified) when there is no other way to get one into the guest. The script's
+docstring carries the serial gotchas that have each cost hours.
+
+**What it cannot do is look at the screen.** Anything whose acceptance is
+visual still needs `make build-release && make run` and a human. Note the
+rootfs stages need root, so a build cannot be fully automated either.
+
 ## Source documents
 
 Read these directly for full depth — this file is a summary, not a replacement:

@@ -56,7 +56,7 @@ to-do, not "in progress."
 | 11 | **Window resizing** (new, found in testing) | 📋 **to-do** — not implemented at all; windows currently only have two fixed sizes (maximized / restored-default). No user-driven resize (edge/corner drag) exists yet | `evo/shell/grabs.rs`, `xdg.rs` |
 | 12 | **General visual enhancements** (new, found in testing) | 📋 to-do — umbrella item, scope TBD next pass (title bar/border legibility, spacing, etc.) | Evo SSD / Bloom |
 | — | Window layering (shell below apps) | ✅ verified on-device | `evo/shell/element.rs` |
-| — | Installer present / install flow | 🚧 **opkg present and working on-device** (`list-installed` rc=0); the app is now reachable from the UI (alpha 4 dynamic registry). Remaining: a real `.ipk` through real `opkg` on device | `installer` app + service |
+| — | Installer present / install flow | ✅ **verified end to end on device 2026-09-20** — a real `.ipk` built with `pyxis-sdk`, installed through `installer.Install` → `opkg`, indexed by Nova, launched into a live Evo-composited window, and removed again. Only the *visual* confirmation in the launcher is outstanding (no headless screenshot channel) | `installer` app + service |
 
 ---
 
@@ -657,6 +657,97 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### Alpha4 B — .ipk end to end on a real boot (2026-09-20)
+
+The alpha 4 acceptance flow, run on the booted alpha3 image. No Rust had
+changed since that image was built, so the service layer under test is
+current; only the shell bundle was hot-swapped in over serial.
+
+**New: `scripts/serial-test.py`.** Serial is this project's only
+verification channel and it had no harness, so every on-device check was a
+retyped manual session. The script boots the image on a qcow2 overlay (the
+pristine image is never mutated), waits for the `ttyS0` root shell, runs a
+list of commands, and prints each one's output. It encodes the gotchas that
+have each cost hours: boot-script output never reaches serial, markers must
+be split so they cannot match the shell's own echo, `echo-cli` needs
+`XDG_RUNTIME_DIR` and the full destination name. It can also push a file
+into the guest by chunked base64 with a sha256 check at the end — there is
+no shared filesystem and no sshd, and mounting the image needs root, which
+is the thing the harness exists to avoid. `scripts/serial-tests/alpha4-ipk-e2e.txt` is
+the first suite.
+
+**Verified** (`scripts/serial-tests/alpha4-ipk-e2e.txt`): `pyxis-sdk new` → `package` →
+`installer.ListAvailable` → `Inspect` → `Install` → `opkg install` → Nova
+reload → indexed as tier `opkg` / source `appinfo.json` / `removable: false`
+→ derived native manifest + `origins.map` → visible to `appHost.ListApps`
+and `pyxis-appctl` → `nova.Launch` → **live session with a mapped
+compositor surface**, Evo negotiating SSD for it. Then `nova.Uninstall`
+correctly refuses ("use `opkg remove`"), `installer.Remove` succeeds, and
+everything is cleaned up.
+
+**The app really runs.** A mapped surface only proves a window exists, so
+the test app writes a probe through the bridge. On device it reported
+`origin=pyxis://com.pyxis.hello`, `secureContext=true`, `bridge=present`,
+`initialized=true` — and the write succeeded, which means Nova's
+appinfo→capability mapping grants a *third-party* opkg app a real
+capability, not just the built-ins.
+
+**Two bugs found, both fixed:**
+
+1. **Nova handed web clients a filesystem path.** `info_json`'s `icons` came
+   straight from `manifest.icons`, which `load_one_appinfo` fills with an
+   *absolute* path (`/usr/pyxis/applications/<id>/icon.png`) so the derived
+   *native* manifest has something AppHost can read. Handing that to a
+   `pyxis://` client resolves against the origin root and 404s. Two
+   consumers, incompatible needs. `info_json` now projects app-root-relative
+   paths via `RegistryEntry::web_icons`; the native manifest keeps its
+   absolute one. Three unit tests. Bloom's `relativeIconPath` also recovers
+   the relative form, because it may run against an older Nova — which is
+   exactly the case on the current image.
+2. **`useApps()` fetched once per consumer.** Six components call it; the
+   first on-device run showed **five `nova.List` calls for one shell
+   start**, and every `RegistryChanged` fanned out to all six. Rewritten as
+   one module-level store read through `useSyncExternalStore`, with an
+   in-flight guard. Re-verified on device: **exactly one `nova.List` per
+   shell start**, rising by two on each install and each removal.
+
+**Also found, not fixed** (out of scope, tracked): the bridge advertises
+`getSystemInfo()` and `listServices()`, which call `org.geckoOS.system` — a
+service registered nowhere. Any app touching them gets "Service not
+registered".
+
+**Also confirmed:** the shell's registry wiring works on the real bus, not
+just the mock. `nova.List` appears in echo.log per shell start and again
+after each install/remove, which a hardcoded-array Bloom would never emit.
+
+**Still open, and it needs a human:** whether the app *visibly* appears in
+the launcher. QMP `screendump` reports "no surface" on a GL scanout —
+re-confirmed on QEMU 10.2.1 with `device`/`head` variants, so this is not
+stale tooling and not a misconfiguration. Everything behind the pixels is
+verified; the pixels are not. `make build-release && make run` and look.
+
+**Open question, minor:** an install produces *two* `nova.List` calls, not
+one, and so does a removal. Symmetric, so most likely `RegistryChanged` is
+emitted twice per operation on the Rust side rather than anything in the
+shell. Not chased.
+
+**Found by the test procedure, not by the change** — worth recording because
+it bears on alpha 6's "shell restart without losing session": killing the
+boot-launched Bloom and relaunching it through `nova.Launch` produces
+`TypeError: Property 'handleEvent' is not callable` in echo.log. It looked
+at first like a regression in the new shell bundle, so it was checked
+against a control: the **unmodified** alpha3 Bloom, killed and relaunched
+the same way, produces it too (0 → 1), while a clean boot of either produces
+none. So the trigger is the relaunch path — Bloom launched via Nova rather
+than by `geckoOS-boot`, and without `--kiosk` — not the bundle. A shell
+respawn is supposed to become a supported operation in alpha 6; this is
+waiting there.
+
+Useful control data from the same run: the pre-alpha4 Bloom calls
+`nova.List` **zero** times, which is what makes the single call from the new
+one meaningful. The ~18 `nova.GetInfo` calls per shell start are also
+pre-existing, not introduced here — chatty, but not new.
 
 ### Alpha4 A+D — dynamic app registry + first test suite (2026-09-20)
 
