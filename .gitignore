@@ -66,3 +66,4 @@ target/
 *.pdf
 boot/initramfs/initramfs-init
 scripts/serial-tests/**/dist/
+scripts/serial-tests/**/.pyxis/
