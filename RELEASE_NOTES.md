@@ -1,3 +1,153 @@
+# GeckoOS / Pyxis — Alpha 4 Release Notes
+
+**Theme: "All my apps working."**
+
+**Headline:** the app pipeline runs end to end. A third-party application
+packaged with `pyxis-sdk` installs through the Installer, appears in the
+launcher without anyone editing a source file, launches into its own
+Evo-composited window on its own `pyxis://` origin, reaches the system
+bridge with the capabilities it declared, and uninstalls cleanly. The
+hardcoded app list is gone.
+
+Alpha 3 made the system stop lying. Alpha 4 makes it useful.
+
+---
+
+## The headline change: the launcher reads a registry
+
+`PYXIS_APPS` in Bloom was a hardcoded array and the *only* source of apps
+for the launcher, drawer, search and dock. No `.ipk` could ever appear on
+the desktop, however cleanly it installed — and the Installer app itself,
+built and staged since July, was unreachable from the UI.
+
+The shell now reads `nova.List` through `useApps()`, refreshed on Nova's
+`AppInstalled` / `AppUninstalled` / `RegistryChanged` signals. `PYXIS_APPS`
+survives only as a *presentation overlay*: which Lucide glyph a built-in
+draws with, its accent colour, whether it is pinned, its preferred window
+size. An app absent from it still appears, drawn from its own manifest icon
+with a generic glyph as the last resort.
+
+**The load-bearing detail, easy to get wrong:** `RegistryChanged` is the
+signal that matters, not `AppInstalled`. `nova.Install` is the user-tier
+tarball path; an `.ipk` goes Installer → `opkg` → `nova.Reload`, which emits
+`RegistryChanged` alone. Subscribing only to `AppInstalled` reads as
+obviously correct and never fires for the case the feature exists for.
+
+## Packaging, install and launch, verified on a real boot
+
+`scripts/serial-tests/alpha4-ipk-e2e.txt` drives the whole flow with 33
+assertions: `pyxis-sdk package` → `installer.ListAvailable` discovers it →
+`Inspect` reads metadata without installing → `Install` → `opkg install` →
+Nova indexes it as tier `opkg`, source `appinfo.json`, `removable: false` →
+derived `setpriv` manifest and `origins.map` entry → visible to
+`appHost.ListApps` and `pyxis-appctl` → `nova.Launch` → a live session with
+a mapped compositor surface and server-side decoration.
+
+The test app proves it *ran*, not merely that a window opened: it probes the
+bridge on load and writes the result to a file. On device it reports
+`origin=pyxis://com.pyxis.hello`, `secureContext=true`, `bridge=present` —
+and the write itself succeeding proves Nova's appinfo→capability mapping
+grants a **third-party** app a real capability, not just the built-ins.
+
+The tier split holds: `nova.Uninstall` refuses an opkg-owned app and says to
+use `opkg remove`; `installer.Remove` succeeds and Nova drops it.
+
+## Two long-standing window bugs closed
+
+- **#7, maximize → unmaximize closed the app.** A single physical click was
+  dispatched on both press *and* release, and the header bar's button bands
+  move between the two — so the release landed on Close. Fixed by ignoring
+  anything but `ButtonState::Pressed`. Confirmed by hand; it cannot be
+  automated, since driving maximize over IPC never touches the pointer path.
+- **#10, restore from the dock.** Three separate faults, all fixed in August
+  and none confirmed until now: Evo bound surfaces into its own
+  process-global `AppHost` instead of the daemon's; it bound at map time,
+  before a real `app_id` exists, so everything landed under `"unknown"`; and
+  `IPCBus::call_method` never forwarded in-process→external calls, so
+  `nova.Focus` could not reach Evo at all. The whole chain now round-trips.
+
+## `org.geckoOS.system` — the bridge's last two dead methods
+
+`window.geckoOS.getSystemInfo()` and `.listServices()` were in the API
+surface every app sees, pointing at a service registered nowhere. Built
+rather than deleted, since `listServices` is genuinely useful.
+
+It exposed a real trap while being built: `org.geckoOS.Echo`'s own
+`ListServices` reads `ServiceRegistry`, which **only** the over-the-wire
+`RegisterService` call writes to — so on a booted device it reports 3
+services while a dozen are live. The new `system.listServices` merges the
+router's handler table with the registry and reports 16, resolving
+`reachable` per entry against the live connection table. The old handler is
+left alone deliberately (external clients may depend on its shape) and is
+now documented as a trap rather than fixed.
+
+## The reference VM needs 4 GB
+
+Every app is its own vela — a full Gecko. Eight of them plus the shell
+saturate a 2 GB guest at ~1929/1987 MB, and the apps that lose the race stay
+**alive, with no oom-kill**, simply unable to allocate enough to map a
+surface. That presents as a compositor fault and is not one. `QEMU_MEMORY`
+now defaults to 4096, where all eight map using ~2793 MB. Giving a
+backgrounded app its memory back is alpha 6's job (cgroups, Puppis
+freeze/thaw); this is headroom, not a cure for the appetite.
+
+## Testing became real
+
+Bloom had zero tests. It now has Vitest and a Nova contract suite whose
+shape assertions are **parsed out of `nova.rs` at test time** rather than
+restated, so adding a field to the Rust projection without teaching the mock
+fails at the desk instead of on device three weeks later. That suite
+immediately earned itself: the mock implemented `nova.List` by delegating to
+`appHost.ListApps` — a different projection of a different thing, colliding
+on the field name `entry` — so anything built on it worked in `npm run dev`
+and would have broken on device.
+
+On the systems side, `scripts/serial-test.py` boots the image headless and
+scripts the serial console, which is this project's only verification
+channel. Suites assert with `#!must` / `#!must-not` directives. That was not
+the first design: the suites originally only *printed*, and a run in which
+every step failed still exited 0 — which happened, twice, and is why the
+assertions exist.
+
+## Fixed along the way
+
+- Nova handed web clients an absolute *filesystem* path for app icons, which
+  a `pyxis://` client resolves against its origin root and 404s. The native
+  manifest still needs the absolute form, so the two projections are now
+  separate.
+- `useApps()` fetched once per consumer — six components, five `nova.List`
+  calls per shell start, and a fan-out on every signal. One shared store now.
+- `evo`'s `FocusWindow`/`MinimizeWindow`/`RestoreWindow` answered
+  `{"success": true, "window_id": 0}` for any argument, including the
+  natural mistake of passing `appId`. They now reject a missing or
+  non-numeric id.
+
+## Known limits
+
+- A window action's reply is sent when the action is **queued**; existence is
+  resolved later in the compositor loop, which has no way back to that reply.
+  So a well-formed id for a window that does not exist still returns success.
+  Fixing it means plumbing a response channel through the queue.
+- The service registry is never pruned on disconnect, so a registered-then-
+  crashed client keeps its entry. `listServices` marks it unreachable rather
+  than hiding it.
+- No permission is *enforced* at the bridge yet. Nova computes the grant
+  correctly; nothing refuses an ungranted call. That is alpha 6.
+- Headless screenshots remain impossible (QMP `screendump` → "no surface" on
+  a GL scanout, re-confirmed on QEMU 10.2.1), so anything whose acceptance is
+  visual still needs a human.
+
+## Overall
+
+Alpha 4 set out to make the app pipeline work end to end, and it does. The
+unplanned cost was in the tests rather than the product: two suites that
+passed while proving nothing, and one fix of mine that broke `nova.Focus`
+outright and was caught only by running it on a device. Both are the same
+lesson alpha 3 learned about the system — a green result you have not
+watched fail is not evidence — now applied to the test tooling itself.
+
+---
+
 # GeckoOS / Pyxis — Alpha 3 Release Notes
 
 **Theme: "Nothing lies to the user."**
