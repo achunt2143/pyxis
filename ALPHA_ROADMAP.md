@@ -149,25 +149,46 @@ on alpha 3's opkg fix, and its debugging depends on alpha 3's honesty fixes.
 
 ### Scope
 
-**A. Dynamic app registry** (audit §2.1) — *the headline*
+**A. Dynamic app registry** (audit §2.1) — *the headline* — ✅ **done**
 
-- [ ] Add `listApps()` / `getAppInfo(id)` to `@pyxis/app-sdk`'s `useEcho`,
-      calling `org.geckoOS.nova` `List`/`GetInfo`. The mock path already
-      handles both (`EchoClient.ts:689-698`) — extend it to return the same
-      shape as the real service.
-- [ ] Add a `useApps()` hook: Nova's list as the source of truth, refreshed on
-      Nova's install/uninstall signals, with `PYXIS_APPS` demoted to a
-      *presentation overlay* (Lucide icon + pin state + default size for
-      built-ins only).
-- [ ] Extend `PyxisAppDef` with an `iconUrl` so third-party apps can supply
-      `pyxis://<id>/icon.png`; keep `LucideIcon` as the built-in fallback and
-      a generic glyph as the last resort.
-- [ ] Repoint `LeftLauncher`, `AppDrawer`, `DesktopSearch`, `BottomDock` at
-      `useApps()`.
-- [ ] Add `installer` to the registry so the App Installer is reachable from
-      the desktop. *(It is currently built, packaged, staged, and invisible.)*
-- [ ] Change `registry.ts`'s `entryHtml` to `pyxis://<id>/index.html`, keeping
-      the `localhost:518x` ports behind a dev-only branch.
+- [x] Add `listApps()` / `getAppInfo(id)` to `@pyxis/app-sdk`'s `useEcho`,
+      calling `org.geckoOS.nova` `List`/`GetInfo`.
+      **Corrected while doing it:** the mock did not "already handle both" in
+      any usable sense — `nova.List` was implemented by *delegating to
+      `appHost.ListApps`*, a different projection of a different thing. It
+      returned `exec`/`icon`/`count` and omitted `tier`/`removable`/
+      `singleInstance`/`icons`, so anything built against it would have
+      worked in dev and broken on device. Replaced with `mockNovaRegistry()`,
+      a real `info_json()`-shaped projection, and pinned by item D.
+- [x] Add a `useApps()` hook (`src/hooks/useApps.ts`): Nova's list as the
+      source of truth, refreshed on `AppInstalled`/`AppUninstalled`/
+      `RegistryChanged`, with `PYXIS_APPS` demoted to a presentation overlay.
+      `RegistryChanged` turned out to be the load-bearing one: it is what
+      `nova.Reload` emits, and the Installer's `opkg` path goes through
+      Reload — so an `.ipk` app arrives by that signal and no other.
+      The hook deliberately carries no liveness; running-ness stays
+      `useAppHost`'s question.
+- [x] Extend `PyxisAppDef` with `iconUrl`; the three-tier fallback (Lucide
+      glyph → manifest artwork → generic package glyph, plus an `onError`
+      catch so a 404 doesn't leave a broken-image box) lives in the new
+      `AppIcon` component, shared by all four consumers.
+- [x] Repoint `LeftLauncher`, `AppDrawer`, `DesktopSearch`, `BottomDock` at
+      `useApps()` — plus `useWindows` and `Desktop.tsx`, which the roadmap
+      missed: `Desktop`'s three launch sites each did
+      `mockApps.find(...)` and **silently dropped the launch** when the id
+      wasn't in the hardcoded list, so repointing the launcher alone would
+      have made third-party apps visible but unlaunchable. `AppDrawer`'s
+      empty state now distinguishes loading / unreachable-registry / no
+      matches instead of always claiming "No applications found".
+- [x] Add `installer` to the registry so the App Installer is reachable from
+      the desktop. *(Done in the alpha3 Bloom pass; also added to the mock
+      app set, which was still missing it.)*
+- [x] Replace `registry.ts`'s hardcoded `entryHtml` with `entryUrlFor(id,
+      entry)`: `pyxis://<id>/<entry>` on device, the package's `devPort` off
+      it. The discriminator is `location.protocol === 'pyxis:'` rather than
+      `import.meta.env.DEV` — the latter is a build-time flag and would be
+      wrong for a dev build run on device. `DesktopWindowType.entryHtml` is
+      renamed `entryUrl` to match.
 
 **B. Installer end-to-end** (audit §1.1)
 
@@ -192,21 +213,33 @@ on alpha 3's opkg fix, and its debugging depends on alpha 3's honesty fixes.
       / `unmaximize_request`) around a repro before changing any code. Answer
       first: does Evo itself die (all windows go) or just the client?
 
-**D. Bridge contract tests** (audit §5.4)
+**D. Bridge contract tests** (audit §5.4) — *done, shipped with A*
 
-- [ ] Add Vitest to `pyxis-experience`. First suite: assert `EchoClient`'s mock
-      responses match the real services' JSON shapes, generated from or checked
-      against the Rust side. This is the test that would have caught the Files
-      class of bug at the desk instead of on device.
+- [x] Add Vitest to `pyxis-experience` (`npm test`; `tsconfig.test.json`
+      typechecks tests separately so the app bundle never gets node types).
+      First suite, `src/hooks/__tests__/novaContract.test.ts` (10 tests):
+      asserts the mock's `nova.List` carries every field **parsed out of
+      `nova.rs::to_info_json`/`info_json` at test time**, so the check
+      maintains itself; asserts it leaks none of appHost's; and drives the
+      full install → appears → remove → gone flow through `EchoClient`.
+      Confirmed it bites by deleting `tier` from the mock and watching it
+      fail with an actionable message. **Done as part of A rather than last**
+      — it is the test that catches exactly the mismatch A uncovered.
 
 ### Exit criteria
 
-- A third-party `.ipk`, built with `pyxis-sdk` and installed through the
-  Installer app, appears in the launcher with its own icon and launches.
-- Uninstalling it removes it from the launcher.
-- All 8 built-in apps launch, focus from the dock, minimize, restore, and close.
-- Maximize→unmaximize does not crash.
-- Vitest suite green in CI.
+- [ ] A third-party `.ipk`, built with `pyxis-sdk` and installed through the
+      Installer app, appears in the launcher with its own icon and launches.
+      **Shell half done and verified in the browser** — installing `weather`
+      through the installer makes it appear in the drawer and desktop search,
+      removing it drops it, driven only by Nova's `RegistryChanged`. What
+      remains is the on-device half: a real `.ipk` through real `opkg`.
+- [ ] Uninstalling it removes it from the launcher. *(Same: verified against
+      the mock, not yet on device.)*
+- [ ] All 8 built-in apps launch, focus from the dock, minimize, restore, and
+      close.
+- [ ] Maximize→unmaximize does not crash.
+- [x] Vitest suite green (10/10), lint 0, `tsc -b` clean, `npm run build` ok.
 
 ---
 

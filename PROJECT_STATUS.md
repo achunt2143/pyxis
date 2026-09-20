@@ -56,7 +56,7 @@ to-do, not "in progress."
 | 11 | **Window resizing** (new, found in testing) | 📋 **to-do** — not implemented at all; windows currently only have two fixed sizes (maximized / restored-default). No user-driven resize (edge/corner drag) exists yet | `evo/shell/grabs.rs`, `xdg.rs` |
 | 12 | **General visual enhancements** (new, found in testing) | 📋 to-do — umbrella item, scope TBD next pass (title bar/border legibility, spacing, etc.) | Evo SSD / Bloom |
 | — | Window layering (shell below apps) | ✅ verified on-device | `evo/shell/element.rs` |
-| — | Installer present / install flow | 🚧 **opkg now present and working on-device** (`list-installed` rc=0); the app itself is still unreachable from the UI until alpha4's dynamic registry | `installer` app + service |
+| — | Installer present / install flow | 🚧 **opkg present and working on-device** (`list-installed` rc=0); the app is now reachable from the UI (alpha 4 dynamic registry). Remaining: a real `.ipk` through real `opkg` on device | `installer` app + service |
 
 ---
 
@@ -83,14 +83,25 @@ hardcoded 50% + a constant 40°C on machines with no battery — it now reports
 regardless — it now writes the sysfs backlight directly and finds the device
 rather than hardcoding `intel_backlight`.
 
-### New blocker — the shell can't see installed apps
+### Resolved in alpha 4 — the shell now reads Nova's registry
 
-📋 **`PYXIS_APPS` (`pyxis-experience/src/apps/registry.ts`) is a hardcoded
-array and is the only app source for the launcher, drawer, search, and dock.
-Nothing in the shell ever calls `nova.List`.** Consequences: any `.ipk` app a
-user installs is invisible on the desktop, and the **Installer app itself is
-not in the registry** — it's built, packaged, and staged, but unreachable from
-the UI. This is the top functional gap; see `ALPHA_ROADMAP.md` Alpha 4.
+✅ **`useApps()` (`pyxis-experience/src/hooks/useApps.ts`) is the shell's app
+source**: `nova.List`, refreshed on `AppInstalled`/`AppUninstalled`/
+`RegistryChanged`. `PYXIS_APPS` is now only a presentation overlay (glyph,
+accent, pin state, default size) and is read in exactly two places — pin
+ordering inside `useApps`, and `appById`. The launcher, drawer, desktop
+search, dock, `useWindows` and `Desktop`'s three launch sites all go through
+the hook.
+
+Verified in the browser (not yet on device): installing `weather` via the
+installer makes it appear in the drawer and search with the fallback glyph,
+and removing it drops it — no code change, no restart.
+
+**The non-obvious part, don't re-derive it:** `RegistryChanged` is the
+load-bearing signal, not `AppInstalled`. `nova.Install` is the *user-tier*
+tarball path; an `.ipk` goes installer → `opkg` → `nova.Reload`, and Reload
+emits `RegistryChanged` alone. Subscribing only to `AppInstalled` would look
+correct and never fire for the case that matters.
 
 ### Root cause found and fixed for #3 (Files) — 🟢 awaiting on-device confirmation
 
@@ -635,7 +646,7 @@ Condensed from CLAUDE.md, updated with this session's progress.
   (webOS card-style) — the only viable form of #1b; own project.
 - Extract Nova to a standalone crate.
 - Archive `pyxis-evo`; remove `ouranos.service`.
-- Bloom dead-code/lint cleanup + test coverage.
+- Extend Bloom test coverage beyond the Nova contract suite (components, hooks).
 
 ### Nice-to-have 💡
 - Window snapping/tiling; minimize/restore animations.
@@ -646,6 +657,62 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### Alpha4 A+D — dynamic app registry + first test suite (2026-09-20)
+
+Alpha 4's headline (scope item A) and its contract tests (item D), done
+together because A uncovered exactly the bug D exists to catch. **Verified in
+the browser preview, not on device** — items B and C of alpha 4 are the
+on-device half and are still open.
+
+**The bug A uncovered.** The roadmap said the mock "already handles both"
+`nova.List`/`GetInfo`. It did not, in the way that mattered: mock `nova.List`
+was implemented by *delegating to `appHost.ListApps`*. Those are two different
+projections of two different things — AppHost's is "apps I can supervise"
+(`exec`, `icon`, `sessions`, `count`), Nova's is "apps that exist"
+(`tier`, `removable`, `singleInstance`, `icons`, `source`). They even collide
+on `entry`, which means a component name to AppHost and a webroot-relative
+path to Nova. Anything written against the mock would have worked in
+`npm run dev` and failed on device — the alpha 2 failure mode, again.
+
+**Shell (`pyxis-experience`)**
+- ✅ `useApps()` — Nova's `List` as the app source, refreshed on
+  `AppInstalled`/`AppUninstalled`/`RegistryChanged`. Carries no liveness by
+  design; running-ness stays `useAppHost`'s question, so a launch doesn't
+  read as a registry change.
+- ✅ `PYXIS_APPS` demoted to a presentation overlay. Read in two places now.
+- ✅ `AppIcon` — glyph → manifest artwork → generic package glyph, with an
+  `onError` catch so a missing icon isn't a broken-image box.
+- ✅ `entryUrlFor(id, entry)` replaces hardcoded `entryHtml`:
+  `pyxis://<id>/<entry>` on device, the package's `devPort` off it.
+  `DesktopWindowType.entryHtml` → `entryUrl`.
+- ✅ Repointed: `LeftLauncher`, `AppDrawer`, `DesktopSearch`, `BottomDock`,
+  and — **not in the roadmap** — `useWindows` and `Desktop`. Desktop's three
+  launch sites each did `mockApps.find(...)` and silently dropped the launch
+  on a miss, so repointing the launcher alone would have made third-party
+  apps visible but unlaunchable.
+- ✅ `AppDrawer` empty state distinguishes loading / registry-unreachable /
+  no-matches, instead of always claiming "No applications found".
+- ✅ Mock `nova.List`/`GetInfo` rewritten as a real `info_json()` projection;
+  `installer` added to the mock app set; installer mock now emits
+  `RegistryChanged` **on Nova's interface**, matching the device, where it is
+  Nova (via `Reload`) and not the installer that announces a new registry.
+
+**Tests — first suite in this repo's UI side**
+- ✅ Vitest wired up (`npm test`), with `tsconfig.test.json` so tests can use
+  node types the app bundle must never get.
+- ✅ `src/hooks/__tests__/novaContract.test.ts`, 10 tests. The shape test
+  **parses the field list out of `nova.rs` at test time** rather than
+  restating it, so it maintains itself. Confirmed it bites: deleting `tier`
+  from the mock fails it with a message naming the field and the fix site.
+
+**Observed working** (browser preview, mock backend): drawer renders Nova's 8
+apps including the previously-unreachable Installer; installing `weather`
+makes it appear in drawer + desktop search with the fallback glyph; removing
+it drops it from both. Lint 0, `tsc -b` clean, `npm run build` ok, tests 10/10.
+
+**Carried into the rest of alpha 4:** B (a real `.ipk` through real `opkg` on
+device), C (#10 restore-from-dock, #7 maximize→unmaximize crash).
 
 ### Alpha3 — "Nothing lies to the user" (2026-08-16)
 
