@@ -493,11 +493,18 @@ impl EchoClient {
 
         match response.header.message_type {
             MessageType::MethodReturn => Ok(response.body),
+            // Accept `error` as well as the canonical `message`. Evo wrote
+            // the former for a long time, so every error it returned
+            // surfaced as "Unknown error" and the actual reason was lost on
+            // the wire. Evo is fixed, but reading both means the next
+            // service to get this wrong degrades to a wrong-looking field
+            // rather than to no information at all.
             MessageType::Error => Err(anyhow::anyhow!(
                 "{}",
                 response
                     .body
                     .get("message")
+                    .or_else(|| response.body.get("error"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown error")
             )),

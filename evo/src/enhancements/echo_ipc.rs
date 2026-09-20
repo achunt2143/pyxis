@@ -188,8 +188,15 @@ impl EchoMessage {
                 reply_to: Some(reply_to),
                 timestamp: now_ms(),
             },
+            // `message`, not `error`: that is what Echo's own
+            // Message::error writes (echo/src/message.rs) and what
+            // IPCBus::call_method reads back. Evo was the odd one out, so
+            // EVERY error it returned reached the caller as the useless
+            // "Unknown error" — including diagnostics like "no mapped
+            // compositor window yet", which is exactly the sort of message
+            // that would have shortened the #10 hunt.
             body: json!({
-                "error": error_message
+                "message": error_message
             }),
         }
     }

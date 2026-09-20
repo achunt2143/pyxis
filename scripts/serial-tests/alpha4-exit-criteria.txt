@@ -92,10 +92,17 @@ echo-cli call org.geckoOS.appHost GetAppState --interface org.geckoOS.appHost --
 # {"success": true, "window_id": 0} for anything — including the natural
 # mistake of passing appId, since every *Nova* method is keyed that way.
 # A test of mine did exactly that and "passed" while doing nothing.
+# Assert the rejection, and that the REASON survives the trip. The reason
+# used to be lost: Evo's method_error wrote body["error"] while the bus and
+# IPCBus::call_method use body["message"], so every Evo error reached the
+# caller as "Unknown error". Fixed on both sides 2026-09-20 — asserting the
+# text here is what keeps it fixed.
 #!must-not "success": true
+#!must-not Unknown error
 #!must window_id
 echo-cli call org.geckoOS.evo MinimizeWindow --interface org.geckoOS.evo --args '{"appId":"files"}'
 #!must-not "success": true
+#!must-not Unknown error
 #!must must be a number
 echo-cli call org.geckoOS.evo RestoreWindow --interface org.geckoOS.evo --args '{"window_id":"three"}'
 # A well-formed id for a window that does not exist still answers success:
