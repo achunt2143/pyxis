@@ -393,6 +393,32 @@ sudo mkdir -p "$ESP_MOUNT"/boot/grub
 GRUB_EFI_DIR="${ESP_MOUNT}/boot/grub/efi"
 sudo mkdir -p "$GRUB_EFI_DIR"
 
+# Stage the GRUB module directory where an `insmod` can actually find it.
+#
+# boot/grub/grub.cfg's load_video() runs `insmod all_video`, and GRUB resolves
+# that as `$prefix/x86_64-efi/all_video.mod`. Embedding the module in the core
+# image via grub-install --modules= is NOT sufficient here: the menuentry that
+# runs load_video comes from the chainloaded rootfs grub.cfg (see the
+# `configfile /boot/grub/grub.cfg` fallback), which resolves $prefix against
+# the partition it booted from -- so the lookup goes to disk regardless, and
+# with no module dir present it printed
+#   "error: file '/boot/grub/x86_64-efi/all_video.mod' not found"
+# on every single boot.
+#
+# Copied to BOTH the ESP and the rootfs because which one $prefix resolves to
+# depends on how the config was reached; the modules are ~3MB and staging both
+# is cheaper than another boot cycle spent guessing which one GRUB wanted.
+if [ -d "$GRUB_MODULES_DIR" ]; then
+    log_info "Staging GRUB modules for runtime insmod..."
+    sudo mkdir -p "$ESP_MOUNT/boot/grub/x86_64-efi"
+    sudo cp "$GRUB_MODULES_DIR"/*.mod "$ESP_MOUNT/boot/grub/x86_64-efi/" 2>/dev/null || true
+    sudo mkdir -p "$ROOTFS_DIR/boot/grub/x86_64-efi"
+    sudo cp "$GRUB_MODULES_DIR"/*.mod "$ROOTFS_DIR/boot/grub/x86_64-efi/" 2>/dev/null || true
+    log_success "GRUB modules staged ($(ls "$GRUB_MODULES_DIR"/*.mod 2>/dev/null | wc -l) modules)"
+else
+    log_warn "GRUB module dir $GRUB_MODULES_DIR not found; insmod may fail at boot"
+fi
+
 # Copy kernel to ESP
 log_info "Copying kernel to ESP..."
 sudo cp "$KERNEL_FILE" "$ESP_MOUNT"/vmlinuz
@@ -432,13 +458,23 @@ fi
     log_section "Building UEFI Bootloader"
 
 log_info "Installing GRUB UEFI bootloader to ESP..."
+# `all_video` is embedded deliberately, not just efi_gop. boot/grub/grub.cfg's
+# load_video() branches on `feature_all_video_module`, which IS set in this
+# GRUB, so it takes the `insmod all_video` path -- and with the module only on
+# disk (not in the core image) that produced
+# "error: file '/boot/grub/x86_64-efi/all_video.mod' not found" on every boot.
+# Embedding it makes the insmod a no-op instead of a disk lookup. Harmless
+# either way (GRUB falls through and boots), but it's the first thing on screen
+# at every startup, and a boot that opens with an error trains you to ignore
+# errors. video_bochs/video_cirrus cover load_video()'s else-branch for the
+# same reason.
 sudo grub-install \
     --target=x86_64-efi \
     --efi-directory="$ESP_MOUNT" \
     --bootloader-id=GRUB \
     --no-nvram \
     --removable \
-    --modules="efi_gop gfxterm gfxterm_background linux normal fat ext2 part_gpt part_msdos" \
+    --modules="all_video efi_gop video_bochs video_cirrus gfxterm gfxterm_background linux normal fat ext2 part_gpt part_msdos" \
     "$LOOP_DEV"
 
 # Verify bootloader was installed

@@ -35,10 +35,34 @@ git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
 ════════════════════════════════════════════════════════════════════════
 
 diff --git a/browser/base/content/browser-init.js b/browser/base/content/browser-init.js
-index c32b781be079..9e978a8101fe 100644
+index c32b781be079..68d89bce1e36 100644
 --- a/browser/base/content/browser-init.js
 +++ b/browser/base/content/browser-init.js
-@@ -114,6 +114,48 @@ var gBrowserInit = {
+@@ -101,6 +101,23 @@ var gBrowserInit = {
+       );
+       toolbarMenubar.setAttribute("data-l10n-attrs", "toolbarname");
+     }
++    // PYXIS-DIAG (temporary, 2026-08-17): the decisive probe for alpha2 #10.
++    // This logs unconditionally -- BEFORE the `window.arguments[1]` guard --
++    // so a window that arrives with no arguments at all is distinguishable
++    // from one whose arguments are present but the wrong shape. Those two
++    // cases have completely different fixes. Remove once #10 is closed.
++    try {
++      let a = window.arguments;
++      console.error(
++        `PYXIS-DIAG browser-init: arguments=${a ? a.length : "none"} ` +
++          `[1]=${a && a[1] ? String(a[1]) : "undefined"} ` +
++          `isBag=${!!(a && a[1] && a[1] instanceof Ci.nsIWritablePropertyBag2)} ` +
++          `hasPyxisApp=${!!(a && a[1] && a[1] instanceof Ci.nsIWritablePropertyBag2 && a[1].hasKey("pyxisApp"))}`
++      );
++    } catch (e) {
++      console.error(`PYXIS-DIAG browser-init: probe threw: ${e}`);
++    }
++
+     // If opening a Taskbar Tab window, add an attribute to the top-level element
+     // to inform window styling.
+     if (window.arguments && window.arguments[1]) {
+@@ -114,6 +131,48 @@ var gBrowserInit = {
            extraOptions.getPropertyAsAString("taskbartab")
          );
        }
@@ -87,7 +111,7 @@ index c32b781be079..9e978a8101fe 100644
      }
  
      // Run menubar initialization first, to avoid CustomTitlebar code picking
-@@ -524,6 +566,34 @@ var gBrowserInit = {
+@@ -524,6 +583,34 @@ var gBrowserInit = {
        }
      }
  

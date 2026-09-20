@@ -267,9 +267,41 @@ impl IPCBus {
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
         tracing::debug!("Method call: {}.{}.{}", service, interface, method);
-        
+
         let message = Message::method_call(service, interface, method, args)?;
-        let response = self.send_message(message).await?;
+
+        // Route to an in-process handler if one exists, otherwise FORWARD to
+        // the socket connection that owns the service.
+        //
+        // Without the forward branch this only ever consulted the in-process
+        // router, so any in-process service calling an *external* one got
+        // "No handler registered for <service>.<method>" even though the
+        // service was registered and connected. `daemon.rs`'s socket path has
+        // always done this lookup for messages arriving over a socket — the
+        // gap was only for calls originating inside the daemon.
+        //
+        // Concretely, this is the last link of alpha2 #10: `Nova::focus` runs
+        // in-process and calls `org.geckoOS.evo` `FocusWindow`; Evo is an
+        // external client, so the call was rejected by the router and
+        // restore-from-dock could never work — even once the session and its
+        // surfaces were correct. Measured on-device as
+        // "Method call failed: No handler registered for
+        // org.geckoOS.evo.FocusWindow" with the right window id in hand.
+        let response = if self.router().has_handler(service, method) {
+            self.send_message(message).await?
+        } else if let Some(conn_id) = self.get_connection_for_service(service).await {
+            tracing::debug!(
+                "no in-process handler for {}.{}; forwarding to connection {}",
+                service,
+                method,
+                conn_id
+            );
+            self.forward_call(&conn_id, message).await?
+        } else {
+            // Fall through to the router so the caller still gets its
+            // existing "No handler registered" error rather than a new one.
+            self.send_message(message).await?
+        };
 
         match response.header.message_type {
             MessageType::MethodReturn => Ok(response.body),

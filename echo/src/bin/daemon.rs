@@ -606,12 +606,10 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
     info!("Registering filesystem service handlers");
 
     // readDirectory
-    let bus_clone = bus.clone();
     bus.router().register_handler(
         "org.geckoOS.filesystem",
         "readDirectory",
         handler(move |msg| {
-            let bus = bus_clone.clone();
             Box::pin(async move {
                 let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("/");
                 match services::filesystem::FilesystemService::read_directory(path) {
@@ -624,7 +622,6 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
     );
 
     // readFile
-    let bus_clone = bus.clone();
     bus.router().register_handler(
         "org.geckoOS.filesystem",
         "readFile",
@@ -636,7 +633,8 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
                     .get("encoding")
                     .and_then(|v| v.as_str())
                     .unwrap_or("utf-8");
-                match services::filesystem::FilesystemService::read_file(path, encoding) {
+                let max_bytes = msg.body.get("maxBytes").and_then(|v| v.as_u64());
+                match services::filesystem::FilesystemService::read_file(path, encoding, max_bytes) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &e.to_string())),
                 }

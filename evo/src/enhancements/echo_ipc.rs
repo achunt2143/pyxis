@@ -500,6 +500,68 @@ impl GeckoEchoService {
         })
     }
 
+    /// Bind a mapped Wayland surface to its AppHost session, **over IPC**.
+    ///
+    /// This has to be a real method call to the daemon, not a call on
+    /// `geckoOS_echo::AppHost::global()`. `AppHost::global()` is a
+    /// `OnceLock` *process*-global (services/apphost.rs), and Evo is a
+    /// separate process from `echo-daemon` — so calling it here operated on a
+    /// fresh, empty AppHost living inside the compositor, which no one else
+    /// can see and which was never `set_bus`'d (so it emitted no signals
+    /// either). The daemon's real session therefore never learned about its
+    /// window.
+    ///
+    /// That single mistake produced the whole of alpha2 #10: the session kept
+    /// `surfaces: []`, `appHost.ListSurfaceSessions` stayed empty, the shell
+    /// never received `AppSurfaceMapped`, and `nova.Focus` — which does
+    /// `session.surfaces.first()` — answered "app has no mapped compositor
+    /// window yet", so restore-from-dock could never work.
+    pub fn bind_surface_remote(&self, app_id: &str, surface_id: u32) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = EchoCommand::Call {
+            message: EchoMessage::method_call(
+                "org.geckoOS.appHost".to_string(),
+                "org.geckoOS.appHost".to_string(),
+                "BindSurface".to_string(),
+                json!({ "appId": app_id, "surfaceId": surface_id }),
+            ),
+            reply: tx,
+        };
+
+        self.runtime_handle.block_on(async {
+            self.command_tx
+                .send(cmd)
+                .await
+                .map_err(|e| anyhow!("Command channel error: {}", e))?;
+            rx.await.map_err(|_| anyhow!("BindSurface channel closed"))??;
+            Ok(())
+        })
+    }
+
+    /// Detach a surface from its AppHost session. See `bind_surface_remote`
+    /// for why this must not touch `AppHost::global()`.
+    pub fn unbind_surface_remote(&self, surface_id: u32) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = EchoCommand::Call {
+            message: EchoMessage::method_call(
+                "org.geckoOS.appHost".to_string(),
+                "org.geckoOS.appHost".to_string(),
+                "UnbindSurface".to_string(),
+                json!({ "surfaceId": surface_id }),
+            ),
+            reply: tx,
+        };
+
+        self.runtime_handle.block_on(async {
+            self.command_tx
+                .send(cmd)
+                .await
+                .map_err(|e| anyhow!("Command channel error: {}", e))?;
+            rx.await.map_err(|_| anyhow!("UnbindSurface channel closed"))??;
+            Ok(())
+        })
+    }
+
     /// Emit window closed signal (SYNC)
     pub fn emit_window_closed(&self, window_id: u32) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();

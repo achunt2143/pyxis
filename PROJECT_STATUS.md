@@ -7,6 +7,12 @@ how it works, and what's done / in progress / to-do / backlog per module.
   for the deep component map + design rationale). This file is the *status/roadmap*
   layer on top of it. Deep-dive design docs are listed in CLAUDE.md's
   "Source documents" section.
+  [`AUDIT_2026-08.md`](AUDIT_2026-08.md) is a full read-only codebase audit
+  (2026-08-05) with file:line evidence; [`ALPHA_ROADMAP.md`](ALPHA_ROADMAP.md)
+  turns it into the alpha3 → pre-beta release plan. **Read the audit before
+  re-diagnosing any item below** — several long-standing entries turned out to
+  be stale, and several "broken" features were found to be blocked on missing
+  rootfs binaries rather than on the Rust.
 - **Keep this current:** when a status changes, update the module section *and*
   the snapshot table. When you finish something marked 🟢, verify it on a real
   build/boot before promoting it to ✅.
@@ -39,25 +45,359 @@ to-do, not "in progress."
 | 1a | Browser launches straight to Vela | ✅ verified on-device | Bloom `Desktop.tsx` |
 | 1b | Hybrid embed browser in a web app | 🗄️ backlog (architecturally out of scope as DOM embed) | — |
 | 2 | Terminal QOL (tab/history/etc.) | 📋 **to-do** — still needs work; **evaluating moving Terminal to a native app** instead of xterm.js-in-web-view | `apps/terminal`, `terminal.rs` |
-| 3 | Files app — real file ops | 📋 **to-do** — dev-mock only; **on real device, files are not yet displaying properly** | `FilesApp.tsx`, `filesystem.rs` |
+| 3 | Files app — real file ops | ✅ **root cause fixed & verified on-device** — `readDirectory` on `/proc` now returns 171 entries with `created: null` instead of erroring; `$HOME`/`/tmp` list fine. base64 `readFile` + image preview added. UI-level retest pending the boot fix | `FilesApp.tsx`, `filesystem.rs` |
 | 4 | Settings persistence | ✅ verified on-device | `settings.rs` |
 | 5 | Kiosk-first / regular-window-after | ✅ verified on-device | `nova.rs` |
 | 6 | Rebrand Firefox → Vela | 📋 to-do (needs vela rebuild) — not attempted this cycle | `gecko/` |
-| 7 | Maximize closes app on unmaximize | 📋 **to-do — still crashes.** The SSD-size + `size=None` fix from this cycle did NOT resolve it; needs re-diagnosis with the added `info!` logging (see Evo section) | `evo/shell/xdg.rs`, `ssd.rs` |
-| 8 | Thin window border (+ follows rounding) | 🚧 base implementation shipped; **general visual polish still required** (see #12) | `evo/shell/ssd.rs` |
-| 9 | Title bar shows app name | 🚧 base implementation shipped; **general visual polish still required** (see #12) | `evo/shell/ssd.rs`, `element.rs` |
+| 7 | **Unmaximize** (restore-down) closes app — maximize itself now works | 📋 **to-do — still crashes.** The SSD-size + `size=None` fix from this cycle did NOT resolve it; needs re-diagnosis with the added `info!` logging (see Evo section) | `evo/shell/xdg.rs`, `ssd.rs` |
+| 8 | Thin window border (+ follows rounding) | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD (see decoration decision below) | `evo/shell/ssd.rs` |
+| 9 | Title bar shows app name | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD | `evo/shell/ssd.rs`, `element.rs` |
 | 10 | Restore from dock | 📋 **to-do — still does not work.** The `suspended`-state dock fix didn't resolve it; needs re-diagnosis (see Evo/Bloom sections) | Bloom `BottomDock.tsx`, `useEcho.ts` |
 | 11 | **Window resizing** (new, found in testing) | 📋 **to-do** — not implemented at all; windows currently only have two fixed sizes (maximized / restored-default). No user-driven resize (edge/corner drag) exists yet | `evo/shell/grabs.rs`, `xdg.rs` |
 | 12 | **General visual enhancements** (new, found in testing) | 📋 to-do — umbrella item, scope TBD next pass (title bar/border legibility, spacing, etc.) | Evo SSD / Bloom |
 | — | Window layering (shell below apps) | ✅ verified on-device | `evo/shell/element.rs` |
-| — | Installer present / install flow | 📋 to-do (build + e2e test) | `installer` app + service |
+| — | Installer present / install flow | 🚧 **opkg now present and working on-device** (`list-installed` rc=0); the app itself is still unreachable from the UI until alpha4's dynamic registry | `installer` app + service |
 
 ---
+
+## Audit corrections (2026-08-05)
+
+Found by the full codebase sweep in [`AUDIT_2026-08.md`](AUDIT_2026-08.md).
+These change the reading of the punch list above, so they belong here rather
+than only in the audit.
+
+### Rootfs/service blockers — 🟢 fixed 2026-08-16, awaiting a real build
+
+| Finding | Effect | Resolution |
+|---|---|---|
+| ⚠️ **`opkg` is not installed in the rootfs** | `installer.rs`'s `require_opkg()` fails every install/remove. The installer flow was never runnable on-device. | 🟢 **Built from source.** The audit's "add it to the apt list" fix is **not available — Debian ships no `opkg` or `opkg-utils` in any suite** (verified against the sid index; adding it would have broken the build). New `stage_opkg()` in `create-rootfs.sh` builds pinned+checksummed opkg 0.10.0 from the Yocto release tarball inside the chroot, minus curl/gpgme/libsolv (local installs only), and writes `/etc/opkg/opkg.conf` with an arch list mapped from `DEBIAN_ARCH` to Vroom's naming (`amd64`→`x86_64`). |
+| ⚠️ **`nmcli` is not installed** | `NetworkService::get_status()` always reports `connected: false`; the top bar shows offline on a machine with a working DHCP lease. | 🟢 Rewritten on direct kernel reads — `/proc/net/route` for the default route, `/sys/class/net/*/device` to filter synthetic NICs, `operstate` for liveness. NetworkManager is no longer referenced at all. Unit-tested. |
+| ⚠️ **`shutdown`/`systemctl` don't apply** | BusyBox is PID 1 and there's no systemd — every `power.rs` action fails. | 🟢 Repointed at `busybox poweroff`/`reboot` (with `-d` honouring the delay). `sleep()` now writes `/sys/power/state` and returns a structured `supported: false` instead of a spurious success. |
+| 📋 **No audio stack** | `libasound2` (a client library) only. No PipeWire/PulseAudio/ALSA config. Unscoped subsystem. | Still open — alpha 5. |
+
+**Also fixed in the same pass** (same "stop reporting things that aren't true"
+theme, found while in the files): `power.rs`'s battery status returned a
+hardcoded 50% + a constant 40°C on machines with no battery — it now reports
+`present: false` and scans for the real battery instead of assuming `BAT0`;
+`set_screen_brightness` piped nothing into `tee` and reported success
+regardless — it now writes the sysfs backlight directly and finds the device
+rather than hardcoding `intel_backlight`.
+
+### New blocker — the shell can't see installed apps
+
+📋 **`PYXIS_APPS` (`pyxis-experience/src/apps/registry.ts`) is a hardcoded
+array and is the only app source for the launcher, drawer, search, and dock.
+Nothing in the shell ever calls `nova.List`.** Consequences: any `.ipk` app a
+user installs is invisible on the desktop, and the **Installer app itself is
+not in the registry** — it's built, packaged, and staged, but unreachable from
+the UI. This is the top functional gap; see `ALPHA_ROADMAP.md` Alpha 4.
+
+### Root cause found and fixed for #3 (Files) — 🟢 awaiting on-device confirmation
+
+`filesystem.rs::read_directory` used `metadata.created()?` **inside** the entry
+loop. `created()` returns `Err(Unsupported)` on tmpfs/overlayfs/procfs/sysfs
+and older ext4 inodes, so **one bad entry aborted the whole listing** and
+`FilesApp` rendered nothing.
+
+🟢 Fixed 2026-08-16: both timestamps are now non-fatal (serialize as `null`),
+per-entry `metadata()` failures skip that entry instead of aborting, and a
+dangling symlink falls back to `symlink_metadata()` so it still lists. Covered
+by a regression test that lists `/proc` — the guaranteed-failure case — and
+asserts a null `created` is present rather than an error.
+
+`readFile` also now honours its `encoding` parameter (it was `read_to_string`
+regardless, so any binary file errored): `base64` is supported for binary reads,
+with a `maxBytes` cap checked against the file's real length before reading,
+since the whole body crosses the bus as one JSON message.
+
+🟢 **Files image preview is wired on top of it** — `FilesApp` requests
+`encoding: 'base64'` for image extensions and renders a `data:` URI, instead of
+falling through to the metadata card. The dev mock honours `encoding` the same
+way so the two don't drift. The base64 encoder is hand-rolled (no new crate,
+same call made for sha256 in `nova.rs`) and pinned by a regression test against
+a real PNG encoded by an independent implementation.
+
+### #7 / #10 — re-diagnosed on-device 2026-08-17 (both prior theories were wrong)
+
+### #7 — ROOT-CAUSED AND FIXED 2026-08-17
+
+**A single physical click was dispatched twice, and the two dispatches resolved
+to different buttons.** `PointerTarget::button` in `evo/src/shell/element.rs`
+called `HeaderBar::clicked` without checking `event.state`, so it fired on both
+press *and* release. `clicked` hit-tests relative to the header bar's **current**
+width, and the window changes width in between:
+
+```
+press    click lands in the maximize band of a MAXIMIZED window (width 1280)
+         -> defers unmaximize_request
+[idle]   window unmaximizes; header bar shrinks to its restored width, so every
+         button band moves left
+release  the SAME pointer x is now past `width - BUTTON_WIDTH`
+         -> the CLOSE band -> send_close()
+```
+
+The client closes its only window and Gecko quits the whole app —
+**confirmed on-device by `quit-application-requested reason="lastwindow"`**,
+followed by `domwindowclosed ... windowclass=files sizemode=normal`.
+
+Maximizing looked fine only because both dispatches landed on the same button
+when the width hadn't changed yet. This is why the item read as
+"maximize closes the app" for two cycles: the *maximize* click was never the
+problem, and Evo's maximize/unmaximize handlers were correct all along
+(verified: geometry saved, restored to the right point, client ACKs).
+
+Fixed by returning early unless `event.state == ButtonState::Pressed`, matching
+`input_handler.rs`'s existing idiom. Touch is unaffected (it has separate
+`touch_down`/`touch_up`). The same double-dispatch also affected the titlebar
+drag/move and minimize paths, so those get more predictable too.
+
+**Awaiting on-device confirmation.**
+
+**Also fixed 2026-08-17 (separate, real, but NOT the cause of #7).** `unmaximize_request` was skipping
+`map_element` entirely whenever no pre-maximize geometry was saved — and that is
+the *common* path, not a corner case: `OldGeometry` is only populated by Evo's
+own `maximize_request`, but GTK/Gecko brings windows up maximized on its own
+(browser-init's `sizemode="maximized"`) without ever sending
+`xdg_toplevel.set_maximized`. Observed on-device as
+`unmaximize_request: restored_loc=None had_saved_geo=false`. The client was told
+"unmaximized, pick your own size" while Evo left the element at its maximized
+origin, so the two disagreed about the window's geometry from then on. Evo now
+synthesizes a centred restore position in that case. **Unverified against the
+crash** — needs a rebuild and a repro.
+
+**#7 is not a crash.** A repro capture shows the app exiting **cleanly**:
+appHost emits `AppStopped`, not `AppCrashed`, which `handle_reaped` only does
+for a zero exit status (or a user-initiated stop). The app's Echo connection
+closes with "unexpected end of file" and is then reaped normally. Evo survives.
+No `maximize_request`, `unmaximize_request` or `SSD maximize button` line
+appears anywhere in the captured window, and Evo's own handlers are defensive
+with no panics. So the framing carried since alpha2 — "unmaximize crashes the
+app" — is wrong twice over: maximize works, and the app is *quitting*, not
+crashing. Caveat: the capture's evo.log half looked thin, so "Evo logged
+nothing" is suggestive rather than conclusive; confirm before building on it.
+
+**#10 is an app-identity failure, but not the one predicted.** There is exactly
+**one** appHost session per app, not two — the synthesized-second-session theory
+is disproven. Apps launch correctly and their bridge works (a launched Files app
+makes real `readDirectory`/`settings.get` calls). What fails is that the window
+never binds: `surfaces: []`, `ListSurfaceSessions` count 0, so `nova.Focus`
+correctly answers "app has no mapped compositor window yet".
+
+### #10 — ROOT CAUSE FOUND 2026-08-17: Evo bound surfaces into the WRONG PROCESS
+
+`evo/src/state.rs` bound each mapped Wayland surface with
+`geckoOS_echo::AppHost::global().bind_surface(...)`, on the stated assumption
+that it was "a same-process call — AppHost is a global — so this is cheap and
+safe." **`AppHost::global()` is a `OnceLock` *process*-global, and Evo is a
+separate process from `echo-daemon`.** So the compositor bound every surface
+into a fresh, empty AppHost living inside itself — invisible to the daemon, and
+never `set_bus`'d, so it emitted no lifecycle signals either.
+
+That one mistake produces the entire #10 symptom set, all of which we measured:
+
+| Observed | Explained by |
+|---|---|
+| session keeps `surfaces: []` | bind landed in Evo's local instance |
+| `appHost.ListSurfaceSessions` count 0 | daemon never saw a bind |
+| `nova.Focus` → "no mapped compositor window yet" | it reads `surfaces.first()` |
+| shell never gets `AppSurfaceMapped`; dock stuck "starting" | Evo's local AppHost has no bus |
+
+Fix part 1: Evo now calls `org.geckoOS.appHost.BindSurface`/`UnbindSurface`
+over its existing Echo connection (`bind_surface_remote`/`unbind_surface_remote`
+in `enhancements/echo_ipc.rs`) so binds reach the daemon's real registry.
+**Confirmed working on-device** — the dock stopped reporting apps as
+permanently "starting", i.e. `AppSurfaceMapped` now arrives at the shell.
+
+**Fix part 2 (the rest of #10): bound at the wrong TIME.** With part 1 in, the
+measured session state was:
+
+```json
+{ "appId": "unknown", "pid": 0,   "surfaces": [1,2,3] }   <- all surfaces here
+{ "appId": "files",   "pid": 558, "surfaces": []      }   <- real app has none
+```
+
+Evo bound from the window-map path, where `XdgToplevelSurfaceData.app_id` is
+still unset — GTK/vela assign it later (`windowclass` ->
+`SyncAttributesToWidget` -> `nsWindow::SetWindowClass` ->
+`gdk_wayland_window_set_application_id`). So every surface bound under the
+literal `"unknown"` fallback, `bind_surface` synthesized a session for it, and
+the real app session stayed empty — which is precisely why `nova.Focus`
+(`surfaces.first()`) still answered "no mapped compositor window yet".
+
+Binding moved to `xdg.rs::ack_configure`, the first point where a real app id
+exists. It is idempotent (`bind_surface` skips a surface already listed), so
+running on every ack is self-healing: whichever ack first carries a real id
+binds. The shell is excluded (it is the desktop, not an app). **Awaiting
+on-device confirmation.**
+
+**Fix part 3 — the last link: in-process services could not call external
+services at all.** With sessions and surfaces finally correct
+(`files -> surfaces:[3]`), `nova.Focus` still failed, with:
+
+```
+Error: Method call failed: No handler registered for org.geckoOS.evo.FocusWindow
+```
+
+`FocusWindow` *is* declared in Evo's `ServiceInterface`, and Evo *was*
+registered and connected. The problem was `IPCBus::call_method`: it only ever
+consulted the **in-process router**. Evo is an external socket client, so there
+is no router handler for it and the call was rejected. `daemon.rs` had always
+done the `get_connection_for_service` -> `forward_call` lookup for messages
+arriving *over a socket*; the gap was only for calls originating *inside* the
+daemon — which is exactly what Nova is.
+
+`call_method` now forwards to the owning connection when no in-process handler
+exists. This affects every in-process -> external call, not just Focus, so
+minimize/restore driven from the shell go through the same repaired path.
+**Awaiting on-device confirmation.**
+
+Also seen and worth fixing separately: `evo.MinimizeWindow` accepts an
+`app_id` argument, silently ignores it, and returns
+`{"success": true, "window_id": 0}` before warning
+"Ignoring Minimize for unknown window 0". It should reject an unknown/absent
+window instead of reporting success.
+
+⚠️ **Caveat to revisit:** both helpers do a blocking round-trip
+(`block_on` + await the METHOD_RETURN) from the compositor's map path. That
+matches the existing `emit_window_created` pattern next to it, but a slow or
+wedged daemon can now stall Evo's event loop. A fire-and-forget variant for
+bind/unbind is the right long-term shape.
+
+### Related, still open
+
+**The app-id theory is DISPROVEN** (instrumented and measured 2026-08-17, not
+inspected). Temporary `PYXIS-DIAG` probes were added through the whole chain and
+every link fires correctly for a Nova-launched app:
+
+```
+handle(): flag/env app id = files, cmdLine.state=0, preventDefault(before)=false
+openPyxisAppWindow(): appId=files url=pyxis://files/index.html args.length=2 hasKey=true
+browser-init: arguments=2 [1]=[...nsIWritablePropertyBag2] isBag=true hasPyxisApp=true
+openPyxisAppWindow(): window opened, windowclass=files pyxisapp=files
+```
+
+Evo confirms it: `app_id=Some("files")`, `app_id=Some("notes")`. **Stamping
+works; the patch is correct and is present in the built binary.** Do not spend
+more time here.
+
+**What is real:** there are additional `vela-default` toplevels that Evo
+configures but which **never run `browser-init`** (all 3 probe hits had the
+bag). So they are not `browser.xhtml` windows — they are some other toplevel the
+vela process creates. If one of those is what the dock/appHost binds to, that
+would explain the surface confusion. Identifying what they are is the open
+question, not the app id.
+
+**Shell-side defect found in the same pass (not yet fixed):**
+`useAppHost`'s `refresh()` does a wholesale `setSessions(next)` replace, and
+`upsert` is a blind overwrite by `sessionId` with no ordering guard. Any
+refresh that resolves after a signal has updated state will clobber it with a
+stale snapshot. Worth hardening once surface binding is confirmed, since it can
+mask or mimic the same "stuck in starting" symptom.
+
+**Trap that cost a cycle:** `start_daemon` truncates `/var/log/echo.log` on
+every boot, so a reboot between reproducing and grepping silently destroys the
+evidence. Capture to a file outside `/var/log/*.log`, or grep before rebooting.
+
+### #10 (dock restore) — superseded by the entry above; kept for the trail
+
+The full chain (`BottomDock` → `handleOrphanSelect` → `nova.Focus` →
+`Nova::focus` → Evo `FocusWindow` → queued `WindowAction::Focus` → drained in
+all three backends → `raise_window` → auto-`unminimize_window` → `WindowMinimized`
+→ `handle_window_restored` → `SIGCONT`) **exists and each link is correct**;
+`FocusWindow` does send a `method_return`, so there's no hang. Most likely
+failure is upstream at `nova.rs:1016-1019` (`surfaces.first()` is `None`) when
+vela's Wayland `app_id` doesn't match Nova's app id — `bind_surface` then
+synthesizes a *second* session holding the surfaces. **Check
+`appHost.ListRunning` for two sessions per app.** Fast discriminator: a failed
+dock click should raise a "Couldn't reach …" snackbar — if it doesn't, the
+click never reached `handleOrphanSelect` and the bus isn't the problem.
+
+### Decoration model — RESOLVED 2026-08-16: Evo owns SSD
+
+There was no live contradiction; there was **stale text**. The audit read
+`create-rootfs.sh`'s 2026-07-08 comment block ("GTK owns app decoration, Evo
+draws no SSD"), which had been superseded on 2026-07-25 and never updated.
+
+The code has owned this since then: `evo/src/shell/xdg.rs`'s `ack_configure`
+computes `is_ssd = !is_shell && (xdg_ssd || kde_mode == Server)`, and
+`state.rs` creates `KdeDecorationState` with default mode `Server`. **Evo draws
+the decoration; vela draws none.** The boot script's comment has been rewritten
+to match, and the full model is documented in `CLAUDE.md` §"Window decoration
+model".
+
+Consequence: #8/#9/#11 keep their existing Evo-SSD scoping — they were written
+correctly. #7 is an **Evo SSD bug**, not a two-parties-disagree bug, and is not
+blocked on any decision.
+
+### Stale items — already fixed, safe to stop tracking
+
+- ✅ `echo/src/dbus.rs:637-640` `todo!()` test — **fixed**, the struct is complete.
+- ✅ `ouranos.service` — **already removed** from `boot/startup/systemd/services/`.
+- ✅ Bloom dead code (`AppLauncher`/`Sidebar`/`FilesModal`/`Background`, orphan
+  `.scss`, `tsconfig-json.json`) — **all already deleted**.
+- ✅ "12 `no-explicit-any` lint errors" — **stale**; `npx eslint .` reports
+  **2** errors, both `react-hooks/set-state-in-effect` in `DesktopSearch.tsx`.
+- ✅ `AppDrawer` phantom entries — **none**; it renders `PYXIS_APPS` directly.
+- ✅ `stage_binaries()`'s `pyxis` binary "has no Cargo target" — **stale**;
+  `vroom/Cargo.toml:29-31` defines it.
+- ⚠️ `CLAUDE.md` says Nova scans `/usr/palm/applications` — code and spec both
+  use **`/usr/pyxis/applications`** (`nova.rs:61`).
+
+### Still true, still open
+
+- `apphost.rs:20`'s "Intentionally NOT in this MVP" comment is stale (surface
+  registration is real at `state.rs:1701`) — comment needs updating.
+- `pyxis-experience/README.md` is still the stock Vite template.
+- Zero UI test coverage (0 test files) vs. **177** Rust tests across 41 files.
+- `shift/src/echo_ipc.rs:369-505` — every Echo handler is a stub returning
+  fabricated data (hardcoded pid 1000, a literal
+  `[{app_id:"firefox"},{app_id:"thunderbird"}]` process list, constant
+  128 MB / 5% usage) while the real implementations sit unused in
+  `process.rs`/`resources.rs`/`tree.rs`. `shift-daemon` *does* run at boot.
+
+---
+
+## Kiosk-on-relaunch — ROOT CAUSED 2026-08-17: an orphaned vela, not a kiosk bug
+
+**Symptom:** launch an app, close it, launch it again — the second window is a
+plain Firefox window with omnibar, menu and extension buttons instead of a
+chromeless kiosk one.
+
+**It is not a kiosk bug at all.** Instrumented both launches end to end and the
+probe output is *byte-for-byte identical*: `handle()` reaches the pyxis branch,
+`openPyxisAppWindow()` runs with the right features, the `pyxisApp` bag arrives
+in `browser-init`, and the window opens with `windowclass=files`. Both times.
+
+The chrome window is a **leaked process from the previous launch**:
+
+```
+pid=606 ppid=1(init) start=<launch 1>   cmd: /usr/lib/pyxis-gecko/vela   <- argv stripped
+                                        env: PYXIS_APP_ID=files
+pid=710 ppid=212(echo-daemon)           cmd: vela --profile ... --pyxis-app files ...
+```
+
+vela re-execs itself during startup, and the replacement process has a
+**different pid** (and, notably, a stripped argv — which is why it renders as a
+normal browser window: it no longer has `--pyxis-app`). `AppHost::close` sent
+SIGTERM to the *recorded* pid, which by then no longer existed, so the signal
+landed nowhere and the real process survived, reparented to init. Relaunching
+then leaves two velas for one app, and the orphan owns the chrome window.
+
+**Fixed** in `apphost.rs`:
+- apps spawn with `process_group(0)`, so the app is its own process-group
+  leader and any re-exec'd descendant stays in the group;
+- `close`/`kill` signal the **group** (`kill(-pgid)`) with a single-pid
+  fallback for synthesized sessions;
+- `close` escalates to SIGKILL after 5s if the group is still alive, so a hung
+  app can no longer linger invisibly.
+
+Same class of bug as the boot-script `setsid` fix, one layer down. **Awaiting
+on-device confirmation.**
 
 ## Modules
 
 ### Evo — Wayland compositor & window manager
-- **Path:** `evo/` (crate `geckoOS-evo`) · ~17.5k lines · mature
+- **Path:** `evo/` (crate `geckoOS-evo`) · ~16.5k lines · mature
 - **What/how:** Smithay-based compositor. Owns all windowing: XDG + XWayland
   shells, wlr-layer-shell, workspaces, SSD (server-side decorations), input,
   DRM/udev + winit backends, screencopy. Talks to Echo over
@@ -234,16 +574,16 @@ to-do, not "in progress."
     as launcher/supervisor.
 
 ### Rockhopper — hardware abstraction + FirefoxOS-era compat
-- **Path:** `rockhopper/` · ~2,900 lines · real (`wayland.rs`, `dbus_session.rs`,
+- **Path:** `rockhopper/` · ~2,300 lines · real (`wayland.rs`, `dbus_session.rs`,
   `elf_loader.rs`, `compatibility.rs`). Daemon uses Puppis's `GeckoAppLauncher`.
 - **Status:** 🚧 substantial; role vs Nova/appHost worth clarifying.
 
 ### Shift — system orchestrator
-- **Path:** `shift/` · ~2,250 lines · real. Process supervision, boot ordering,
+- **Path:** `shift/` · ~1,800 lines · real. Process supervision, boot ordering,
   power states; own `echo_ipc.rs`. **Status:** 🚧 real.
 
 ### Puppis — Gecko native-app lifecycle
-- **Path:** `puppis/` · ~700 lines · real `suspend_app`/`resume_app` freeze/thaw.
+- **Path:** `puppis/` · ~730 lines · real `suspend_app`/`resume_app` freeze/thaw.
 - **Status:** 🚧 real but **not yet wired** — roadmap item to drive its freeze/thaw
   from Nova/appHost on top of the existing SIGSTOP/CONT suspend.
 
@@ -306,6 +646,105 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### Alpha3 — "Nothing lies to the user" (2026-08-16)
+
+First alpha3 pass, working the scope in [`ALPHA_ROADMAP.md`](ALPHA_ROADMAP.md).
+**A real build + boot happened.** Everything marked ✅ below was observed on
+the booted image via the serial console, not inferred. Two bugs were found by
+that boot that no amount of desk-checking would have caught — see
+"Found on-device" at the end of this entry.
+
+**A. Rootfs / service backends**
+- ✅ **opkg now ships** — built from pinned, checksummed source in a new
+  `stage_opkg()`. The roadmap budgeted one apt-list line for this; that turned
+  out to be impossible (**Debian packages no `opkg` at all**), so it became a
+  chroot build stage instead. **On-device: `opkg version 0.10.0`,
+  `opkg list-installed` → rc=0.**
+- ✅ **Network status reads the kernel** instead of the absent `nmcli`.
+  **On-device: `{"connected": true, "ssid": "enp0s3", "type": "ethernet"}`** —
+  previously this reported `connected: false` on every machine forever.
+- ✅ **Power actions target BusyBox init**. **On-device: `power.shutdown` over
+  Echo powered the guest off.** `/sys/power/state` reports `freeze mem`, so
+  `sleep()` has a real backend here.
+- ✅ Battery stopped fabricating values. **On-device:
+  `{"present": false, "level": null, "charging": false}`** on a machine with no
+  battery, instead of the old hardcoded 50% + 40°C.
+
+**B. Correctness**
+- ✅ `read_directory` no longer aborts a whole listing over one missing birth
+  time. **On-device: `/proc` returns `count: 171` with `"created": null`** —
+  the exact call that previously errored and blanked the Files app. `$HOME`
+  and `/tmp` list correctly too. This closes #3's root cause.
+- ✅ `readFile` honours `encoding` + `maxBytes`, and Files previews images
+  inline off the base64 path. **On-device: a PNG read back as
+  `"iVBORw0KGgo="`, and a 3000-byte file with `maxBytes:100` correctly
+  refused** with the actionable message.
+- ✅ **The clock ticks** — verified live in the browser preview (advanced
+  02:19→02:24 PM unattended). Aligned to the minute boundary.
+- ✅ **Dead quick-settings toggles resolved.** "Notifications",
+  "Auto-brightness", "WiFi Enabled" and "Low Power Mode" had no handler and no
+  backend to wire one to — removed; WiFi became a read-only status row. "Show
+  percentage in top bar" was **wired for real** through the settings bus and
+  verified end-to-end: flipping it persists and adds/removes the top bar's
+  readout live.
+- ✅ **Found and fixed a bug the audit missed:** remochi's `Toggle` declares a
+  `checked` prop in its types but the shipped component reads `value`, so
+  **every toggle in the shell rendered a permanent "Off"** regardless of state
+  — Dark Mode included. Bridged with a correctly-typed `Switch` in both
+  `QuickSettingsMenu.tsx` and `SettingsApp.tsx`.
+- ✅ **Lint is at zero** (`npx eslint .` → 0 errors, was 2).
+- ✅ **Rust tests green: 68 passing, was 58 passing + 1 failing.** The failure
+  was pre-existing and deterministic in a full run (`reap_once` calls
+  `waitpid(-1)`, which is process-wide, so two parallel reaper tests ate each
+  other's children). Merged into one test; 8 new tests added for the
+  filesystem and network changes.
+
+**C. Decoration model — decided: Evo owns SSD.** It was already implemented and
+verified; only the docs disagreed. See the resolved section above.
+
+**D. Doc drift** — the 8 stale `CLAUDE.md` claims are deleted (not annotated),
+`/usr/palm` corrected to `/usr/pyxis`, the boot script's superseded decoration
+comment rewritten, and a new "Window decoration model" section added.
+
+**Found on-device — two bugs a build was the only way to catch:**
+
+1. 📋 **`opkg.conf` had an invalid line.** `lists_dir ext <path>` is an old
+   OpenWrt-ism; opkg 0.10.0's parser dispatches the first token as a *type*
+   (`option`/`dest`/`arch`/`src`/`dist`), so it printed
+   `Ignoring invalid line` on **every** invocation. Corrected to
+   `option lists_dir <path>` and **verified live** by applying it in the
+   running guest: error before, clean after. Also fixed in `create-rootfs.sh`,
+   so the next build bakes it in.
+2. ✅ **No daemons survive boot — FIXED and verified.** `geckoOS-boot` runs from `/etc/inittab` as
+   `::wait:`, so every daemon it backgrounds sits in that script's process
+   group sharing `/dev/console`. When the script exits, the group takes SIGHUP
+   and they all die. Symptom: `/var/log/{echo,evo,vela}.log` are written
+   normally at boot and then stop mid-line with no error, and `ps` shows
+   nothing but the two getty bashes — while running the *same script by hand*
+   from a serial shell works perfectly (the interactive shell keeps the
+   session alive). Fixed by `setsid ... </dev/null` in `start_daemon`.
+   **Needs a rebuild to confirm** — this is the one item still unverified.
+
+**Unattended boot now reaches a working system.** On the rebuilt image, with
+nothing started by hand: Echo has evo + Rockhopper registered, `readDirectory
+/proc` returns 153 entries, `network.getStatus` reports
+`connected: true / enp0s3 / ethernet`, `opkg list-installed` is clean (no more
+"Ignoring invalid line"), `power.reboot` reboots the machine, and
+**`pyxis-appctl list` shows all 10 apps registered — bloom, browser, files,
+notes, contacts, tasks, settings, terminal, testapp, and installer.**
+
+That last one matters for alpha 4: Nova's registry already knows about
+`installer` and every other app. The gap is purely that Bloom's `PYXIS_APPS`
+array never asks it — exactly as the audit said.
+
+**Verification method:** QEMU + pexpect over the serial console
+(`/etc/inittab` respawns a root bash on ttyS0). Note `/dev/console` resolves to
+tty0 because the kernel cmdline ends `console=ttyS0,115200 console=tty0`, so
+boot-script output is *not* visible on serial — that cost real diagnostic time
+and is worth knowing next pass. `echo-cli call` needs the **full** destination
+(`org.geckoOS.filesystem`, not `filesystem`) and `XDG_RUNTIME_DIR=/run/user/1000`
+to find the bus socket.
 
 ### Alpha2 — on-device test pass (post-build)
 

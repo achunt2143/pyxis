@@ -362,6 +362,33 @@ impl AppHost {
         self.sessions.insert(session_id.clone(), starting.clone());
         self.emit_lifecycle("AppStarting", &starting);
 
+        // Put every app in its OWN process group, so it can later be signalled
+        // as a group rather than as a single pid.
+        //
+        // Signalling one pid is not enough for vela: Gecko re-execs itself in
+        // some startup paths, and the replacement process has a DIFFERENT pid
+        // (observed on-device with its argv stripped bare — `/usr/lib/
+        // pyxis-gecko/vela` with no arguments, but still carrying
+        // PYXIS_APP_ID=files in its environment). `close()` then SIGTERMs the
+        // pid AppHost recorded, which by that point is gone, the signal lands
+        // nowhere, and the real process survives — reparented to init.
+        //
+        // The leak is user-visible: that orphan owns a window, and because it
+        // lost its `--pyxis-app` argv it renders as a plain Firefox window with
+        // the omnibar. Launch an app, close it, launch it again, and you get
+        // the orphan's chrome window instead of a clean kiosk one — the
+        // "subsequent launches don't respect kiosk mode" report.
+        //
+        // `process_group(0)` makes the child a process-group leader with pgid
+        // == its own pid, so a re-exec'd descendant stays in the group and
+        // `kill(-pgid)` reaches it. Same reasoning as the `setsid` fix in
+        // create-rootfs.sh's start_daemon, one layer down.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -438,7 +465,29 @@ impl AppHost {
             set.insert(session_id.to_string());
         }
         if session.pid > 0 {
-            let _ = Self::send_signal(session.pid, Signal::SIGTERM);
+            // Signal the whole group, then escalate. A single SIGTERM to one
+            // pid used to leave an orphaned vela owning a window (see
+            // `signal_session`); escalation guarantees the app is actually gone
+            // rather than merely asked to leave.
+            Self::signal_session(session.pid, Signal::SIGTERM);
+
+            let pid = session.pid;
+            let sid = session_id.to_string();
+            std::thread::spawn(move || {
+                // Give it a beat to shut down cleanly, then insist.
+                for _ in 0..20 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if Self::session_gone(pid) {
+                        return;
+                    }
+                }
+                tracing::warn!(
+                    "session {} (pid {}) ignored SIGTERM after 5s; sending SIGKILL",
+                    sid,
+                    pid
+                );
+                Self::signal_session(pid, Signal::SIGKILL);
+            });
         } else {
             // Foreign-synthesized or pre-spawn sessions never had a child;
             // finalize immediately since SIGCHLD won't fire.
@@ -464,7 +513,10 @@ impl AppHost {
             set.insert(session_id.to_string());
         }
         if session.pid > 0 {
-            let _ = Self::send_signal(session.pid, Signal::SIGKILL);
+            // Group-wide, same reasoning as `close`: a re-exec'd vela has a
+            // different pid and would otherwise survive a kill aimed at the
+            // recorded one.
+            Self::signal_session(session.pid, Signal::SIGKILL);
         } else {
             self.finalize_exit(session_id, AppState::Crashed);
         }
@@ -874,6 +926,34 @@ impl AppHost {
         Ok(())
     }
 
+    /// Signal a session's whole process GROUP, falling back to the bare pid.
+    ///
+    /// Apps are spawned with `process_group(0)` (see `spawn_and_track`), so the
+    /// group id equals the pid AppHost recorded. Signalling `-pid` therefore
+    /// reaches every process in that group — including one vela re-exec'd
+    /// itself into, which has a different pid and is exactly what leaked before
+    /// (an orphan Firefox window surviving `close`).
+    ///
+    /// The single-pid fallback covers sessions that predate the group (e.g. a
+    /// synthesized foreign-process session), where no group was ever set up.
+    fn signal_session(pid: u32, signal: Signal) {
+        if pid == 0 {
+            return;
+        }
+        // Negative pid == "the process group with this id".
+        if kill(Pid::from_raw(-(pid as i32)), signal).is_err() {
+            let _ = kill(Pid::from_raw(pid as i32), signal);
+        }
+    }
+
+    /// True once nothing in the session's process group is alive.
+    fn session_gone(pid: u32) -> bool {
+        if pid == 0 {
+            return true;
+        }
+        kill(Pid::from_raw(-(pid as i32)), None).is_err() && !Self::pid_alive(pid)
+    }
+
     fn pid_alive(pid: u32) -> bool {
         kill(Pid::from_raw(pid as i32), None).is_ok()
     }
@@ -1050,64 +1130,77 @@ mod tests {
         assert_eq!(host.list_surface_sessions()[0].surfaces, vec![2]);
     }
 
-    #[test]
-    fn reaper_marks_unexpected_exit_as_crashed() {
-        // Spawn a child that exits non-zero immediately; verify the reaper
-        // reports AppCrashed and clears the session.
-        let host = AppHost::new();
-        let child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exit 7"])
-            .spawn()
-            .expect("spawn /bin/sh");
-        let pid = child.id();
-        std::mem::forget(child);
-        let sid = "sess-crash".to_string();
+    /// Register an already-spawned pid as a running session on `host`.
+    fn track_session(host: &AppHost, sid: &str, app_id: &str, pid: u32) {
         host.sessions.insert(
-            sid.clone(),
+            sid.to_string(),
             AppSession {
-                session_id: sid.clone(),
-                app_id: "crashy".into(),
+                session_id: sid.to_string(),
+                app_id: app_id.into(),
                 pid,
                 started_at: 0,
                 state: AppState::Running,
                 surfaces: vec![],
             },
         );
-        host.pid_index.write().unwrap().insert(pid, sid.clone());
-        // Give the kernel a beat to deliver the exit.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = host.reap_once();
-        assert!(
-            host.get_state(&sid).is_none(),
-            "crashed session should be removed after reap"
-        );
+        host.pid_index.write().unwrap().insert(pid, sid.to_string());
     }
 
-    #[test]
-    fn reaper_marks_expected_exit_as_stopped() {
-        let host = AppHost::new();
+    /// Spawn a child that exits immediately with `code`, and leak the handle so
+    /// `Child::drop` can't reap it out from under `reap_once`.
+    fn spawn_exiting_child(code: u8) -> u32 {
         let child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
+            .args(["-c", &format!("exit {code}")])
             .spawn()
             .expect("spawn /bin/sh");
         let pid = child.id();
         std::mem::forget(child);
-        let sid = "sess-stop".to_string();
-        host.sessions.insert(
-            sid.clone(),
-            AppSession {
-                session_id: sid.clone(),
-                app_id: "stoppy".into(),
-                pid,
-                started_at: 0,
-                state: AppState::Running,
-                surfaces: vec![],
-            },
+        pid
+    }
+
+    /// Both reaper outcomes are asserted in **one** test on purpose.
+    ///
+    /// `reap_once` calls `waitpid(-1)`, which is process-wide, and cargo runs
+    /// tests as parallel threads of a single process. As two separate tests
+    /// these raced: whichever called `reap_once` first consumed *both*
+    /// children's exit statuses, so the loser's session was never finalized and
+    /// it failed on every full-suite run while passing in isolation. One test,
+    /// one reap, both assertions -- no cross-test interference to lose to.
+    #[test]
+    fn reaper_reports_crashed_and_stopped_exits_distinctly() {
+        let host = AppHost::new();
+
+        // Non-zero exit with nothing in expected_stops -> Crashed.
+        let crashed_pid = spawn_exiting_child(7);
+        track_session(&host, "sess-crash", "crashy", crashed_pid);
+
+        // Clean exit that the user asked for -> Stopped.
+        let stopped_pid = spawn_exiting_child(0);
+        track_session(&host, "sess-stop", "stoppy", stopped_pid);
+        host.expected_stops
+            .write()
+            .unwrap()
+            .insert("sess-stop".to_string());
+
+        // Both children must have actually exited before WNOHANG sees them;
+        // poll rather than sleeping a fixed beat so a loaded machine can't
+        // turn this into a spurious failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            host.reap_once();
+            if host.get_state("sess-crash").is_none() && host.get_state("sess-stop").is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            host.get_state("sess-crash").is_none(),
+            "crashed session should be removed after reap"
         );
-        host.pid_index.write().unwrap().insert(pid, sid.clone());
-        host.expected_stops.write().unwrap().insert(sid.clone());
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = host.reap_once();
-        assert!(host.get_state(&sid).is_none());
+        assert!(
+            host.get_state("sess-stop").is_none(),
+            "stopped session should be removed after reap"
+        );
     }
 }

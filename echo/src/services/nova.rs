@@ -1239,6 +1239,30 @@ user_pref("accessibility.force_disabled", 1);
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.sessionstore.max_resumed_crashes", 0);
 user_pref("browser.startup.page", 0);
+// No WebExtensions in a single-purpose app profile.
+//
+// This is NOT tidiness. WebExtensions creates a hidden background-page host,
+// `chrome://extensions/content/dummy.xhtml`, and in this environment that
+// window maps as a REAL Wayland toplevel: Evo sees it at full output size,
+// with no `pyxisApp` stamp (it never runs browser-init's PYXIS block), so its
+// app id falls back to vela's default `vela-default`. Consequences, both
+// observed on-device:
+//   - AppHost synthesizes a session for it (pid 0), which the shell's dock
+//     renders as a phantom running app the user never launched;
+//   - it is GTK-decorated and full-size, so on a relaunch it can present as
+//     the "kiosk mode wasn't respected" window sitting over the real one.
+// Confirmed as the culprit by a `domwindowclosed` probe naming
+// `chrome://extensions/content/dummy.xhtml` directly.
+//
+// Safe here because the `window.geckoOS` bridge is a COMPILED-IN
+// JSWindowActor (registered in ActorManagerParent.sys.mjs as PyxisBridge),
+// not a WebExtension -- verified that no .xpi is staged into any app profile.
+// The old Synergy WebExtension bridge is dev-only and unused on-device.
+user_pref("extensions.autoDisableScopes", 15);
+user_pref("extensions.enabledScopes", 0);
+user_pref("extensions.installDistroAddons", false);
+user_pref("extensions.systemAddon.update.enabled", false);
+user_pref("xpinstall.enabled", false);
 "#;
         let path = dir.join("user.js");
         fs::write(&path, prefs).with_context(|| format!("write {}", path.display()))?;

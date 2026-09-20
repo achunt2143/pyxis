@@ -49,7 +49,7 @@ git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
 ════════════════════════════════════════════════════════════════════════
 
 diff --git a/browser/components/BrowserContentHandler.sys.mjs b/browser/components/BrowserContentHandler.sys.mjs
-index daaa2dae0015..bb560202fa29 100644
+index daaa2dae0015..d0553a56eb5a 100644
 --- a/browser/components/BrowserContentHandler.sys.mjs
 +++ b/browser/components/BrowserContentHandler.sys.mjs
 @@ -101,6 +101,15 @@ let gMajorUpgrade = false;
@@ -68,7 +68,7 @@ index daaa2dae0015..bb560202fa29 100644
  const OVERRIDE_NONE = 0;
  const OVERRIDE_NEW_PROFILE = 1;
  const OVERRIDE_NEW_MSTONE = 2;
-@@ -363,6 +372,110 @@ function openBrowserWindow(
+@@ -363,6 +372,133 @@ function openBrowserWindow(
    });
  }
  
@@ -168,18 +168,41 @@ index daaa2dae0015..bb560202fa29 100644
 +  args.appendElement(urlString);
 +  args.appendElement(extraOptions);
 +
++  // PYXIS-DIAG (temporary, 2026-08-17): confirm the bag is built and handed
++  // over. If this logs but the browser-init probe never fires, the args are
++  // being lost between here and the new window -- which is the one link in
++  // this chain nobody has actually observed working (the `taskbartab`
++  // precedent this was modelled on uses a different opener).
++  console.error(
++    `PYXIS-DIAG openPyxisAppWindow(): appId=${appId} url=${url} ` +
++      `args.length=${args.length} hasKey=${extraOptions.hasKey("pyxisApp")}`
++  );
++
 +  return lazy.BrowserWindowTracker.promiseOpenWindow({
 +    args,
 +    features: kPyxisAppWindowFeatures,
 +    all: false,
 +    private: false,
-+  });
++  }).then(
++    win => {
++      console.error(
++        `PYXIS-DIAG openPyxisAppWindow(): window opened, ` +
++          `windowclass=${win?.document?.documentElement?.getAttribute("windowclass")} ` +
++          `pyxisapp=${win?.document?.documentElement?.getAttribute("pyxisapp")}`
++      );
++      return win;
++    },
++    err => {
++      console.error(`PYXIS-DIAG openPyxisAppWindow() REJECTED: ${err}`);
++      throw err;
++    }
++  );
 +}
 +
  function openPreferences(cmdLine) {
    openBrowserWindow(cmdLine, lazy.gSystemPrincipal, "about:preferences");
  }
-@@ -451,6 +564,106 @@ nsBrowserContentHandler.prototype = {
+@@ -451,6 +587,184 @@ nsBrowserContentHandler.prototype = {
        gKiosk = true;
        Glean.browserStartup.kioskMode.set(true);
      }
@@ -226,6 +249,84 @@ index daaa2dae0015..bb560202fa29 100644
 +      pyxisAppIdParam = Services.env.exists("PYXIS_APP_ID")
 +        ? Services.env.get("PYXIS_APP_ID")
 +        : null;
++    }
++    // PYXIS-DIAG (temporary, 2026-08-17): trace whether the app-id ever
++    // reaches the window. Windows are reaching Evo as `vela-default` instead
++    // of their Pyxis id, which stops `bind_surface` correlating them to a
++    // Nova session (alpha2 #10). Every link in this chain reads correct
++    // statically, so the failure is runtime-conditional -- these three probes
++    // say which link. Remove once #10 is closed.
++    console.error(
++      `PYXIS-DIAG handle(): flag/env app id = ${pyxisAppIdParam}, ` +
++        `cmdLine.state=${cmdLine.state}, preventDefault(before)=${cmdLine.preventDefault}`
++    );
++
++    // PYXIS-DIAG (temporary, 2026-08-17): answer two linked questions in one
++    // pass.
++    //
++    // (1) WHY DOES THE APP QUIT ON RESTORE-DOWN? Evo's side is proven correct
++    //     (it saves geometry, restores it, and the client ACKs the configure),
++    //     then ~0.5s later the app tears itself down through a *clean* Gecko
++    //     shutdown. Nothing logs the reason. `quit-application-requested`
++    //     carries it.
++    //
++    // (2) WHY DOES A SUBSEQUENT LAUNCH IGNORE KIOSK MODE? `openPyxisAppWindow`
++    //     is proven to run and to produce a correctly-stamped chromeless
++    //     window, so a non-kiosk window on a later launch must be a SECOND
++    //     window opened by something else (session restore is the suspect --
++    //     see the user.js comment in nova.rs, which already tried to suppress
++    //     exactly this). Logging every window open with its URI tells us
++    //     whether a second one appears and where it comes from.
++    //
++    // These are almost certainly the same story: an app that dies on
++    // unmaximize is what leaves the state that makes the next launch restore.
++    try {
++      if (!globalThis.__pyxisDiagObservers) {
++        globalThis.__pyxisDiagObservers = true;
++        const diag = {
++          observe(subject, topic, data) {
++            try {
++              let extra = "";
++              if (topic === "domwindowopened" || topic === "domwindowclosed") {
++                let uri = subject?.document?.documentURI ?? "(no doc yet)";
++                let cls =
++                  subject?.document?.documentElement?.getAttribute(
++                    "windowclass"
++                  ) ?? "(none)";
++                let sizemode =
++                  subject?.document?.documentElement?.getAttribute("sizemode") ??
++                  "(none)";
++                let nargs = subject?.arguments ? subject.arguments.length : 0;
++                extra = ` uri=${uri} windowclass=${cls} sizemode=${sizemode} args=${nargs}`;
++              }
++              if (topic === "quit-application-requested") {
++                // `data` is the quit reason ("restart"/"lastwindow"/...); the
++                // subject is a cancelable nsISupportsPRBool. "lastwindow" would
++                // confirm the last-browser-window theory outright.
++                extra = ` reason="${data}"`;
++              }
++              console.error(
++                `PYXIS-DIAG observer: ${topic}${extra} ` +
++                  `windows=${Services.wm.getEnumerator("navigator:browser").hasMoreElements() ? "some" : "none"}`
++              );
++            } catch (e) {
++              console.error(`PYXIS-DIAG observer(${topic}) threw: ${e}`);
++            }
++          },
++        };
++        for (let t of [
++          "domwindowopened",
++          "domwindowclosed",
++          "quit-application-requested",
++          "quit-application-granted",
++          "quit-application",
++        ]) {
++          Services.obs.addObserver(diag, t);
++        }
++        console.error("PYXIS-DIAG: window/quit observers registered");
++      }
++    } catch (e) {
++      console.error(`PYXIS-DIAG: observer registration failed: ${e}`);
 +    }
 +    if (pyxisAppIdParam) {
 +      gPyxisAppId = pyxisAppIdParam;
@@ -286,7 +387,7 @@ index daaa2dae0015..bb560202fa29 100644
      if (cmdLine.handleFlag("disable-pinch", false)) {
        let defaults = Services.prefs.getDefaultBranch(null);
        defaults.setBoolPref("apz.allow_zooming", false);
-@@ -687,6 +900,12 @@ nsBrowserContentHandler.prototype = {
+@@ -687,6 +1001,12 @@ nsBrowserContentHandler.prototype = {
        "  --kiosk-monitor <num> Place kiosk browser window on given monitor.\n";
      info +=
        "  --disable-pinch    Disable touch-screen and touch-pad pinch gestures.\n";
@@ -299,7 +400,7 @@ index daaa2dae0015..bb560202fa29 100644
      return info;
    },
  
-@@ -1095,6 +1314,21 @@ nsBrowserContentHandler.prototype = {
+@@ -1095,6 +1415,21 @@ nsBrowserContentHandler.prototype = {
      return gKiosk;
    },
  

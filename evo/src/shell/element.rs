@@ -8,6 +8,7 @@ use smithay::{
     desktop::{
         space::SpaceElement, utils::OutputPresentationFeedback, Window, WindowSurface, WindowSurfaceType,
     },
+    backend::input::ButtonState,
     input::{
         pointer::{
             AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
@@ -306,6 +307,30 @@ impl<BackendData: Backend> PointerTarget<EvoState<BackendData>> for SSD {
         data: &mut EvoState<BackendData>,
         event: &ButtonEvent,
     ) {
+        // Act on PRESS only. Without this check a single physical click
+        // dispatched `clicked` TWICE -- once on press, once on release -- and
+        // the two dispatches did not necessarily resolve to the same button,
+        // because `HeaderBar::clicked` hit-tests relative to the *current*
+        // `self.width` and the window can change width in between.
+        //
+        // That is alpha2 #7, and it is why "maximize works but restore-down
+        // quits the app":
+        //   press   -> click lands in the maximize band of a MAXIMIZED window
+        //              (width 1280) -> defers unmaximize_request
+        //   [idle]  -> window unmaximizes, header bar shrinks to its restored
+        //              width, so every button band moves left
+        //   release -> the SAME pointer x is now past `width - BUTTON_WIDTH`,
+        //              i.e. inside the CLOSE band -> send_close()
+        // The client closes its only window, and Gecko quits the whole app
+        // with `quit-application-requested reason="lastwindow"` (confirmed
+        // on-device). Maximizing looked fine only because both dispatches
+        // landed on the same button when the width didn't change first.
+        //
+        // Matches input_handler.rs's existing
+        // `wl_pointer::ButtonState::Pressed == state` idiom.
+        if event.state != ButtonState::Pressed {
+            return;
+        }
         let mut state = self.0.decoration_state();
         if state.is_ssd {
             state.header_bar.clicked(seat, data, &self.0, event.serial);

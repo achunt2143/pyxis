@@ -1,27 +1,34 @@
 //! Network Service
-//! 
+//!
 //! Provides network interface and connectivity information.
+//!
+//! Connectivity state is read straight from the kernel (`/sys/class/net`,
+//! `/proc/net/route`) rather than from NetworkManager. Pyxis boots BusyBox
+//! `udhcpc` under BusyBox init (`scripts/create-rootfs.sh`) and ships no
+//! NetworkManager at all, so the previous `nmcli` implementation reported
+//! `connected: false` on every machine regardless of its actual lease --
+//! the status bar showed "offline" over a working connection. `ip`-based
+//! helpers further down are fine to keep: `iproute2` *is* in the image.
 
 use serde_json::{json, Value};
 use anyhow::{Result, anyhow};
+use std::path::Path;
 use std::process::Command;
 
 pub struct NetworkService;
 
 impl NetworkService {
     pub fn get_status() -> Result<Value> {
-        let output = Command::new("nmcli")
-            .args(&["-t", "-f", "ACTIVE", "con", "show", "--active"])
-            .output();
+        let active = active_interface();
 
-        let connected = output.is_ok() && !output.unwrap().stdout.is_empty();
-
-        let net_type = if connected {
-            get_connection_type()?
-        } else {
-            "none".to_string()
+        let (connected, net_type, ssid) = match &active {
+            Some(iface) => (
+                true,
+                if iface.is_wireless { "wifi" } else { "ethernet" }.to_string(),
+                connection_name(iface),
+            ),
+            None => (false, "none".to_string(), String::new()),
         };
-        let ssid = if connected { get_active_connection_name() } else { String::new() };
 
         Ok(json!({
             "connected": connected,
@@ -32,7 +39,11 @@ impl NetworkService {
 
     pub fn get_type() -> Result<Value> {
         Ok(json!({
-            "type": get_connection_type()?
+            "type": match active_interface() {
+                Some(iface) if iface.is_wireless => "wifi",
+                Some(_) => "ethernet",
+                None => "none",
+            }
         }))
     }
 
@@ -138,49 +149,90 @@ impl NetworkService {
     }
 }
 
-/// Real network name for the active connection: the WiFi SSID via
-/// `iwgetid -r` when on wireless, falling back to NetworkManager's active
-/// connection display name otherwise (e.g. a wired connection's profile
-/// name) — real values were missing entirely before (the JSON response had
-/// no `ssid` field at all, though the shell's `NetworkStatus` type and
-/// `TopSystemBar.tsx` both expect one), which is what made Bloom's status
-/// bar fall back to displaying nothing/mock data for the network name even
-/// once the method-name mismatch (see useEcho.ts) was fixed.
-fn get_active_connection_name() -> String {
-    if let Ok(output) = Command::new("iwgetid").arg("-r").output() {
-        let ssid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !ssid.is_empty() {
-            return ssid;
-        }
+/// A real, kernel-visible network interface.
+struct NetInterface {
+    name: String,
+    is_wireless: bool,
+}
+
+/// The interface currently carrying the default route, if it is a real device
+/// that is operationally up.
+///
+/// "Connected" is deliberately defined as *has a usable default route* rather
+/// than *a link is up*: a NIC with carrier but no DHCP lease is up, and
+/// reporting that as connected is exactly the kind of lie this pass exists to
+/// remove.
+fn active_interface() -> Option<NetInterface> {
+    let iface = default_route_interface()?;
+
+    // Synthetic interfaces (lo, dummy0, sit0, ...) have no `device` symlink to
+    // a PCI/USB parent. The same filter is applied at boot when picking a NIC
+    // for udhcpc -- this kernel's CONFIG_DUMMY/CONFIG_IPV6_SIT always create
+    // dummy0/sit0, and they sort before any real NIC name.
+    if !Path::new(&format!("/sys/class/net/{}/device", iface)).exists() {
+        return None;
     }
-    if let Ok(output) = Command::new("nmcli")
-        .args(&["-t", "-f", "NAME", "con", "show", "--active"])
-        .output()
-    {
-        if let Some(name) = String::from_utf8_lossy(&output.stdout).lines().next() {
-            if !name.trim().is_empty() {
-                return name.trim().to_string();
+
+    if operstate(&iface) != "up" {
+        return None;
+    }
+
+    Some(NetInterface {
+        is_wireless: is_wireless(&iface),
+        name: iface,
+    })
+}
+
+/// Interface name owning the IPv4 default route, read from `/proc/net/route`.
+fn default_route_interface() -> Option<String> {
+    parse_default_route(&std::fs::read_to_string("/proc/net/route").ok()?)
+}
+
+/// Columns are `Iface Destination Gateway Flags ...` with the addresses as
+/// little-endian hex; a destination of all zeros is the default route.
+fn parse_default_route(routes: &str) -> Option<String> {
+    routes
+        .lines()
+        .skip(1) // header
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let iface = fields.next()?;
+            let destination = fields.next()?;
+            (destination == "00000000").then(|| iface.to_string())
+        })
+}
+
+/// `/sys/class/net/<iface>/operstate` -- "up", "down", "unknown", ...
+fn operstate(iface: &str) -> String {
+    std::fs::read_to_string(format!("/sys/class/net/{}/operstate", iface))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Wireless NICs expose a `wireless` directory (and, on modern cfg80211
+/// drivers, a `phy80211` symlink); wired ones expose neither.
+fn is_wireless(iface: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{}/wireless", iface)).exists()
+        || Path::new(&format!("/sys/class/net/{}/phy80211", iface)).exists()
+}
+
+/// Display name for the active connection: the WiFi SSID when on wireless,
+/// and the interface name otherwise.
+///
+/// The shell's `NetworkStatus` type and `TopSystemBar.tsx` both expect an
+/// `ssid` field, so this must always produce *something* meaningful -- a
+/// wired connection has no SSID, and showing the interface it's actually on
+/// beats showing an empty string.
+fn connection_name(iface: &NetInterface) -> String {
+    if iface.is_wireless {
+        if let Ok(output) = Command::new("iwgetid").arg("-r").output() {
+            let ssid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !ssid.is_empty() {
+                return ssid;
             }
         }
     }
-    String::new()
-}
-
-fn get_connection_type() -> Result<String> {
-    // Check for WiFi
-    let wifi_check = Command::new("nmcli").args(&["device", "status"]).output();
-    
-    if let Ok(output) = wifi_check {
-        let out_str = String::from_utf8_lossy(&output.stdout);
-        if out_str.contains("wifi") && out_str.contains("connected") {
-            return Ok("wifi".to_string());
-        }
-        if out_str.contains("ethernet") && out_str.contains("connected") {
-            return Ok("ethernet".to_string());
-        }
-    }
-
-    Ok("unknown".to_string())
+    iface.name.clone()
 }
 
 fn get_interface_info(name: &str) -> Result<Value> {
@@ -225,4 +277,42 @@ fn get_interface_info(name: &str) -> Result<Value> {
         "isRunning": is_up,
         "mtu": 1500
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `/proc/net/route` from a QEMU boot: the default route is on the
+    /// second data row, and `dummy0` (which sorts first and has no default
+    /// route) must not win.
+    const PROC_NET_ROUTE: &str = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+dummy0\t0000FEA9\t00000000\t0001\t0\t0\t1000\t0000FFFF\t0\t0\t0
+enp0s3\t00000000\t0202000A\t0003\t0\t0\t100\t00000000\t0\t0\t0
+enp0s3\t0000020A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0";
+
+    #[test]
+    fn finds_the_interface_carrying_the_default_route() {
+        assert_eq!(
+            parse_default_route(PROC_NET_ROUTE).as_deref(),
+            Some("enp0s3")
+        );
+    }
+
+    #[test]
+    fn reports_no_default_route_when_there_is_none() {
+        let no_default = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+enp0s3\t0000020A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0";
+
+        assert_eq!(parse_default_route(no_default), None);
+    }
+
+    /// The header row names a column "Destination", which is not a route.
+    #[test]
+    fn ignores_the_header_row() {
+        assert_eq!(parse_default_route("Iface\tDestination\tGateway"), None);
+        assert_eq!(parse_default_route(""), None);
+    }
 }

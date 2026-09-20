@@ -1,3 +1,181 @@
+# GeckoOS / Pyxis — Alpha 3 Release Notes
+
+**Theme: "Nothing lies to the user."**
+
+**Headline:** every place the system reported something false, or failed because
+a binary simply wasn't in the image, is fixed — and a boot-level bug that had
+been silently killing *every daemon* moments after startup is fixed with it.
+The status bar, the network indicator, the battery readout, the Files listing,
+the package manager and the power actions now all tell the truth, verified on a
+real boot rather than on a type-check.
+
+This was intended as a cheap "clear the noise" release before the harder work.
+It mostly was — but booting it turned up two defects that no amount of desk
+review would have found, one of them significant.
+
+---
+
+## The boot fix (the big one)
+
+**No daemon survived boot.** `geckoOS-boot` runs from `/etc/inittab` as a
+`::wait:` entry, so every daemon it backgrounded shared that script's process
+group and controlling terminal. When the script exited, the whole group took
+SIGHUP and died together.
+
+The symptom was almost designed to mislead: `/var/log/{echo,evo,vela}.log` were
+each written normally at boot and then simply stopped mid-line with no error,
+and by the time you had a shell, `ps` showed nothing but the two getty bashes —
+while running *the same script by hand* from that shell worked perfectly, because
+an interactive shell keeps the session alive and no SIGHUP is ever sent.
+
+Fixed with `setsid ... </dev/null` in `start_daemon`, so each daemon is its own
+session leader with no controlling terminal. Verified: an unattended boot now
+brings up the full stack (`echo-daemon` pid 211/sid 211, `vela` pid 252/sid 252).
+
+This is very likely implicated in some of alpha2's "IPC doesn't work" symptoms —
+a shell talking to a compositor that has already been killed produces exactly
+that class of failure.
+
+## Rootfs / packaging
+
+- **opkg now ships.** The Installer service gates every operation on
+  `require_opkg()`, and opkg had never been in the image — which is why the
+  install flow had never once been runnable. It cannot be apt-installed:
+  **Debian packages no `opkg` (and no `opkg-utils`) in any suite.** It is now
+  built from pinned, sha256-checked source (Yocto 0.10.0) in a new chroot build
+  stage, configured for local `.ipk` installs only (no curl/gpgme/libsolv), with
+  build dependencies purged afterwards.
+- `/etc/opkg/opkg.conf` is generated with an architecture list mapped from
+  `DEBIAN_ARCH` to Vroom's naming (`amd64` → `x86_64`), so a native `.ipk` built
+  by `pyxis-pdk` is accepted on the machine that built it.
+- Verified on-device: `opkg version 0.10.0`, `opkg list-installed` → rc 0.
+
+## Echo services
+
+- **Network status reads the kernel.** `get_status()`/`get_type()` used `nmcli`,
+  which is not in the image (Pyxis uses BusyBox `udhcpc`), so the shell reported
+  `connected: false` on every machine forever. Now reads `/proc/net/route` for
+  the default route, filters synthetic interfaces by the `/sys/class/net/*/device`
+  symlink, and checks `operstate`. Verified on-device:
+  `{"connected": true, "ssid": "enp0s3", "type": "ethernet"}`.
+- **Power actions target BusyBox init**, not the absent `shutdown`/`systemctl`.
+  Verified on-device: shutdown powers the machine off, reboot reboots it.
+  `sleep()` now uses `/sys/power/state` and returns a structured
+  `supported: false` instead of a spurious success.
+- **Battery stops inventing numbers.** It previously fell back to a hardcoded
+  50% and a constant 40°C on machines with no battery; it now reports
+  `present: false` with a null level, and scans for the real battery rather than
+  assuming `BAT0`.
+- **`set_screen_brightness` actually sets brightness.** It was piping nothing
+  into `tee` and reporting success regardless — it now writes the sysfs backlight
+  directly, and finds the device instead of hardcoding `intel_backlight`.
+- **Files is fixed at the root cause.** `read_directory` propagated with `?` on
+  `created()`, which returns `Unsupported` on tmpfs/overlayfs/procfs/sysfs and
+  older ext4 inodes — so **one bad entry aborted the entire listing** and the app
+  rendered nothing. Timestamps are now non-fatal (serialized as `null`),
+  unreadable entries are skipped rather than fatal, and dangling symlinks fall
+  back to `symlink_metadata`. Verified on-device: `/proc` returns 171 entries
+  with `created: null`, the exact call that used to fail outright.
+- **`readFile` honours its `encoding` parameter** (it was `read_to_string`
+  regardless, so every binary read errored). `base64` is supported, with a
+  `maxBytes` cap checked against the file's real length before reading, since the
+  whole body crosses the bus as one JSON message.
+
+## Bloom (desktop shell)
+
+- **The clock ticks.** It was computed once per render with no timer, so it
+  showed boot time forever. Now aligned to the minute boundary.
+- **Files previews images inline**, using the new base64 read path.
+- **Dead quick-settings controls are gone.** "Notifications",
+  "Auto-brightness", "WiFi Enabled" and "Low Power Mode" had no handler and no
+  backend to wire one to; they were removed, and WiFi became an honest read-only
+  status row. "Show percentage in top bar" was wired for real through the
+  settings bus and verified end to end.
+- **Every toggle in the shell was rendering a permanent "Off"** — including Dark
+  Mode. remochi's published types declare a `checked` prop, but the component it
+  actually exports reads `value` and calls `onChange({value})`, so `checked`
+  type-checked cleanly and was silently ignored. Bridged with a correctly-typed
+  wrapper in both the shell and Settings.
+- The SDK stops fabricating fallbacks: a failed battery or network call returns
+  `null` instead of `level: 87` / `connected: true, ssid: "GeckoNet"`. The
+  latter was the worst of them — an unreachable network service was
+  indistinguishable from a healthy connection.
+
+## Evo (compositor)
+
+- **The decoration model is settled and written down: Evo owns server-side
+  decoration for app windows.** There was no live contradiction, only stale
+  text — the boot script still carried a superseded 2026-07-08 comment. The code
+  has implemented Evo-SSD since 2026-07-25, negotiated over
+  `org_kde_kwin_server_decoration` (GTK3 never binds `xdg-decoration` at all).
+  Documented in `CLAUDE.md`; items #8/#9/#11 keep their existing Evo-SSD scoping,
+  and #7 is an SSD bug rather than a two-parties-disagree bug.
+
+## Testing and verification
+
+- **Rust: 69 tests passing, up from 58 passing + 1 permanently failing.** That
+  failure was deterministic in a full run: `reap_once` calls process-wide
+  `waitpid(-1)`, and two parallel reaper tests consumed each other's children.
+  Merged into one test; 9 new tests added for the filesystem and network changes,
+  including a base64 encoder pinned against an independent implementation.
+- **Lint is at zero** (`npx eslint .`, down from 2 errors). `cargo clippy` went
+  from 32 warnings to 26, none new.
+- On-device verification is now a repeatable process: QEMU + pexpect over the
+  serial console, which `/etc/inittab` gives a root shell. Documented, including
+  the traps — boot-script output goes to tty0 rather than serial, and `echo-cli`
+  needs both the full destination name and `XDG_RUNTIME_DIR`.
+
+## Documentation
+
+- Eight stale claims in `CLAUDE.md` were deleted rather than annotated (the
+  `todo!()` test, `ouranos.service`, Bloom "dead code", the "12 lint errors",
+  phantom launcher entries, "minimize not implemented", and more — all long since
+  fixed), along with stale module line counts and `/usr/palm` → `/usr/pyxis`.
+- The audit that drove this release is `AUDIT_2026-08.md`; the plan is
+  `ALPHA_ROADMAP.md`. Both are current as of this release.
+
+## Known issues carried into alpha 4
+
+- **#7 narrowed this cycle: maximize now works — it is *unmaximize* that
+  crashes the app.** Restoring a maximized window down kills the client; the
+  compositor survives. That is a meaningful narrowing: the item has been recorded
+  since alpha2 as "maximize closes the app", and the maximize path is fine. Both
+  handlers are defensively written with no panics, so the fault is in what the
+  client is told on the way *down* — `unmaximize_request` sends
+  `state.size = None` and re-maps at the saved location. Next step is the
+  client-side log at the moment of the crash;
+  `scripts/capture-maximize-repro.sh` collects exactly that window.
+- **#10 restore-from-dock: re-diagnosed, and the previous theory was wrong.** The
+  audit predicted two appHost sessions per app from an app_id mismatch; there is
+  only one. Apps launch correctly and their bridge works (a launched Files app
+  makes real `readDirectory` calls). The actual fault is narrower: **the
+  compositor surface never binds to the appHost session** — `surfaces: []`,
+  `ListSurfaceSessions` count 0 — so `nova.Focus` correctly reports "no mapped
+  compositor window yet". Surface binding is where to look, not identity.
+- #2 Terminal QOL, #11 window resize, and #12 visual polish are unchanged.
+  #12 remains an undefined umbrella and needs scoping before it can be scheduled.
+- The shell's app list is still the hardcoded `PYXIS_APPS` array — Nova's
+  registry already returns all 10 apps on-device, including the Installer, but
+  nothing in the shell asks it. That is alpha 4's headline.
+
+---
+
+## Overall Alpha 3 summary
+
+Alpha 3 was meant to be the cheap release that makes later debugging
+trustworthy, and it delivered that: the status bar, network, battery, Files,
+packaging and power actions are now all honest, and each was confirmed on a real
+boot rather than assumed. The unplanned wins were larger than the planned ones —
+opkg turned out to need building from source rather than a one-line package add,
+and the discovery that no daemon survived boot reframes several long-standing
+"IPC is broken" symptoms as downstream of a dead compositor. The app pipeline
+itself is in better shape than the audit suggested: apps launch, the bridge
+works, and Nova's registry is complete. What remains between here and "all my
+apps working" is surface binding, the maximize crash, and pointing the shell at
+the registry that already exists.
+
+---
+
 # GeckoOS / Pyxis — Alpha 1 Release Notes
 
 **Headline:** first end-to-end boot-to-app milestone. The system now boots on real (QEMU-virtualized) hardware, brings up its full service stack, and runs one real application — a terminal — through the complete Bloom → Synergy → Echo → Rockhopper/Gecko pipeline. Everything else in the stack is present and running, but not yet wired to user-facing functionality.

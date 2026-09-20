@@ -14,6 +14,14 @@ DEBIAN_SUITE="${DEBIAN_SUITE:-sid}"
 DEBIAN_ARCH="${DEBIAN_ARCH:-amd64}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian/}"
 
+# opkg, built from source in stage_opkg(). Debian packages no opkg at all
+# (verified against the sid package index -- neither `opkg` nor `opkg-utils`
+# exists in any suite), so it cannot simply be added to the apt list above.
+# The Yocto Project is upstream and publishes release tarballs.
+OPKG_VERSION="${OPKG_VERSION:-0.10.0}"
+OPKG_SHA256="${OPKG_SHA256:-4d099e010a5d262b34184fee4766bc60a8c7439741fb210aa11d51704afd04d1}"
+OPKG_URL_BASE="${OPKG_URL_BASE:-https://downloads.yoctoproject.org/releases/opkg}"
+
 GECKO_PREBUILT=${GECKO_PREBUILT:-0}
 KERNEL_PREBUILT=${KERNEL_PREBUILT:-0}
 FORCE_REBUILD=${FORCE_REBUILD:-0}
@@ -333,6 +341,120 @@ CHROOT_EOF
     log_success "Base packages installed"
 }
 
+stage_opkg() {
+    log_section "Stage 3b: opkg package manager (built from source)"
+
+    # WHY THIS IS BUILT RATHER THAN apt-installed
+    # ------------------------------------------------------------------
+    # opkg is the backend for the entire Vroom SDK/PDK -> Installer app
+    # pipeline: `echo/src/services/installer.rs` gates every mutating call on
+    # `require_opkg()` and fails with "opkg is not available on this system"
+    # without it. Until alpha3 it was simply absent from the image, which is
+    # why the install flow had never once been runnable on-device -- the Rust
+    # was correct, the binary was never there.
+    #
+    # It can't be apt-installed: Debian ships no `opkg` (and no `opkg-utils`)
+    # package in any suite -- checked against the sid package index, not
+    # assumed. Upstream is the Yocto Project, which publishes release
+    # tarballs, so this mirrors what scripts/busybox-install.sh already does
+    # for BusyBox: build the one missing piece from pinned, checksummed source.
+    #
+    # Built INSIDE the chroot, not on the host, so it links against the
+    # rootfs's own libarchive/liblzma rather than the build machine's -- the
+    # host here is Ubuntu and the target is Debian sid, so host-built binaries
+    # would be a version-skew bug waiting to happen.
+    #
+    # FEATURE SET: deliberately minimal. Pyxis only ever installs *local*
+    # .ipk files (installer.rs validates a path and hands it to `opkg
+    # install`), so the network half of opkg is dead weight:
+    #   WITH_CURL=OFF          no remote feeds -> no libcurl, no TLS stack
+    #   WITH_GPGME=OFF         signature checking is an alpha6 roadmap item;
+    #                          turning it on now would demand a keyring the
+    #                          project doesn't have yet
+    #   USE_SOLVER_LIBSOLV=OFF the built-in solver is enough for self-contained
+    #                          bundled apps and drops the libsolv dependency
+    #   WITH_XZ=ON             kept (upstream default): Vroom emits gzip today,
+    #                          but xz .ipks are legal and cheap to support
+    # libarchive is the one hard, unconditional dependency.
+    #
+    # Build deps are purged afterwards so they don't ship in the image; only
+    # the runtime libs (libarchive, liblzma) stay behind.
+
+    if sudo test -x "${ROOTFS_DIR}/usr/bin/opkg" && [[ "${FORCE_REBUILD}" != "1" ]]; then
+        log_info "opkg already present in rootfs, skipping build (pass --force to rebuild)"
+        return 0
+    fi
+
+    sudo chroot "${ROOTFS_DIR}" /bin/bash <<CHROOT_EOF
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+OPKG_VERSION="${OPKG_VERSION}"
+OPKG_SHA256="${OPKG_SHA256}"
+OPKG_URL_BASE="${OPKG_URL_BASE}"
+
+# Build-only toolchain. Recorded so the purge below removes exactly what
+# this stage added and nothing the runtime still needs.
+BUILD_DEPS="build-essential cmake pkg-config libarchive-dev liblzma-dev"
+
+apt update
+apt install -y --no-install-recommends \$BUILD_DEPS libarchive13 liblzma5
+
+cd /tmp
+rm -rf "opkg-\${OPKG_VERSION}" "opkg-\${OPKG_VERSION}.tar.gz"
+
+echo "[rootfs] fetching opkg \${OPKG_VERSION}"
+curl -fsSL -o "opkg-\${OPKG_VERSION}.tar.gz" \
+    "\${OPKG_URL_BASE}/opkg-\${OPKG_VERSION}.tar.gz"
+
+# Fail loudly on a checksum mismatch: this tarball is fetched over the
+# network at build time and then compiled and run as root on the device.
+echo "\${OPKG_SHA256}  opkg-\${OPKG_VERSION}.tar.gz" | sha256sum -c -
+
+tar xzf "opkg-\${OPKG_VERSION}.tar.gz"
+cd "opkg-\${OPKG_VERSION}"
+
+# The 0.10.0 release tarball SHIPS a populated \`build/\` directory containing
+# the maintainer's own CMakeCache.txt, with CMAKE_CACHEFILE_DIR baked to
+# \`/usr/local/src/opkg/build\`. Configuring into \`build\` therefore reuses that
+# stale cache and CMake hard-fails:
+#   "The current CMakeCache.txt directory ... is different than the directory
+#    /usr/local/src/opkg/build where CMakeCache.txt was created"
+# Delete the shipped directory and configure into a distinct one, so neither
+# the stale cache nor a future tarball shipping the same layout can collide.
+rm -rf build
+cmake -B build-pyxis \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DWITH_CURL=OFF \
+    -DWITH_GPGME=OFF \
+    -DUSE_SOLVER_LIBSOLV=OFF \
+    -DWITH_XZ=ON
+cmake --build build-pyxis -j"\$(nproc)"
+cmake --install build-pyxis
+
+# Prove the binary actually runs in this rootfs before declaring success --
+# a build that links against something the image doesn't ship would
+# otherwise only surface at first use on-device.
+/usr/bin/opkg --version
+
+cd /tmp
+rm -rf "opkg-\${OPKG_VERSION}" "opkg-\${OPKG_VERSION}.tar.gz"
+
+apt purge -y \$BUILD_DEPS
+apt autoremove -y --purge
+apt clean
+
+# The purge above can take libarchive13/liblzma5 with it as autoremoved
+# dependencies of the -dev packages; reinstall them explicitly, since opkg
+# links against both at runtime.
+apt install -y --no-install-recommends libarchive13 liblzma5
+CHROOT_EOF
+
+    log_success "opkg ${OPKG_VERSION} built and installed"
+}
+
 stage_rootfs_dirs() {
     log_section "Stage 4: GeckoOS directory layout"
 
@@ -477,6 +599,62 @@ libxul_path = "/usr/lib/gecko/libxul.so"
 profile_dir = "/var/gecko"
 enable_gpu = true
 cache_size_mb = 256
+EOF
+
+    # opkg is the package manager behind the whole Vroom SDK/PDK -> Installer
+    # pipeline: `echo/src/services/installer.rs` gates every mutating call on
+    # `require_opkg()` and errors with "opkg is not available on this system"
+    # when it can't find the binary. It was missing from the image entirely
+    # until alpha3, which is why the installer flow had never once been
+    # runnable on-device -- the Rust was correct, the binary just wasn't there.
+    #
+    # `dest root /` installs into the real filesystem rather than a prefix,
+    # which is what puts apps under /usr/pyxis/applications where Nova's
+    # registry scan (nova.rs) actually looks for them.
+    #
+    # The arch list must cover everything Vroom stamps into CONTROL/control
+    # (vroom/src/control.rs, vroom/src/template.rs::host_arch): `all` for web
+    # apps and the concrete target arch for native ones. An unlisted
+    # architecture is refused by opkg at install time, so a native .ipk built
+    # by pyxis-pdk would be rejected on the machine it was built for. Higher
+    # priority wins when a package is available for several.
+    sudo mkdir -p "${ROOTFS_DIR}/etc/opkg" \
+                  "${ROOTFS_DIR}/var/lib/opkg" \
+                  "${ROOTFS_DIR}/var/lib/opkg/lists" \
+                  "${ROOTFS_DIR}/var/lib/pyxis/incoming"
+
+    # Debian's arch names aren't Vroom's: Vroom derives the value it stamps
+    # into CONTROL/control from Rust's std::env::consts::ARCH, so an amd64
+    # image must accept `x86_64`, not `amd64`. Hardcoding either one breaks
+    # the other target silently -- opkg simply refuses the package.
+    local pyxis_arch
+    case "${DEBIAN_ARCH}" in
+        amd64) pyxis_arch="x86_64" ;;
+        arm64) pyxis_arch="aarch64" ;;
+        armhf) pyxis_arch="armv7" ;;
+        *)
+            log_info "WARN: no Vroom arch mapping for DEBIAN_ARCH=${DEBIAN_ARCH}, using it verbatim in opkg.conf"
+            pyxis_arch="${DEBIAN_ARCH}"
+            ;;
+    esac
+
+    write_rootfs_file "${ROOTFS_DIR}/etc/opkg/opkg.conf" <<EOF
+# Pyxis package configuration. See vroom/docs/pyxis-sdk-pdk-spec.md.
+#
+# Line syntax is "TYPE NAME VALUE", where TYPE is one of
+# option/dest/arch/src/src-gz/dist (libopkg/opkg_conf.c's dispatch). Anything
+# else is reported as "Ignoring invalid line" on EVERY opkg invocation --
+# "lists_dir ext PATH" is an old OpenWrt-ism that opkg 0.10.0 rejects; the
+# directory settings are plain options.
+dest root /
+option lists_dir /var/lib/opkg/lists
+option tmp_dir /tmp
+
+# Architectures accepted on this machine, lowest priority first.
+# \`all\`  -> web apps  (pyxis-sdk; architecture is always "all")
+# native -> PDK apps  (pyxis-pdk; x86_64 / aarch64 / armv7)
+arch all 1
+arch ${pyxis_arch} 10
 EOF
 
     log_success "System configuration written"
@@ -640,7 +818,24 @@ start_daemon() {
         return
     fi
     echo "[boot] starting ${name}..."
-    "$bin" "$@" > "/var/log/${name}.log" 2>&1 &
+    # `setsid` + `</dev/null` is load-bearing, NOT tidiness (found 2026-08-16
+    # on a real boot). This script runs from /etc/inittab as `::wait:`, so
+    # BusyBox init waits for it and then reaps it -- and every daemon
+    # backgrounded here is in this script's process group, sharing
+    # /dev/console as its controlling terminal. When the script exits, that
+    # group gets SIGHUP and every daemon dies with it.
+    #
+    # The symptom was brutal to read: /var/log/{echo,evo,vela}.log were all
+    # written normally at boot and then simply stopped mid-line with no error,
+    # and by the time you got a shell `ps` showed nothing but the two getty
+    # bashes -- an apparently daemon-less boot that came back perfectly when
+    # you ran this same script by hand from that shell (where the interactive
+    # shell keeps the session alive, so no SIGHUP is ever sent).
+    #
+    # setsid puts each daemon in its own session with no controlling terminal,
+    # which is what a daemon should have anyway; </dev/null stops any of them
+    # blocking on console reads.
+    setsid "$bin" "$@" > "/var/log/${name}.log" 2>&1 < /dev/null &
 }
 
 wait_for_socket() {
@@ -869,6 +1064,19 @@ user_pref("accessibility.force_disabled", 1);
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.sessionstore.max_resumed_crashes", 0);
 user_pref("browser.startup.page", 0);
+// No WebExtensions in a single-purpose profile. Its hidden background-page
+// host (chrome://extensions/content/dummy.xhtml) maps as a real Wayland
+// toplevel here, with no pyxisApp stamp, so it reaches Evo as vela's default
+// `vela-default` app id -- which AppHost then synthesizes a phantom session
+// for, and which can present as a GTK-decorated window over the real kiosk
+// one. Safe because the window.geckoOS bridge is a compiled-in JSWindowActor
+// (PyxisBridge), not an extension. Kept in lockstep with nova.rs's
+// write_profile_prefs.
+user_pref("extensions.autoDisableScopes", 15);
+user_pref("extensions.enabledScopes", 0);
+user_pref("extensions.installDistroAddons", false);
+user_pref("extensions.systemAddon.update.enabled", false);
+user_pref("xpinstall.enabled", false);
 PREFS
     chown 1000:1000 /var/lib/pyxis/profiles/@@BOOT_APP@@/user.js
 
@@ -956,20 +1164,38 @@ PREFS
     # anymore -- kept explicit anyway since relying on an unstated default
     # is exactly the kind of thing that bites you the next time this
     # bootstrapping mechanism changes.
-    # MOZ_GTK_TITLEBAR_DECORATION=none + GTK_CSD=0 make vela defer window
-    # decorations to Evo's server-side title bar (shell/ssd.rs's HeaderBar)
-    # instead of drawing Firefox's own client-side (CSD) titlebar. On
-    # Wayland, Firefox hardcodes CSD (widget/gtk/nsWindow.cpp
-    # GetSystemGtkWindowDecoration returns GTK_DECORATION_CLIENT) unless
-    # WINDOW DECORATION MODEL (revised 2026-07-08 after live QEMU debugging;
-    # supersedes the earlier "Evo draws the one SSD title bar" note here):
-    # on Wayland, GTK draws its OWN default titlebar on any decorated
-    # toplevel, and MOZ_GTK_TITLEBAR_DECORATION=none only suppresses
-    # Firefox's *CSD*, not that GTK titlebar (verified live -- see
-    # evo/src/shell/xdg.rs's ack_configure comment and the
-    # vela-gtk-titlebar-decoration notes). So the model is now: ordinary app
-    # windows keep GTK's own working titlebar and Evo draws no SSD; the
-    # desktop SHELL (Bloom) must instead be fully chromeless.
+    # WINDOW DECORATION MODEL -- current as of 2026-07-25, verified live.
+    #
+    # **Evo owns app-window decoration.** Ordinary app windows get Evo's
+    # server-side title bar (shell/ssd.rs's HeaderBar) and vela draws no
+    # chrome of its own. This is the deliberate choice: one compositor-drawn
+    # frame keeps decoration consistent across every client instead of
+    # inheriting whatever theme GTK happens to apply.
+    #
+    # MOZ_GTK_TITLEBAR_DECORATION=none is the CLIENT-SIDE HALF of that and is
+    # load-bearing -- do not drop it as cosmetic. GTK3 (and therefore vela)
+    # never binds `zxdg_decoration_manager_v1` at all; the protocol it does
+    # speak is `org_kde_kwin_server_decoration`, which Evo offers with default
+    # mode Server (state.rs's KdeDecorationState::new). Measured with
+    # WAYLAND_DEBUG protocol traces:
+    #   vela with no env override        -> request_mode(Client) -> CSD
+    #   vela with this env var set        -> request_mode(Server) -> Evo SSD
+    # So the env var is what makes GDK ask for Server; without it Firefox
+    # forces its own CSD and you get vela's titlebar instead of Evo's.
+    # xdg.rs's ack_configure derives `is_ssd` from whichever protocol the
+    # client actually negotiated, so the two decoration sources stay mutually
+    # exclusive by negotiation rather than by hardcoding.
+    #
+    # GTK_CSD=0 is a no-op on Wayland (GetSystemGtkWindowDecoration returns
+    # GTK_DECORATION_CLIENT before it ever reads it) -- kept only as belt and
+    # braces for any X11/XWayland client that does honour it.
+    #
+    # NOTE: an earlier 2026-07-08 revision of this comment recorded the
+    # opposite model ("app windows keep GTK's titlebar, Evo draws no SSD").
+    # That was correct only for xdg-decoration, and was superseded once the
+    # KDE protocol path landed. It is called out here because the stale text
+    # outlived the code and sent a later audit hunting a contradiction that
+    # no longer existed.
     #
     # --kiosk (added below, only for the fullscreen/shell boot mode) is what
     # makes the shell chromeless: it sets nsAppRunner's native gKioskMode,
@@ -981,8 +1207,15 @@ PREFS
     # NON-exclusively (xdg.rs's SHELL_APP_ID branch), so app windows launched
     # from the dock still stack on top. --kiosk affects ONLY this boot vela;
     # Nova-launched apps have their own command lines (no --kiosk) and stay
-    # decorated. MOZ_GTK_TITLEBAR_DECORATION=none/GTK_CSD=0 are kept (they
-    # still suppress Firefox's redundant CSD on the app windows).
+    # decorated.
+    #
+    # Bloom is ALSO exempted from SSD compositor-side (xdg.rs's `is_shell`
+    # check). Both halves are needed: bloom is launched with the same
+    # MOZ_GTK_TITLEBAR_DECORATION=none as every app, so it negotiates Server
+    # like they do, and only --kiosk makes it request Client instead. Since
+    # --kiosk is passed only when BOOT_DISPLAY_MODE=fullscreen, without that
+    # compositor-side guard a windowed-mode boot would put an Evo header bar
+    # across the top of the desktop.
     KIOSK_FLAG=""
     if [ "@@BOOT_DISPLAY_MODE@@" = "fullscreen" ]; then
         KIOSK_FLAG="--kiosk"
@@ -1485,6 +1718,9 @@ main() {
     stage_debootstrap_base
     stage_mount_chroot_support
     stage_install_base_packages
+    # Must run while the chroot mounts are still up: it needs /proc and
+    # working DNS inside the chroot to fetch and compile the tarball.
+    stage_opkg
     cleanup_mounts
 
     stage_rootfs_dirs

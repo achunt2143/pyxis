@@ -321,6 +321,71 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                     is_ssd
                 );
                 window.set_ssd(is_ssd);
+
+                // Bind the surface to its AppHost session HERE, not at map
+                // time, because this is the first point at which the app id is
+                // actually known.
+                //
+                // The map path (state.rs) reads `XdgToplevelSurfaceData.app_id`
+                // while the toplevel is still being set up, and GTK/vela don't
+                // set it until later (it arrives via `windowclass` ->
+                // SyncAttributesToWidget -> nsWindow::SetWindowClass ->
+                // gdk_wayland_window_set_application_id). Binding there
+                // therefore saw `None`, fell back to the literal "unknown",
+                // and `AppHost::bind_surface` *synthesized* a session for it --
+                // measured on-device as one bogus `appId: "unknown"` session
+                // holding surfaces [1,2,3] while the real `files` session had
+                // `surfaces: []`. That empty list is why `nova.Focus` (which
+                // reads `surfaces.first()`) always answered "no mapped
+                // compositor window yet" and restore-from-dock never worked.
+                //
+                // `bind_surface` is idempotent (it skips a surface already in
+                // the session's list), so re-running on every configure ack is
+                // cheap and self-healing: whichever ack first carries a real
+                // app id is the one that binds.
+                #[cfg(feature = "echo-ipc")]
+                {
+                    if let Some(app_id) = app_id.as_deref() {
+                        // Only bind toplevels that are actually apps.
+                        //
+                        // `AppHost::bind_surface` SYNTHESIZES a session for any
+                        // app id it doesn't already know, and the shell renders
+                        // every session as a dock entry — so anything bound
+                        // here that isn't a real app becomes a phantom running
+                        // app the user never launched. Excluded:
+                        //   - `bloom`, the shell itself: it's the desktop, not
+                        //     an app, and has no appHost session to bind to;
+                        //   - `unknown`, the fallback for a toplevel with no
+                        //     xdg app_id at all;
+                        //   - `vela-default`, vela's own default app id, which
+                        //     is what any window that never ran browser-init's
+                        //     PYXIS block reports. Nova's profile prefs now
+                        //     disable the WebExtensions dummy window that was
+                        //     producing these, but this stays as a backstop:
+                        //     any future stray vela toplevel must not be able
+                        //     to invent a dock entry.
+                        let bindable = !app_id.is_empty()
+                            && app_id != SHELL_APP_ID
+                            && app_id != "unknown"
+                            && app_id != "vela-default";
+                        if bindable {
+                            if let Some(window_id) = self.window_id_for(&window) {
+                                if let Err(e) = self
+                                    .echo_service
+                                    .read()
+                                    .bind_surface_remote(app_id, window_id)
+                                {
+                                    tracing::warn!(
+                                        "bind_surface({}, {}) failed: {}",
+                                        app_id,
+                                        window_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
             self.maybe_init_shell_fullscreen(&surface);
         }
@@ -434,10 +499,16 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         // Defensive: a compositor must never panic on a maximize (it takes
         // down every client with it -- "dumps you to a shell"). Every lookup
-        // here is a graceful early-return instead of unwrap()/expect(). This
-        // is the path GTK's own titlebar maximize button drives (apps use
-        // that now, since Evo draws no SSD -- see ack_configure); it must be
-        // bulletproof.
+        // here is a graceful early-return instead of unwrap()/expect().
+        //
+        // Two different buttons land here. A *client*-decorated window (the
+        // boot shell, which runs --kiosk and so negotiates Client) drives it
+        // via GTK's own titlebar. A *server*-decorated window -- every
+        // Nova-launched app, which negotiates Server over
+        // org_kde_kwin_server_decoration (see ack_configure) -- drives it via
+        // Evo's own `HeaderBar::handle_maximize`, deferred through
+        // `insert_idle` to avoid a decoration_state double-borrow. Both must
+        // be bulletproof; the SSD path is the one alpha2 #7 reports crashing.
         let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
             return;
         };
@@ -523,8 +594,54 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             state.size = None;
         });
 
-        if let Some(old_geo) = restored {
-            self.space.map_element(window, old_geo.loc, true);
+        // `restored == None` is not a corner case here, it is the COMMON one,
+        // and leaving it unhandled is a real defect (observed on-device:
+        // "unmaximize_request: restored_loc=None had_saved_geo=false").
+        //
+        // `OldGeometry` is only ever populated by our own `maximize_request`.
+        // A client that comes up maximized under its own steam -- which
+        // GTK/Gecko does, via the `sizemode="maximized"` path in
+        // browser-init.js's onBeforeInitialXULLayout, without ever sending
+        // xdg_toplevel.set_maximized to us -- was never maximized *by Evo*, so
+        // nothing was saved. The window then restores down with no saved rect.
+        //
+        // Previously that meant skipping `map_element` entirely: the client
+        // was told "unmaximized, pick your own size" while the compositor left
+        // the element mapped at its maximized origin, so the two disagreed
+        // about the window's geometry from that moment on. Place it
+        // deliberately instead -- centred on its output at a conventional
+        // restore size -- so both sides agree on where the window is.
+        let restore_loc = restored.map(|old_geo| old_geo.loc).or_else(|| {
+            let output = self
+                .space
+                .outputs_for_element(&window)
+                .first()
+                .cloned()
+                .or_else(|| self.space.outputs().next().cloned())?;
+            let output_geo = self.space.output_geometry(&output)?;
+            let size = self
+                .space
+                .element_bbox(&window)
+                .map(|bbox| bbox.size)
+                .unwrap_or(output_geo.size);
+            // Centre, clamped so the titlebar can never land off-screen.
+            Some(
+                (
+                    output_geo.loc.x + ((output_geo.size.w - size.w) / 2).max(0),
+                    output_geo.loc.y + ((output_geo.size.h - size.h) / 2).max(0),
+                )
+                    .into(),
+            )
+        });
+
+        tracing::info!(
+            "unmaximize_request: mapping to {:?} (synthesized={})",
+            restore_loc,
+            restored.is_none()
+        );
+
+        if let Some(loc) = restore_loc {
+            self.space.map_element(window, loc, true);
         }
 
         if surface.is_initial_configure_sent() {

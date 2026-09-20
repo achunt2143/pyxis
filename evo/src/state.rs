@@ -1693,17 +1693,29 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                     );
 
                     // Bind the freshly mapped Wayland surface to its AppHost
-                    // session. Same-process call — AppHost is a global —
-                    // so this is cheap and safe to issue from the
-                    // compositor's hot path. We pass `pid: None` because
-                    // `WindowElement` doesn't surface the client pid; the
-                    // session that LaunchApp created already carries it.
-                    geckoOS_echo::AppHost::global().bind_surface(
-                        &app_id,
-                        id,
-                        None,
-                        None,
-                    );
+                    // session — over IPC, NOT via `AppHost::global()`.
+                    //
+                    // This used to call `geckoOS_echo::AppHost::global()`
+                    // directly, on the theory that it was a cheap same-process
+                    // call. It isn't: `global()` is a `OnceLock` *process*
+                    // global, and Evo is a separate process from echo-daemon,
+                    // so that bound the surface into an empty AppHost living
+                    // inside the compositor — invisible to the daemon, and
+                    // never `set_bus`'d, so it emitted no lifecycle signals
+                    // either. The daemon's session kept `surfaces: []` and
+                    // `nova.Focus` (which reads `surfaces.first()`) always
+                    // answered "no mapped compositor window yet" — alpha2 #10.
+                    //
+                    // NOTE: surface->session binding deliberately does NOT
+                    // happen here. At map time the xdg app_id is usually still
+                    // unset (GTK/vela assign it later, via `windowclass` ->
+                    // nsWindow::SetWindowClass), so this path saw the "unknown"
+                    // fallback above and `AppHost::bind_surface` synthesized a
+                    // junk session for it -- one bogus `appId: "unknown"`
+                    // session holding every surface, while the real app session
+                    // kept `surfaces: []`. Binding now lives in
+                    // `xdg.rs::ack_configure`, which is the first point where a
+                    // real app id is available. See the comment there.
                 }
             }
         }
@@ -1739,8 +1751,10 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             if let Some(id) = self.unregister_window(window) {
                 let _ = self.echo_service.read().emit_window_closed(id);
                 // Unbind from the AppHost session so its `surfaces` list
-                // and `AppSurfaceUnmapped` signal stay in sync.
-                let _ = geckoOS_echo::AppHost::global().unbind_surface(id);
+                // and `AppSurfaceUnmapped` signal stay in sync. Over IPC for
+                // the same reason as the bind above — `AppHost::global()` in
+                // this process is not the daemon's registry.
+                let _ = self.echo_service.read().unbind_surface_remote(id);
             }
         }
     }
