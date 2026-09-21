@@ -1,0 +1,71 @@
+# Kiosk lost on relaunch after a graceful window close.
+#
+#   scripts/serial-test.py --script scripts/serial-tests/kiosk-relaunch.txt
+#
+# Reported symptom: launch an app (chromeless, correct), close it with the
+# titlebar X, launch it again -> full browser chrome.
+#
+# The close method is the whole point. `nova.Close` signals the process
+# through AppHost and relaunches cleanly — verified, not the bug. The
+# titlebar X sends `xdg_toplevel.close`, letting Gecko run its own
+# teardown, and that is the path that leaves state behind. Driving it needs
+# `evo.CloseWindow`, which was a stub until 2026-09-21 and never sent the
+# client anything, which is why this went unreproduced for so long.
+#
+# Full browser chrome means `openPyxisAppWindow` did not run and the normal
+# `openBrowserWindow` path did. The PYXIS-DIAG probes compiled into vela
+# log `cmdLine.state` and the app id at handle() time, which distinguishes
+# the candidates:
+#   state=0 (INITIAL_LAUNCH) + app id present  -> should have gone kiosk;
+#                                                 look inside the handler
+#   state=2 (REMOTE_AUTO)                      -> remoted into a surviving
+#                                                 vela; MOZ_NO_REMOTE is
+#                                                 not doing its job
+#   app id null                                -> the env/flag was lost on
+#                                                 the second exec
+
+echo "=== LAUNCH 1 ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+#!must windowclass=files
+grep -a 'PYXIS-DIAG' /var/log/echo.log | tail -6
+WID=$(echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"windowId": [0-9]*' | grep -o '[0-9]*'); echo "WID=$WID"
+VELA1=$(pgrep -f '[-]-pyxis-app files' | head -1); echo "vela1=$VELA1"
+
+echo "=== CLOSE VIA THE WINDOW, as the titlebar X does ==="
+#!must "success": true
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$WID}"
+sleep 12
+
+# Did the process actually exit, or is it lingering with no windows? A
+# lingering vela still holds the profile lock, and AppHost still has a live
+# session for it — which sends the next Launch down the single-instance
+# raise path instead of a fresh spawn.
+echo "vela1 still alive: $(kill -0 $VELA1 2>/dev/null && echo YES || echo no)"
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -cE '"appId": "files"'
+ls /var/lib/pyxis/profiles/files/.parentlock 2>&1
+ls -la /var/lib/pyxis/profiles/files/sessionstore-backups/ 2>&1 | tail -2
+
+wc -l < /var/log/echo.log > /tmp/mk
+echo "=== LAUNCH 2 — the reported failure ==="
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 20
+
+echo "--- what the handler saw on launch 2 ---"
+tail -n +$(cat /tmp/mk) /var/log/echo.log | grep -a 'PYXIS-DIAG' | tail -25
+
+echo "--- did a chromeless window get built? ---"
+#!must openPyxisAppWindow(): window opened
+tail -n +$(cat /tmp/mk) /var/log/echo.log | grep -a 'PYXIS-DIAG'
+
+echo "--- what Evo was handed ---"
+grep -a 'ack_configure' /var/log/evo.log | tail -4
+# A browser-chrome window is a second toplevel, or one stamped
+# vela-default instead of the app id.
+#!must-not vela-default
+grep -a 'ack_configure' /var/log/evo.log | tail -2
+
+echo "--- processes and sessions ---"
+pgrep -af '[-]-pyxis-app files' | head -3
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -A4 surfaces
