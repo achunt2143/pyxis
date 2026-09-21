@@ -86,6 +86,43 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
 }
 
 
+    /// A client destroyed its toplevel. Take the window out of the
+    /// workspace, the Space, and the Echo registries.
+    ///
+    /// **This was missing entirely**, and `XdgShellHandler` provides a no-op
+    /// default, so it compiled and silently did nothing — Evo never learned
+    /// that a window had gone away. Observed 2026-09-21: the workspace
+    /// window count only ever rose (1,2,3,4,5,6 across three launches of one
+    /// app) and `remove_window_from_workspace`'s own debug line never
+    /// appeared once in a whole session.
+    ///
+    /// The only call to that function was in the commit handler, guarded by
+    /// `if !root.alive()` — which cannot fire for a normally-closed window,
+    /// because destroying a toplevel is precisely when commits STOP. It
+    /// could only ever catch a surface that died between a commit being
+    /// queued and handled.
+    ///
+    /// What the user saw: close an app, launch it again, and get a dead
+    /// browser-chrome window sitting over the real one. Those are stale
+    /// elements Evo kept compositing — including the short-lived unstamped
+    /// window Gecko opens and closes during startup, which reaches Evo as
+    /// `vela-default` (no `pyxisApp` stamp) and then never leaves. It read
+    /// as "kiosk mode was ignored on relaunch"; the window was real, just
+    /// nobody's.
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.0.toplevel().map(|t| t == &surface).unwrap_or(false))
+            .cloned()
+        else {
+            // Already gone, or never made it into the Space.
+            debug!("toplevel_destroyed: no tracked window for this surface");
+            return;
+        };
+        self.remove_window_from_workspace(&window);
+    }
+
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         self.unconstrain_popup(&surface);
 

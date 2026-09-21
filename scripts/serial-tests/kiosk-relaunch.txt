@@ -69,3 +69,41 @@ grep -a 'ack_configure' /var/log/evo.log | tail -2
 echo "--- processes and sessions ---"
 pgrep -af '[-]-pyxis-app files' | head -3
 echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -A4 surfaces
+
+# ---------- the actual root cause: Evo never removed destroyed windows ----
+# Found 2026-09-21 from a user session's logs. `remove_window_from_workspace`
+# was only reachable from the commit handler under `if !root.alive()`, which
+# cannot fire for a normally-closed window — destroying a toplevel is when
+# commits STOP. XdgShellHandler::toplevel_destroyed was not implemented, and
+# the trait's no-op default meant this compiled and silently did nothing.
+#
+# Symptom in the log: the workspace count only ever rose (1,2,3,4,5,6 over
+# three launches of one app) and the removal debug line never appeared once.
+# On screen: dead browser-chrome windows stacking over the real app, which
+# read as "kiosk mode ignored on relaunch".
+#
+# Three close/relaunch cycles. The count must come back down, not climb.
+echo "=== cycle A ==="
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"terminal"}' >/dev/null; sleep 16
+WA=$(echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -o '"windowId": [0-9]*' | grep -o '[0-9]*')
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$WA}" >/dev/null; sleep 10
+echo "=== cycle B ==="
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"terminal"}' >/dev/null; sleep 16
+WB=$(echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -o '"windowId": [0-9]*' | grep -o '[0-9]*')
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$WB}" >/dev/null; sleep 10
+echo "=== cycle C ==="
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"terminal"}' >/dev/null; sleep 18
+
+# Removal must actually happen — this line was absent from an entire session.
+#!must Removed window from workspace
+grep -a 'Removed window from workspace' /var/log/evo.log | tail -3
+
+# The count is the regression guard. Bloom + one app is 2; with the leak it
+# reached 6 over three launches. Anything above 3 means windows are piling up.
+#!must WINDOW-COUNT-SANE
+test $(grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).*/\1/' | sort -n | tail -1) -le 3 && echo WINDOW-COUNT-SANE || echo WINDOWS-LEAKING
+grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).*/count=\1/' | tr '\n' ' '
+
+# And no unstamped leftovers should still be mapped at the end.
+#!must ONLY-EXPECTED-WINDOWS
+test $(echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -c '"appId"') -eq 1 && echo ONLY-EXPECTED-WINDOWS || echo EXTRA-SESSIONS
