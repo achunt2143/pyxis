@@ -684,6 +684,54 @@ Condensed from CLAUDE.md, updated with this session's progress.
 
 ## Change log
 
+### Kiosk-on-relaunch — NOT reproducible on the 2026-09-21 build
+
+Reported again as still present: launch an app (chromeless, correct), close
+it with the titlebar X, launch it again -> full browser chrome. Chased with
+`scripts/serial-tests/kiosk-relaunch.txt` and two ad-hoc variants. **Could
+not be reproduced by any teardown path that can be driven over IPC.**
+
+| How the app ended | Left behind | Relaunch |
+|---|---|---|
+| `nova.Close` (signals the process) | nothing | chromeless ✓ |
+| Graceful window close (`xdg_toplevel.close`, the titlebar-X path) | nothing — vela exits, AppHost drops the session, `sessionstore-backups/` empties | chromeless ✓ |
+| `SIGKILL` (a crash) | `recovery.jsonlz4` **and** a stale `.parentlock` | chromeless ✓ |
+
+Four consecutive launch/close cycles mixing all three: four
+`openPyxisAppWindow(): window opened`, four `is_ssd=true` toplevels, no
+second window, `cmdLine.state=0` with the app id resolved every time.
+
+The crash row is the interesting one — it is the exact state the 2026-08-17
+comment in `BrowserContentHandler.sys.mjs` predicted would trigger a
+restore ("an app that dies on unmaximize is what leaves the state that
+makes the next launch restore"). `user.js`'s `sessionstore.resume_from_crash
+= false` / `max_resumed_crashes = 0` / `startup.page = 0` hold even with a
+recovery file present.
+
+**Working theory: it was a downstream symptom of #7** (maximize→unmaximize
+killing the app), which is fixed and user-confirmed. The comment tied the
+two together explicitly, and the trigger it named is gone. Not being closed
+on that reasoning alone — it needs a re-test on a current image, because
+the report came from a long-running GUI VM that was booted pre-fix *and*
+had its backing file overwritten underneath it by a rebuild.
+
+**If it recurs on a fresh image**, the PYXIS-DIAG probes compiled into vela
+separate the candidates in one line of `echo.log`: `cmdLine.state=0` with
+an app id means the fault is inside the handler; `state=2` (REMOTE_AUTO)
+means the launch was remoted into a surviving vela and `MOZ_NO_REMOTE` is
+not working; a null app id means the flag and env were both lost on the
+second exec.
+
+**Found while chasing it — a real gap, now fixed:** `evo.CloseWindow` was a
+stub. It deleted an id from `EchoIpcService::windows` (the create/claim map,
+which never holds app windows) and reported success from that, never
+sending the client anything. There was no way to close an app window from
+the shell at all — only `nova.Close`, which signals the process. Now queued
+like the other window actions and applied against `windows_by_id`, sending
+`xdg_toplevel.close`, the same call the titlebar X makes. Verified on
+device: vela exits, the session drops, the profile lock clears.
+
+
 ### Alpha4 fixes — error reporting, log volume (2026-09-20)
 
 Found by running the suites against the rebuilt image.
