@@ -1881,6 +1881,16 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 }
                 WindowAction::Minimize => self.minimize_window(&window),
                 WindowAction::Restore => self.unminimize_window(&window),
+                // Same call the SSD close button makes (shell/ssd.rs's
+                // handle_close): ask the client to close and let it run its
+                // own teardown, rather than signalling the process.
+                WindowAction::Close => match window.0.underlying_surface() {
+                    smithay::desktop::WindowSurface::Wayland(w) => w.send_close(),
+                    #[cfg(feature = "xwayland")]
+                    smithay::desktop::WindowSurface::X11(w) => {
+                        let _ = w.close();
+                    }
+                },
             }
         }
     }

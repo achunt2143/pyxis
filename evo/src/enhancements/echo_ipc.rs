@@ -105,6 +105,10 @@ pub enum WindowAction {
     Focus,
     Minimize,
     Restore,
+    /// Ask the client to close, as the titlebar X does — `xdg_toplevel.close`,
+    /// not a signal. The app gets to run its own teardown; `nova.Close`
+    /// (which signals the process through AppHost) is the forceful path.
+    Close,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1072,23 +1076,38 @@ impl GeckoEchoService {
                 response_msg
             }
 
+            // Was a stub: it removed the id from `EchoIpcService::windows`
+            // and reported success from whether that map happened to hold
+            // it. That map only ever contains windows Evo *created* via the
+            // two-step create/claim contract (see resolve_window_arg), so
+            // for an ordinary app window it removed nothing, answered
+            // `{"success": false}`, and — the actual problem — never told
+            // the client anything. There was no way to close an app window
+            // from the shell at all; only nova.Close, which signals the
+            // process rather than asking the window to go away.
+            //
+            // Now queued like every other window action, and applied in
+            // EvoState::process_pending_window_actions against
+            // `windows_by_id` (the map that has real toplevels), where it
+            // sends xdg_toplevel.close — the same thing the titlebar X does.
             "CloseWindow" => {
-                let window_id = msg
-                    .body
-                    .get("window_id")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-
-                let was_tracked = {
-                    let mut windows_map = windows.write();
-                    windows_map.remove(&window_id).is_some()
-                };
-
-                if was_tracked {
-                    info!("Closed window {}", window_id);
+                match Self::resolve_window_arg(&msg) {
+                    Ok(window_id) => {
+                        pending_window_actions.write().push(PendingWindowAction {
+                            window_id,
+                            action: WindowAction::Close,
+                        });
+                        info!("Queued CloseWindow request for window {}", window_id);
+                        EchoMessage::method_return(
+                            message_id,
+                            json!({ "success": true, "window_id": window_id }),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("CloseWindow: {}", e);
+                        EchoMessage::method_error(message_id, &e)
+                    }
                 }
-
-                EchoMessage::method_return(message_id, json!({ "success": was_tracked }))
             }
 
             "SwitchWorkspace" => {
