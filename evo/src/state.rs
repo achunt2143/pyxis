@@ -1884,6 +1884,27 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 // Same call the SSD close button makes (shell/ssd.rs's
                 // handle_close): ask the client to close and let it run its
                 // own teardown, rather than signalling the process.
+                // Straight through to the same requests the SSD button
+                // defers to. No insert_idle needed here: ssd.rs defers
+                // because it runs while a decoration_state RefMut is still
+                // held by the pointer-button path, and maximize_request
+                // re-borrows it via Space::map_element. This runs from the
+                // event loop with no such borrow outstanding.
+                WindowAction::Maximize | WindowAction::Unmaximize => {
+                    if let smithay::desktop::WindowSurface::Wayland(w) =
+                        window.0.underlying_surface()
+                    {
+                        use smithay::wayland::shell::xdg::XdgShellHandler;
+                        let surface = w.clone();
+                        if matches!(pending.action, WindowAction::Maximize) {
+                            XdgShellHandler::maximize_request(self, surface);
+                        } else {
+                            XdgShellHandler::unmaximize_request(self, surface);
+                        }
+                    } else {
+                        warn!("{:?} is only implemented for Wayland toplevels", pending.action);
+                    }
+                }
                 WindowAction::Close => match window.0.underlying_surface() {
                     smithay::desktop::WindowSurface::Wayland(w) => w.send_close(),
                     #[cfg(feature = "xwayland")]

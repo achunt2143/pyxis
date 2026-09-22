@@ -684,7 +684,52 @@ Condensed from CLAUDE.md, updated with this session's progress.
 
 ## Change log
 
-### Kiosk-on-relaunch — NOT reproducible on the 2026-09-21 build
+### Kiosk-on-relaunch — still open; one real bug fixed on the way
+
+**Correction to the entry below**: it was written before a user re-test and
+overstated the conclusion. The window-leak fix (`toplevel_destroyed`) was a
+genuine bug and is confirmed fixed on device — the workspace count now holds
+at 2 with removals logged, where it previously climbed 1→6 with none ever.
+**It was not the reported bug**, which still reproduces for the user.
+
+What the user's logs prove, across five launches of terminal and files:
+Gecko is not at fault. `openPyxisAppWindow(): window opened,
+windowclass=<app>` on every launch, one toplevel each, all `ssd=true`, no
+stray `vela-default` any more. Both sides look correct and the user still
+sees Firefox chrome.
+
+**The mistake that cost time here:** treating
+`openPyxisAppWindow(): window opened` as proof of chromelessness. It proves
+the chromeless code *path* ran and the window got stamped — nothing about
+whether `chromehidden` actually took effect. Two different claims.
+
+**The one state difference between the user's runs and every reproduction
+attempt:** `xulstore.json`. The user maximizes; every scripted run had
+`sizemode=normal`. After a maximize the profile carries
+
+```json
+"chrome://browser/content/browser.xhtml": { "main-window": { "sizemode": "maximized" } }
+```
+
+and a fresh profile has no `xulstore.json` at all — which is exactly the
+shape of "first launch fine, later ones not". Whether persisted geometry can
+actually bring chrome back is NOT established; `xulstore` should not touch
+`chromehidden`. It is the lead, not the answer.
+
+**Two gaps found while trying to reproduce it, both now fixed:**
+- `evo.MaximizeWindow` answered "Method not implemented" — there was no IPC
+  for maximize at all, so neither the shell nor a test could maximize a
+  window, only a human with a pointer. That is why #7 and this bug both
+  resisted headless reproduction. `MaximizeWindow`/`UnmaximizeWindow` now
+  queue like the other window actions.
+- The acceptance app's probe now measures chrome directly —
+  `window.toolbar.visible` / `locationbar` / `menubar` are standard DOM,
+  readable from content, and reflect the window features that were actually
+  applied. That is the missing instrument: it distinguishes "the chromeless
+  path ran" from "the chrome is hidden", with no screenshot channel and no
+  Gecko rebuild.
+
+### Superseded note — reproduction attempts before the user's re-test
 
 Reported again as still present: launch an app (chromeless, correct), close
 it with the titlebar X, launch it again -> full browser chrome. Chased with

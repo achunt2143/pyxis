@@ -109,6 +109,13 @@ pub enum WindowAction {
     /// not a signal. The app gets to run its own teardown; `nova.Close`
     /// (which signals the process through AppHost) is the forceful path.
     Close,
+    /// What the SSD titlebar's maximize button does. There was no IPC for
+    /// this at all — `MaximizeWindow` fell through to "Method not
+    /// implemented" — so neither the shell nor a test could maximize a
+    /// window, only a human with a pointer. That made bug #7 and the
+    /// kiosk-on-relaunch report impossible to reproduce headlessly.
+    Maximize,
+    Unmaximize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1105,6 +1112,31 @@ impl GeckoEchoService {
                     }
                     Err(e) => {
                         warn!("CloseWindow: {}", e);
+                        EchoMessage::method_error(message_id, &e)
+                    }
+                }
+            }
+
+            "MaximizeWindow" | "UnmaximizeWindow" => {
+                let action = if method == "MaximizeWindow" {
+                    WindowAction::Maximize
+                } else {
+                    WindowAction::Unmaximize
+                };
+                match Self::resolve_window_arg(&msg) {
+                    Ok(window_id) => {
+                        pending_window_actions.write().push(PendingWindowAction {
+                            window_id,
+                            action,
+                        });
+                        info!("Queued {} request for window {}", method, window_id);
+                        EchoMessage::method_return(
+                            message_id,
+                            json!({ "success": true, "window_id": window_id }),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("{}: {}", method, e);
                         EchoMessage::method_error(message_id, &e)
                     }
                 }

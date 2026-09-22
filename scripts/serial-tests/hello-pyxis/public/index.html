@@ -22,6 +22,22 @@
     // attached for a *third-party* origin, and Nova's appinfo->capability
     // mapping actually granted filesystem:write to an ordinary opkg app.
     const PROOF = '/tmp/pyxis-hello-proof.txt';
+    // Chrome visibility, measured rather than looked at. These barprops are
+    // standard DOM and readable from content, and they reflect the window
+    // features openPyxisAppWindow passed (toolbar=no, location=no,
+    // menubar=no). If a relaunch comes up with Firefox chrome, these are
+    // what say so from inside a headless run — there is no screenshot
+    // channel, and the existing PYXIS-DIAG only proves the chromeless code
+    // PATH ran, not that the chrome is actually hidden.
+    const CHROME = [
+      'toolbar=' + (window.toolbar ? window.toolbar.visible : '?'),
+      'locationbar=' + (window.locationbar ? window.locationbar.visible : '?'),
+      'menubar=' + (window.menubar ? window.menubar.visible : '?'),
+      'personalbar=' + (window.personalbar ? window.personalbar.visible : '?'),
+      'statusbar=' + (window.statusbar ? window.statusbar.visible : '?'),
+      'outer=' + window.outerWidth + 'x' + window.outerHeight,
+      'inner=' + window.innerWidth + 'x' + window.innerHeight,
+    ].join(' ');
     const out = document.getElementById('out');
 
     async function probe() {
@@ -30,6 +46,7 @@
         'href=' + location.href,
         'secureContext=' + window.isSecureContext,
         'bridge=' + (window.geckoOS ? 'present' : 'ABSENT'),
+        'chrome: ' + CHROME,
       ];
       if (window.geckoOS) {
         lines.push('initialized=' + window.geckoOS.initialized);
@@ -45,7 +62,14 @@
 
       if (window.geckoOS?.filesystem) {
         try {
-          await window.geckoOS.filesystem.writeFile(PROOF, lines.join('\n') + '\n');
+          // One file per launch, not appendFile — appendFile wrote nothing
+          // at all on device (the file did not exist and was not created),
+          // and the whole question is how launch 2 differs from launch 1,
+          // so each launch needs its own record rather than overwriting.
+          await window.geckoOS.filesystem.writeFile(
+            PROOF.replace('.txt', '-' + Date.now() + '.txt'),
+            lines.join('\n') + '\n'
+          );
         } catch (e) {
           // Nothing else to do — the absence of the file IS the result.
           out.textContent += '\nwriteFile FAILED: ' + e;
