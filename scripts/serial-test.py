@@ -95,7 +95,17 @@ def kvm_args() -> list[str]:
 
 class Guest:
     def __init__(self, image: Path, overlay: bool, memory: int, logfile) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="pyxis-serial-"))
+        # Next to the image, NOT tempfile.mkdtemp(). /tmp is a 16 GB tmpfs on
+        # this machine — i.e. RAM — so putting a qcow2 overlay there means the
+        # guest's writes are backed by the host's memory, competing with the
+        # 4 GB the guest itself wants. Learned the hard way: image copies and
+        # overlays left in /tmp reached 13 GB of a 16 GB tmpfs and took the
+        # host down to 3 GB free, at which point subprocesses started failing
+        # outright. The image directory is on real disk and already holds
+        # multi-GB artefacts.
+        scratch = image.parent / ".serial-test"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="run-", dir=scratch))
         self.logfile = logfile
 
         if overlay:

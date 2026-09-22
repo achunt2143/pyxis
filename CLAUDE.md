@@ -103,7 +103,7 @@ decision — the decision is above.
   never pruned on disconnect, so a registered-then-crashed client keeps its
   entry forever — the listing now shows it as unreachable instead of implying
   it is running.
-- No permission/capability model is *enforced* anywhere yet — Nova has the vocabulary, nothing checks it at the bridge. See next section.
+- **Permissions ARE enforced at the bridge** — this file said the opposite for months. `PyxisBridgeParent.sys.mjs`'s `_capabilityFor(service, method)` maps each call to a capability (`filesystem.writeFile` → `filesystem:write`, `readFile`/`readDirectory`/`exists`/`stat` → `filesystem:read`, …) and throws `Pyxis capability denied: app '<id>' did not declare '<cap>'` when the app's declared list lacks it. Verified on device 2026-09-21 the hard way: a probe page dropped into the `files` app wrote nothing at all, because `files`' `manifest.webapp` declares only `filesystem:read`. What is still missing is the *visible* half — an install-time prompt, a per-app view, and revocation (roadmap item 6) — not the check itself.
 - `pyxis-experience`'s README is still the stock Vite template. Test coverage is no longer zero — Vitest is wired up (`npm test`), with `src/hooks/__tests__/novaContract.test.ts` asserting the mock's `nova.List` shape against fields **parsed out of `nova.rs` itself**, so adding a field to `to_info_json` without teaching the mock fails at the desk. That suite is the pattern to extend; it is still the only one.
 - **remochi's `Toggle` types don't match its runtime**: `index.d.ts` declares a `checked` prop, but the exported component reads `value` and calls `onChange({ value })`. Passing `checked` type-checks and is silently ignored. Bloom bridges this with a locally-typed `Switch` cast in `QuickSettingsMenu.tsx` and `SettingsApp.tsx` — check for that trap before adding a new `Toggle`.
 
@@ -113,7 +113,7 @@ decision — the decision is above.
 
 ## The one thing webOS got right that Pyxis hasn't built
 
-webOS's LS2 bus enforced a **JSON role-file allow-list per identity** at the bus itself, before any message was delivered. Echo has **no equivalent** today (`apphost.rs`'s own doc comment lists "permissions enforcement" as not-in-MVP). This is called out across multiple docs as the single biggest security-model gap, and the plan is to add a per-app capability allow-list (from `manifest.webapp`'s `permissions[]`) enforced at the Synergy/bridge boundary — see `nova-runtime-host-plan.md` §5/§7 and `pyxis-webos-parity-analysis.md` §4 item 6.
+webOS's LS2 bus enforced a **JSON role-file allow-list per identity** *at the bus itself*, before any message was delivered. Pyxis enforces at the **bridge** instead (`PyxisBridgeParent._capabilityFor`, checked against the app's declared `permissions[]` — confirmed working on device 2026-09-21), which covers every `pyxis://` app but **not** a native client that opens the Echo socket directly: `echo-cli` can still call anything. So the gap is narrower than this section used to claim — it is bus-level enforcement for non-bridge clients, plus the user-visible half (install-time prompt, per-app view, revoke) in roadmap item 6. See `nova-runtime-host-plan.md` §5/§7 and `pyxis-webos-parity-analysis.md` §4 item 6.
 
 ## Consolidated roadmap (dependency order)
 

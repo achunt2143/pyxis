@@ -372,9 +372,17 @@ a demo from something you'd leave running.
 - [ ] Install-time permission prompt in the Installer, driven by Nova's
       declared-permission list (`nova.rs:194-232`).
 - [ ] Settings → Apps: per-app permission view with revoke.
-- [ ] Enforce the capability allow-list at the bridge boundary — the
-      `JSWindowActor` should refuse an ungranted service call, not just filter
-      the API surface.
+- [x] Enforce the capability allow-list at the bridge boundary. **Already
+      done and confirmed on device 2026-09-21** — this was listed as
+      outstanding for months while `PyxisBridgeParent._capabilityFor` was
+      already refusing ungranted calls with
+      `Pyxis capability denied: app '<id>' did not declare '<cap>'`. Found
+      by accident: a probe dropped into the `files` app could not write a
+      file, because its `manifest.webapp` declares only `filesystem:read`.
+      **Still open**, and the real content of this item: Echo's *socket*
+      clients bypass it entirely (`echo-cli` can call anything), so
+      enforcement is per-bridge, not per-bus the way webOS's LS2 role files
+      were.
 
 **B. Package integrity**
 
