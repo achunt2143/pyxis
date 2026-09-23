@@ -684,6 +684,65 @@ Condensed from CLAUDE.md, updated with this session's progress.
 
 ## Change log
 
+### Kiosk/chrome on app windows — measured, characterised, NOT yet fixed (2026-09-23)
+
+The reported bug ("second and subsequent launches come up with Firefox
+chrome") is real and now has numbers behind it. It is **not** fixed.
+
+**The instrument.** There is no screenshot channel, and the existing
+PYXIS-DIAG probes only prove `openPyxisAppWindow` *ran* — not that the
+chrome is hidden. Reading that as proof of chromelessness cost this
+investigation a lot; they are different claims. The only valid measurement
+found is `window.outerHeight - window.innerHeight` from content, taken by a
+probe page swapped into an app's webroot.
+
+**Do not use `window.toolbar.visible`.** From content it reports `true` even
+for a genuinely chromeless window — bloom reads `toolbar=true` with a
+delta of 1px. The barprops describe the content window, not the chrome.
+
+**Measured, with bloom as the control** (bloom is the one surface with no
+chrome on screen):
+
+| window | launched with | chromeDelta |
+|---|---|---|
+| bloom (the shell) | `--kiosk --pyxis-app bloom` | **1px** |
+| files, launch 1, fresh profile | `--pyxis-app files` | **49px** |
+| files, launch 2 | same | **134px** |
+| files, launch 3 | same | **87px** |
+| com.pyxis.hello (opkg tier) | same | 49 / 132 / 88 |
+
+Three conclusions follow:
+
+1. **Chrome is present on EVERY app launch, including the first.** 49px is
+   real Firefox chrome — roughly one toolbar, most likely `#TabsToolbar`,
+   whose hiding the patch's own comment says depends on
+   `window.toolbar.visible === false`.
+2. **It is not tier-specific.** A built-in and an opkg app measure the same
+   to within a pixel, so the launch path is not the variable.
+3. **`--kiosk` is what actually produces a chromeless window**, exactly as
+   `create-rootfs.sh:1200` says. `kPyxisAppWindowFeatures` →
+   `chromehidden` does not achieve it alone.
+
+**`--kiosk` is not a drop-in fix.** Adding it to an app's command line (same
+env, only the flag differing) produced a window Evo saw as `vela-default`
+with `kde_decoration=Client` — unstamped, so AppHost could not bind it, and
+the app's page never loaded. It also forces fullscreen via nsAppRunner's
+`gKioskMode` → `IsAlwaysUndecoratedWindow()`, which is wrong for windowed
+apps.
+
+**Next step is a Gecko-side fix and therefore a `mach build`** (hours): work
+out why `chromehidden` leaves ~49px when the features string turns
+`toolbar`/`location`/`menubar`/`personalbar`/`status` off, and why the
+residue *grows* on relaunch (49 → 134 → 87). The growth on top of a
+non-zero baseline suggests two separate effects, not one.
+
+**Fixed along the way** (all real, none of them this bug): Evo never removed
+destroyed windows (`toplevel_destroyed` unimplemented; count climbed 1→6
+with zero removals), `evo.CloseWindow` was a stub that never told the client
+anything, and `evo.MaximizeWindow` did not exist at all — which is why this
+bug and #7 both resisted headless reproduction, since the user maximizes.
+
+
 ### Kiosk-on-relaunch — still open; one real bug fixed on the way
 
 **Correction to the entry below**: it was written before a user re-test and
