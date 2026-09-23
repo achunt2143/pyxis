@@ -1291,6 +1291,33 @@ user_pref("extensions.enabledScopes", 0);
 user_pref("extensions.installDistroAddons", false);
 user_pref("extensions.systemAddon.update.enabled", false);
 user_pref("xpinstall.enabled", false);
+
+// No notification bars in an app window.
+//
+// This is the "second and subsequent launches come up with Firefox chrome"
+// bug, measured 2026-09-23. It was never chrome: `chromehidden` works
+// perfectly (menubar/toolbar/location/directories/status/extrachrome all
+// set, #nav-bar display:none, #TabsToolbar 0px). The 49px was
+// #notifications-toolbar, which lives inside #navigator-toolbox but carries
+// no `chromeclass-*`, so not one of the chromehidden CSS rules can reach it.
+//
+// What it was showing: `sandbox-unprivileged-namespaces`, Firefox's warning
+// that unprivileged user namespaces are unavailable so the content sandbox
+// is weakened. That warning is CORRECT — the kernel is built with
+// `# CONFIG_USER_NS is not set` (scripts/.config), so the sandbox really is
+// degraded. Suppressing the bar does not fix the sandbox; see
+// PROJECT_STATUS for that as a separate, real security item.
+//
+// And notification bars STACK, which is the whole "gets worse each launch"
+// symptom: measured toolbarH=48 on the first launch and 96.7 on the second,
+// the same warning added again.
+user_pref("security.sandbox.warn_unprivileged_namespaces", false);
+// Belt and braces for the same class of problem: an app window should never
+// surface browser-level notification bars, whatever raises them.
+user_pref("browser.tabs.crashReporting.sendReport", false);
+user_pref("browser.aboutConfig.showWarning", false);
+user_pref("datareporting.policy.firstRunURL", "");
+user_pref("browser.startup.homepage_override.mstone", "ignore");
 "#;
         let path = dir.join("user.js");
         fs::write(&path, prefs).with_context(|| format!("write {}", path.display()))?;
