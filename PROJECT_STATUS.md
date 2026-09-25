@@ -374,7 +374,7 @@ blocked on any decision.
 
 ---
 
-## Kiosk-on-relaunch — ROOT CAUSED 2026-08-17: an orphaned vela, not a kiosk bug
+## Kiosk-on-relaunch — ROOT CAUSED 2026-08-17: an orphaned vela, not a kiosk bug — SUPERSEDED (2026-09-25)
 
 **Symptom:** launch an app, close it, launch it again — the second window is a
 plain Firefox window with omnibar, menu and extension buttons instead of a
@@ -684,7 +684,100 @@ Condensed from CLAUDE.md, updated with this session's progress.
 
 ## Change log
 
-### Kiosk/chrome on app windows — measured, characterised, NOT yet fixed (2026-09-23)
+### Kiosk-on-relaunch — ROOT CAUSED AND FIXED (2026-09-25)
+
+**Everything below this entry about this bug is superseded.** Three
+diagnoses were wrong before this one; all of them are kept because the
+*reasons* they were wrong are the reusable part.
+
+**It was SessionStore, not the kiosk window features.** The window is opened
+chromeless correctly on every launch, and then has its chrome flags
+rewritten out from under it about two seconds later:
+
+| measured in the app window | at `load` | at `load+2s` |
+|---|---|---|
+| `chromehidden` | `menubar toolbar location directories status extrachrome` | `extrachrome` |
+| `window.toolbar.visible` | `false` | `true` |
+| `#nav-bar` | 0px (`display:none`) | **40px** |
+| content top offset | 1px | 41px |
+| tabs / visible tabs | 1 / 1 | 1 / 1 (unchanged) |
+
+The call path, from a stack captured on device:
+
+```
+ssi_restoreWindows -> _restoreWindowsInReversedZOrder
+                   -> _restoreWindowsFeaturesAndTabs
+                   -> restoreWindowFeatures(window, state.windows[0])
+```
+
+and `restoreWindowFeatures()` does, for every `WINDOW_HIDEABLE_FEATURES`
+entry, `aWindow[aItem].visible = !hidden.includes(aItem)`. The app window's
+restore state carries no `hidden` field, so that is `.visible = true` for
+menubar, toolbar, locationbar, personalbar and statusbar. Setting those from
+chrome rewrites the window's chrome flags; `AppWindow::ApplyChromeFlags()`
+regenerates `chromehidden`, un-hiding `#nav-bar` (40px of URL bar). It also
+flips `window.toolbar.visible` back to true, which undoes
+`TabBarVisibility.update()`'s popup-like single-tab treatment.
+
+**Why the second launch:** the restore needs a previous session to restore.
+A profile whose app has never run and quit has no state, so launch 1 is
+clean; after that every launch is chromed. Once state exists the first
+launch after a boot is chromed too — verified. "First launch is fine" meant
+the first launch in a profile's life, not per boot.
+
+**The fix** (`gecko/patches/pyxis/browser/components/sessionstore/SessionStore.sys.mjs.PYXIS_DIFF`)
+is upstream's own escape hatch. Firefox has this exact problem with its own
+single-purpose app windows (Taskbar Tabs) and guards SessionStore against it
+in four places, all keyed on one `taskbartab` root-element attribute. A
+`pyxisapp` window is the same kind of thing; the patch adds one predicate,
+`pyxisIsSinglePurposeAppWindow()`, and calls it at the two sites that read
+the attribute. No C++ and **no `mach build`** — vela ships loose JS, and
+`dist/bin` symlinks straight into the source tree, so a rootfs restage
+picks it up.
+
+**Verified on device, with a control.** Three launches of `files`, closing
+the window each time, on the same image:
+
+| | with the patch | control (upstream SessionStore) |
+|---|---|---|
+| `toolbar.visible` | `false` ×3 | `true` ×3 |
+| `#nav-bar` | `0` ×3 | `40` ×3 |
+| `chromehidden` | full kiosk set ×3 | `extrachrome` ×3 |
+
+The control is the point: it proves the new suite can fail, and that the
+patch is what makes it pass. Both runs are in
+`scripts/serial-tests/kiosk-relaunch.txt`'s final section.
+
+**Why this took four attempts, and what to do differently.** Every probe
+before this one fired at or before window load, where the window is still
+correct — so a broken build measured clean. `PYXIS-DIAG chrome-late:`
+(browser-init.js, now permanent) logs the *settled* state 5s in; that is the
+only thing worth asserting about window chrome. The corollary for any
+future chrome bug: **measure the settled state, not the state at open.**
+
+Two earlier diagnoses were recorded as fixes and were not:
+
+- **The stacking notification bar** (commit `25fee78`) — `#notifications-toolbar`
+  really does carry no `chromeclass-*`, really is unreachable by
+  `chromehidden`, and really did stack a `sandbox-unprivileged-namespaces`
+  bar per launch. All true, and all irrelevant: suppressing it left the
+  40px `#nav-bar` untouched. The pref it added
+  (`security.sandbox.warn_unprivileged_namespaces=false`) is kept — the bar
+  is noise in an app window — but it fixed nothing. **The warning itself is
+  correct**: the kernel is built with `# CONFIG_USER_NS is not set`, so
+  vela's content sandbox genuinely is degraded. That is a real open security
+  item, not cosmetic, and enabling `CONFIG_USER_NS` is a kernel rebuild.
+- **The window leak** (`toplevel_destroyed`, commit `7fe1268`) — a genuine
+  bug, genuinely fixed, confirmed on device (count holds at 2 with removals
+  logged, where it climbed 1→6 with none). Also not this bug.
+
+A third theory that the measurement killed before it could be shipped:
+`TabBarVisibility.update()` makes the chromeless treatment conditional on
+`gBrowser.visibleTabs.length == 1`, so a second tab would show the tab strip
+by design. Plausible, wrong — the tab count was 1 throughout, on every
+launch. Worth knowing the conditional exists.
+
+### Kiosk/chrome on app windows — measured, characterised, NOT yet fixed (2026-09-23) — SUPERSEDED, see above
 
 The reported bug ("second and subsequent launches come up with Firefox
 chrome") is real and now has numbers behind it. It is **not** fixed.
@@ -743,7 +836,7 @@ anything, and `evo.MaximizeWindow` did not exist at all — which is why this
 bug and #7 both resisted headless reproduction, since the user maximizes.
 
 
-### Kiosk-on-relaunch — still open; one real bug fixed on the way
+### Kiosk-on-relaunch — still open; one real bug fixed on the way — SUPERSEDED (2026-09-25)
 
 **Correction to the entry below**: it was written before a user re-test and
 overstated the conclusion. The window-leak fix (`toplevel_destroyed`) was a

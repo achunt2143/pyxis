@@ -1,0 +1,154 @@
+Real, verified unified diff against the upstream file
+browser/components/sessionstore/SessionStore.sys.mjs (checkout
+target/gecko-src/gecko-dev, branch central-work @
+5836a062726f715fda621338a17b51aff30d0a8c).
+
+FIXES: "second and subsequent launches of an app come up with full Firefox
+chrome" -- the longest-running open bug in the app-window work, reported
+repeatedly from 2026-08 and finally root-caused on device 2026-09-25.
+
+It was never the kiosk window features, and never `chromehidden`. Those are
+applied correctly on every launch, as measured in the app window itself:
+
+    at window load  chromehidden="menubar toolbar location directories
+                                  status extrachrome"
+                    toolbar.visible=false  nav-bar=0px  contentTop=1px
+
+    ~2s later       chromehidden="extrachrome"
+                    toolbar.visible=true   nav-bar=40px contentTop=41px
+
+The window is born chromeless and then has its chrome flags rewritten out
+from under it. The culprit is SessionStore restoring the previous session's
+window features into the newly opened app window:
+
+  ssi_restoreWindows
+    -> _restoreWindowsInReversedZOrder
+      -> _restoreWindowsFeaturesAndTabs
+        -> restoreWindowFeatures(window, state.windows[0])
+
+and restoreWindowFeatures() does, for every WINDOW_HIDEABLE_FEATURES entry,
+
+    aWindow[aItem].visible = !hidden.includes(aItem);
+
+With `aWinData.hidden` undefined -- which is what the app window's restore
+state carries -- that is `.visible = true` for menubar, toolbar, locationbar,
+personalbar and statusbar. Setting those from chrome rewrites the window's
+chrome flags; AppWindow::ApplyChromeFlags() then regenerates the root
+element's `chromehidden` attribute, which un-hides #nav-bar (40px of URL
+bar, .chromeclass-location). It also flips `window.toolbar.visible` back to
+true, which un-does TabBarVisibility.update()'s popup-like single-tab
+treatment for good measure.
+
+Why only the *second* launch: the restore needs something to restore. A
+profile whose app has never run and quit has no session state, so launch 1
+is clean; from then on every launch has a previous window to restore and is
+chromed. (Once state exists, the first launch after a boot is chromed too --
+verified. The reported "first launch is fine" is the first launch in a
+profile's life, not per boot.)
+
+The fix is upstream's own escape hatch. Firefox has this exact problem with
+its own single-purpose app windows (Taskbar Tabs) and guards SessionStore
+against it in four places, all keyed on one `taskbartab` root-element
+attribute: the `isTaskbarTab` flag latched in onLoad() makes
+initializeWindow() defer the initial state instead of restoring it, excludes
+the window from the state collected in getCurrentState(), and keeps it out
+of the last-session split at shutdown; restoreWindowFeatures() then
+re-checks the attribute directly as a second line of defence.
+
+A `pyxisapp` window is the same kind of thing and gets the same treatment.
+This patch adds one module-level predicate, pyxisIsSinglePurposeAppWindow(),
+and calls it at the two sites that read the attribute -- the flag latch in
+onLoad() and the re-check in restoreWindowFeatures(). The stored field keeps
+upstream's `isTaskbarTab` name so the other consumers are reached unchanged;
+overloading it is deliberate and is what makes this a two-line behavioural
+change rather than a four-site one.
+
+Note this does NOT rely on the window being popup-like. initializeWindow()'s
+first branch tests only `isPrivateWindow || isTaskbarTab` -- `toolbar.visible
+== false` does not protect an app window there, which is why the kiosk
+features alone were never enough.
+
+Related, and deliberately NOT relied on: nova.rs's generated per-app user.js
+already sets browser.sessionstore.resume_from_crash=false and
+browser.startup.page=0. Neither prevents this path -- the restore observed
+here ran with those prefs in force (opts={"firstWindow":true,
+"overwriteTabs":false}). Prefs are not the fix; the attribute guard is.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/components/sessionstore/SessionStore.sys.mjs b/browser/components/sessionstore/SessionStore.sys.mjs
+index 517df0472760..7a34b66c96ef 100644
+--- a/browser/components/sessionstore/SessionStore.sys.mjs
++++ b/browser/components/sessionstore/SessionStore.sys.mjs
+@@ -109,6 +109,42 @@ const WINDOW_OPEN_FEATURES_MAP = {
+   statusbar: "status",
+ };
+ 
++// PYXIS: is this a single-purpose app window -- one that shows exactly one
++// app and must never become a session-restore target?
++//
++// Upstream already has this concept for its own app windows (Taskbar Tabs)
++// and guards SessionStore with it in four places, all reachable from the two
++// call sites of this function: the `isTaskbarTab` flag latched in onLoad()
++// gates initializeWindow()'s restore (it defers the state instead), excludes
++// the window from the state collected in getCurrentState(), and keeps it out
++// of the last-session split on shutdown; restoreWindowFeatures() re-checks
++// the attribute directly.
++//
++// A `pyxisapp` window (BrowserContentHandler.sys.mjs's openPyxisAppWindow(),
++// stamped onto the root element by browser-init.js) is the same kind of
++// thing, and needs those guards for the same reason. Without this, launching
++// an app a second time reproducibly came up with full browser chrome:
++// SessionStore restored the previous session's window features into the new
++// app window, and restoreWindowFeatures() sets
++//
++//     aWindow[aItem].visible = !hidden.includes(aItem)
++//
++// for every WINDOW_HIDEABLE_FEATURES entry. With `aWinData.hidden`
++// undefined that is `.visible = true` for menubar/toolbar/locationbar/
++// personalbar/statusbar, which rewrites the window's chrome flags, which
++// regenerates the root element's `chromehidden` attribute -- measured on
++// device 2026-09-25 going from
++// "menubar toolbar location directories status extrachrome" to just
++// "extrachrome" about two seconds after load, un-hiding #nav-bar (40px of
++// URL bar) and flipping `window.toolbar.visible` back to true, which in turn
++// un-does TabBarVisibility.update()'s popup-like single-tab treatment.
++// The kiosk window features were always applied correctly -- they were being
++// overwritten afterwards.
++function pyxisIsSinglePurposeAppWindow(aWindow) {
++  let root = aWindow.document.documentElement;
++  return root.hasAttribute("taskbartab") || root.hasAttribute("pyxisapp");
++}
++
+ // These are tab events that we listen to.
+ const TAB_EVENTS = [
+   "TabOpen",
+@@ -2003,7 +2039,10 @@ var SessionStoreInternal = {
+       this._windows[aWindow.__SSi].isPopup = true;
+     }
+ 
+-    if (aWindow.document.documentElement.hasAttribute("taskbartab")) {
++    // PYXIS: `|| pyxisapp` -- see pyxisIsSinglePurposeAppWindow(). The stored
++    // field keeps upstream's name so every consumer of it below is reached
++    // unchanged.
++    if (pyxisIsSinglePurposeAppWindow(aWindow)) {
+       this._windows[aWindow.__SSi].isTaskbarTab = true;
+     }
+ 
+@@ -6477,8 +6516,9 @@ var SessionStoreInternal = {
+    */
+   restoreWindowFeatures: function ssi_restoreWindowFeatures(aWindow, aWinData) {
+     var hidden = aWinData.hidden ? aWinData.hidden.split(",") : [];
+-    var isTaskbarTab =
+-      aWindow.document.documentElement.hasAttribute("taskbartab");
++    // PYXIS: `|| pyxisapp` -- see pyxisIsSinglePurposeAppWindow(). This is the
++    // guard that was missing: the line below is what un-hid the chrome.
++    var isTaskbarTab = pyxisIsSinglePurposeAppWindow(aWindow);
+     if (!isTaskbarTab) {
+       WINDOW_HIDEABLE_FEATURES.forEach(function (aItem) {
+         aWindow[aItem].visible = !hidden.includes(aItem);

@@ -35,6 +35,14 @@ for those literal characters, never matches, and so passes vacuously. To
 assert a numeric condition, make the command say it in words —
 `test $(...) -gt 10 && echo MANY || echo TOO-FEW` with `#!must MANY`.
 
+Keep such a sentinel SHORT. Command echo is stripped from the head of the
+output by matching the flattened command text, and the sentinel a command
+prints is by definition a substring of that command — so a long one is
+eaten and the assertion fails on a run that actually passed. The cutoff is
+8 characters: `MANY` and `TOO-FEW` are safe, `LATE-COUNT-3` is not (that
+one cost an hour on 2026-09-25). When the value itself is short, prefer
+asserting it directly — `grep -c foo` with `#!must 3` — over a sentinel.
+
 Usage:
     scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt
     scripts/serial-test.py -c 'uname -a' -c 'opkg list-installed | head'

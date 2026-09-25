@@ -27,6 +27,17 @@ initiating the fullscreen compositor-side (evo/src/shell/xdg.rs ack_configure
 SHELL_APP_ID). Kept because it's harmless and documents intent. See
 evo-firefox-decoration-arch.
 
+UPDATE (2026-09-25): added a permanent `PYXIS-DIAG chrome-late:` block to
+delayed startup, logging the app window's settled chrome state (toolbar.visible,
+#nav-bar height, chromehidden) 5s after load. This is the regression guard for
+the "second and subsequent launches come up with full Firefox chrome" bug --
+see the SessionStore.sys.mjs patch in this series for the root cause. It is
+permanent, not a temporary probe: that window is born chromeless and has its
+chrome flags rewritten ~2s later, so every check made at window open reports a
+correct window, and there is no other way to observe the settled state (serial
+console only; QMP screendump reports "no surface" on Evo's GL scanout).
+Asserted by scripts/serial-tests/kiosk-relaunch.txt.
+
 ════════════════════════════════════════════════════════════════════════
 The unified diff below is generated from the checkout and is applied with
   git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
@@ -35,7 +46,7 @@ git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
 ════════════════════════════════════════════════════════════════════════
 
 diff --git a/browser/base/content/browser-init.js b/browser/base/content/browser-init.js
-index c32b781be079..68d89bce1e36 100644
+index c32b781be079..ff623747d677 100644
 --- a/browser/base/content/browser-init.js
 +++ b/browser/base/content/browser-init.js
 @@ -101,6 +101,23 @@ var gBrowserInit = {
@@ -111,7 +122,7 @@ index c32b781be079..68d89bce1e36 100644
      }
  
      // Run menubar initialization first, to avoid CustomTitlebar code picking
-@@ -524,6 +583,34 @@ var gBrowserInit = {
+@@ -524,6 +583,77 @@ var gBrowserInit = {
        }
      }
  
@@ -141,6 +152,49 @@ index c32b781be079..68d89bce1e36 100644
 +      }
 +    } catch (e) {
 +      console.error("pyxis: fullscreen init failed", e);
++    }
++
++    // PYXIS-DIAG (permanent): the regression guard for "second and subsequent
++    // launches come up with full Firefox chrome".
++    //
++    // This one is deliberately NOT temporary. That bug was reported five
++    // times over two months and misdiagnosed twice, because the only thing
++    // anyone could say about it was what it looked like on a screen no test
++    // can see -- scripts/serial-test.py drives the serial console and QMP
++    // screendump reports "no surface" on Evo's GL scanout. A window that is
++    // born chromeless and has its chrome flags rewritten ~2s later is
++    // invisible to any check made at window open, which is why the earlier
++    // probes (all of which fire at or before load) kept reporting a correct
++    // window. Logging the settled state gives the suites something to assert
++    // on; see scripts/serial-tests/kiosk-relaunch.txt.
++    //
++    // The actual bug was SessionStore.restoreWindowFeatures() reasserting
++    // every WINDOW_HIDEABLE_FEATURES entry as visible -- fixed by the
++    // SessionStore.sys.mjs patch in this series, which reads its rationale.
++    // `toolbarvis` is the load-bearing field: it is the flag SessionStore
++    // flipped, and TabBarVisibility.update() derives the window's whole
++    // popup-like single-tab treatment from it.
++    try {
++      if (document.documentElement.hasAttribute("pyxisapp")) {
++        window.setTimeout(() => {
++          try {
++            let root = document.documentElement;
++            let nav = document.getElementById("nav-bar");
++            let box = document.getElementById("navigator-toolbox");
++            let h = el => (el ? Math.round(el.getBoundingClientRect().height) : -1);
++            console.error(
++              `PYXIS-DIAG chrome-late: app=${root.getAttribute("pyxisapp")} ` +
++                `toolbarvis=${window.toolbar.visible} ` +
++                `navbar=${h(nav)} toolbox=${h(box)} ` +
++                `chromehidden="${root.getAttribute("chromehidden")}"`
++            );
++          } catch (e) {
++            console.error(`PYXIS-DIAG chrome-late: threw: ${e}`);
++          }
++        }, 5000);
++      }
++    } catch (e) {
++      console.error("PYXIS-DIAG chrome-late: install failed", e);
 +    }
 +
      if (Services.policies.status === Services.policies.ACTIVE) {

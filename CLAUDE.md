@@ -105,6 +105,28 @@ decision — the decision is above.
   it is running.
 - **Permissions ARE enforced at the bridge** — this file said the opposite for months. `PyxisBridgeParent.sys.mjs`'s `_capabilityFor(service, method)` maps each call to a capability (`filesystem.writeFile` → `filesystem:write`, `readFile`/`readDirectory`/`exists`/`stat` → `filesystem:read`, …) and throws `Pyxis capability denied: app '<id>' did not declare '<cap>'` when the app's declared list lacks it. Verified on device 2026-09-21 the hard way: a probe page dropped into the `files` app wrote nothing at all, because `files`' `manifest.webapp` declares only `filesystem:read`. What is still missing is the *visible* half — an install-time prompt, a per-app view, and revocation (roadmap item 6) — not the check itself.
 - `pyxis-experience`'s README is still the stock Vite template. Test coverage is no longer zero — Vitest is wired up (`npm test`), with `src/hooks/__tests__/novaContract.test.ts` asserting the mock's `nova.List` shape against fields **parsed out of `nova.rs` itself**, so adding a field to `to_info_json` without teaching the mock fails at the desk. That suite is the pattern to extend; it is still the only one.
+- **App windows must stay out of SessionStore, and chrome must be measured
+  *settled*.** `SessionStore.restoreWindowFeatures()` reasserts every
+  `WINDOW_HIDEABLE_FEATURES` entry as `.visible = true` when the restore state
+  carries no `hidden` field, which rewrites a window's chrome flags and
+  regenerates `chromehidden` — turning a correctly-opened chromeless app
+  window into a normal Firefox window (40px of `#nav-bar`) about two seconds
+  after load. Fixed 2026-09-25 by giving `pyxisapp` windows the same guard
+  upstream gives its own Taskbar Tabs windows
+  (`gecko/patches/pyxis/browser/components/sessionstore/SessionStore.sys.mjs.PYXIS_DIFF`
+  — read its header before touching app-window chrome). The reusable lesson:
+  **a chrome check made at window open passes on a broken build.** Four
+  diagnoses were wrong because every probe fired at or before load;
+  `PYXIS-DIAG chrome-late:` logs the settled state 5s in and is what
+  `scripts/serial-tests/kiosk-relaunch.txt` asserts on.
+- **The kernel has no `CONFIG_USER_NS`** (`# CONFIG_USER_NS is not set`), so
+  vela's content sandbox is genuinely degraded — unprivileged user namespaces
+  are unavailable. Firefox's own `sandbox-unprivileged-namespaces` warning was
+  telling the truth; it is suppressed in app windows
+  (`security.sandbox.warn_unprivileged_namespaces=false` in nova.rs's user.js
+  template) because a notification bar in an app window is noise, **not**
+  because the problem is solved. Enabling it is a kernel rebuild and belongs
+  with roadmap item 6.
 - **remochi's `Toggle` types don't match its runtime**: `index.d.ts` declares a `checked` prop, but the exported component reads `value` and calls `onChange({ value })`. Passing `checked` type-checks and is silently ignored. Bloom bridges this with a locally-typed `Switch` cast in `QuickSettingsMenu.tsx` and `SettingsApp.tsx` — check for that trap before adding a new `Toggle`.
 
 ### Corrected 2026-08-16 (were stale, verified fixed — do not re-investigate)

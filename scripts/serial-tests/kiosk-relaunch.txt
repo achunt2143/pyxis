@@ -107,3 +107,76 @@ grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).
 # And no unstamped leftovers should still be mapped at the end.
 #!must ONLY-EXPECTED-WINDOWS
 test $(echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -c '"appId"') -eq 1 && echo ONLY-EXPECTED-WINDOWS || echo EXTRA-SESSIONS
+
+# ---------- the actual root cause, found 2026-09-25 --------------------------
+# Everything above measures WINDOWS. The bug was never a window: it was the one
+# window having its chrome flags rewritten ~2 seconds after it opened, by
+# SessionStore.restoreWindowFeatures() reasserting every
+# WINDOW_HIDEABLE_FEATURES entry as visible (`aWindow[item].visible =
+# !hidden.includes(item)`, with aWinData.hidden undefined). That regenerates
+# the root element's `chromehidden` and un-hides #nav-bar -- 40px of URL bar,
+# which is what "it looks like a regular Firefox window" was.
+#
+# Fixed by the SessionStore.sys.mjs patch (gecko/patches/pyxis/...), which
+# gives a `pyxisapp` window the same guard upstream already gives its own
+# Taskbar Tabs app windows. Read that patch's header before touching this.
+#
+# Why the assertions below look at `chrome-late` and not at window open: a
+# check made at window open PASSES on a broken build. Every earlier probe did,
+# which is how this survived two wrong diagnoses. `PYXIS-DIAG chrome-late:`
+# (browser-init.js, permanent) logs the settled state 5s in; that is the only
+# thing worth asserting.
+#
+# Three launches of one app, each with a graceful window close in between.
+# Launch 1 was ALWAYS clean, on broken builds too -- the restore needs a
+# previous session to restore, so the regression only shows from launch 2 on.
+# Asserting launch 1 would pass on a build with the bug fully present.
+echo "=== chrome-late: three launches, closing the window each time ==="
+# The sections above leave `files` running, and nova's single-instance policy
+# would raise that window rather than spawn a new one -- no new chrome-late
+# line, and every assertion below would pass vacuously.
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' >/dev/null; sleep 8
+wc -l < /var/log/echo.log > /tmp/klmk
+
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' >/dev/null; sleep 24
+K=$(echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"windowId": [0-9]*' | grep -o '[0-9]*')
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$K}" >/dev/null; sleep 10
+
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' >/dev/null; sleep 24
+K=$(echo-cli call org.geckoOS.nova Focus --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"windowId": [0-9]*' | grep -o '[0-9]*')
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$K}" >/dev/null; sleep 10
+
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' >/dev/null; sleep 24
+
+# The diagnostic has to be there at all, or every assertion below is vacuous.
+#!must chrome-late
+tail -n +$(cat /tmp/klmk) /var/log/echo.log | grep -a 'chrome-late' | sed 's/.*PYXIS-DIAG/LATE/'
+
+# All three launches must report a chromeless window. toolbarvis is the
+# load-bearing one: SessionStore set it true, and TabBarVisibility.update()
+# derives the whole popup-like single-tab treatment from it.
+#!must-not toolbarvis=true
+tail -n +$(cat /tmp/klmk) /var/log/echo.log | grep -a 'chrome-late' | grep -o 'toolbarvis=[a-z]*' | sort | uniq -c
+
+# #nav-bar visible at 40px IS the bug. 0 is the fix. Assert both directions:
+# must-not is what catches the regression, must is what catches the case where
+# the field stopped being logged at all and must-not passed on an empty grep.
+#!must navbar=0
+#!must-not navbar=4
+tail -n +$(cat /tmp/klmk) /var/log/echo.log | grep -a 'chrome-late' | grep -o 'navbar=[0-9-]*' | sort | uniq -c
+
+# And chromehidden must still carry the kiosk set, not have decayed to
+# "extrachrome" (which is what a restored/reasserted window ends up with).
+#!must-not chromehidden="extrachrome
+tail -n +$(cat /tmp/klmk) /var/log/echo.log | grep -a 'chrome-late' | grep -o 'chromehidden=.*' | sort | uniq -c
+
+# Exactly three launches were made; fewer chrome-late lines means a launch
+# never opened a window and every assertion above passed vacuously.
+#
+# Asserting the bare count, NOT a `&& echo SOME-TOKEN` sentinel: the harness
+# strips command echo from the head of the output by matching the flattened
+# command text, so a sentinel that appears verbatim in the command that prints
+# it gets eaten and the assertion fails on a passing run. Anything under 8
+# characters (like "3") is never stripped. Cost an hour on 2026-09-25.
+#!must 3
+tail -n +$(cat /tmp/klmk) /var/log/echo.log | grep -ac 'chrome-late'
