@@ -32,8 +32,14 @@ echo-cli call org.geckoOS.Echo ListServices --interface Bus --args '{}' | head -
 # registered over the wire, and answers in single digits; this one sees the
 # router too. Phrased as a word because assertions are substring matches,
 # not regexes — `#!must-not ^[0-4]$` would pass vacuously.
-#!must SEES-IN-PROCESS-SERVICES
-test $(echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -c '"destination"') -gt 8 && echo SEES-IN-PROCESS-SERVICES || echo TOO-FEW-SERVICES
+#
+# The sentinel must stay UNDER 8 CHARACTERS. It used to be
+# SEES-IN-PROCESS-SERVICES, which the command-echo stripper ate -- the sentinel
+# a command prints is by definition a substring of the command that prints it,
+# and the stripper drops head lines of 8+ characters that match. This assertion
+# therefore failed on every passing run. See serial-test.py's docstring.
+#!must MANY
+test $(echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -c '"destination"') -gt 8 && echo MANY || echo FEW
 #!must org.geckoOS.nova
 #!must org.geckoOS.filesystem
 #!must org.geckoOS.installer
@@ -59,7 +65,7 @@ echo-cli ping 2>&1 | tail -4
 # hello-pyxis probes the bridge on load and writes the result to a file.
 # Before this service existed the probe recorded
 #   getSystemInfo=FAILED Error: Method failed: Service not registered: org.geckoOS.system
-rm -f /tmp/pyxis-hello-proof.txt
+rm -f /tmp/pyxis-hello-proof*.txt
 echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args '{"packagePath":"/var/lib/pyxis/incoming/com.pyxis.hello_0.2.0_all.ipk"}' | grep -E 'registeredApps|launchable'
 #!must sessionId
 echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep sessionId
@@ -67,9 +73,18 @@ sleep 15
 # The acceptance check: a THIRD-PARTY app calling the new service through
 # the bridge. This line read "getSystemInfo=FAILED ... Service not
 # registered: org.geckoOS.system" before the service existed.
+# The page writes ONE FILE PER LAUNCH -- /tmp/pyxis-hello-proof-<ms>.txt, not
+# a fixed name (see hello-pyxis/public/index.html: appendFile wrote nothing at
+# all on device, so each launch records itself instead). This read globbed the
+# old fixed name until 2026-09-25 and so asserted on a file that is never
+# created: `cat` printed "No such file or directory" and all three assertions
+# below failed on a perfectly good run, for weeks. Cat the glob, and assert the
+# file count too so a missing probe cannot pass quietly.
 #!must getSystemInfo=ok
 #!must bridge=present
-cat /tmp/pyxis-hello-proof.txt 2>&1
+cat /tmp/pyxis-hello-proof-*.txt 2>&1
+#!must 1
+ls /tmp/pyxis-hello-proof-*.txt 2>/dev/null | wc -l
 
 # ---------- clean up so the image is left as it was ----------
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep appId

@@ -71,7 +71,7 @@ echo-cli call org.geckoOS.appHost ListApps --interface org.geckoOS.appHost --arg
 pyxis-appctl list 2>&1 | head -20
 
 # ---------- launch ----------
-rm -f /tmp/pyxis-hello-proof.txt
+rm -f /tmp/pyxis-hello-proof*.txt
 #!must sessionId
 echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}'
 sleep 15
@@ -83,10 +83,19 @@ echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHos
 # and writes the result. A mapped surface alone proves neither that the
 # pyxis:// origin served the document nor that a third-party app gets the
 # bridge and its declared capabilities.
+# The page writes ONE FILE PER LAUNCH -- /tmp/pyxis-hello-proof-<ms>.txt, not
+# a fixed name (see hello-pyxis/public/index.html: appendFile wrote nothing at
+# all on device, so each launch records itself instead). This read globbed the
+# old fixed name until 2026-09-25 and so asserted on a file that is never
+# created: `cat` printed "No such file or directory" and all three assertions
+# below failed on a perfectly good run, for weeks. Cat the glob, and assert the
+# file count too so a missing probe cannot pass quietly.
 #!must bridge=present
 #!must secureContext=true
 #!must getSystemInfo=ok
-cat /tmp/pyxis-hello-proof.txt 2>&1
+cat /tmp/pyxis-hello-proof-*.txt 2>&1
+#!must 1
+ls /tmp/pyxis-hello-proof-*.txt 2>/dev/null | wc -l
 
 #!must is_ssd=true
 grep -a 'com.pyxis.hello' /var/log/evo.log | tail -2

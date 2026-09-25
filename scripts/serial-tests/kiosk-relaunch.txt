@@ -100,13 +100,27 @@ grep -a 'Removed window from workspace' /var/log/evo.log | tail -3
 
 # The count is the regression guard. Bloom + one app is 2; with the leak it
 # reached 6 over three launches. Anything above 3 means windows are piling up.
-#!must WINDOW-COUNT-SANE
-test $(grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).*/\1/' | sort -n | tail -1) -le 3 && echo WINDOW-COUNT-SANE || echo WINDOWS-LEAKING
+# Sentinels under 8 characters: the stripper ate WINDOW-COUNT-SANE (17) and
+# this assertion failed on every passing run until 2026-09-25.
+#!must SANE
+test $(grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).*/\1/' | sort -n | tail -1) -le 3 && echo SANE || echo LEAK
 grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).*/count=\1/' | tr '\n' ' '
 
 # And no unstamped leftovers should still be mapped at the end.
-#!must ONLY-EXPECTED-WINDOWS
-test $(echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -c '"appId"') -eq 1 && echo ONLY-EXPECTED-WINDOWS || echo EXTRA-SESSIONS
+# Assert the count itself rather than a sentinel -- ONLY-EXPECTED-WINDOWS (21
+# chars) was eaten by the stripper. A bare number is never stripped.
+#
+# TWO, not one. This suite leaves exactly two apps running with open windows:
+# `files` from its launch 2 above (only launch 1 is closed) and `terminal` from
+# cycle C (only A and B are closed). The old assertion demanded 1 and was
+# simply wrong -- it never ran, so nobody found out. Naming both appIds as well
+# is what actually catches the thing this guards against: a stray unstamped
+# session surviving a relaunch would make the count 3.
+#!must 2
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -c '"appId"'
+#!must files
+#!must terminal
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep '"appId"' | sort
 
 # ---------- the actual root cause, found 2026-09-25 --------------------------
 # Everything above measures WINDOWS. The bug was never a window: it was the one
