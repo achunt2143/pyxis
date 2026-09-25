@@ -7,7 +7,12 @@ use libc;
 
 /// Represents a running process
 pub struct Process {
+    /// Shift's own bookkeeping id, from `allocate_pid()`'s counter (starts at
+    /// 1000). NOT a kernel pid -- never pass it to kill(2).
     pub pid: u32,
+    /// The kernel pid, once there is one. `None` for every process today:
+    /// `Shift::fork_and_exec` does not spawn anything yet.
+    pub os_pid: Option<u32>,
     pub app_id: String,
     pub executable: String,
     pub state: Mutex<ProcessState>,
@@ -24,9 +29,10 @@ pub enum ProcessState {
 }
 
 impl Process {
-    pub fn new(pid: u32, config: crate::ProcessLaunchConfig) -> Result<Self> {
+    pub fn new(pid: u32, os_pid: Option<u32>, config: crate::ProcessLaunchConfig) -> Result<Self> {
         Ok(Process {
             pid,
+            os_pid,
             app_id: config.app_id,
             executable: config.executable,
             state: Mutex::new(ProcessState::Created),
@@ -45,12 +51,34 @@ impl Process {
         }
     }
 
+    /// Signal the OS process behind this entry, refusing if there is none.
+    ///
+    /// This used to `kill(self.pid, ...)` -- and `self.pid` is the bookkeeping
+    /// id, not a kernel pid, so terminate/suspend/resume signalled whatever
+    /// unrelated process held OS pid 1000, 1001, ... (as root, on device).
+    /// Found 2026-09-25: `test_launch_and_terminate` failed with "Failed to
+    /// send signal 15 to process 1000", and only *failed* because nothing
+    /// happened to hold pid 1000 on the machine it ran on.
     pub fn send_signal(&self, signal: i32) -> Result<()> {
+        let Some(os_pid) = self.os_pid else {
+            anyhow::bail!(
+                "process {} ({}) has no OS process to signal: Shift does not spawn \
+                 real processes yet, and its ids are not kernel pids",
+                self.pid,
+                self.app_id
+            );
+        };
         unsafe {
-            if libc::kill(self.pid as libc::pid_t, signal) == 0 {
+            if libc::kill(os_pid as libc::pid_t, signal) == 0 {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!("Failed to send signal {} to process {}", signal, self.pid))
+                Err(anyhow::anyhow!(
+                    "Failed to send signal {} to process {} (os pid {}): {}",
+                    signal,
+                    self.pid,
+                    os_pid,
+                    std::io::Error::last_os_error()
+                ))
             }
         }
     }
@@ -104,7 +132,7 @@ mod tests {
             executable: "/usr/bin/test".to_string(),
             ..Default::default()
         };
-        let process = Process::new(1001, config).unwrap();
+        let process = Process::new(1001, None, config).unwrap();
         assert_eq!(process.pid, 1001);
         assert_eq!(process.app_id, "test-app");
         assert_eq!(process.get_state(), ProcessState::Created);
@@ -117,7 +145,7 @@ mod tests {
             executable: "/usr/bin/test".to_string(),
             ..Default::default()
         };
-        let process = Process::new(1001, config).unwrap();
+        let process = Process::new(1001, None, config).unwrap();
         process.update_state(ProcessState::Running);
         assert_eq!(process.get_state(), ProcessState::Running);
         process.update_state(ProcessState::Suspended);

@@ -11,6 +11,9 @@ hardcoded app list is gone.
 
 Alpha 3 made the system stop lying. Alpha 4 makes it useful.
 
+It also closes the longest-running bug in the app-window work: **launching an
+app a second time no longer comes up looking like a regular Firefox window.**
+
 ---
 
 ## The headline change: the launcher reads a registry
@@ -66,6 +69,46 @@ use `opkg remove`; `installer.Remove` succeeds and Nova drops it.
   `IPCBus::call_method` never forwarded in-process→external calls, so
   `nova.Focus` could not reach Evo at all. The whole chain now round-trips.
 
+## Apps no longer come back as Firefox windows
+
+Reported five times since August: the first launch of an app is chromeless,
+every launch after it has a URL bar. Four diagnoses were made; three were
+wrong, and two of those were written up as fixes before a re-test disproved
+them.
+
+The kiosk window features were always applied correctly. The window is born
+chromeless and then has its chrome flags rewritten about two seconds later —
+by **SessionStore**, restoring the previous session's window features into
+the new app window. `restoreWindowFeatures()` sets `.visible = true` on every
+hideable feature the stored state doesn't list as hidden, and the app
+window's state lists none, so the toolbar, location bar and menu bar all come
+back and `#nav-bar` reappears. Only from the second launch, because the
+restore needs a previous session to restore.
+
+Firefox has the same problem with its own single-purpose app windows (Taskbar
+Tabs) and guards SessionStore against it with one root-element attribute. A
+Pyxis app window now gets the same guard. It's a JavaScript-only patch to the
+vela fork, with no Gecko rebuild needed.
+
+Verified on the rebuilt image with a control: three launches with the fix
+keep the full kiosk `chromehidden` set, and the same three launches with
+upstream's SessionStore restore the URL bar every time.
+
+Why it took four attempts is the reusable part: **every probe fired at or
+before window load, where the window is still correct**, so a broken build
+measured clean. `PYXIS-DIAG chrome-late:` now logs the settled state five
+seconds in, and `kiosk-relaunch.txt` asserts on it.
+
+Two of the fixes made while chasing it were real, just not this bug:
+
+- **Evo never removed a destroyed window.** `toplevel_destroyed` wasn't
+  implemented, and smithay's no-op default meant it compiled and silently did
+  nothing — the workspace count climbed 1→6 over three launches with zero
+  removals. Dead windows now leave.
+- **The sandbox-warning notification bar** stacked one per launch. It's
+  suppressed in app windows now. The warning itself was correct, though —
+  see Known limits.
+
 ## `org.geckoOS.system` — the bridge's last two dead methods
 
 `window.geckoOS.getSystemInfo()` and `.listServices()` were in the API
@@ -109,6 +152,17 @@ the first design: the suites originally only *printed*, and a run in which
 every step failed still exited 0 — which happened, twice, and is why the
 assertions exist.
 
+At release, on the rebuilt image:
+
+| | |
+|---|---|
+| On device | `kiosk-relaunch` 16 · `alpha4-ipk-e2e` 34 · `system-service` 21 · `alpha4-exit-criteria` 33 — all green |
+| Bloom | 17 Vitest tests; `tsc -b` and eslint clean |
+| Rust workspace | 171 of 172 — the one failure is the known corner-resize bug (see Known limits) |
+
+Earlier drafts reported "Rust: 75", which was echo's count alone. The
+workspace-wide run is what found the Shift signalling bug.
+
 ## Fixed along the way
 
 - Nova handed web clients an absolute *filesystem* path for app icons, which
@@ -121,6 +175,31 @@ assertions exist.
   `{"success": true, "window_id": 0}` for any argument, including the
   natural mistake of passing `appId`. They now reject a missing or
   non-numeric id.
+- `evo.CloseWindow` was a stub that answered success and never told the
+  client anything. It now sends a real `xdg_toplevel.close`.
+- `evo.MaximizeWindow`/`UnmaximizeWindow` didn't exist ("Method not
+  implemented"). With no IPC for maximize, neither the shell nor a test could
+  maximize a window — only a human with a pointer — which is part of why #7
+  and the kiosk bug both resisted headless reproduction.
+- Every Evo error reached its caller as **"Unknown error"**: Evo wrote
+  `body["error"]`, the bus read `body["message"]`. Both sides fixed, and a
+  suite asserts the reason survives the trip.
+- `echo-daemon` discarded the cause of nearly every error (`e.to_string()`
+  drops anyhow's context chain) and logged every routed message at `info`,
+  burying what was left. Causes kept (`{e:#}`); per-message logging demoted.
+- **Shift signalled the wrong processes.** `send_signal` passed Shift's
+  bookkeeping id — a counter starting at 1000 — to `kill(2)` as though it were
+  a kernel pid, so terminate/suspend/resume hit whatever unrelated process
+  held pid 1000, 1001, and so on, as root on device. It wasn't reachable in a
+  normal boot (Shift's Echo methods are stubs and the daemon launches
+  nothing), but `cargo test` itself sent SIGTERM to pid 1000 on whatever
+  machine ran it. It now refuses to signal a process that has no kernel pid,
+  which today is all of them.
+- Three on-device suites carried assertions that **could not pass**: two read
+  a proof file the acceptance app no longer writes, and three sentinels long
+  enough to be eaten by the harness's command-echo stripper. One of those also
+  demanded the wrong number. All fixed, and the stripper's length rule is now
+  documented where suite authors will read it.
 
 ## Known limits
 
@@ -131,8 +210,26 @@ assertions exist.
 - The service registry is never pruned on disconnect, so a registered-then-
   crashed client keeps its entry. `listServices` marks it unreachable rather
   than hiding it.
-- No permission is *enforced* at the bridge yet. Nova computes the grant
-  correctly; nothing refuses an ungranted call. That is alpha 6.
+- Permissions **are** enforced at the bridge — an app that didn't declare a
+  capability gets `Pyxis capability denied`. (An earlier draft of these notes
+  said the opposite; it was wrong.) What's missing is the visible half, for
+  alpha 6: an install-time prompt, a per-app view, revocation, and enforcement
+  for native clients that open the Echo socket directly, which the bridge
+  never sees.
+- **The kernel is built without `CONFIG_USER_NS`**, so vela's content sandbox
+  is genuinely weaker than it should be. Firefox's warning about it was
+  correct. It's suppressed in app windows because a warning bar in an app is
+  noise, not because the problem is solved. Enabling it means a kernel
+  rebuild, and it belongs with alpha 6's security work.
+- **One Rust test fails, on purpose:** `evo`'s `test_resize_handle_detection`.
+  It's correct: the left and right border regions exclude the corners, so the
+  four corner resize handles can never fire. That belongs to #11 (window
+  resize, alpha 5), and it's left red rather than `#[ignore]`d so it can't be
+  forgotten.
+- Shift's process layer is simulated beneath real bookkeeping: `fork_and_exec`
+  spawns nothing, resource sampling returns constants, and its Echo methods
+  (`LaunchProcess` and the rest) answer success without doing anything.
+  Nothing in a normal boot depends on it.
 - Headless screenshots remain impossible (QMP `screendump` → "no surface" on
   a GL scanout, re-confirmed on QEMU 10.2.1), so anything whose acceptance is
   visual still needs a human.
@@ -141,10 +238,15 @@ assertions exist.
 
 Alpha 4 set out to make the app pipeline work end to end, and it does. The
 unplanned cost was in the tests rather than the product: two suites that
-passed while proving nothing, and one fix of mine that broke `nova.Focus`
+passed while proving nothing, three that could never pass, a "Rust: 75" that
+covered one crate out of seven, and one fix of mine that broke `nova.Focus`
 outright and was caught only by running it on a device. Both are the same
 lesson alpha 3 learned about the system — a green result you have not
 watched fail is not evidence — now applied to the test tooling itself.
+
+The kiosk bug adds a corollary for anything visual: **a check made at the
+wrong moment is as bad as no check.** The window really was chromeless at
+the moment every probe looked at it.
 
 ---
 

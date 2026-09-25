@@ -67,15 +67,15 @@ impl Shift {
     pub async fn launch(&self, config: ProcessLaunchConfig) -> Result<u32> {
         tracing::info!("Launching process: app_id={}", config.app_id);
 
-        // Allocate process ID
+        // Allocate process ID -- Shift's bookkeeping id, not a kernel pid
         let pid = self.allocate_pid()?;
 
-        // Create process structure
-        let process = Process::new(pid, config.clone())?;
-        let process_arc = Arc::new(process);
+        // Fork and exec. `None` means nothing was spawned; see fork_and_exec.
+        let os_pid = self.fork_and_exec(pid, &config).await?;
 
-        // Fork and exec
-        let child_pid = self.fork_and_exec(&process_arc, &config).await?;
+        // Create process structure
+        let process = Process::new(pid, os_pid, config.clone())?;
+        let process_arc = Arc::new(process);
 
         // Record process
         self.processes.insert(pid, process_arc.clone());
@@ -102,7 +102,7 @@ impl Shift {
         let process_info = process_arc.get_info();
         self.echo_service.emit_process_created(pid, &config.app_id).await?;
 
-        tracing::info!("Process launched: pid={}, child_pid={}", pid, child_pid);
+        tracing::info!("Process launched: pid={}, os_pid={:?}", pid, os_pid);
         Ok(pid)
     }
 
@@ -111,8 +111,18 @@ impl Shift {
         tracing::info!("Terminating process: pid={}, signal={}", pid, signal);
 
         if let Some((_k, process)) = self.processes.remove(&pid) {
-            // Send signal
-            process.send_signal(signal)?;
+            // Send signal -- if there is anything to send it to. A process with
+            // no OS pid was never spawned, so there is nothing to stop and the
+            // bookkeeping below is all that terminating it means.
+            if process.os_pid.is_some() {
+                process.send_signal(signal)?;
+            } else {
+                tracing::warn!(
+                    "terminate: process {} ({}) has no OS process; nothing to signal",
+                    pid,
+                    process.app_id
+                );
+            }
 
             // Record lifecycle event
             self.lifecycle.record_event(pid, LifecycleEvent::Terminated)?;
@@ -305,24 +315,30 @@ impl Shift {
 
     // Private methods
 
+    /// Spawn the process and return its kernel pid -- or `None` if nothing was
+    /// spawned, which is every call today.
     async fn fork_and_exec(
         &self,
-        process: &Arc<Process>,
+        pid: u32,
         config: &ProcessLaunchConfig,
-    ) -> Result<u32> {
+    ) -> Result<Option<u32>> {
         // In production, this would:
         // 1. Fork child process
         // 2. Set up environment
         // 3. Configure resource limits
         // 4. Exec binary
         tracing::debug!(
-            "Fork/exec for process: app_id={}, executable={}",
+            "Fork/exec for process: pid={}, app_id={}, executable={}",
+            pid,
             config.app_id,
             config.executable
         );
 
-        // For now, return mock child PID
-        Ok(process.pid + 10000)
+        // Not implemented: nothing is spawned. This used to return a made-up
+        // child pid (`pid + 10000`) that was logged as though it were real.
+        // `None` is the truth, and it is what stops Process::send_signal from
+        // signalling a kernel pid Shift never created.
+        Ok(None)
     }
 
     fn allocate_pid(&self) -> Result<u32> {
@@ -416,5 +432,31 @@ mod tests {
         
         shift.terminate(pid, libc::SIGTERM).await.unwrap();
         assert!(shift.get_process_info(pid).is_none());
+    }
+
+    // Shift's ids are bookkeeping, not kernel pids. Signalling used to
+    // kill(id, ...), hitting whatever unrelated process held OS pid 1000 --
+    // test_launch_and_terminate above failed only because nothing held it on
+    // the machine it ran on. Suspend is the check because, unlike terminate,
+    // it has no "nothing to signal" path: it must refuse outright, and for the
+    // right reason, rather than stop some other process.
+    #[tokio::test]
+    async fn test_never_signals_an_internal_id_as_a_kernel_pid() {
+        let shift = Shift::new().await.unwrap();
+        let pid = shift
+            .launch(ProcessLaunchConfig {
+                app_id: "test.app".to_string(),
+                executable: "/bin/true".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(pid >= 1000, "ids come from allocate_pid's counter");
+
+        let err = shift.suspend(pid).await.expect_err("there is no OS process to stop");
+        assert!(
+            err.to_string().contains("no OS process"),
+            "must refuse for the right reason, not fail inside kill(2): {err}"
+        );
     }
 }

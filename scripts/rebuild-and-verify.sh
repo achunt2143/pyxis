@@ -65,7 +65,10 @@ fi
 
 step "5/5  on-device suites"
 fail=0
-for suite in alpha4-ipk-e2e system-service alpha4-exit-criteria; do
+# kiosk-relaunch is the regression guard for "apps come back as Firefox
+# windows" -- a guard nobody runs is not a guard, and that bug survived four
+# diagnoses. It is the slowest suite (~8 min of launch/close cycles).
+for suite in alpha4-ipk-e2e system-service alpha4-exit-criteria kiosk-relaunch; do
     printf '\n--- %s ---\n' "$suite"
     if python3 scripts/serial-test.py --script "scripts/serial-tests/$suite.txt" \
          --settle 35 --timeout 200 > "/tmp/pyxis-$suite.out" 2>&1; then

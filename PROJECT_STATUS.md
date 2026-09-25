@@ -369,8 +369,14 @@ blocked on any decision.
 - `shift/src/echo_ipc.rs:369-505` — every Echo handler is a stub returning
   fabricated data (hardcoded pid 1000, a literal
   `[{app_id:"firefox"},{app_id:"thunderbird"}]` process list, constant
-  128 MB / 5% usage) while the real implementations sit unused in
-  `process.rs`/`resources.rs`/`tree.rs`. `shift-daemon` *does* run at boot.
+  128 MB / 5% usage). **Correction 2026-09-25:** the library beneath them is
+  not the "real implementation" this note used to call it. Its bookkeeping
+  (`tree.rs`, `lifecycle.rs`, the limits in `resources.rs`) is real, but
+  `fork_and_exec` spawns nothing and `sample_process_resources` returns
+  constants. The one real syscall, `send_signal`'s `kill(2)`, was aimed at
+  Shift's bookkeeping id rather than a kernel pid. That's fixed: it now
+  refuses when there is no kernel pid, which today is always. `shift-daemon`
+  *does* run at boot, and launches nothing.
 
 ---
 
@@ -616,8 +622,10 @@ on-device confirmation.**
 - **Status:** 🚧 substantial; role vs Nova/appHost worth clarifying.
 
 ### Shift — system orchestrator
-- **Path:** `shift/` · ~1,800 lines · real. Process supervision, boot ordering,
-  power states; own `echo_ipc.rs`. **Status:** 🚧 real.
+- **Path:** `shift/` · ~1,800 lines. Process supervision, boot ordering,
+  power states; own `echo_ipc.rs`. **Status:** 🚧 real bookkeeping over a
+  **simulated** process layer: nothing is spawned, resource numbers are
+  constants, and the Echo methods are stubs. See the audit note above.
 
 ### Puppis — Gecko native-app lifecycle
 - **Path:** `puppis/` · ~730 lines · real `suspend_app`/`resume_app` freeze/thaw.
@@ -683,6 +691,29 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### Alpha 4 released (2026-09-25)
+
+Tagged `alpha4` in both repos and pushed with its `release/alpha4` branch.
+`alpha3`, which had never been tagged or pushed in either repo, went up first.
+Bloom also got the `alpha2` tag its already-public branch never had. The
+convention is a release branch plus a lightweight tag. There's no merge to
+`main`, which shares no history with the code (it holds only the README and
+screenshots).
+
+Last-mile fixes, from running the whole Rust workspace for the first time
+(the exit criteria's "Rust: 75" had been echo's count alone):
+
+- **Shift signalled the wrong processes** — see the Shift audit note. Fixed,
+  with a regression test that checks the refusal *reason*, so a `kill(2)`
+  that merely happens to fail can't satisfy it.
+- **`evo::test_resize_handle_detection` stays red on purpose.** The test is
+  right, and the corner resize handles can never fire. It's handed to alpha 5
+  D (resize) instead of being `#[ignore]`d.
+
+Release notes corrected: they claimed no permission was enforced at the
+bridge, which was disproved on 2026-09-21. `kiosk-relaunch` is now part of
+`rebuild-and-verify.sh`.
 
 ### Kiosk-on-relaunch — ROOT CAUSED AND FIXED (2026-09-25)
 

@@ -221,8 +221,10 @@ one step needs a human*
       bus. echo.log shows exactly one `nova.List` per shell start, rising on
       each install and each removal — so `useApps`'s `RegistryChanged`
       subscription works against real Echo, not just the mock.
-- [ ] **Needs a human at the screen:** confirm the app *appears* in the
-      launcher and launches from a click. Headless screenshots are
+- [x] **Needs a human at the screen:** confirm the app *appears* in the
+      launcher and launches from a click. **Confirmed by the user**, and on
+      2026-09-25 with the real 128×128 icon drawn, which closes the icon
+      caveat under the exit criteria below. Headless screenshots are
       impossible here — QMP `screendump` reports "no surface" on a GL
       scanout, re-confirmed on QEMU 10.2.1, so this is not stale tooling.
       Everything behind the pixels is verified; what is unverified is the
@@ -266,9 +268,27 @@ one step needs a human*
       fail with an actionable message. **Done as part of A rather than last**
       — it is the test that catches exactly the mismatch A uncovered.
 
+**Also fixed, outside the plan**
+
+- [x] **Apps came back as Firefox windows on relaunch** (reported since
+      alpha 2, never in scope). SessionStore restored the previous session's
+      window features into the new app window and un-hid the URL bar about
+      two seconds after load. Fixed 2026-09-25 by giving `pyxisapp` windows
+      the SessionStore guard upstream gives Taskbar Tabs. Verified on device
+      against a control. See
+      `gecko/patches/pyxis/browser/components/sessionstore/SessionStore.sys.mjs.PYXIS_DIFF`.
+- [x] Evo never removed destroyed windows (`toplevel_destroyed`
+      unimplemented); `evo.CloseWindow` was a stub; `evo.Maximize`/
+      `UnmaximizeWindow` didn't exist; every Evo error arrived as
+      "Unknown error".
+- [x] Shift sent signals to its bookkeeping ids as though they were kernel
+      pids. It was latent in a normal boot, but live under `cargo test`.
+- [x] Three on-device suites had assertions that could not pass.
+
 ### Exit criteria
 
-Status as of 2026-09-20, after a rebuild and a full on-device pass.
+Status as of 2026-09-20, after a rebuild and a full on-device pass;
+re-verified at release 2026-09-25.
 
 - [x] **A third-party `.ipk`, built with `pyxis-sdk` and installed through
       the Installer app, appears in the launcher and launches.** Confirmed
@@ -277,8 +297,8 @@ Status as of 2026-09-20, after a rebuild and a full on-device pass.
       *Caveat on "with its own icon":* the acceptance package shipped a 1×1
       transparent placeholder from `pyxis-sdk new`, which loads without
       error and draws as nothing — so the icon path could not be told apart
-      from the generic fallback. It now carries a real 128×128 icon, but
-      that has not been looked at on screen yet.
+      from the generic fallback. It now carries a real 128×128 icon, **seen
+      on screen by the user 2026-09-25** — the manifest-icon path works.
 - [x] **Uninstalling it removes it from the launcher.** Verified both ways.
 - [x] **All 8 built-in apps launch, focus from the dock, minimize, restore,
       and close.** All eight at once did not fit the old 2 GB reference VM:
@@ -293,9 +313,19 @@ Status as of 2026-09-20, after a rebuild and a full on-device pass.
       appetite.
 - [x] **Maximize→unmaximize does not crash.** Confirmed by the user on the
       rebuilt image. See item C for why this one could not be automated.
-- [x] **Test suite green.** Bloom: 17 vitest, `tsc -b` and eslint clean.
-      Rust: 75. On-device: `alpha4-ipk-e2e.txt` 33/33,
-      `system-service.txt` and `alpha4-exit-criteria.txt` green at 4 GB.
+- [x] **Test suite green** — with one known, deliberate exception.
+      Re-verified at release, 2026-09-25, on the rebuilt image. Bloom: 17
+      vitest, `tsc -b` and eslint clean. On device: `kiosk-relaunch` 16,
+      `alpha4-ipk-e2e` 34, `system-service` 21, `alpha4-exit-criteria` 33.
+      Rust workspace: **171 of 172**.
+      **Correction:** this line used to say "Rust: 75", which was echo's count
+      alone. Nobody had run the workspace, which had two red tests. One was
+      catching a real bug (Shift passing its bookkeeping id to `kill(2)` as a
+      kernel pid), now fixed. The other,
+      `evo::test_resize_handle_detection`, is correct and is left failing:
+      the corner resize handles can never fire. It moves to alpha 5 D with
+      resize. Two on-device suites had also stopped being able to pass (see
+      "Also fixed" above).
 
 ## Alpha 5 — "A desktop, not a shell"
 
@@ -331,9 +361,15 @@ Status as of 2026-09-20, after a rebuild and a full on-device pass.
 
 **D. Window management completion**
 
-- [ ] Resize, scoped per alpha 3's decoration decision. If GTK owns app
-      decoration this is mostly already handled and the work is confined to
-      non-GTK/XWayland clients.
+- [ ] Resize (#11). The decoration decision is made — **Evo owns
+      server-side decoration** (see CLAUDE.md, "Window decoration model") —
+      so this is Evo SSD work, not GTK's. The first concrete bug is already
+      known and has a failing test: `evo/src/enhancements/decorations.rs`'s
+      `get_resize_handle` tests corners as `top_border ∩ left_border`, but
+      `get_regions` builds the side borders to *exclude* the corners, so the
+      intersection is always empty and the four diagonal handles can never
+      fire. `test_resize_handle_detection` is correct and has been red since
+      April. Fix the corner test first; it's a few lines.
 - [ ] Real values in Evo's `GetRenderingStatus` IPC method — the signal path
       (`record_frame`, `current_process_rss_mb`) is already real, only the
       method returns hardcoded fps/memory.
