@@ -18,7 +18,7 @@ use smithay::{
 #[cfg(feature = "xwayland")]
 use smithay::{utils::Rectangle, xwayland::xwm::ResizeEdge as X11ResizeEdge};
 
-use super::{SurfaceData, WindowElement};
+use super::{ssd::MIN_FRAME_SIZE, SurfaceData, WindowElement};
 use crate::{
     focus::PointerFocusTarget,
     state::{EvoState, Backend},
@@ -314,6 +314,19 @@ impl From<X11ResizeEdge> for ResizeEdge {
     }
 }
 
+/// The size a configure carries for a frame of size `frame`: the client's
+/// own, which is shorter by the SSD header bar when Evo decorates it.
+///
+/// Resize grabs track the frame, because `WindowElement::geometry` (and so
+/// `initial_window_size`) includes the header. Sending that frame size
+/// straight to the client grew every SSD window by the header's height the
+/// moment a resize began. No client-initiated resize ever had a header to
+/// get wrong, so nothing had hit this until the SSD band started resizes of
+/// its own.
+fn client_size(window: &WindowElement, frame: Size<i32, Logical>) -> Size<i32, Logical> {
+    (frame.w, frame.h - window.decoration_height()).into()
+}
+
 /// Information about the resize operation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ResizeData {
@@ -373,12 +386,15 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
         let left_right = ResizeEdge::LEFT | ResizeEdge::RIGHT;
         let top_bottom = ResizeEdge::TOP | ResizeEdge::BOTTOM;
 
+        // Round, don't truncate: the pointer delta is fractional (libinput
+        // scales the tablet's axis into output pixels), and `as i32` on
+        // 752 - 80.007 gave 671, so a -80 drag shrank a window by 81.
         if self.edges.intersects(left_right) {
             if self.edges.intersects(ResizeEdge::LEFT) {
                 dx = -dx;
             }
 
-            new_window_width = (self.initial_window_size.w as f64 + dx) as i32;
+            new_window_width = (self.initial_window_size.w as f64 + dx).round() as i32;
         }
 
         if self.edges.intersects(top_bottom) {
@@ -386,7 +402,7 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
                 dy = -dy;
             }
 
-            new_window_height = (self.initial_window_size.h as f64 + dy) as i32;
+            new_window_height = (self.initial_window_size.h as f64 + dy).round() as i32;
         }
 
         let (min_size, max_size) = if let Some(surface) = self.window.wl_surface() {
@@ -399,10 +415,15 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
             ((0, 0).into(), (0, 0).into())
         };
 
-        let min_width = min_size.w.max(1);
-        let min_height = min_size.h.max(1);
+        // These sizes are the frame's, header bar included (see
+        // `client_size`). So the client's own min/max are raised by the
+        // header to match, and an SSD frame keeps room for its buttons.
+        let header = self.window.decoration_height();
+        let frame_min = if header > 0 { MIN_FRAME_SIZE } else { (1, 1) };
+        let min_width = min_size.w.max(frame_min.0);
+        let min_height = (min_size.h + header).max(frame_min.1);
         let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
-        let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h };
+        let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h + header };
 
         new_window_width = new_window_width.max(min_width).min(max_width);
         new_window_height = new_window_height.max(min_height).min(max_height);
@@ -413,7 +434,7 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
             WindowSurface::Wayland(xdg) => {
                 xdg.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
+                    state.size = Some(client_size(&self.window, self.last_window_size));
                 });
                 xdg.send_pending_configure();
             }
@@ -456,7 +477,7 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
                 WindowSurface::Wayland(xdg) => {
                     xdg.with_pending_state(|state| {
                         state.states.unset(xdg_toplevel::State::Resizing);
-                        state.size = Some(self.last_window_size);
+                        state.size = Some(client_size(&self.window, self.last_window_size));
                     });
                     xdg.send_pending_configure();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
@@ -669,7 +690,7 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
             WindowSurface::Wayland(xdg) => {
                 xdg.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
+                    state.size = Some(client_size(&self.window, self.last_window_size));
                 });
                 xdg.send_pending_configure();
                 if self.edges.intersects(ResizeEdge::TOP_LEFT) {
@@ -775,7 +796,7 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
                 dx = -dx;
             }
 
-            new_window_width = (self.initial_window_size.w as f64 + dx) as i32;
+            new_window_width = (self.initial_window_size.w as f64 + dx).round() as i32;
         }
 
         if self.edges.intersects(top_bottom) {
@@ -783,7 +804,7 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
                 dy = -dy;
             }
 
-            new_window_height = (self.initial_window_size.h as f64 + dy) as i32;
+            new_window_height = (self.initial_window_size.h as f64 + dy).round() as i32;
         }
 
         let (min_size, max_size) = if let Some(surface) = self.window.wl_surface() {
@@ -796,10 +817,15 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
             ((0, 0).into(), (0, 0).into())
         };
 
-        let min_width = min_size.w.max(1);
-        let min_height = min_size.h.max(1);
+        // These sizes are the frame's, header bar included (see
+        // `client_size`). So the client's own min/max are raised by the
+        // header to match, and an SSD frame keeps room for its buttons.
+        let header = self.window.decoration_height();
+        let frame_min = if header > 0 { MIN_FRAME_SIZE } else { (1, 1) };
+        let min_width = min_size.w.max(frame_min.0);
+        let min_height = (min_size.h + header).max(frame_min.1);
         let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
-        let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h };
+        let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h + header };
 
         new_window_width = new_window_width.max(min_width).min(max_width);
         new_window_height = new_window_height.max(min_height).min(max_height);
@@ -810,7 +836,7 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
             WindowSurface::Wayland(xdg) => {
                 xdg.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
+                    state.size = Some(client_size(&self.window, self.last_window_size));
                 });
                 xdg.send_pending_configure();
             }

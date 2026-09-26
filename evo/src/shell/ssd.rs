@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 use crate::{state::Backend, EvoState};
-use super::WindowElement;
+use super::{grabs::ResizeEdge, WindowElement};
 
 // === PYXIS DECORATION SHAPE COLORS ===
 // Matches Bloom's window-chrome design language (src/components/DesktopWindow.tsx):
@@ -338,6 +338,17 @@ pub const HEADER_BAR_HEIGHT: i32 = 32;
 const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;
 const BUTTON_WIDTH: u32 = 32;
 
+/// Depth of the invisible band around an SSD frame that starts a resize.
+/// It lies outside the visible window (see `WindowElement::ssd_resize_band`).
+pub const RESIZE_BAND: i32 = 8;
+/// How far a corner's diagonal grab reaches along each edge. The top corners
+/// are rounded at GLASS_CORNER_RADIUS, so this is the band plus that curve.
+const RESIZE_CORNER: i32 = RESIZE_BAND + GLASS_CORNER_RADIUS as i32;
+/// The smallest frame a resize will make: the three buttons plus a little
+/// title, over a strip of client. Below about three buttons wide, the
+/// button hit-tests' `width - BUTTON_WIDTH * n` had nothing left to mean.
+pub const MIN_FRAME_SIZE: (i32, i32) = (BUTTON_WIDTH as i32 * 3 + 64, HEADER_BAR_HEIGHT + 48);
+
 impl HeaderBar {
     /// Create a new header bar with default or themed colors
     pub fn new() -> Self {
@@ -412,6 +423,53 @@ impl HeaderBar {
     pub fn pointer_leave(&mut self) {
         self.pointer_loc = None;
     }
+
+    /// The pointer, when it is over the header bar itself. `pointer_loc`
+    /// also covers the resize band around the frame (shell/element.rs), and
+    /// the button and hover tests below only mean anything inside the bar.
+    /// Without this check, pressing the band just right of a window would
+    /// hit-test as its close button.
+    fn header_point(&self) -> Option<Point<f64, Logical>> {
+        self.pointer_loc.filter(|loc| {
+            loc.x >= 0.0 && loc.x < self.width as f64 && loc.y >= 0.0 && loc.y < HEADER_BAR_HEIGHT as f64
+        })
+    }
+
+    /// The resize edge under the pointer, when it is in the band around the
+    /// frame. `pointer_loc` is frame-relative, so the band is whatever lies
+    /// outside `0..width` × `0..window_height`.
+    #[cfg(feature = "decorations")]
+    fn resize_edge(&self) -> Option<ResizeEdge> {
+        use crate::enhancements::decorations::{resize_handle_at, ResizeHandle};
+
+        let loc = self.pointer_loc?;
+        let (x, y) = (loc.x.floor() as i32, loc.y.floor() as i32);
+        let (w, h) = (self.width as i32, self.window_height as i32);
+        if (0..w).contains(&x) && (0..h).contains(&y) {
+            return None;
+        }
+        let outer = WindowGeometry {
+            x: -RESIZE_BAND,
+            y: -RESIZE_BAND,
+            width: (w + 2 * RESIZE_BAND) as u32,
+            height: (h + 2 * RESIZE_BAND) as u32,
+        };
+        Some(match resize_handle_at(x, y, &outer, RESIZE_BAND, RESIZE_CORNER)? {
+            ResizeHandle::Top => ResizeEdge::TOP,
+            ResizeHandle::Bottom => ResizeEdge::BOTTOM,
+            ResizeHandle::Left => ResizeEdge::LEFT,
+            ResizeHandle::Right => ResizeEdge::RIGHT,
+            ResizeHandle::TopLeft => ResizeEdge::TOP_LEFT,
+            ResizeHandle::TopRight => ResizeEdge::TOP_RIGHT,
+            ResizeHandle::BottomLeft => ResizeEdge::BOTTOM_LEFT,
+            ResizeHandle::BottomRight => ResizeEdge::BOTTOM_RIGHT,
+        })
+    }
+
+    #[cfg(not(feature = "decorations"))]
+    fn resize_edge(&self) -> Option<ResizeEdge> {
+        None
+    }
     
     /// Handle click with GeckoOS decoration hit testing
     #[cfg(feature = "decorations")]
@@ -467,6 +525,14 @@ impl HeaderBar {
         window: &WindowElement,
         serial: Serial,
     ) {
+        // The band around the frame first. It is outside the header, so it
+        // never competes with the buttons, but it must win over the header
+        // fallbacks below, which read only `loc.x`.
+        if let Some(edges) = self.resize_edge() {
+            info!("SSD resize band press: edges={:?}", edges);
+            self.handle_resize(seat, state, window, serial, edges);
+            return;
+        }
         // Diagnostic: which button a titlebar click resolves to, with the
         // coordinates that decided it. If "maximize closes the app" is really
         // a hit-test overshoot (the maximize/close buttons sit adjacent at the
@@ -480,21 +546,21 @@ impl HeaderBar {
             self.width.saturating_sub(BUTTON_WIDTH * 2),
             self.width.saturating_sub(BUTTON_WIDTH * 3),
         );
-        match self.pointer_loc.as_ref() {
+        match self.header_point().as_ref() {
             // Close button (rightmost)
-            Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH) as f64 => {
                 info!("Close button clicked");
                 self.handle_close(window);
             }
 
             // Maximize button (second from right)
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 2) as f64 => {
                 info!("Maximize button clicked");
                 self.handle_maximize(state, window);
             }
 
             // Minimize button (third from right)
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 3) as f64 => {
                 info!("Minimize button clicked");
                 self.handle_minimize(state, window);
             }
@@ -582,6 +648,32 @@ impl HeaderBar {
         state.minimize_window(window);
     }
     
+    /// Start an interactive resize from a press in the band around the
+    /// frame. Deferred to an idle callback for the same reason as
+    /// `handle_move` and `handle_maximize`: this runs inside the SSD click's
+    /// borrow of `decoration_state`, and setting up the grab reads the
+    /// window's geometry, which borrows it again.
+    ///
+    /// This is what #11 was missing. vela negotiates server-side decoration,
+    /// so the frame being dragged is Evo's own, and no client ever sends the
+    /// `xdg_toplevel.resize` that the xdg path waits for.
+    fn handle_resize<B: Backend>(
+        &self,
+        seat: &Seat<EvoState<B>>,
+        state: &mut EvoState<B>,
+        window: &WindowElement,
+        serial: Serial,
+        edges: ResizeEdge,
+    ) {
+        if let WindowSurface::Wayland(w) = window.0.underlying_surface() {
+            let seat = seat.clone();
+            let toplevel = w.clone();
+            state
+                .handle
+                .insert_idle(move |data| data.resize_request_xdg(&toplevel, &seat, serial, edges));
+        }
+    }
+
     /// Handle window move action
     fn handle_move<B: Backend>(
         &self,
@@ -616,11 +708,12 @@ impl HeaderBar {
         window: &WindowElement,
         serial: Serial,
     ) {
-        // For touch, we only handle move (not button clicks on touch down)
-        match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {}
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {}
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {}
+        // For touch, we only handle move (not button clicks on touch down).
+        // The resize band is pointer-only: a touch there does nothing.
+        match self.header_point().as_ref() {
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH) as f64 => {}
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 2) as f64 => {}
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 3) as f64 => {}
             Some(_) => {
                 self.handle_move(seat, state, window, serial);
             }
@@ -636,14 +729,14 @@ impl HeaderBar {
         window: &WindowElement,
         _serial: Serial,
     ) {
-        match self.pointer_loc.as_ref() {
-            Some(loc) if loc.x >= (self.width - BUTTON_WIDTH) as f64 => {
+        match self.header_point().as_ref() {
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH) as f64 => {
                 self.handle_close(window);
             }
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 2)) as f64 => {
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 2) as f64 => {
                 self.handle_maximize(state, window);
             }
-            Some(loc) if loc.x >= (self.width - (BUTTON_WIDTH * 3)) as f64 => {
+            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 3) as f64 => {
                 self.handle_minimize(state, window);
             }
             _ => {}
@@ -712,9 +805,8 @@ impl HeaderBar {
 
         // === CLOSE BUTTON (rightmost) ===
         let close_hovered = self
-            .pointer_loc
-            .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH) as f64)
+            .header_point()
+            .map(|l| l.x >= width.saturating_sub(BUTTON_WIDTH) as f64)
             .unwrap_or(false);
         if needs_redraw_buttons || close_hovered != self.close_button_hover {
             let rgb = if close_hovered { CLOSE_HOVER_RGB } else { CLOSE_RGB };
@@ -724,9 +816,11 @@ impl HeaderBar {
 
         // === MAXIMIZE BUTTON (second from right, plain colored square) ===
         let maximize_hovered = self
-            .pointer_loc
-            .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH * 2) as f64 && l.x <= (width - BUTTON_WIDTH) as f64)
+            .header_point()
+            .map(|l| {
+                l.x >= width.saturating_sub(BUTTON_WIDTH * 2) as f64
+                    && l.x <= width.saturating_sub(BUTTON_WIDTH) as f64
+            })
             .unwrap_or(false);
         if needs_redraw_buttons || maximize_hovered != self.maximize_button_hover {
             let rgb = if maximize_hovered { MAXIMIZE_HOVER_RGB } else { MAXIMIZE_RGB };
@@ -739,9 +833,11 @@ impl HeaderBar {
 
         // === MINIMIZE BUTTON (third from right) ===
         let minimize_hovered = self
-            .pointer_loc
-            .as_ref()
-            .map(|l| l.x >= (width - BUTTON_WIDTH * 3) as f64 && l.x <= (width - BUTTON_WIDTH * 2) as f64)
+            .header_point()
+            .map(|l| {
+                l.x >= width.saturating_sub(BUTTON_WIDTH * 3) as f64
+                    && l.x <= width.saturating_sub(BUTTON_WIDTH * 2) as f64
+            })
             .unwrap_or(false);
         if needs_redraw_buttons || minimize_hovered != self.minimize_button_hover {
             let rgb = if minimize_hovered { MINIMIZE_HOVER_RGB } else { MINIMIZE_RGB };

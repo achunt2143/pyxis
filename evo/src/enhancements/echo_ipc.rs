@@ -71,7 +71,7 @@ impl CreateWindowRequest {
 }
 
 /// Window information exposed via IPC
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowInfo {
     pub window_id: u32,
     pub app_id: String,
@@ -250,12 +250,79 @@ enum EchoCommand {
         interface: ServiceInterface,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
-    /// Emit a signal
-    EmitSignal {
-        signal_name: String,
-        args: Value,
-        reply: tokio::sync::oneshot::Sender<Result<()>>,
-    },
+    /// Emit a signal. Fire-and-forget: nothing waits on the reply, so a
+    /// signal can never stall the compositor thread (see `emit`).
+    EmitSignal { signal_name: String, args: Value },
+}
+
+/// Largest frame the broker will read. Anything larger means the stream is
+/// out of step, or someone is misbehaving.
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+/// How long the compositor thread will wait on an Echo reply (`request`).
+/// Before this, every call waited forever, on the thread that draws the
+/// desktop. So an Echo daemon that never answered would have frozen the
+/// screen, not just IPC.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A request the broker sent and has not had the reply to yet, keyed in the
+/// broker by its message_id. The reply is matched by `reply_to`, which is how
+/// echo-daemon correlates the calls it forwards to Evo.
+enum PendingReply {
+    Call(tokio::sync::oneshot::Sender<Result<Value>>),
+    /// `None` when the broker re-registers on its own, after a reconnect.
+    Register(Option<tokio::sync::oneshot::Sender<Result<()>>>),
+    Signal(String),
+}
+
+impl PendingReply {
+    fn complete(self, reply: EchoMessage) {
+        let ok = reply.header.message_type == "METHOD_RETURN";
+        match self {
+            PendingReply::Call(tx) => {
+                let _ = tx.send(if ok {
+                    Ok(reply.body)
+                } else {
+                    Err(anyhow!("Echo error: {:?}", reply.body))
+                });
+            }
+            PendingReply::Register(tx) => {
+                let result = if ok {
+                    info!("✓ Service registered with Echo daemon");
+                    Ok(())
+                } else {
+                    Err(anyhow!("Registration failed: {:?}", reply.body))
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(result);
+                } else if let Err(e) = result {
+                    error!("Re-registration after reconnect failed: {}", e);
+                }
+            }
+            PendingReply::Signal(name) => {
+                if ok {
+                    debug!("✓ Signal emitted: {}", name);
+                } else {
+                    warn!("Signal {} failed: {:?}", name, reply.body);
+                }
+            }
+        }
+    }
+
+    /// The connection went away with this request unanswered. The caller
+    /// hears about it now, rather than never.
+    fn fail(self) {
+        let lost = || anyhow!("Echo connection lost before the reply");
+        match self {
+            PendingReply::Call(tx) => {
+                let _ = tx.send(Err(lost()));
+            }
+            PendingReply::Register(Some(tx)) => {
+                let _ = tx.send(Err(lost()));
+            }
+            PendingReply::Register(None) | PendingReply::Signal(_) => {}
+        }
+    }
 }
 
 // ============================================================================
@@ -270,6 +337,13 @@ pub struct GeckoEchoService {
     pub service_name: String,
     pub ready: Arc<RwLock<bool>>,
     pub windows: Arc<RwLock<HashMap<u32, WindowInfo>>>,
+    /// Every live toplevel, as the compositor last saw it: what
+    /// `ListWindows` and `GetRenderingStatus` report. `windows` above holds
+    /// only windows made through the create/claim contract, so a
+    /// Nova-launched app is never in it. Answering from it made
+    /// `ListWindows` empty on a real device, and froze each entry's
+    /// geometry at creation. Written by `EvoState::sync_toplevels`.
+    toplevels: Arc<RwLock<Vec<WindowInfo>>>,
     pub next_window_id: Arc<RwLock<u32>>,
     pub command_tx: mpsc::Sender<EchoCommand>,
     pub runtime_handle: tokio::runtime::Handle,
@@ -316,13 +390,16 @@ impl GeckoEchoService {
     let ready = Arc::new(RwLock::new(false));
     let create_window_cb = Arc::new(RwLock::new(None));
     let windows = Arc::new(RwLock::new(HashMap::new()));
+    let toplevels = Arc::new(RwLock::new(Vec::new()));
     let next_window_id = Arc::new(RwLock::new(1));
     let pending_window_actions = Arc::new(RwLock::new(Vec::new()));
+    let last_fps = Arc::new(AtomicU32::new(0));
 
     let (command_tx, command_rx) = mpsc::channel::<EchoCommand>(32);
 
     // Clone for broker
-    let windows_clone = Arc::clone(&windows);
+    let toplevels_clone = Arc::clone(&toplevels);
+    let last_fps_clone = Arc::clone(&last_fps);
     let next_window_id_clone = Arc::clone(&next_window_id);
     let create_window_cb_clone = Arc::clone(&create_window_cb);
     let pending_window_actions_clone = Arc::clone(&pending_window_actions);
@@ -334,7 +411,8 @@ impl GeckoEchoService {
         Self::echo_broker_loop(
             command_rx,
             socket_path,
-            windows_clone,
+            toplevels_clone,
+            last_fps_clone,
             next_window_id_clone,
             create_window_cb_clone,
             pending_window_actions_clone,
@@ -350,6 +428,7 @@ impl GeckoEchoService {
         service_name: "org.geckoOS.evo".to_string(),
         ready,
         windows,
+        toplevels,
         next_window_id,
         command_tx,
         runtime_handle,
@@ -357,7 +436,7 @@ impl GeckoEchoService {
         pending_window_actions,
         frame_count: Arc::new(AtomicU64::new(0)),
         fps_window_start: Arc::new(RwLock::new(Instant::now())),
-        last_fps: Arc::new(AtomicU32::new(0)),
+        last_fps,
     })
 }
 
@@ -366,38 +445,52 @@ impl GeckoEchoService {
     // SYNC PUBLIC API (for use in Evo)
     // ========================================================================
 
-    /// Register service with Echo bus (SYNC)
-    pub fn register(&self) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let interface = self.create_service_interface();
-        let cmd = EchoCommand::Register { interface, reply: tx };
-
+    /// Send a request to the broker, and wait (at most REQUEST_TIMEOUT)
+    /// for its reply. This runs on the compositor thread, so the wait is
+    /// bounded.
+    fn request<T>(
+        &self,
+        cmd: EchoCommand,
+        reply: tokio::sync::oneshot::Receiver<Result<T>>,
+        what: &str,
+    ) -> Result<T> {
         self.runtime_handle.block_on(async {
             self.command_tx
                 .send(cmd)
                 .await
                 .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Registration channel closed"))?
+            match tokio::time::timeout(REQUEST_TIMEOUT, reply).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(anyhow!("{} got no reply: the broker dropped it", what)),
+                Err(_) => Err(anyhow!("{} timed out after {:?}", what, REQUEST_TIMEOUT)),
+            }
         })
+    }
+
+    /// Queue a signal and return at once. A signal needs no answer, and it
+    /// used to block the compositor thread on the broker's reply just the
+    /// same. Every focus change emits one, and so every click did.
+    fn emit(&self, signal_name: &str, args: Value) -> Result<()> {
+        self.command_tx
+            .try_send(EchoCommand::EmitSignal {
+                signal_name: signal_name.to_string(),
+                args,
+            })
+            .map_err(|e| anyhow!("Signal {} not queued: {}", signal_name, e))
+    }
+
+    /// Register service with Echo bus (SYNC). The broker remembers the
+    /// interface and registers it again after any reconnect.
+    pub fn register(&self) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let interface = self.create_service_interface();
+        self.request(EchoCommand::Register { interface, reply: tx }, rx, "RegisterService")
     }
 
     /// Signal that Gecko is ready (SYNC)
     pub fn signal_ready(&self) -> Result<()> {
         *self.ready.write() = true;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "GeckoReady".to_string(),
-            args: json!({}),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+        self.emit("GeckoReady", json!({}))
     }
 
     /// Allocate a new window ID (SYNC)
@@ -479,13 +572,20 @@ impl GeckoEchoService {
 
     /// Get rendering status (SYNC)
     pub fn get_rendering_status(&self) -> RenderingStatus {
-        let ready = *self.ready.read();
-        let windows = self.windows.read();
         RenderingStatus {
-            is_ready: ready,
-            active_windows: windows.len(),
+            is_ready: *self.ready.read(),
+            active_windows: self.toplevels.read().len(),
             fps: self.last_fps.load(Ordering::Relaxed),
             memory_mb: current_process_rss_mb(),
+        }
+    }
+
+    /// Replace the live-toplevel snapshot (see `toplevels`). It takes the
+    /// write lock only when something changed, so calling it on a timer
+    /// from the render loop costs a read lock when the desktop is idle.
+    pub fn set_toplevels(&self, toplevels: Vec<WindowInfo>) {
+        if *self.toplevels.read() != toplevels {
+            *self.toplevels.write() = toplevels;
         }
     }
 
@@ -497,25 +597,12 @@ impl GeckoEchoService {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowCreated".to_string(),
-            args: json!({
+        self.emit("WindowCreated", json!({
                 "window_id": window_id,
                 "app_id": app_id,
                 "width": width,
                 "height": height
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Bind a mapped Wayland surface to its AppHost session, **over IPC**.
@@ -546,14 +633,7 @@ impl GeckoEchoService {
             reply: tx,
         };
 
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("BindSurface channel closed"))??;
-            Ok(())
-        })
+        self.request(cmd, rx, "BindSurface").map(|_| ())
     }
 
     /// Detach a surface from its AppHost session. See `bind_surface_remote`
@@ -570,32 +650,12 @@ impl GeckoEchoService {
             reply: tx,
         };
 
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("UnbindSurface channel closed"))??;
-            Ok(())
-        })
+        self.request(cmd, rx, "UnbindSurface").map(|_| ())
     }
 
     /// Emit window closed signal (SYNC)
     pub fn emit_window_closed(&self, window_id: u32) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowClosed".to_string(),
-            args: json!({ "window_id": window_id }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+        self.emit("WindowClosed", json!({ "window_id": window_id }))
     }
 
     /// Emit window moved signal (SYNC)
@@ -605,47 +665,21 @@ impl GeckoEchoService {
         x: i32,
         y: i32,
     ) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowMoved".to_string(),
-            args: json!({
+        self.emit("WindowMoved", json!({
                 "window_id": window_id,
                 "x": x,
                 "y": y,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit workspace changed signal (SYNC)
     pub fn emit_workspace_changed(&self, workspace_id: u32, workspace_name: &str) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WorkspaceChanged".to_string(),
-            args: json!({
+        self.emit("WorkspaceChanged", json!({
                 "workspace_id": workspace_id,
                 "workspace_name": workspace_name,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit window moved to workspace signal (SYNC)
@@ -655,25 +689,12 @@ impl GeckoEchoService {
         from_workspace: u32,
         to_workspace: u32,
     ) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowMovedToWorkspace".to_string(),
-            args: json!({
+        self.emit("WindowMovedToWorkspace", json!({
                 "window_id": window_id,
                 "from_workspace": from_workspace,
                 "to_workspace": to_workspace,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit window focus changed signal (SYNC)
@@ -682,133 +703,55 @@ impl GeckoEchoService {
         window_id: Option<u32>,
         workspace_id: u32,
     ) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowFocusChanged".to_string(),
-            args: json!({
+        self.emit("WindowFocusChanged", json!({
                 "window_id": window_id,
                 "workspace_id": workspace_id,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit window minimized signal (SYNC)
     pub fn emit_window_minimized(&self, window_id: u32, minimized: bool) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowMinimized".to_string(),
-            args: json!({
+        self.emit("WindowMinimized", json!({
                 "window_id": window_id,
                 "minimized": minimized,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit window maximized signal (SYNC)
     pub fn emit_window_maximized(&self, window_id: u32, maximized: bool) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowMaximized".to_string(),
-            args: json!({
+        self.emit("WindowMaximized", json!({
                 "window_id": window_id,
                 "maximized": maximized,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit window fullscreen signal (SYNC)
     pub fn emit_window_fullscreen(&self, window_id: u32, fullscreen: bool) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WindowFullscreen".to_string(),
-            args: json!({
+        self.emit("WindowFullscreen", json!({
                 "window_id": window_id,
                 "fullscreen": fullscreen,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit workspace created signal (SYNC)
     pub fn emit_workspace_created(&self, workspace_id: u32, workspace_name: &str) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WorkspaceCreated".to_string(),
-            args: json!({
+        self.emit("WorkspaceCreated", json!({
                 "workspace_id": workspace_id,
                 "workspace_name": workspace_name,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Emit workspace deleted signal (SYNC)
     pub fn emit_workspace_deleted(&self, workspace_id: u32) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::EmitSignal {
-            signal_name: "WorkspaceDeleted".to_string(),
-            args: json!({
+        self.emit("WorkspaceDeleted", json!({
                 "workspace_id": workspace_id,
                 "timestamp": now_ms()
-            }),
-            reply: tx,
-        };
-
-        self.runtime_handle.block_on(async {
-            self.command_tx
-                .send(cmd)
-                .await
-                .map_err(|e| anyhow!("Command channel error: {}", e))?;
-            rx.await.map_err(|_| anyhow!("Signal channel closed"))?
-        })
+            }))
     }
 
     /// Drain and return all pending FocusWindow/MinimizeWindow/RestoreWindow
@@ -885,12 +828,20 @@ impl GeckoEchoService {
     async fn echo_broker_loop(
     mut command_rx: mpsc::Receiver<EchoCommand>,
     socket_path: PathBuf,
-    windows: Arc<RwLock<HashMap<u32, WindowInfo>>>,
+    toplevels: Arc<RwLock<Vec<WindowInfo>>>,
+    last_fps: Arc<AtomicU32>,
     next_window_id: Arc<RwLock<u32>>,
     // ✅ Arc instead of Box
     create_window_cb: Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
     pending_window_actions: Arc<RwLock<Vec<PendingWindowAction>>>,
 ) {
+    // The interface last registered, replayed after every reconnect.
+    // echo-daemon drops a connection's service names when the connection
+    // closes (IPCBus::remove_connection). A broker that reconnected without
+    // re-registering therefore left `org.geckoOS.evo` gone for the rest of
+    // the session, and every nova.Focus and window action failed with
+    // "Service not registered".
+    let mut registration: Option<ServiceInterface> = None;
     loop {
         match UnixStream::connect(&socket_path).await {
             Ok(stream) => {
@@ -921,36 +872,65 @@ impl GeckoEchoService {
                     }
                 }
 
+                // One reader for everything that arrives. A reply is matched
+                // to its request by `reply_to`, the way echo-daemon matches
+                // the calls it forwards to us. This used to send a request and
+                // then take the next frame as its answer. But the next frame
+                // can be a broadcast signal, or a call the daemon is
+                // forwarding to Evo (someone's `ListWindows`). That call was
+                // then eaten as the "reply" and never answered, and the real
+                // reply turned up later as a stray METHOD_RETURN.
+                let mut pending: HashMap<String, PendingReply> = HashMap::new();
+
+                if let Some(interface) = &registration {
+                    info!("Re-registering with Echo daemon after reconnect");
+                    let message = Self::register_message(interface);
+                    let id = message.header.message_id.clone();
+                    if Self::send_echo_message(&mut write_half, &message).await.is_ok() {
+                        pending.insert(id, PendingReply::Register(None));
+                    }
+                }
+
                 loop {
                     tokio::select! {
-                        msg_result = Self::recv_echo_message(&mut read_half) => {
-                            match msg_result {
-                                Ok(msg) => {
-                                    // ✅ Pass the individual components instead of full service
-                                    if let Err(e) = Self::handle_incoming_message(
-                                        &mut write_half,
-                                        msg,
-                                        &windows,
-                                        &next_window_id,
-                                        &create_window_cb,
-                                        &pending_window_actions,
-                                    )
-                                    .await
-                                    {
-                                        error!("Error handling incoming message: {}", e);
-                                    }
-                                }
+                        incoming = Self::recv_frame(&mut read_half) => {
+                            let msg = match incoming {
+                                Ok(Some(msg)) => msg,
+                                // A frame that did not parse. It was read in
+                                // full, so the stream is still in step: skip it.
+                                Ok(None) => continue,
                                 Err(e) => {
                                     error!("Error receiving message: {}", e);
                                     break;
                                 }
+                            };
+                            if matches!(msg.header.message_type.as_str(), "METHOD_RETURN" | "ERROR") {
+                                let reply_to = msg.header.reply_to.clone().unwrap_or_default();
+                                match pending.remove(&reply_to) {
+                                    Some(waiting) => waiting.complete(msg),
+                                    None => debug!("Reply to nothing we sent: {}", reply_to),
+                                }
+                                continue;
+                            }
+                            if let Err(e) = Self::handle_incoming_message(
+                                &mut write_half,
+                                msg,
+                                &toplevels,
+                                &last_fps,
+                                &next_window_id,
+                                &create_window_cb,
+                                &pending_window_actions,
+                            )
+                            .await
+                            {
+                                error!("Error handling incoming message: {}", e);
                             }
                         }
 
                         cmd = command_rx.recv() => {
                             match cmd {
                                 Some(cmd) => {
-                                    if let Err(e) = Self::process_command(&mut write_half, &mut read_half, cmd).await {
+                                    if let Err(e) = Self::send_command(&mut write_half, cmd, &mut pending, &mut registration).await {
                                         error!("Command processing error: {}", e);
                                         break;
                                     }
@@ -963,6 +943,12 @@ impl GeckoEchoService {
                         }
                     }
                 }
+
+                // Everyone still waiting on this connection hears so now.
+                for (_, waiting) in pending.drain() {
+                    waiting.fail();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(e) => {
                 error!("Failed to connect to Echo daemon: {}", e);
@@ -977,7 +963,8 @@ impl GeckoEchoService {
     async fn handle_incoming_message(
     write_half: &mut OwnedWriteHalf,
     msg: EchoMessage,
-    windows: &Arc<RwLock<HashMap<u32, WindowInfo>>>,
+    toplevels: &Arc<RwLock<Vec<WindowInfo>>>,
+    last_fps: &Arc<AtomicU32>,
     next_window_id: &Arc<RwLock<u32>>,
     create_window_cb: &Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
     pending_window_actions: &Arc<RwLock<Vec<PendingWindowAction>>>,
@@ -997,9 +984,9 @@ impl GeckoEchoService {
 
         let response = match method {
             "ListWindows" => {
-                let windows_list = windows.read();
+                let windows_list = toplevels.read();
                 let window_list: Vec<Value> = windows_list
-                    .values()
+                    .iter()
                     .map(|w| {
                         json!({
                             "window_id": w.window_id,
@@ -1017,12 +1004,14 @@ impl GeckoEchoService {
             }
 
             "GetRenderingStatus" => {
-                let windows_list = windows.read();
+                // These were literals, `"fps": 60` and `"memory_mb": 256`,
+                // while the signal path (`get_rendering_status`) read the
+                // real counters. Both answer from the same place now.
                 let status = json!({
                     "is_ready": true,
-                    "active_windows": windows_list.len(),
-                    "fps": 60,
-                    "memory_mb": 256,
+                    "active_windows": toplevels.read().len(),
+                    "fps": last_fps.load(Ordering::Relaxed),
+                    "memory_mb": current_process_rss_mb(),
                 });
                 EchoMessage::method_return(message_id, json!({ "status": status }))
             }
@@ -1245,51 +1234,23 @@ impl GeckoEchoService {
         Self::send_echo_message(write_half, &response).await
     }
 
-    async fn process_command(
+    /// Write a command's message and note what is waiting on the reply.
+    /// Nothing is read here: the broker loop is the only reader.
+    async fn send_command(
         write_half: &mut tokio::net::unix::OwnedWriteHalf,
-        read_half: &mut tokio::net::unix::OwnedReadHalf,
         cmd: EchoCommand,
+        pending: &mut HashMap<String, PendingReply>,
+        registration: &mut Option<ServiceInterface>,
     ) -> Result<()> {
-        match cmd {
-            EchoCommand::Call { message, reply } => {
-                Self::send_echo_message(write_half, &message).await?;
-                let response = Self::recv_echo_message(read_half).await?;
-                let result = if response.header.message_type == "METHOD_RETURN" {
-                    Ok(response.body)
-                } else {
-                    Err(anyhow!("Echo error: {:?}", response.body))
-                };
-                let _ = reply.send(result);
-            }
-
+        let (message, waiting) = match cmd {
+            EchoCommand::Call { message, reply } => (message, PendingReply::Call(reply)),
             EchoCommand::Register { interface, reply } => {
-                let msg = EchoMessage::method_call(
-                    "org.geckoOS.Echo".to_string(),
-                    "org.geckoOS.Echo".to_string(),
-                    "RegisterService".to_string(),
-                    json!({
-                        "name": "org.geckoOS.evo",
-                        "interface": serde_json::to_value(&interface)?
-                    }),
-                );
-
-                Self::send_echo_message(write_half, &msg).await?;
-                let response = Self::recv_echo_message(read_half).await?;
-                let result = if response.header.message_type == "METHOD_RETURN" {
-                    info!("✓ Service registered with Echo daemon");
-                    Ok(())
-                } else {
-                    Err(anyhow!("Registration failed: {:?}", response.body))
-                };
-                let _ = reply.send(result);
+                let message = Self::register_message(&interface);
+                *registration = Some(interface);
+                (message, PendingReply::Register(Some(reply)))
             }
-
-            EchoCommand::EmitSignal {
-                signal_name,
-                args,
-                reply,
-            } => {
-                let msg = EchoMessage::method_call(
+            EchoCommand::EmitSignal { signal_name, args } => (
+                EchoMessage::method_call(
                     "org.geckoOS.Echo".to_string(),
                     "org.geckoOS.evo".to_string(),
                     "EmitSignal".to_string(),
@@ -1297,26 +1258,52 @@ impl GeckoEchoService {
                         "signal_name": signal_name,
                         "args": args
                     }),
-                );
-
-                Self::send_echo_message(write_half, &msg).await?;
-                let response = Self::recv_echo_message(read_half).await?;
-                let result = if response.header.message_type == "METHOD_RETURN" {
-                    debug!("✓ Signal emitted: {}", signal_name);
-                    Ok(())
-                } else {
-                    Err(anyhow!("Signal emission failed: {:?}", response.body))
-                };
-                let _ = reply.send(result);
-            }
-        }
-
+                ),
+                PendingReply::Signal(signal_name),
+            ),
+        };
+        let id = message.header.message_id.clone();
+        Self::send_echo_message(write_half, &message).await?;
+        pending.insert(id, waiting);
         Ok(())
     }
 
-    // ========================================================================
-    // ECHO MESSAGE I/O
-    // ========================================================================
+    fn register_message(interface: &ServiceInterface) -> EchoMessage {
+        EchoMessage::method_call(
+            "org.geckoOS.Echo".to_string(),
+            "org.geckoOS.Echo".to_string(),
+            "RegisterService".to_string(),
+            json!({
+                "name": "org.geckoOS.evo",
+                "interface": serde_json::to_value(interface).unwrap_or_default()
+            }),
+        )
+    }
+
+    /// One frame off the wire. `Ok(None)` for a frame that arrived whole but
+    /// did not parse. It is logged and skipped, since the stream is still in
+    /// step, where it used to drop the whole connection. Only a failed read
+    /// is an error.
+    async fn recv_frame(read_half: &mut tokio::net::unix::OwnedReadHalf) -> Result<Option<EchoMessage>> {
+        let len = read_half.read_u32_le().await? as usize;
+        if len > MAX_FRAME {
+            return Err(anyhow!("Message too large: {} bytes", len));
+        }
+        let mut buffer = vec![0u8; len];
+        read_half.read_exact(&mut buffer).await?;
+        debug!("Received Echo message: {} bytes", len);
+        match serde_json::from_slice(&buffer) {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) => {
+                warn!(
+                    "Skipping an Echo message that did not parse ({}): {}",
+                    e,
+                    String::from_utf8_lossy(&buffer[..buffer.len().min(200)])
+                );
+                Ok(None)
+            }
+        }
+    }
 
     async fn send_echo_message(
         write_half: &mut tokio::net::unix::OwnedWriteHalf,
@@ -1335,7 +1322,7 @@ impl GeckoEchoService {
         read_half: &mut tokio::net::unix::OwnedReadHalf,
     ) -> Result<EchoMessage> {
         let len = read_half.read_u32_le().await? as usize;
-        if len > 1024 * 1024 {
+        if len > MAX_FRAME {
             return Err(anyhow!("Message too large: {} bytes", len));
         }
 
@@ -1719,6 +1706,7 @@ impl Clone for GeckoEchoService {
             service_name: self.service_name.clone(),
             ready: Arc::clone(&self.ready),
             windows: Arc::clone(&self.windows),
+            toplevels: Arc::clone(&self.toplevels),
             next_window_id: Arc::clone(&self.next_window_id),
             command_tx: self.command_tx.clone(),
             runtime_handle: self.runtime_handle.clone(),
@@ -1777,6 +1765,119 @@ fn current_process_rss_mb() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the broker against a scripted daemon ----
+
+    async fn write_frame(stream: &mut UnixStream, value: &Value) {
+        let data = serde_json::to_vec(value).unwrap();
+        stream.write_u32_le(data.len() as u32).await.unwrap();
+        stream.write_all(&data).await.unwrap();
+    }
+
+    async fn read_frame(stream: &mut UnixStream) -> Value {
+        let len = stream.read_u32_le().await.unwrap() as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await.unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    fn frame(message_type: &str, fields: Value) -> Value {
+        let mut header = json!({
+            "message_id": Uuid::new_v4().to_string(),
+            "message_type": message_type,
+            "destination": "",
+            "interface": "",
+            "method": "",
+            "timestamp": 0,
+        });
+        for (k, v) in fields.as_object().unwrap() {
+            header[k] = v.clone();
+        }
+        json!({ "header": header, "body": {} })
+    }
+
+    /// The failure that cost a device run on 2026-09-25. The broker used to
+    /// take the next frame after a request as that request's reply, and it
+    /// dropped the connection on any frame it could not parse. It also
+    /// never re-registered after reconnecting. So a daemon that interleaved
+    /// traffic, which is exactly what a busy bus does, left Evo's calls
+    /// unanswered and, sooner or later, `org.geckoOS.evo` unregistered.
+    #[tokio::test]
+    async fn broker_matches_replies_and_survives_a_busy_bus() {
+        // A regression here shows up as a hang (a reply that never comes),
+        // so bound it and fail loudly instead.
+        tokio::time::timeout(std::time::Duration::from_secs(10), busy_bus())
+            .await
+            .expect("broker stopped answering: see busy_bus");
+    }
+
+    async fn busy_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("echo.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let (command_tx, command_rx) = mpsc::channel(8);
+        tokio::spawn(GeckoEchoService::echo_broker_loop(
+            command_rx,
+            path.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(RwLock::new(1)),
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(Vec::new())),
+        ));
+
+        let (mut daemon, _) = listener.accept().await.unwrap();
+        let hello = read_frame(&mut daemon).await;
+        assert_eq!(hello["header"]["message_type"], "HANDSHAKE");
+        write_frame(&mut daemon, &frame("METHOD_RETURN", json!({}))).await;
+
+        let interface: ServiceInterface = serde_json::from_value(json!({
+            "name": "org.geckoOS.evo", "methods": [], "signals": [], "properties": []
+        }))
+        .unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        command_tx
+            .send(EchoCommand::Register { interface, reply: reply_tx })
+            .await
+            .unwrap();
+        let register = read_frame(&mut daemon).await;
+        assert_eq!(register["header"]["method"], "RegisterService");
+        let register_id = register["header"]["message_id"].clone();
+
+        // Everything a busy bus can put in front of the reply.
+        write_frame(&mut daemon, &frame("SIGNAL", json!({ "interface": "org.geckoOS.nova", "method": "RegistryChanged" }))).await;
+        daemon.write_u32_le(9).await.unwrap();
+        daemon.write_all(b"not json!").await.unwrap();
+        let list = frame("METHOD_CALL", json!({ "destination": "org.geckoOS.evo", "interface": "org.geckoOS.evo", "method": "ListWindows" }));
+        let list_id = list["header"]["message_id"].clone();
+        write_frame(&mut daemon, &list).await;
+        write_frame(&mut daemon, &frame("METHOD_RETURN", json!({ "reply_to": register_id }))).await;
+
+        // The forwarded call is answered, not eaten as the reply...
+        let answer = read_frame(&mut daemon).await;
+        assert_eq!(answer["header"]["reply_to"], list_id);
+        assert_eq!(answer["body"]["windows"], json!([]));
+        // ...and the registration got its own reply.
+        reply_rx.await.unwrap().unwrap();
+
+        // Drop the connection. The broker must come back and register again
+        // without being asked.
+        drop(daemon);
+        let (mut daemon, _) = listener.accept().await.unwrap();
+        assert_eq!(read_frame(&mut daemon).await["header"]["message_type"], "HANDSHAKE");
+        write_frame(&mut daemon, &frame("METHOD_RETURN", json!({}))).await;
+        let again = read_frame(&mut daemon).await;
+        assert_eq!(again["header"]["method"], "RegisterService");
+        assert_eq!(again["body"]["name"], "org.geckoOS.evo");
+    }
+
+    #[test]
+    fn a_lost_connection_fails_the_waiting_call_instead_of_leaving_it() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        PendingReply::Call(tx).fail();
+        assert!(rx.try_recv().unwrap().is_err());
+    }
 
     #[test]
     fn test_create_window_request() {

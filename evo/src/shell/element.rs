@@ -20,7 +20,10 @@ use smithay::{
     },
     output::Output,
     reexports::{
-        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
+        wayland_protocols::{
+            wp::presentation_time::server::wp_presentation_feedback,
+            xdg::shell::server::xdg_toplevel,
+        },
         wayland_server::protocol::wl_surface::WlSurface,
     },
     render_elements,
@@ -35,7 +38,7 @@ use smithay::{
     },
 };
 
-use super::ssd::{DecorationRenderElement, HEADER_BAR_HEIGHT};
+use super::ssd::{DecorationRenderElement, HEADER_BAR_HEIGHT, RESIZE_BAND};
 use super::xdg::SHELL_APP_ID;
 use crate::{focus::PointerFocusTarget, state::Backend, EvoState};
 
@@ -46,6 +49,19 @@ use crate::{focus::PointerFocusTarget, state::Backend, EvoState};
 /// title-bar-clicked) agree on the same saved geometry.
 #[derive(Debug, Default)]
 pub(crate) struct OldGeometry(RefCell<Option<Rectangle<i32, Logical>>>);
+
+/// Marks a window whose location is a guess, made before its size was known.
+///
+/// A new toplevel gets a location when it is created, but its size only
+/// arrives with its first buffer. So the location is picked blind, and a
+/// window as large as vela's (1152x720, plus the header) landed partly off
+/// the output about half the time, band and buttons included. The first
+/// commit that gives the window a real size while it floats places it for
+/// real (`first_real_placement` in shell/xdg.rs). A window born maximized
+/// keeps the mark until it is first restored, which is also why its guessed
+/// location is never saved as the place to restore to.
+#[derive(Default)]
+pub(crate) struct PlacementPending(std::cell::Cell<bool>);
 impl OldGeometry {
     pub fn save(&self, geo: Rectangle<i32, Logical>) {
         *self.0.borrow_mut() = Some(geo);
@@ -86,6 +102,89 @@ impl WindowElement {
         ))
     }
 
+    /// The SSD frame (header bar and client) in the same render-origin space
+    /// as `ssd_header_rect`, when it can be resized from its edges. Returns
+    /// `None` when the window isn't server-decorated, or is maximized or
+    /// fullscreen. Such a window fills its space, so it has no edge to drag,
+    /// and its band would sit off the output anyway.
+    fn ssd_resizable_frame(&self) -> Option<Rectangle<i32, Logical>> {
+        // Let this borrow end before `geometry()` takes its own (see
+        // `surface_under`).
+        let is_ssd = self.decoration_state().is_ssd;
+        if !is_ssd {
+            return None;
+        }
+        let WindowSurface::Wayland(toplevel) = self.0.underlying_surface() else {
+            // SSD resize starts an xdg configure-driven grab. X11 windows keep
+            // whatever resize their client does.
+            return None;
+        };
+        // The committed state, i.e. what is on screen now. A maximize that
+        // is only pending has not changed anything the pointer can see yet.
+        let fills_its_space = toplevel.with_committed_state(|state| {
+            state.is_some_and(|state| {
+                state.states.contains(xdg_toplevel::State::Maximized)
+                    || state.states.contains(xdg_toplevel::State::Fullscreen)
+            })
+        });
+        if fills_its_space {
+            return None;
+        }
+        Some(SpaceElement::geometry(self))
+    }
+
+    /// The resizable SSD frame and the outer edge of the invisible band
+    /// around it, where a press starts a resize (`HeaderBar::clicked`).
+    ///
+    /// The band lies wholly OUTSIDE the visible frame. Taking it from inside
+    /// would steal the client's own edge pixels, such as a scrollbar. That is
+    /// why it needs the matching `bbox` and `is_in_input_region` below:
+    /// without them the space never offers this window a point outside it.
+    fn ssd_resize_band(&self) -> Option<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)> {
+        let frame = self.ssd_resizable_frame()?;
+        let outer = Rectangle::new(
+            frame.loc - Point::from((RESIZE_BAND, RESIZE_BAND)),
+            frame.size + Size::from((2 * RESIZE_BAND, 2 * RESIZE_BAND)),
+        );
+        Some((frame, outer))
+    }
+
+    /// Whether `point` (render-origin space) is in the resize band.
+    fn in_ssd_resize_band(&self, point: Point<f64, Logical>) -> bool {
+        self.ssd_resize_band().is_some_and(|(frame, outer)| {
+            outer.to_f64().contains(point) && !frame.to_f64().contains(point)
+        })
+    }
+
+    /// How much taller server-side decoration makes the window than its
+    /// client: the header bar, or nothing for a client that decorates itself.
+    ///
+    /// Resize grabs work in frame size, which is what the user drags and what
+    /// `geometry()` reports. A configure carries the client's own size, so
+    /// they convert with this at the protocol boundary.
+    pub fn decoration_height(&self) -> i32 {
+        if self.decoration_state().is_ssd {
+            HEADER_BAR_HEIGHT
+        } else {
+            0
+        }
+    }
+
+    /// Mark this window's location as a guess, or as settled (see
+    /// `PlacementPending`).
+    pub fn set_placement_pending(&self, pending: bool) {
+        self.user_data().insert_if_missing(PlacementPending::default);
+        if let Some(mark) = self.user_data().get::<PlacementPending>() {
+            mark.0.set(pending);
+        }
+    }
+
+    pub fn placement_pending(&self) -> bool {
+        self.user_data()
+            .get::<PlacementPending>()
+            .is_some_and(|mark| mark.0.get())
+    }
+
     /// The window's human-readable title for the SSD title bar: the
     /// xdg_toplevel title (X11 WM title), falling back to the app_id/class when
     /// the client hasn't set a title (so e.g. a web app that never set
@@ -119,21 +218,25 @@ impl WindowElement {
         }
     }
 
-    /// Whether this window is the desktop shell (Bloom), identified by
-    /// app_id / X11 class. Used to pin it beneath app windows in the z-order.
-    pub(crate) fn is_shell(&self) -> bool {
+    /// The xdg_toplevel app_id, or the X11 class. `None` until a Wayland
+    /// client sets one.
+    pub fn app_id(&self) -> Option<String> {
         match self.0.underlying_surface() {
             WindowSurface::Wayland(toplevel) => with_states(toplevel.wl_surface(), |states| {
                 states
                     .data_map
                     .get::<XdgToplevelSurfaceData>()
                     .and_then(|d| d.lock().ok().and_then(|g| g.app_id.clone()))
-                    .as_deref()
-                    == Some(SHELL_APP_ID)
             }),
             #[cfg(feature = "xwayland")]
-            WindowSurface::X11(s) => s.class() == SHELL_APP_ID,
+            WindowSurface::X11(s) => Some(s.class()),
         }
+    }
+
+    /// Whether this window is the desktop shell (Bloom), identified by
+    /// app_id / X11 class. Used to pin it beneath app windows in the z-order.
+    pub(crate) fn is_shell(&self) -> bool {
+        self.app_id().as_deref() == Some(SHELL_APP_ID)
     }
 
     pub fn surface_under(
@@ -154,6 +257,13 @@ impl WindowElement {
                 // header-relative (they compare `loc.x` against
                 // `self.width`). Handing back the render origin here shifted
                 // every button hit-test by the shadow margin.
+                return Some((PointerFocusTarget::SSD(SSD(self.clone())), header.loc));
+            }
+            // The resize band belongs to the frame too, and is reported from
+            // the same origin, so `HeaderBar` sees frame-relative
+            // coordinates: negative above and left of the frame, and past
+            // its width or height below and right.
+            if self.in_ssd_resize_band(location) {
                 return Some((PointerFocusTarget::SSD(SSD(self.clone())), header.loc));
             }
         }
@@ -503,6 +613,11 @@ impl SpaceElement for WindowElement {
         if self.decoration_state().is_ssd {
             bbox.size.h += HEADER_BAR_HEIGHT;
         }
+        // Space::element_under filters on bbox before it ever asks
+        // is_in_input_region, so the resize band has to be inside it.
+        if let Some((_, outer)) = self.ssd_resize_band() {
+            bbox = bbox.merge(outer);
+        }
         bbox
     }
     fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
@@ -511,6 +626,7 @@ impl SpaceElement for WindowElement {
         // `geometry().loc.y ..= +HEADER_BAR_HEIGHT`, not `0 ..= HEADER_BAR_HEIGHT`.
         if let Some(header) = self.ssd_header_rect() {
             header.to_f64().contains(*point)
+                || self.in_ssd_resize_band(*point)
                 || SpaceElement::is_in_input_region(
                     &self.0,
                     &(*point - Point::from((0.0, HEADER_BAR_HEIGHT as f64))),

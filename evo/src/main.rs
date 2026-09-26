@@ -1,7 +1,5 @@
 use tracing::{error, info};
 
-#[cfg(feature = "echo-ipc")]
-use geckoOS_evo::enhancements::echo_ipc::GeckoEchoService;
 
 static POSSIBLE_BACKENDS: &[&str] = &[
     #[cfg(feature = "winit")]
@@ -43,38 +41,13 @@ std::env::set_var("WAYLAND_DISPLAY", &wayland_display);
 
 info!("Wayland socket: {}", wayland_display);
 
-    // Initialize Echo IPC service if feature is enabled
-    #[cfg(feature = "echo-ipc")]
-    {
-        match GeckoEchoService::new() {
-            Ok(service) => {
-                info!("✓ Echo service created with background broker");
-                
-                // Register service synchronously
-                if let Err(e) = service.register() {
-                    error!("Failed to register Echo service: {}", e);
-                    error!("Continuing without Echo IPC support");
-                } else {
-                    info!("✓ Echo service registered with daemon");
-                    
-                    // Signal ready synchronously
-                    if let Err(e) = service.signal_ready() {
-                        error!("Failed to signal Echo ready: {}", e);
-                    } else {
-                        info!("✓ Echo ready signal sent");
-                    }
-                }
-                
-                // Note: service is dropped here, but the background broker runtime
-                // continues running. The actual Echo service is managed in EvoState.
-                info!("Echo IPC initialized and available for compositor");
-            }
-            Err(e) => {
-                error!("Failed to create Echo service: {}", e);
-                error!("Continuing without Echo IPC support");
-            }
-        }
-    }
+    // Echo IPC is set up by EvoState (state.rs), which owns the service for
+    // the compositor's lifetime. A second instance used to be created here,
+    // registered as `org.geckoOS.evo`, and dropped a line later. The comment
+    // on it claimed its broker kept running, but a dropped service closes its
+    // command channel, the broker shuts down, and its connection closes.
+    // All that bought was the same name registered twice, on two
+    // connections, one of them already closing.
 
     // Initialize profiling if enabled
     #[cfg(feature = "profile-with-tracy")]

@@ -449,6 +449,8 @@ pub fn run_winit() {
             state.popups.cleanup();
             #[cfg(feature = "echo-ipc")]
             state.process_pending_window_actions();
+            #[cfg(feature = "echo-ipc")]
+            state.sync_toplevels();
             display_handle.flush_clients().unwrap();
         }
 

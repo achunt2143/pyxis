@@ -145,13 +145,11 @@ use smithay::{
 };
 
 #[cfg(feature = "echo-ipc")]
-use crate::enhancements::echo_ipc::{GeckoEchoService, WindowAction};
+use crate::enhancements::echo_ipc::{GeckoEchoService, WindowAction, WindowInfo};
 #[cfg(feature = "hotplug")]
 use crate::enhancements::hotplug::HotPlugManager;
 #[cfg(feature = "screencopy")]
-use crate::enhancements::screencopy::{
-    copy_frame_to_shm_buffer, ScreencopyHandler, ScreencopyManagerState,
-};
+use crate::enhancements::screencopy::{ScreencopyHandler, ScreencopyManagerState};
 #[cfg(feature = "advanced-input")]
 use crate::input::AdvancedInputManager;
 #[cfg(feature = "gecko-surface")]
@@ -249,6 +247,10 @@ pub struct EvoState<BackendData: Backend + 'static> {
 
     pub start_time: Instant,
     pub workspace_manager: WorkspaceManager,
+
+    /// When `sync_toplevels` last published the window list.
+    #[cfg(feature = "echo-ipc")]
+    last_toplevel_sync: Instant,
 
     #[cfg(feature = "screencopy")]
     pub screencopy_state: ScreencopyManagerState,
@@ -821,18 +823,12 @@ impl<BackendData: Backend> ScreencopyHandler for EvoState<BackendData> {
         &mut self.screencopy_state
     }
 
-    fn copy_frame(
-        &mut self,
-        output: &Output,
-        buffer: &WlBuffer,
-        region: Option<Rectangle<i32, Logical>>,
-        overlay_cursor: bool,
-    ) -> Result<(), crate::shell::screencopy::ScreencopyError> {
-        copy_frame_to_shm_buffer(self, output, buffer, region, overlay_cursor)
+    fn screencopy_supported(&self) -> bool {
+        BackendData::HAS_SCREENCOPY
     }
 }
 #[cfg(feature = "screencopy")]
-delegate_screencopy!(@<BackendData: Backend + 'static> EvoState<BackendData>);
+crate::delegate_screencopy!(@<BackendData: Backend + 'static> EvoState<BackendData>);
 
 impl<BackendData: Backend> IdleNotifierHandler for EvoState<BackendData> {
     fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
@@ -1148,6 +1144,8 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             renderdoc: renderdoc::RenderDoc::new().ok(),
             show_window_preview: false,
             start_time,
+            #[cfg(feature = "echo-ipc")]
+            last_toplevel_sync: Instant::now(),
             #[cfg(feature = "gecko-window-manager")]
             window_manager,
             #[cfg(feature = "hotplug")]
@@ -1860,6 +1858,45 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     /// event-loop iteration by each backend (winit/udev/x11), since the
     /// broker that receives these IPC requests runs on a separate tokio
     /// thread with no direct access to `Space`/`Seat`.
+    /// Publish every live toplevel to the IPC side, for `ListWindows` and
+    /// `GetRenderingStatus` (see `GeckoEchoService::toplevels`). Each backend
+    /// calls this from its event loop, next to
+    /// `process_pending_window_actions`. It rebuilds at most four times a
+    /// second, and `set_toplevels` writes only on change.
+    ///
+    /// Geometry is the frame's, header bar included, at the frame's top-left.
+    /// A minimized window is unmapped from the space, so it reports
+    /// `visible: false` at 0,0.
+    #[cfg(feature = "echo-ipc")]
+    pub fn sync_toplevels(&mut self) {
+        if self.last_toplevel_sync.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.last_toplevel_sync = Instant::now();
+
+        let focused = self.seat.get_keyboard().and_then(|keyboard| keyboard.current_focus());
+        let mut toplevels: Vec<WindowInfo> = self
+            .windows_by_id
+            .iter()
+            .map(|(&window_id, window)| {
+                let location = self.space.element_location(window);
+                let size = window.geometry().size;
+                WindowInfo {
+                    window_id,
+                    app_id: window.app_id().unwrap_or_default(),
+                    width: size.w.max(0) as u32,
+                    height: size.h.max(0) as u32,
+                    x: location.map_or(0, |l| l.x),
+                    y: location.map_or(0, |l| l.y),
+                    focused: matches!(&focused, Some(KeyboardFocusTarget::Window(w)) if *w == window.0),
+                    visible: location.is_some(),
+                }
+            })
+            .collect();
+        toplevels.sort_by_key(|w| w.window_id);
+        self.echo_service.read().set_toplevels(toplevels);
+    }
+
     #[cfg(feature = "echo-ipc")]
     pub fn process_pending_window_actions(&mut self) {
         let actions = self.echo_service.read().take_pending_window_actions();
@@ -2084,6 +2121,9 @@ pub fn take_presentation_feedback(
 pub trait Backend {
     const HAS_RELATIVE_MOTION: bool = false;
     const HAS_GESTURES: bool = false;
+    /// Whether the backend fulfils queued screencopy captures in its repaint
+    /// (see enhancements/screencopy.rs). Only udev does.
+    const HAS_SCREENCOPY: bool = false;
     fn seat_name(&self) -> String;
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);

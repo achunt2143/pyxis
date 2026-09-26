@@ -19,6 +19,8 @@ use crate::{
     shell::WindowRenderElement,
     state::{DndIcon, SurfaceDmabufFeedback},
 };
+#[cfg(feature = "screencopy")]
+use crate::enhancements::screencopy::PendingCapture;
 #[cfg(feature = "renderer_sync")]
 use smithay::backend::drm::compositor::PrimaryPlaneElement;
 #[cfg(feature = "egl")]
@@ -46,7 +48,7 @@ use smithay::{
         renderer::{
             damage::Error as OutputDamageTrackerError,
             element::{memory::MemoryRenderBuffer, AsRenderElements, RenderElementStates},
-            gles::{Capability, GlesRenderer},
+            gles::{Capability, GlesRenderer, GlesTexture},
             multigpu::{gbm::GbmGlesBackend, GpuManager, MultiRenderer},
             DebugFlags, ImportDma, ImportMemWl,
         },
@@ -188,6 +190,7 @@ delegate_dmabuf!(EvoState<UdevData>);
 impl Backend for UdevData {
     const HAS_RELATIVE_MOTION: bool = true;
     const HAS_GESTURES: bool = true;
+    const HAS_SCREENCOPY: bool = true;
 
     fn seat_name(&self) -> String {
         self.session.seat()
@@ -540,6 +543,8 @@ pub fn run_udev() {
             state.popups.cleanup();
             #[cfg(feature = "echo-ipc")]
             state.process_pending_window_actions();
+            #[cfg(feature = "echo-ipc")]
+            state.sync_toplevels();
             display_handle.flush_clients().unwrap();
         }
     }
@@ -1502,6 +1507,9 @@ impl EvoState<UdevData> {
                 buffer
             });
 
+        #[cfg(feature = "screencopy")]
+        let mut captures = self.screencopy_state.take_pending(&output);
+
         let result = render_surface(
             surface,
             &mut renderer,
@@ -1513,7 +1521,17 @@ impl EvoState<UdevData> {
             &self.dnd_icon,
             &mut self.cursor_status,
             self.show_window_preview,
+            #[cfg(feature = "screencopy")]
+            &mut captures,
+            #[cfg(feature = "screencopy")]
+            self.clock.now().into(),
         );
+
+        // Whatever the repaint did not fulfil (copy_with_damage on an
+        // undamaged frame, or every capture if the repaint failed before
+        // reaching them) waits for the next one.
+        #[cfg(feature = "screencopy")]
+        self.screencopy_state.requeue(captures);
         let reschedule = match result {
             Ok((has_rendered, states)) => {
                 let dmabuf_feedback = surface.dmabuf_feedback.clone();
@@ -1602,6 +1620,8 @@ fn render_surface<'a>(
     dnd_icon: &Option<DndIcon>,
     cursor_status: &mut CursorImageStatus,
     show_window_preview: bool,
+    #[cfg(feature = "screencopy")] captures: &mut Vec<PendingCapture>,
+    #[cfg(feature = "screencopy")] now: Duration,
 ) -> Result<(bool, RenderElementStates), SwapBuffersError> {
     let output_geometry = space.output_geometry(output).unwrap();
     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -1714,6 +1734,31 @@ fn render_surface<'a>(
             .drm_output
             .queue_frame(Some(output_presentation_feedback))
             .map_err(Into::<SwapBuffersError>::into)?;
+    }
+
+    // Screencopy: draw this repaint's elements a second time, offscreen, for
+    // each capture queued on this output. The frame just queued is no use
+    // here: the DRM compositor may have put some of these elements on planes.
+    #[cfg(feature = "screencopy")]
+    if !captures.is_empty() {
+        let without_cursor: Vec<_> = elements
+            .iter()
+            .filter(|element| {
+                !matches!(
+                    element,
+                    OutputRenderElements::Custom(CustomRenderElements::Pointer(_))
+                )
+            })
+            .collect();
+        for capture in std::mem::take(captures) {
+            if capture.with_damage() && !rendered {
+                captures.push(capture);
+            } else if capture.overlay_cursor() {
+                capture.fulfil::<_, GlesTexture, _>(renderer, &elements, clear_color, now);
+            } else {
+                capture.fulfil::<_, GlesTexture, _>(renderer, &without_cursor, clear_color, now);
+            }
+        }
     }
 
     Ok((rendered, states))

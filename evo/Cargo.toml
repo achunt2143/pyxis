@@ -87,7 +87,7 @@ libinput_backend = []
 egl-backend = []
 #profiling = ["smithay/profiling"]
 debug = []
-default = ["egl", "winit", "udev", "xwayland", "echo-ipc", "decorations"]
+default = ["egl", "winit", "udev", "xwayland", "echo-ipc", "decorations", "screencopy"]
 
 # Individual features
 damage-tracking = []
@@ -96,6 +96,8 @@ hotplug = []
 echo-ipc = []
 advanced-input = []
 data-device = []
+# wlr-screencopy: what `grim`, and so the serial harness's screenshots, use.
+screencopy = []
 
 # Meta features
 all-features = [

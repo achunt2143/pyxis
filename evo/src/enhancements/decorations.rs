@@ -166,17 +166,21 @@ impl WindowDecoration {
                 width: window_geom.width as i32,
                 height: self.config.border_width as i32,
             },
+            // Full height, corners included. These used to stop
+            // `border_width` short of each end, so no point was ever in both
+            // a side border and the top or bottom one, and no corner handle
+            // could fire (the "#11 corner bug").
             left_border: Rect {
                 x: window_geom.x,
-                y: window_geom.y + self.config.border_width as i32,
+                y: window_geom.y,
                 width: self.config.border_width as i32,
-                height: window_geom.height as i32 - 2 * self.config.border_width as i32,
+                height: window_geom.height as i32,
             },
             right_border: Rect {
                 x: window_geom.x + window_geom.width as i32 - self.config.border_width as i32,
-                y: window_geom.y + self.config.border_width as i32,
+                y: window_geom.y,
                 width: self.config.border_width as i32,
-                height: window_geom.height as i32 - 2 * self.config.border_width as i32,
+                height: window_geom.height as i32,
             },
             bottom_border: Rect {
                 x: window_geom.x,
@@ -237,43 +241,8 @@ impl WindowDecoration {
 
     /// Check if point is on a resize handle
     pub fn get_resize_handle(&self, x: i32, y: i32, window_geom: &WindowGeometry) -> Option<ResizeHandle> {
-        let regions = self.get_regions(window_geom);
         let border = self.config.border_width as i32;
-        
-        // Top-left
-        if regions.top_border.contains(x, y) && regions.left_border.contains(x, y) {
-            return Some(ResizeHandle::TopLeft);
-        }
-        // Top-right
-        if regions.top_border.contains(x, y) && regions.right_border.contains(x, y) {
-            return Some(ResizeHandle::TopRight);
-        }
-        // Bottom-left
-        if regions.bottom_border.contains(x, y) && regions.left_border.contains(x, y) {
-            return Some(ResizeHandle::BottomLeft);
-        }
-        // Bottom-right
-        if regions.bottom_border.contains(x, y) && regions.right_border.contains(x, y) {
-            return Some(ResizeHandle::BottomRight);
-        }
-        // Top
-        if regions.top_border.contains(x, y) {
-            return Some(ResizeHandle::Top);
-        }
-        // Bottom
-        if regions.bottom_border.contains(x, y) {
-            return Some(ResizeHandle::Bottom);
-        }
-        // Left
-        if regions.left_border.contains(x, y) {
-            return Some(ResizeHandle::Left);
-        }
-        // Right
-        if regions.right_border.contains(x, y) {
-            return Some(ResizeHandle::Right);
-        }
-        
-        None
+        resize_handle_at(x, y, window_geom, border, border + self.config.corner_radius as i32)
     }
 
     /// Update button state on hover
@@ -318,6 +287,49 @@ impl WindowDecoration {
             if enabled { "enabled" } else { "disabled" },
             self.window_id);
     }
+}
+
+/// Which resize handle `(x, y)` is on, for a frame whose outer rect is
+/// `geom`. The grab band runs `border` deep along every edge. A corner
+/// reaches `corner` along both of its edges, so it is a comfortable target
+/// rather than a `border`-square sliver. (Pass `corner == border` for plain
+/// band intersections.) Returns `None` inside the band or outside `geom`.
+///
+/// Evo's SSD frame calls this with a band that lies wholly outside the
+/// visible window (shell/element.rs), so that grabbing an edge never steals
+/// the client's own edge pixels, such as a scrollbar.
+pub fn resize_handle_at(x: i32, y: i32, geom: &WindowGeometry, border: i32, corner: i32) -> Option<ResizeHandle> {
+    let (left, top) = (geom.x, geom.y);
+    let (right, bottom) = (left + geom.width as i32, top + geom.height as i32);
+    if x < left || x >= right || y < top || y >= bottom {
+        return None;
+    }
+
+    let near = |edge_distance: i32, depth: i32| edge_distance < depth;
+    let (to_left, to_right, to_top, to_bottom) = (x - left, right - 1 - x, y - top, bottom - 1 - y);
+    let in_band = near(to_left, border) || near(to_right, border) || near(to_top, border) || near(to_bottom, border);
+    if !in_band {
+        return None;
+    }
+
+    // Corners first, so a point near a corner is diagonal even when it's
+    // only in one edge's band.
+    let (cl, cr, ct, cb) = (
+        near(to_left, corner),
+        near(to_right, corner),
+        near(to_top, corner),
+        near(to_bottom, corner),
+    );
+    Some(match (ct, cb, cl, cr) {
+        (true, _, true, _) => ResizeHandle::TopLeft,
+        (true, _, _, true) => ResizeHandle::TopRight,
+        (_, true, true, _) => ResizeHandle::BottomLeft,
+        (_, true, _, true) => ResizeHandle::BottomRight,
+        _ if near(to_top, border) => ResizeHandle::Top,
+        _ if near(to_bottom, border) => ResizeHandle::Bottom,
+        _ if near(to_left, border) => ResizeHandle::Left,
+        _ => ResizeHandle::Right,
+    })
 }
 
 /// Decoration regions
@@ -419,6 +431,44 @@ mod tests {
         
         let handle = decoration.get_resize_handle(2, 2, &geom);
         assert_eq!(handle, Some(ResizeHandle::TopLeft));
+    }
+
+    #[test]
+    fn every_resize_handle_is_reachable() {
+        // Band 4 deep, corners reaching 12 along each edge, on 800x600.
+        let geom = WindowGeometry { x: 0, y: 0, width: 800, height: 600 };
+        let at = |x, y| resize_handle_at(x, y, &geom, 4, 12);
+
+        assert_eq!(at(1, 1), Some(ResizeHandle::TopLeft));
+        assert_eq!(at(798, 2), Some(ResizeHandle::TopRight));
+        assert_eq!(at(0, 599), Some(ResizeHandle::BottomLeft));
+        assert_eq!(at(799, 599), Some(ResizeHandle::BottomRight));
+        assert_eq!(at(400, 0), Some(ResizeHandle::Top));
+        assert_eq!(at(400, 597), Some(ResizeHandle::Bottom));
+        assert_eq!(at(3, 300), Some(ResizeHandle::Left));
+        assert_eq!(at(796, 300), Some(ResizeHandle::Right));
+    }
+
+    #[test]
+    fn corners_reach_along_the_edges() {
+        let geom = WindowGeometry { x: 0, y: 0, width: 800, height: 600 };
+        // In the top band only, but within 12 of the left edge: diagonal.
+        assert_eq!(resize_handle_at(10, 1, &geom, 4, 12), Some(ResizeHandle::TopLeft));
+        // Just past the corner's reach: back to a plain edge.
+        assert_eq!(resize_handle_at(12, 1, &geom, 4, 12), Some(ResizeHandle::Top));
+        // With corner == border, only the band intersection is a corner.
+        assert_eq!(resize_handle_at(10, 1, &geom, 4, 4), Some(ResizeHandle::Top));
+    }
+
+    #[test]
+    fn interior_and_outside_are_not_handles() {
+        let geom = WindowGeometry { x: 100, y: 50, width: 800, height: 600 };
+        assert_eq!(resize_handle_at(500, 300, &geom, 4, 12), None);
+        assert_eq!(resize_handle_at(99, 300, &geom, 4, 12), None);
+        assert_eq!(resize_handle_at(900, 300, &geom, 4, 12), None);
+        assert_eq!(resize_handle_at(500, 650, &geom, 4, 12), None);
+        // Offset geometry: the band follows the frame, not the origin.
+        assert_eq!(resize_handle_at(100, 50, &geom, 4, 12), Some(ResizeHandle::TopLeft));
     }
 
     #[test]

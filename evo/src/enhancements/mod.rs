@@ -88,5 +88,3 @@ pub use data_device::*;
 #[cfg(feature = "window-enhance")]
 pub use window_stack::*;
 
-#[cfg(feature = "screencopy")]
-pub use data_device::*;

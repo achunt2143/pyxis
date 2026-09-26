@@ -183,6 +183,9 @@ impl<BackendData: Backend> CompositorHandler for EvoState<BackendData> {
             }
             if let Some(window) = self.window_for_surface(root.clone()) {
                 window.0.on_commit();
+                if window.placement_pending() {
+                    xdg::settle_placement(&mut self.space, &window);
+                }
 
                 if &root == surface {
                     let buffer_offset = with_states(surface, |states| {

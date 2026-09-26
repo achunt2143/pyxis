@@ -15,7 +15,7 @@ use smithay::{
             Resource,
         },
     },
-    utils::{Logical, Point, Serial},
+    utils::{Logical, Point, Rectangle, Serial, Size},
     wayland::{
         compositor::{self, with_states},
         seat::WaylandFocus,
@@ -37,7 +37,6 @@ use super::{
     fullscreen_output_geometry, place_new_window, FullscreenSurface, OldGeometry, PointerMoveSurfaceGrab,
     PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState, SurfaceData, WindowElement,
 };
-use super::ssd::HEADER_BAR_HEIGHT;
 
 /// Wayland `xdg_toplevel` app_id of the desktop shell (Bloom), stamped by
 /// `browser-init.js`'s PYXIS block via `gdk_wayland_window_set_application_id`
@@ -68,6 +67,9 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
 
     // Add to workspace manager which will also register with Echo and map to space
     self.add_window_to_workspace(window.clone(), location);
+    // That location was picked before the window had a size; the first
+    // commit that gives it one places it for real.
+    window.set_placement_pending(true);
 
     debug!("Created new XDG toplevel window at {:?}", location);
 
@@ -159,106 +161,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         edges: xdg_toplevel::ResizeEdge,
     ) {
         let seat: Seat<EvoState<BackendData>> = Seat::from_resource(&seat).unwrap();
-
-        if let Some(touch) = seat.get_touch() {
-            if touch.has_grab(serial) {
-                let start_data = touch.grab_start_data().unwrap();
-
-                let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
-                    return;
-                };
-
-                if start_data.focus.is_none()
-                    || !start_data
-                        .focus
-                        .as_ref()
-                        .unwrap()
-                        .0
-                        .same_client_as(&surface.wl_surface().id())
-                {
-                    return;
-                }
-                let geometry = window.geometry();
-                let loc = self.space.element_location(&window).unwrap();
-                let (initial_window_location, initial_window_size) = (loc, geometry.size);
-
-                with_states(surface.wl_surface(), move |states| {
-                    states
-                        .data_map
-                        .get::<RefCell<SurfaceData>>()
-                        .unwrap()
-                        .borrow_mut()
-                        .resize_state = ResizeState::Resizing(ResizeData {
-                        edges: edges.into(),
-                        initial_window_location,
-                        initial_window_size,
-                    });
-                });
-
-                let grab = TouchResizeSurfaceGrab {
-                    start_data,
-                    window,
-                    edges: edges.into(),
-                    initial_window_location,
-                    initial_window_size,
-                    last_window_size: initial_window_size,
-                };
-
-                touch.set_grab(self, grab, serial);
-                return;
-            }
-        }
-
-        let pointer = seat.get_pointer().unwrap();
-
-        if !pointer.has_grab(serial) {
-            return;
-        }
-
-        let start_data = pointer.grab_start_data().unwrap();
-
-        let window = self
-            .window_for_surface(surface.wl_surface().clone())
-            .unwrap();
-
-        if start_data.focus.is_none()
-            || !start_data
-                .focus
-                .as_ref()
-                .unwrap()
-                .0
-                .same_client_as(&surface.wl_surface().id())
-        {
-            return;
-        }
-
-        let geometry = window.geometry();
-        let loc = self.space.element_location(&window).unwrap();
-        let (initial_window_location, initial_window_size) = (loc, geometry.size);
-
-        with_states(surface.wl_surface(), move |states| {
-            states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut()
-                .resize_state = ResizeState::Resizing(ResizeData {
-                edges: edges.into(),
-                initial_window_location,
-                initial_window_size,
-            });
-        });
-
-        let grab = PointerResizeSurfaceGrab {
-            start_data,
-            window,
-            edges: edges.into(),
-            initial_window_location,
-            initial_window_size,
-            last_window_size: initial_window_size,
-        };
-
-        pointer.set_grab(self, grab, serial, Focus::Clear);
+        self.resize_request_xdg(&surface, &seat, serial, edges.into())
     }
 
     fn ack_configure(&mut self, surface: WlSurface, configure: Configure) {
@@ -357,7 +260,34 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                     kde_mode,
                     is_ssd
                 );
+                let was_ssd = window.decoration_height() > 0;
                 window.set_ssd(is_ssd);
+
+                // Re-fit a maximized window when its decoration changes.
+                // vela asks to be maximized the moment its toplevel exists
+                // (Firefox maximizes a first-run window on any screen smaller
+                // than 1280x1040), and it does so BEFORE it negotiates
+                // server-side decoration. So maximize_request saw
+                // is_ssd=false and sized the client to the whole output. When
+                // SSD then turned on, the 32 px header pushed the client's
+                // bottom rows off the screen: every app on the 1280x800 VM
+                // was a 1280x832 frame. Found 2026-09-25, in the first
+                // harness screenshot of an app window.
+                let acked_maximized = configure.state.states.contains(xdg_toplevel::State::Maximized);
+                if was_ssd != is_ssd && acked_maximized {
+                    if let (Some(toplevel), Some(geometry)) =
+                        (window.0.toplevel().cloned(), self.maximize_target(&window))
+                    {
+                        let client_size = maximized_client_size(&window, geometry.size);
+                        tracing::info!(
+                            "decoration changed on a maximized window: is_ssd={} -> re-fit client to {:?}",
+                            is_ssd,
+                            client_size
+                        );
+                        toplevel.with_pending_state(|state| state.size = Some(client_size));
+                        toplevel.send_configure();
+                    }
+                }
 
                 // Bind the surface to its AppHost session HERE, not at map
                 // time, because this is the first point at which the app id is
@@ -549,44 +479,28 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
             return;
         };
-        let outputs_for_window = self.space.outputs_for_element(&window);
-        let Some(output) = outputs_for_window
-            .first()
-            .cloned()
-            .or_else(|| self.space.outputs().next().cloned())
-        else {
-            return;
-        };
-        let Some(geometry) = self.space.output_geometry(&output) else {
+        let Some(geometry) = self.maximize_target(&window) else {
             return;
         };
 
         // Remember pre-maximize geometry so unmaximize_request can put the
-        // window back where it was.
-        if let Some(old_geo) = self.space.element_bbox(&window) {
+        // window back where it was. Not for a window that has never had a
+        // real place (PlacementPending). One maximized at birth would
+        // otherwise "restore" to the blind guess it was created at.
+        if window.placement_pending() {
+            // Nothing worth remembering.
+        } else if let Some(old_geo) = self.space.element_bbox(&window) {
             window.user_data().insert_if_missing(OldGeometry::default);
             if let Some(saved) = window.user_data().get::<OldGeometry>() {
                 saved.save(old_geo);
             }
         }
 
-        // A server-decorated window's client area sits BELOW Evo's
-        // HEADER_BAR_HEIGHT-tall title bar (element.rs's SpaceElement
-        // geometry/bbox add it to the element height; the render path pushes
-        // the client down by it). So the client must be configured that much
-        // SHORTER than the output, or header + client together overflow the
-        // screen (the client's bottom rows fall off). Read is_ssd into a local
-        // so the RefMut is dropped before map_element re-borrows
-        // decoration_state.
-        let is_ssd = window.decoration_state().is_ssd;
-        let mut client_size = geometry.size;
-        if is_ssd {
-            client_size.h = (client_size.h - HEADER_BAR_HEIGHT).max(1);
-        }
+        let client_size = maximized_client_size(&window, geometry.size);
         tracing::info!(
             "maximize_request: output_size={:?} is_ssd={} client_size={:?}",
             geometry.size,
-            is_ssd,
+            window.decoration_height() > 0,
             client_size
         );
 
@@ -792,6 +706,141 @@ impl<BackendData: Backend> EvoState<BackendData> {
         }
     }
 
+    /// The output geometry a maximized `window` fills: its own output, or
+    /// the first one if it has none yet (a window maximized before it was
+    /// ever mapped onto an output).
+    fn maximize_target(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
+        let output = self
+            .space
+            .outputs_for_element(window)
+            .first()
+            .cloned()
+            .or_else(|| self.space.outputs().next().cloned())?;
+        self.space.output_geometry(&output)
+    }
+
+    /// Start an interactive resize of `surface` from the press that `serial`
+    /// belongs to. There are two callers: a client's own
+    /// `xdg_toplevel.resize` (`resize_request`), and a press on the resize
+    /// band of Evo's SSD frame (`HeaderBar::handle_resize`).
+    ///
+    /// `initial_window_size` is the frame size, header bar included.
+    /// Conversion to the client's own size happens in the grab, where it
+    /// sends configures.
+    pub fn resize_request_xdg(
+        &mut self,
+        surface: &ToplevelSurface,
+        seat: &Seat<Self>,
+        serial: Serial,
+        edges: ResizeEdge,
+    ) {
+
+        if let Some(touch) = seat.get_touch() {
+            if touch.has_grab(serial) {
+                let start_data = touch.grab_start_data().unwrap();
+
+                let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+                    return;
+                };
+
+                if start_data.focus.is_none()
+                    || !start_data
+                        .focus
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .same_client_as(&surface.wl_surface().id())
+                {
+                    return;
+                }
+                let geometry = window.geometry();
+                let loc = self.space.element_location(&window).unwrap();
+                let (initial_window_location, initial_window_size) = (loc, geometry.size);
+
+                with_states(surface.wl_surface(), move |states| {
+                    states
+                        .data_map
+                        .get::<RefCell<SurfaceData>>()
+                        .unwrap()
+                        .borrow_mut()
+                        .resize_state = ResizeState::Resizing(ResizeData {
+                        edges,
+                        initial_window_location,
+                        initial_window_size,
+                    });
+                });
+
+                let grab = TouchResizeSurfaceGrab {
+                    start_data,
+                    window,
+                    edges,
+                    initial_window_location,
+                    initial_window_size,
+                    last_window_size: initial_window_size,
+                };
+
+                touch.set_grab(self, grab, serial);
+                return;
+            }
+        }
+
+        let pointer = seat.get_pointer().unwrap();
+
+        if !pointer.has_grab(serial) {
+            return;
+        }
+
+        let start_data = pointer.grab_start_data().unwrap();
+
+        // Not unwrap(): the SSD path gets here from an idle callback, and the
+        // window can close between the press and the callback.
+        let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+            return;
+        };
+
+        if start_data.focus.is_none()
+            || !start_data
+                .focus
+                .as_ref()
+                .unwrap()
+                .0
+                .same_client_as(&surface.wl_surface().id())
+        {
+            return;
+        }
+
+        let geometry = window.geometry();
+        let Some(loc) = self.space.element_location(&window) else {
+            return;
+        };
+        let (initial_window_location, initial_window_size) = (loc, geometry.size);
+
+        with_states(surface.wl_surface(), move |states| {
+            states
+                .data_map
+                .get::<RefCell<SurfaceData>>()
+                .unwrap()
+                .borrow_mut()
+                .resize_state = ResizeState::Resizing(ResizeData {
+                edges,
+                initial_window_location,
+                initial_window_size,
+            });
+        });
+
+        let grab = PointerResizeSurfaceGrab {
+            start_data,
+            window,
+            edges,
+            initial_window_location,
+            initial_window_size,
+            last_window_size: initial_window_size,
+        };
+
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+    }
+
+
     pub fn move_request_xdg(
         &mut self,
         surface: &ToplevelSurface,
@@ -922,6 +971,76 @@ impl<BackendData: Backend> EvoState<BackendData> {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
     }
+}
+
+/// Give a window with a guessed location (PlacementPending) its real place,
+/// once it has a size and floats. The compositor's commit handler calls this
+/// right after `Window::on_commit`. That is the one point where the size is
+/// current: in a post-commit hook, which runs first, the first buffer's size
+/// is not in yet. vela paints into a subsurface and rarely commits its
+/// toplevel again, so the hook version never placed a vela window at all
+/// (found on device, 2026-09-25).
+pub(crate) fn settle_placement(space: &mut Space<WindowElement>, window: &WindowElement) {
+    if window.is_shell() {
+        // The shell places itself (fullscreen, see
+        // maybe_init_shell_fullscreen). Never centre it.
+        window.set_placement_pending(false);
+    } else if let Some(location) = first_real_placement(space, window) {
+        tracing::info!(
+            "placing {:?} ({:?}) at {:?}, now that it has a size",
+            window.app_id(),
+            window.geometry().size,
+            location
+        );
+        window.set_placement_pending(false);
+        space.map_element(window.clone(), location, false);
+    }
+}
+
+/// Where a floating window goes once its size is known: centred on its
+/// output. `None` while there is nothing to place yet, because it has no size
+/// (no buffer) or fills its output (maximized or fullscreen). The mark stays
+/// set until the window is both sized and floating.
+fn first_real_placement(space: &Space<WindowElement>, window: &WindowElement) -> Option<Point<i32, Logical>> {
+    // geometry() includes an SSD header even before the client has a
+    // buffer, so "no size yet" is a height of just the decoration.
+    let size = window.geometry().size;
+    if size.w <= 0 || size.h <= window.decoration_height() {
+        return None;
+    }
+    let fills_output = window.0.toplevel()?.with_committed_state(|state| {
+        state.is_some_and(|state| {
+            state.states.contains(xdg_toplevel::State::Maximized)
+                || state.states.contains(xdg_toplevel::State::Fullscreen)
+        })
+    });
+    if fills_output {
+        return None;
+    }
+    let output = space
+        .outputs_for_element(window)
+        .first()
+        .cloned()
+        .or_else(|| space.outputs().next().cloned())?;
+    let area = space.output_geometry(&output)?;
+    // Clamped at the top-left, so a window bigger than its output keeps its
+    // title bar and buttons on screen.
+    Some(Point::from((
+        area.loc.x + ((area.size.w - size.w) / 2).max(0),
+        area.loc.y + ((area.size.h - size.h) / 2).max(0),
+    )))
+}
+
+/// The client size that makes a maximized `window` fill an output of
+/// `output_size`. A server-decorated window's client sits BELOW Evo's
+/// HEADER_BAR_HEIGHT-tall title bar (element.rs's geometry and bbox add the
+/// header, and the render path pushes the client down by it). So the client
+/// must be that much shorter than the output, or header and client together
+/// overflow the screen and the client's bottom rows fall off.
+fn maximized_client_size(window: &WindowElement, output_size: Size<i32, Logical>) -> Size<i32, Logical> {
+    let mut client_size = output_size;
+    client_size.h = (client_size.h - window.decoration_height()).max(1);
+    client_size
 }
 
 fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface) -> Option<()> {
