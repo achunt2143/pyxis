@@ -1,0 +1,38 @@
+# Alpha 5 step 0: the harness can see the screen, and move the pointer.
+#
+#   scripts/serial-test.py --script scripts/serial-tests/alpha5-eyes.txt
+#
+# grim asks Evo for the output over wlr-screencopy
+# (evo/src/enhancements/screencopy.rs). Until 2026-09-25 that module had
+# never been compiled, and the stub it held filled every frame with zeros.
+# This suite is the first thing to exercise it.
+#
+# The control is an alpha 4 image. That fails at the first shot, because
+# its rootfs has no grim and its Evo offers no screencopy global.
+#
+# Passing proves only that a non-uniform picture came back. LOOK at
+# target/serial-shots/eyes-*.png afterwards: whether the screen is right is
+# not something a substring can say.
+
+# Give Bloom time to paint its first frame.
+sleep 20
+
+echo "=== the whole output ==="
+#!must-not uniform
+#!shot eyes-desktop
+
+echo "=== a region at an odd offset: capture_output_region, clipped and scaled ==="
+#!must PNG image data, 200 x 100
+WAYLAND_DISPLAY=wayland-0 grim -g "13,17 200x100" /tmp/region.png && file /tmp/region.png
+
+# Flush with the far corner: an off-by-one in clip_region would refuse this
+# or shave a pixel. (grim clips a region that overhangs the output itself,
+# before asking, so Evo only ever sees in-bounds requests from it.)
+echo "=== a region flush with the bottom-right corner ==="
+#!must PNG image data, 80 x 50
+WAYLAND_DISPLAY=wayland-0 grim -g "1200,750 80x50" /tmp/edge.png && file /tmp/edge.png
+
+echo "=== hands: park the pointer mid-screen, then capture WITH the cursor ==="
+#!pointer move 640 400
+#!must-not uniform
+#!shot eyes-cursor -c

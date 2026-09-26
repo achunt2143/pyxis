@@ -1,0 +1,106 @@
+# Alpha 5 D: resize (#11) by dragging the frame.
+#
+#   scripts/serial-test.py --script scripts/serial-tests/alpha5-resize.txt
+#
+# vela negotiates server-side decoration, so no client ever sends
+# xdg_toplevel.resize. Evo has to start the grab itself, from a press in
+# the invisible 8 px band just outside its own frame (shell/element.rs,
+# ssd_resize_band). This suite drags that band at a window's bottom-right
+# corner and measures the window before and after, through
+# evo.ListWindows. ListWindows only reports real windows since alpha 5:
+# until then it listed contract-created windows only, so it was always
+# empty on a device.
+#
+# The controls:
+#   * The same +100 x +80 drag, started 30 px INSIDE the frame on the
+#     client's own content, must not resize the window. That proves the band
+#     is what does it, and that the band steals none of the client's pixels.
+#   * An alpha 4 Evo fails at the first geometry read, because ListWindows
+#     is empty there.
+#
+# LOOK at target/serial-shots/resize-{maximized,before,after}.png.
+#
+# Apps open maximized on this 1280x800 VM: Firefox maximizes a first-run
+# window on any screen smaller than 1280x1040. A maximized window has no
+# band (there is no edge to drag), so the suite restores it first. The
+# maximized shot doubles as the check for the SSD re-fit fix: the frame
+# must fill the screen exactly (1280x800), not overhang it (1280x832, which
+# is what every app was until 2026-09-25).
+
+# Frame geometry of the first window whose app_id is $1, as "x y w h id".
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+
+echo "=== launch an app to resize ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+
+echo "=== maximized: the frame fits the screen, header included ==="
+#!shot resize-maximized
+read MX MY MW MH ID <<< "$(geom files)"; echo "maximized: x=$MX y=$MY w=$MW h=$MH id=$ID"
+#!must 1280x800
+echo "${MW}x${MH}"
+
+echo "=== restore it, so it has edges to drag ==="
+#!must "success": true
+echo-cli call org.geckoOS.evo UnmaximizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$ID}" | grep success
+sleep 3
+
+#!must-not uniform
+#!shot resize-before
+read X Y W H ID <<< "$(geom files)"; echo "before: x=$X y=$Y w=$W h=$H"
+#!must GEOM-OK
+test -n "$H" && echo GEOM-OK || echo NO-GEOM
+# The band must be on screen for a pointer to reach it.
+#!must ON-SCR
+test $((X + W + 8)) -le 1280 -a $((Y + H + 8)) -le 800 && echo ON-SCR || echo OFF-SCR
+
+echo "=== control: the same drag, started inside the frame, is the client's ==="
+IX=$((X + W - 30)); IY=$((Y + H - 30)); IEX=$((IX + 100)); IEY=$((IY + 80)); echo "inside=$IX,$IY -> $IEX,$IEY"
+#!pointer drag $IX $IY $IEX $IEY
+sleep 2
+read X0 Y0 W0 H0 ID <<< "$(geom files)"; echo "after inside drag: w=$W0 h=$H0"
+#!must SAME
+test "$W0" = "$W" -a "$H0" = "$H" && echo SAME || echo CHANGED
+
+# Every drag stays on the 1280x800 screen. The tablet clamps the pointer at
+# the edge, so a drag aimed past it just stops short: the first run of this
+# suite "failed" by growing the window exactly as far as the pointer could
+# go (+59 x +19 of +100 x +80).
+
+echo "=== shrink: drag the bottom-right band in by 100 x 80 ==="
+BX=$((X + W + 4)); BY=$((Y + H + 4)); EX=$((BX - 100)); EY=$((BY - 80)); echo "band=$BX,$BY -> $EX,$EY"
+#!pointer drag $BX $BY $EX $EY
+sleep 3
+read X1 Y1 W1 H1 ID <<< "$(geom files)"; echo "after: x=$X1 y=$Y1 w=$W1 h=$H1 (want w=$((W - 100)) h=$((H - 80)))"
+#!must THINNER
+test "$W1" -eq $((W - 100)) && echo THINNER || echo "wrong width"
+#!must SHORTER
+test "$H1" -eq $((H - 80)) && echo SHORTER || echo "wrong height"
+# A bottom-right resize must not move the window.
+#!must PINNED
+test "$X1" = "$X" -a "$Y1" = "$Y" && echo PINNED || echo MOVED
+
+echo "=== grow: drag the top-left band out by 40 x 20 ==="
+# This edge moves the window as well as resizing it: the commit-time
+# fix-up keeps the bottom-right corner where it was. Frame and client sizes
+# have to agree for that to hold, which is what grabs.rs's client_size is for.
+TX=$((X1 - 4)); TY=$((Y1 - 4)); TEX=$((TX - 40)); TEY=$((TY - 20)); echo "band=$TX,$TY -> $TEX,$TEY"
+#!pointer drag $TX $TY $TEX $TEY
+sleep 3
+#!must-not uniform
+#!shot resize-after
+read X2 Y2 W2 H2 ID <<< "$(geom files)"; echo "after: x=$X2 y=$Y2 w=$W2 h=$H2 (want x=$((X1 - 40)) y=$((Y1 - 20)) w=$((W1 + 40)) h=$((H1 + 20)))"
+#!must WIDER
+test "$W2" -eq $((W1 + 40)) && echo WIDER || echo "wrong width"
+#!must TALLER
+test "$H2" -eq $((H1 + 20)) && echo TALLER || echo "wrong height"
+# The corner opposite the one dragged must not move.
+#!must HELD
+test $((X2 + W2)) -eq $((X1 + W1)) -a $((Y2 + H2)) -eq $((Y1 + H1)) && echo HELD || echo DRIFTED
+
+echo "=== Evo's own record of the grab ==="
+grep -a 'SSD resize band press' /var/log/evo.log | tail -2
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'

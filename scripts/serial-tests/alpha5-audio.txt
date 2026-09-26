@@ -1,0 +1,89 @@
+# Alpha 5 E: sound, end to end, heard rather than inferred.
+#
+#   scripts/serial-test.py --script scripts/serial-tests/alpha5-audio.txt
+#
+# The harness gives the guest an ICH9 HDA sound card, as emulate.sh does,
+# and records its output to a WAV file on the host. `#!listen <name>`
+# measures whatever played since the previous listen and saves it to
+# target/serial-shots/<name>.wav, so you can play it yourself.
+#
+# Needs the alpha 5 kernel (CONFIG_SND and the HDA drivers) and rootfs
+# (PipeWire, the sounds in /usr/share/sounds/pyxis). An alpha 4 image fails
+# at the first step: it has no /proc/asound at all.
+#
+# The control is the quiet window below. Nothing plays, so nothing must be
+# heard. It is what makes "not silent" mean something.
+
+echo "=== the stack: a sound card, PipeWire, and its Pulse server ==="
+#!must HDA
+cat /proc/asound/cards
+#!must wireplumber
+pgrep -a wireplumber | head -1
+#!must on PipeWire
+setpriv --reuid=1000 --regid=1000 --clear-groups env XDG_RUNTIME_DIR=/run/user/1000 pactl info | grep -i "server name"
+
+echo "=== the boot sound (geckoOS-boot plays it through the sound service) ==="
+#!must "success": true
+cat /var/log/boot-sound.log
+#!must-not silent
+#!listen audio-boot
+
+echo "=== quiet: nothing plays, so nothing is heard ==="
+sleep 6
+#!must silent
+#!listen audio-quiet
+
+echo "=== a system sound, by name, through echo's org.geckoOS.sound ==="
+#!must notification
+echo-cli call org.geckoOS.sound list --interface org.geckoOS.sound --args '{}' | tr -d ' \n'; echo
+#!must "success": true
+echo-cli call org.geckoOS.sound play --interface org.geckoOS.sound --args '{"name":"notification"}' | grep success
+sleep 5
+#!must-not silent
+#!listen audio-notification
+
+echo "=== a name outside the sounds directory is refused ==="
+#!must not a sound name
+echo-cli call org.geckoOS.sound play --interface org.geckoOS.sound --args '{"name":"../../etc/passwd"}' 2>&1 | grep -o "not a sound name"
+
+echo "=== volume goes to the real sink ==="
+#!must "volume": 40
+echo-cli call org.geckoOS.audio setVolume --interface org.geckoOS.audio --args '{"volume":40}' | grep '"volume"'
+#!must Volume: 0.40
+setpriv --reuid=1000 --regid=1000 --clear-groups env XDG_RUNTIME_DIR=/run/user/1000 wpctl get-volume @DEFAULT_AUDIO_SINK@
+#!must "outputs"
+echo-cli call org.geckoOS.audio listOutputs --interface org.geckoOS.audio --args '{}' | grep -m1 outputs
+echo-cli call org.geckoOS.audio setVolume --interface org.geckoOS.audio --args '{"volume":75}' > /dev/null
+
+echo "=== Do Not Disturb silences a normal notification ==="
+#!must "success": true
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.dnd","value":true}' | grep success
+echo-cli call org.geckoOS.notification show --interface org.geckoOS.notification --args '{"title":"quiet please"}' > /dev/null
+sleep 4
+#!must silent
+#!listen audio-dnd
+
+echo "=== vela plays audio from a web page (the exit criterion) ==="
+# hello-pyxis plays a one-second 440 Hz Web Audio tone on launch. Its
+# AudioContext is "running" only if the app profile's autoplay prefs let it
+# start without a click. The app ALSO raises a notification on launch. Do
+# Not Disturb, still on from the step above, keeps that notification's
+# chime out of the recording, so whatever this listen hears is vela.
+PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo removed-if-present
+#!must registeredApps
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}" | grep -E 'registeredApps|Error'
+rm -f /tmp/pyxis-hello-proof*.txt
+#!listen audio-before-vela
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
+sleep 15
+#!must audio=running
+cat /tmp/pyxis-hello-proof-*.txt 2>&1
+#!must-not silent
+#!listen audio-vela
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.dnd","value":false}' | grep success
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' | grep -m1 package

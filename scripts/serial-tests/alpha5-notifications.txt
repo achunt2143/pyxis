@@ -1,0 +1,68 @@
+# Alpha 5 C: "an app-raised notification appears as a toast and lands in
+# the centre".
+#
+#   scripts/serial-test.py --script scripts/serial-tests/alpha5-notifications.txt
+#
+# The raising app is hello-pyxis, the alpha 4 acceptance package, which
+# since alpha 5 calls window.geckoOS.notification.show once per launch. That
+# makes this the real path: a third-party pyxis:// origin, the bridge's
+# capability check on `notifications`, the bridge stamping the caller's app
+# id, echo's store, and the NotificationShown signal Bloom's toast listens
+# for.
+#
+# The control is the store before the launch: it must be empty, so a
+# pre-existing entry cannot pass the assertions below. The alpha 4 image
+# fails this suite outright, because its daemon registered no `list`.
+#
+# LOOK at target/serial-shots/notify-toast.png: the toast is drawn inside
+# Bloom, and Evo stacks Bloom beneath app windows, so it shows only where no
+# window covers the top-right corner.
+
+echo "=== control: the centre starts empty ==="
+#!must "notifications": []
+echo-cli call org.geckoOS.notification list --interface org.geckoOS.notification --args '{}' | grep -o '"notifications": \[\]'
+
+echo "=== install and launch the raising app ==="
+PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+# Remove it first: an image that has been booted by hand (`make run` writes
+# straight to it) may already have it, and opkg refuses to reinstall the
+# same version.
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo removed-if-present
+# Install answers { package, version, registeredApps }: there is no
+# `success` field, and grepping for "success" only ever matched echo-cli's own
+# "Method call successful" banner.
+#!must registeredApps
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}" | grep -E 'registeredApps|Error'
+rm -f /tmp/pyxis-hello-proof*.txt
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
+sleep 15
+
+echo "=== the app says it raised one ==="
+#!must notify=ok
+cat /tmp/pyxis-hello-proof-*.txt 2>&1
+
+echo "=== and it landed in the centre, stamped with the caller's id ==="
+#!must "appId": "com.pyxis.hello"
+echo-cli call org.geckoOS.notification list --interface org.geckoOS.notification --args '{}'
+#!must "title": "Hello Pyxis"
+echo-cli call org.geckoOS.notification list --interface org.geckoOS.notification --args '{}'
+
+# The toast lasts 15 s (the app asks for that), so take the shot inside it.
+#!must-not uniform
+#!shot notify-toast
+
+echo "=== a direct Echo client is not an app: no appId gets stamped ==="
+#!must "appId": null
+echo-cli call org.geckoOS.notification show --interface org.geckoOS.notification --args '{"title":"From echo-cli"}' | grep appId
+
+echo "=== dismissing removes it, once ==="
+ID=$(echo-cli call org.geckoOS.notification list --interface org.geckoOS.notification --args '{}' | grep -o '"id": "[^"]*"' | head -1 | cut -d'"' -f4); echo "ID=$ID"
+#!must "success": true
+echo-cli call org.geckoOS.notification close --interface org.geckoOS.notification --args "{\"notificationId\":\"$ID\"}" | grep success
+#!must "success": false
+echo-cli call org.geckoOS.notification close --interface org.geckoOS.notification --args "{\"notificationId\":\"$ID\"}" | grep success
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' | grep -m1 success
