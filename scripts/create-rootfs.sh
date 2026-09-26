@@ -315,7 +315,9 @@ apt install -y --no-install-recommends \
   libxfixes3 libxi6 libxinerama1 libxrandr2 libxrender1 libxres1 \
   libxau6 libxdmcp6 libxcb1 libxcb-render0 libxcb-shm0 \
   libpci3 fontconfig fonts-dejavu-core \
-  openssl curl wget
+  openssl curl wget \
+  grim \
+  pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils alsa-utils
 
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
@@ -710,8 +712,16 @@ echo "=== rcS: Startup sequence beginning ==="
 
 # /proc, /sys, /dev were already mounted (and moved) by the initramfs before
 # switch_root; this only covers what's left for the real rootfs.
-mkdir -p /dev/pts /run /tmp /var/tmp
+mkdir -p /dev/pts /dev/shm /run /tmp /var/tmp
 mount -t devpts devpts /dev/pts -o gid=5,mode=620 -n 2>/dev/null || true
+# /dev/shm is what shm_open(3) creates its objects in. fstab lists it, but
+# nothing here runs `mount -a`, so until alpha 5 it simply did not exist.
+# Every shm_open() failed as a result: grim died with "failed to create
+# buffer" before it ever asked Evo for a frame (found 2026-09-25, the first
+# time the harness tried to take a screenshot). PulseAudio-protocol audio
+# uses it too. The initramfs's devtmpfs /dev has no shm directory, hence the
+# mkdir above.
+mount -t tmpfs tmpfs /dev/shm -o mode=1777,nosuid,nodev -n 2>/dev/null || true
 mount -t tmpfs tmpfs /run -o mode=755,size=128M -n 2>/dev/null || true
 mount -t tmpfs tmpfs /tmp -o mode=1777,size=512M -n 2>/dev/null || true
 mount -t cgroup2 cgroup2 /sys/fs/cgroup -n 2>/dev/null || true
@@ -809,6 +819,26 @@ export QT_QPA_PLATFORM=wayland
 
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
+
+# Test overlay. Only scripts/serial-test.py uses this; it is absent on any
+# real boot. The harness attaches a read-only virtio disk whose serial is
+# "pyxisin", holding a tar of files to lay over the rootfs (a freshly built
+# evo, say). Applying it HERE, before any daemon starts, means a test boots
+# the image with those files already in place. The alternative is swapping a
+# binary under a session that is already running the old one, which proves
+# nothing. It is keyed on a virtio-blk serial: real hardware has no virtio
+# disks, and whoever chooses a VM's disks already owns the VM.
+for blk in /sys/block/vd*; do
+    [ "$(cat "${blk}/serial" 2>/dev/null)" = "pyxisin" ] || continue
+    xfer_dev="/dev/${blk##*/}"
+    [ -b "$xfer_dev" ] || mknod "$xfer_dev" b $(tr ':' ' ' < "${blk}/dev")
+    if tar -xpf "$xfer_dev" -C / > /var/log/pyxis-xfer.log 2>&1; then
+        tar -tf "$xfer_dev" > /run/pyxis-xfer-applied 2>/dev/null
+        echo "[boot] applied test overlay from ${xfer_dev}: $(wc -l < /run/pyxis-xfer-applied) file(s)"
+    else
+        echo "[boot] WARN: test overlay on ${xfer_dev} did not extract, see /var/log/pyxis-xfer.log"
+    fi
+done
 
 start_daemon() {
     local name="$1" bin="$2"
@@ -979,6 +1009,29 @@ else
     echo "[boot] WARN: evo wayland socket not seen after 20s, continuing anyway"
 fi
 
+# Audio: PipeWire, its session manager (WirePlumber) and its PulseAudio
+# server, run as the session user. They start before Bloom because vela plays
+# through PulseAudio only: its build defines MOZ_PULSEAUDIO, not MOZ_ALSA, so a
+# vela that starts before /run/user/1000/pulse/native exists has no sound.
+# `--groups audio` is what opens /dev/snd (root:audio 0660, per udev). As
+# with vela's video,render, setgroups() grants it directly, with no
+# /etc/group membership needed. There is no D-Bus session bus here, so
+# WirePlumber logs a few warnings about device reservation and runs anyway.
+if [ -x /usr/bin/pipewire ]; then
+    for piece in pipewire wireplumber pipewire-pulse; do
+        start_daemon "$piece" /usr/bin/setpriv --reuid=1000 --regid=1000 --groups audio \
+            /usr/bin/env XDG_RUNTIME_DIR=/run/user/1000 HOME=/home/geckouser "/usr/bin/${piece}"
+        sleep 0.5
+    done
+    if wait_for_socket "${XDG_RUNTIME_DIR}/pulse/native" 20; then
+        echo "[boot] audio ready (PipeWire, Pulse socket up)"
+    else
+        echo "[boot] WARN: no Pulse socket after 10s -- vela will be silent"
+    fi
+else
+    echo "[boot] SKIP audio: pipewire not installed"
+fi
+
 # Bloom (pyxis-experience) is now a real, Nova-discoverable pyxis:// app
 # (manifest.webapp + webroot staged by stage_bloom_app to
 # /usr/share/geckoOS/apps/bloom/) -- launched below as the actual desktop
@@ -1059,6 +1112,14 @@ user_pref("dom.ipc.processCount", 1);
 user_pref("browser.tabs.remote.autostart", false);
 // Quiet non-fatal a11y/dbus autolaunch noise seen in the boot log.
 user_pref("accessibility.force_disabled", 1);
+// Installed apps make sound the way native apps do, without first needing a
+// click. Firefox's default (media.autoplay.default = 1) blocks audible
+// autoplay to protect people from arbitrary websites. A pyxis:// app is
+// installed software, though, and a timer, chat or game app that could not
+// play a sound until touched would simply be broken. Web Audio has its own
+// switch for the same policy.
+user_pref("media.autoplay.default", 0);
+user_pref("media.autoplay.block-webaudio", false);
 // Single-purpose app window: never crash-restore a prior session as a normal
 // browser window (kept in lockstep with nova.rs's write_profile_prefs).
 user_pref("browser.sessionstore.resume_from_crash", false);
@@ -1234,6 +1295,12 @@ else
 fi
 
 start_daemon rockhopper /usr/bin/rockhopper-daemon
+
+# The boot sound, once the shell is on its way. It goes through echo's
+# sound service, the one path every system sound takes (see sound.rs). In the
+# background, so a slow or silent audio stack never holds up the boot.
+( sleep 3; /usr/bin/echo-cli call org.geckoOS.sound play --interface org.geckoOS.sound \
+      --args '{"name":"boot"}' > /var/log/boot-sound.log 2>&1 ) &
 
 echo "=== GeckoOS boot sequence complete ==="
 EOF
@@ -1439,6 +1506,7 @@ stage_bloom_app() {
     "filesystem:write",
     "power",
     "notifications",
+    "notifications:manage",
     "appManager:install",
     "appManager:manage"
   ]
@@ -1609,6 +1677,25 @@ stage_installer_app() {
     sudo mkdir -p "${ROOTFS_DIR}/var/lib/pyxis/incoming"
 }
 
+stage_system_sounds() {
+    log_section "Stage 9b: System sounds"
+
+    # Played by echo's org.geckoOS.sound (echo/src/services/sound.rs), by
+    # name: boot, shutdown, notification, error. The files are placeholders,
+    # dropped into system-sounds/ at the repo root; swapping them needs no
+    # code change. Any format pw-play reads works (libsndfile: wav, ogg,
+    # flac, mp3).
+    if [[ ! -d "${PROJECT_ROOT}/system-sounds" ]]; then
+        log_info "No system-sounds/ directory, skipping"
+        return
+    fi
+    sudo mkdir -p "${ROOTFS_DIR}/usr/share/sounds/pyxis"
+    sudo rm -f "${ROOTFS_DIR}/usr/share/sounds/pyxis/"*
+    sudo cp "${PROJECT_ROOT}/system-sounds/"* "${ROOTFS_DIR}/usr/share/sounds/pyxis/"
+    sudo chmod 644 "${ROOTFS_DIR}/usr/share/sounds/pyxis/"*
+    log_success "System sounds: $(ls "${ROOTFS_DIR}/usr/share/sounds/pyxis" | tr '\n' ' ')"
+}
+
 stage_boot_assets() {
     log_section "Stage 9: Boot assets"
 
@@ -1740,6 +1827,7 @@ main() {
     stage_settings_app
     stage_installer_app
     stage_boot_assets
+    stage_system_sounds
     stage_userspace_apps
     stage_permissions
 

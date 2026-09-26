@@ -193,6 +193,39 @@ force_kconfig() {
   ensure_y CONFIG_NET_VENDOR_INTEL
   ensure_y CONFIG_E1000
   ensure_y CONFIG_E1000E
+
+  # -----------------------------------------------------------------------
+  # Sound (alpha 5 item E). The config had `# CONFIG_SOUND is not set`, so
+  # there was no ALSA at all and nothing in userspace could ever make a
+  # sound. Two drivers, both built in:
+  #   * HDA (intel-hda controller + the generic codec parser). This is what
+  #     most real PCs have, and it is QEMU's `-device intel-hda
+  #     -device hda-duplex`, which is what emulate.sh and the serial harness
+  #     attach.
+  #   * virtio-snd, QEMU's paravirtual sound card (`-device virtio-sound-pci`).
+  # vela plays through PulseAudio only (its build defines MOZ_PULSEAUDIO, not
+  # MOZ_ALSA), so userspace runs PipeWire with its Pulse server on top of these.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_SOUND
+  ensure_y CONFIG_SND
+  ensure_y CONFIG_SND_TIMER
+  ensure_y CONFIG_SND_PCM
+  ensure_y CONFIG_SND_HWDEP
+  ensure_y CONFIG_SND_PCI
+  ensure_y CONFIG_SND_HDA_INTEL
+  ensure_y CONFIG_SND_HDA_GENERIC
+  ensure_y CONFIG_SND_HDA_CODEC_REALTEK
+  ensure_y CONFIG_SND_VIRTIO
+
+  # -----------------------------------------------------------------------
+  # Unprivileged user namespaces: vela's content sandbox needs them, and
+  # without them it runs genuinely degraded. Firefox's
+  # sandbox-unprivileged-namespaces warning was telling the truth, and it is
+  # only suppressed in app windows (nova.rs's user.js template) because a
+  # notification bar there is noise. Batched into the same rebuild as sound.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_NAMESPACES
+  ensure_y CONFIG_USER_NS
 }
 
 main() {

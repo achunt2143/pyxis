@@ -34,6 +34,12 @@ QEMU_FULLSCREEN="${QEMU_FULLSCREEN:-0}"
 # running -- a hardcoded 2222 makes QEMU abort outright with "Could not set up
 # host forwarding rule" rather than just skipping the forward.
 QEMU_SSH_PORT="${QEMU_SSH_PORT:-2222}"
+# Where the guest's sound goes: the host's PipeWire by default, so you can
+# hear it. Anything QEMU's -audiodev accepts works: `pa`, `alsa`, `none` to
+# mute, or `wav` (add a path via QEMU_AUDIO_OPTS=",path=out.wav") to record
+# it instead.
+QEMU_AUDIO="${QEMU_AUDIO:-pipewire}"
+QEMU_AUDIO_OPTS="${QEMU_AUDIO_OPTS:-}"
 
 log_info() {
     echo "[INFO] $*"
@@ -182,6 +188,9 @@ main() {
         -serial mon:stdio \
         -netdev user,id=net0${SSH_FORWARD} \
         -device e1000,netdev=net0 \
+        -audiodev "${QEMU_AUDIO},id=snd0${QEMU_AUDIO_OPTS}" \
+        -device ich9-intel-hda \
+        -device hda-output,audiodev=snd0 \
         -no-reboot \
         -usb \
         -device usb-tablet \
