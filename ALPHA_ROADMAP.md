@@ -333,58 +333,111 @@ re-verified at release 2026-09-25.
 
 ### Scope
 
+**0. Verification that can see, hear and click** *(added 2026-09-25, done)*
+
+Almost every exit criterion below is visual or audible, and the harness could
+only read the serial console. `scripts/serial-test.py` now has:
+
+- [x] **Screenshots.** `#!shot <name>` runs `grim` in the guest, which asks
+      Evo over wlr-screencopy. Evo's screencopy had been a stub that nothing
+      compiled. It is now real (`evo/src/enhancements/screencopy.rs`) and
+      verified on device, full output and regions. It also needed `/dev/shm`,
+      which rcS never mounted.
+- [x] **Pointer.** `#!pointer move|click|drag` drives a virtio tablet over QMP.
+- [x] **Sound.** `#!listen <name>` records the guest's HDA card to a WAV and
+      reports its level (`silent` when nothing played).
+- [x] **Fast iteration.** `--push` files go in on a transfer disk that
+      geckoOS-boot lays over the rootfs before any daemon starts, so a pushed
+      `evo` is what the whole boot runs. `--pull` brings files out, and
+      `--kernel` boots a new kernel with the image's own command line. No sudo
+      rebuild per iteration.
+
 **A. Layer-shell compositing** (audit §4.5) — *unblocks the rest of this alpha*
 
-- [ ] Render `wlr-layer-shell` layers in Evo's `output_elements`. Layers are
-      already accepted, just never composited.
+- [ ] Render `wlr-layer-shell` layers in Evo's `output_elements`. **Probably
+      already true:** the udev path goes through smithay's
+      `space_render_elements`, which draws background/bottom layers below
+      windows and top/overlay above. Unverified, because no layer client
+      exists yet. Note that the fullscreen branch of `output_elements` skips
+      layers entirely.
 - [ ] Move the wallpaper to a real background-layer client, so it sits below
       Bloom rather than inside it. Enables shell transparency, "show desktop",
-      and a wallpaper that survives a shell restart.
+      and a wallpaper that survives a shell restart. **Open design question**,
+      shared with the lock screen and with toasts over app windows: Evo stacks
+      Bloom *beneath* every app, so shell UI that must sit above apps needs
+      either compositor-drawn system UI or a transparent Bloom overlay surface
+      (Gecko supports transparent toplevels via
+      `mozilla.widget.use-argb-visuals` and `browser.tabs.allow_transparent_browser`).
 
 **B. Session control** (audit §4.1)
 
 - [ ] Power menu in quick-settings: Shut down / Restart / Lock / Log out,
-      calling `org.geckoOS.power` (fixed in alpha 3).
+      calling `org.geckoOS.power` (fixed in alpha 3). *Shut down, Restart
+      and Sleep exist and are real. Lock and Log out do not.* Shut down and
+      restart now play the shutdown sound first.
 - [ ] Lock screen as an `overlay`-layer client — input-exclusive, unlocked by
-      a credential check against the geckouser account.
+      a credential check against the geckouser account. (smithay also offers
+      `ext-session-lock`, which gives the compositor-enforced guarantee a lock
+      needs; see A's design question.)
 - [ ] A confirm-before-shutdown flow that gives running apps a chance to close.
 
 **C. Notifications** (audit §3.6, §4.2)
 
-- [ ] Rewrite `notification.rs` as Echo-native: store the notification, emit an
-      Echo signal. Drop the `notify-send`/`dbus-send` shell-outs entirely —
-      there is no notification daemon or session bus in this image, and there
-      shouldn't need to be.
-- [ ] Notification centre in Bloom, on the Bell button (which currently opens
-      quick-settings like every other icon). Toast + history + dismiss.
-- [ ] Expose `notification.Show` through `@pyxis/app-sdk` so apps can use it.
+- [x] Rewrite `notification.rs` as Echo-native: store the notification, emit an
+      Echo signal. The `notify-send`/`dbus-send` shell-outs are gone.
+      `show`/`list`/`close`/`closeAll` are real, with `NotificationShown`
+      and `NotificationClosed` signals. The daemon had registered no `list` at
+      all, so Bloom's centre could never have shown anything.
+- [x] Notification centre in Bloom, on the Bell button, with a badge count;
+      toasts; dismiss. Do Not Disturb holds toasts (not critical ones) and the
+      notification sound. **Known limit:** toasts draw inside Bloom, beneath
+      app windows (see A).
+- [x] Expose notifications through `@pyxis/app-sdk` (`showNotification` and
+      friends). The bridge stamps the caller's app id, so an app cannot post as
+      another. Reading and clearing the centre needs the new privileged
+      `notifications:manage`, which only the shell holds.
 
 **D. Window management completion**
 
-- [ ] Resize (#11). The decoration decision is made — **Evo owns
-      server-side decoration** (see CLAUDE.md, "Window decoration model") —
-      so this is Evo SSD work, not GTK's. The first concrete bug is already
-      known and has a failing test: `evo/src/enhancements/decorations.rs`'s
-      `get_resize_handle` tests corners as `top_border ∩ left_border`, but
-      `get_regions` builds the side borders to *exclude* the corners, so the
-      intersection is always empty and the four diagonal handles can never
-      fire. `test_resize_handle_detection` is correct and has been red since
-      April. Fix the corner test first; it's a few lines.
-- [ ] Real values in Evo's `GetRenderingStatus` IPC method — the signal path
-      (`record_frame`, `current_process_rss_mb`) is already real, only the
-      method returns hardcoded fps/memory.
+- [x] Resize (#11): drag an invisible 8 px band outside Evo's frame, corners
+      included. Verified on device by `alpha5-resize.txt`: a shrink from the
+      bottom-right edge and a grow from the top-left, exact to the pixel, plus
+      a control drag inside the frame that must not resize. The corner bug is
+      fixed (`test_resize_handle_detection` is green, and `cargo test
+      --workspace` has no expected failures now). Found and fixed on the way:
+      maximized SSD windows overhung the screen by the header's 32 px;
+      windows were placed blind, before their size was known, often partly
+      off-screen; and Evo's Echo broker read the next frame as a request's
+      reply, so it could lose its bus registration mid-session.
+- [x] Real values in Evo's `GetRenderingStatus` IPC method, and `ListWindows`
+      now lists the live toplevels. It used to list only contract-created
+      windows, so it was empty on every device.
 - [ ] HiDPI scale read from the render surface (`udev.rs:1460`).
 
 **E. Audio** (audit §1.4)
 
-- [ ] Decide the stack (PipeWire is the current-generation answer; ALSA-direct
-      is the minimal one) and add it to the rootfs.
-- [ ] Volume control in quick-settings; output device selection in Settings.
-- [ ] Verify vela plays audio.
+- [x] Decide the stack: **PipeWire** (with its Pulse server and WirePlumber).
+      This was effectively forced: vela's build defines `MOZ_PULSEAUDIO` and
+      not `MOZ_ALSA`, so it can only play through a Pulse server. The kernel
+      had `# CONFIG_SOUND is not set`. `build-kernel.sh` now builds HDA and
+      virtio-snd in, verified on device (`--kernel`). *The rootfs half (the
+      packages, the boot wiring, the sounds) needs the next image rebuild.*
+- [x] Volume control in quick-settings (the slider used to write a setting
+      nothing read) and output device selection in Settings → Sound, over the
+      new `org.geckoOS.audio`. System sounds (`system-sounds/` at the repo
+      root) play through `org.geckoOS.sound`: boot, shutdown, notification,
+      error.
+- [ ] Verify vela plays audio: `alpha5-audio.txt` is ready, and runs once the
+      image has PipeWire.
 
 **F. Display settings** (audit §4.4)
 
 - [ ] Settings → Display: resolution, scale, and multi-monitor arrangement.
+
+**Pulled forward from alpha 6:** unprivileged user namespaces
+(`CONFIG_USER_NS`), in the same kernel rebuild as sound. vela's content sandbox
+has run degraded without them. Verified on device: the namespace works, and
+apps still launch and render under the sandbox.
 
 ### Exit criteria
 

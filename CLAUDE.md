@@ -31,7 +31,7 @@ A full desktop Linux OS built from scratch, architecturally descended from two r
 
 ## Target app-runtime model
 
-Apps — web or native — are **independent Wayland clients that Evo composites directly**, never DOM-embedded surfaces reparented into Bloom. This retires an earlier framing (in `PYXIS_ASSESSMENT.md`) that treated Bloom's `WaylandSurfaceView` placeholder as a gap to *fill in*; per `pyxis-webos-parity-analysis.md` it should instead be **deleted** — Bloom's card view should be chrome/metadata only (title, icon, thumbnail via `wlr-screencopy`, which `evo/src/enhancements/screencopy.rs` already provides), with Evo owning all real compositing.
+Apps — web or native — are **independent Wayland clients that Evo composites directly**, never DOM-embedded surfaces reparented into Bloom. This retires an earlier framing (in `PYXIS_ASSESSMENT.md`) that treated Bloom's `WaylandSurfaceView` placeholder as a gap to *fill in*; per `pyxis-webos-parity-analysis.md` it should instead be **deleted** — Bloom's card view should be chrome/metadata only (title, icon, thumbnail via `wlr-screencopy`, which `evo/src/enhancements/screencopy.rs` provides for real since 2026-09-25: before that it was a stub that nothing compiled), with Evo owning all real compositing.
 
 **App serving is the biggest newly-scoped workstream.** There is no maintained way to embed Gecko in a native host anymore, so the plan is to **build a customized Gecko from source** (`vela`, pinned to an ESR branch) with three compiled-in additions:
 1. A native `pyxis://<app-id>/<path>` protocol handler (`nsIProtocolHandler`, backed by `nsIStandardURL` so each app gets a real, isolated, secure-context origin — `pyxis://<app-id>` — mapped to `<apps-root>/<app-id>/webroot/`).
@@ -50,6 +50,16 @@ Visually complete desktop shell (draggable/resizable windows, taskbar, launcher,
 - `DesktopWindow.tsx`'s `WaylandSurfaceView` is a placeholder `<div>` — per the target model above, this should be **deleted**, not implemented, and replaced with chrome-only card metadata.
 - Known code health issues: the README is still the stock Vite template. Lint is clean (`npx eslint .` → 0) and `npm test` green as of alpha4; keep both there.
 - **The app list is dynamic as of alpha 4** (`src/hooks/useApps.ts`): Nova's `List` is the source of truth for the launcher, drawer, search, and dock, refreshed on `AppInstalled`/`AppUninstalled`/`RegistryChanged`. `PYXIS_APPS` survives only as a *presentation overlay* (Lucide glyph, accent, pin state, default window size for built-ins); an app absent from it still appears, drawn via `AppIcon`'s manifest-icon → generic-glyph fallback. `entryUrlFor` resolves `pyxis://<id>/<entry>` on device and the package's dev-server port off it. Verified in the browser: installing `weather` makes it appear in drawer + search, removing it drops it, with no code change.
+- **Notifications and sound are real as of alpha 5.** The Bell opens a
+  notification centre fed by echo's `org.geckoOS.notification` store and its
+  `NotificationShown`/`NotificationClosed` signals, and toasts respect Do Not
+  Disturb. The quick-settings volume slider and Settings → Sound drive
+  `org.geckoOS.audio` (PipeWire via `wpctl`). Named system sounds go through
+  `org.geckoOS.sound`, with the files in `system-sounds/` at the repo root.
+  The SDK side of each lives in `packages/app-sdk/src/{notifications,audio,useAudio}.ts`,
+  and each has a Vitest contract suite that reads its Rust source. **Known
+  limit:** toasts draw inside Bloom, and Evo stacks Bloom beneath every app,
+  so an app covering the top-right corner hides them (roadmap alpha 5, A).
 - Git branches: all five remote feature branches are fully merged into `main` or stale pre-merge snapshots — no unmerged work is at risk, though `feature/app-host-client` and `feature/app-surface-embed`'s remote-ref tips are confusingly swapped and worth pruning.
 
 ## Window decoration model
@@ -85,8 +95,10 @@ decision — the decision is above.
 ## Known code-level issues to track
 
 - `echo/src/services/appmanager.rs:102` — no signature verification before tarball extraction (Nova's install plan formalizes the fix; not yet implemented). `appmanager` is superseded by Nova and should probably just be deleted.
-- `evo` TODOs: HiDPI scale not read from render surface (`udev.rs`), hardcoded fps/memory in the `GetRenderingStatus` **IPC method** (the signal path is real), X11 override-redirect ordering (`shell/x11.rs`).
-- `evo` open bug: no user-driven window resize (#11, alpha 5). Its first concrete defect is known: `enhancements/decorations.rs`'s corner resize handles can never fire, because the side-border regions exclude the corners that `get_resize_handle` looks for. **`test_resize_handle_detection` is red on purpose** — it's correct, and it's the one expected failure in `cargo test --workspace`. (#7 maximize→unmaximize and #10 restore-from-dock were fixed and confirmed in alpha 4.)
+- `evo` TODOs: HiDPI scale not read from render surface (`udev.rs`), X11 override-redirect ordering (`shell/x11.rs`). (`GetRenderingStatus` answers with real fps/memory since alpha 5.)
+- `evo` resize (#11) works since alpha 5: an invisible 8 px band **outside** the SSD frame starts the grab (`WindowElement::ssd_resize_band`), because vela never sends `xdg_toplevel.resize` itself. Resize grabs work in **frame** size (header included) and convert to client size only in the configure they send (`grabs.rs::client_size`). Sending the frame size grew every SSD window by 32 px the moment a resize began. `cargo test --workspace` now has no expected failures.
+- `evo`'s Echo broker matches replies by `reply_to`, and it re-registers `org.geckoOS.evo` after any reconnect (alpha 5). It used to take the next frame as a request's reply: a signal, or a call forwarded to Evo, could be eaten and never answered. It also never re-registered, so a dropped connection lost the service for the rest of the session. Its signals are fire-and-forget: a signal never waits on the compositor thread, and a request waits at most 3 s.
+- `evo.ListWindows` lists the live toplevels (`EvoState::sync_toplevels`), with frame geometry. It used to read the create/claim map, which holds only windows Evo created itself, so it was empty on every device (the same two-registries trap the window-action handlers once fell into).
 - `echo`'s `org.geckoOS.Echo` `ListServices` reads only `ServiceRegistry`, which
   is written solely by the over-the-wire `RegisterService` call — never by the
   in-process services `daemon.rs` installs via `register_handler`, so it answers
@@ -119,14 +131,14 @@ decision — the decision is above.
   diagnoses were wrong because every probe fired at or before load;
   `PYXIS-DIAG chrome-late:` logs the settled state 5s in and is what
   `scripts/serial-tests/kiosk-relaunch.txt` asserts on.
-- **The kernel has no `CONFIG_USER_NS`** (`# CONFIG_USER_NS is not set`), so
-  vela's content sandbox is genuinely degraded — unprivileged user namespaces
-  are unavailable. Firefox's own `sandbox-unprivileged-namespaces` warning was
-  telling the truth; it is suppressed in app windows
-  (`security.sandbox.warn_unprivileged_namespaces=false` in nova.rs's user.js
-  template) because a notification bar in an app window is noise, **not**
-  because the problem is solved. Enabling it is a kernel rebuild and belongs
-  with roadmap item 6.
+- **`CONFIG_USER_NS` and sound are on from alpha 5** (`scripts/build-kernel.sh`'s
+  `ensure_y` list; the real kernel config is `scripts/.config` plus that list,
+  **not** `mini/linux/.config`, which is an older kernel the image does not
+  boot). Before, vela's content sandbox ran genuinely degraded, and Firefox's
+  `sandbox-unprivileged-namespaces` warning was telling the truth. The pref
+  that hides that warning in app windows stays, as belt and braces. Verified
+  with `--kernel`: namespaces work, and apps launch and render under the
+  sandbox. The image picks the kernel up at its next rebuild.
 - **remochi's `Toggle` types don't match its runtime**: `index.d.ts` declares a `checked` prop, but the exported component reads `value` and calls `onChange({ value })`. Passing `checked` type-checks and is silently ignored. Bloom bridges this with a locally-typed `Switch` cast in `QuickSettingsMenu.tsx` and `SettingsApp.tsx` — check for that trap before adding a new `Toggle`.
 
 ### Corrected 2026-08-16 (were stale, verified fixed — do not re-investigate)
@@ -152,9 +164,21 @@ webOS's LS2 bus enforced a **JSON role-file allow-list per identity** *at the bu
 ## On-device verification
 
 `scripts/serial-test.py` boots the image headless and drives it over the
-serial console — the project's only verification channel, since Evo needs
-virgl and QMP `screendump` reports "no surface" on a GL scanout (re-checked
-on QEMU 10.2.1 with `device`/`head` variants; it is not stale tooling).
+serial console. Since alpha 5 it can also **see, click and hear**:
+
+- `#!shot <name> [grim args]` saves a screenshot to `target/serial-shots/`.
+  grim asks Evo over wlr-screencopy. QMP `screendump` still reports "no
+  surface" on the GL scanout, so this is the only way to get pixels. Look at
+  the PNG: a capture succeeding says nothing about whether the screen is right.
+- `#!pointer move|click|drag X Y …` drives a virtio tablet over QMP. A
+  coordinate can be `$VAR`, read from the guest shell.
+- `#!listen <name>` saves what the guest's HDA card played since the last
+  listen, and reports `silent` when nothing did.
+- `--push LOCAL:/path` files are laid over the rootfs by geckoOS-boot
+  **before any daemon starts** (a read-only virtio disk, serial `pyxisin`), so
+  `--push target/release/evo:/usr/bin/evo` tests a new Evo with no sudo
+  rebuild. `--pull` brings files out, and `--kernel` boots a new kernel with
+  the image's own root UUID.
 
 ```bash
 scripts/serial-test.py --script scripts/serial-tests/alpha4-ipk-e2e.txt
@@ -165,11 +189,12 @@ scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha4-exit-c
 Suites assert: a `#!must <text>` / `#!must-not <text>` line applies to the
 next command and fails the run. Without them a suite only *prints*, and a
 run in which every step errored still exits 0 — which has happened, twice.
-The four suites live in `scripts/serial-tests/`.
+The suites live in `scripts/serial-tests/`, including `alpha5-*.txt` for
+screenshots, resize, notifications and audio.
 
 It runs on a qcow2 overlay, so the image is never mutated and each run
-starts clean, and it can `--push` a file in by chunked base64 (sha256
-verified) when there is no other way to get one into the guest. The script's
+starts clean. Note that `make run` does NOT use an overlay: a hand-booted image
+keeps whatever you did in it, such as an installed package. The script's
 docstring carries the serial gotchas that have each cost hours.
 
 A full rebuild + verify is one command, `bash scripts/rebuild-and-verify.sh`
@@ -178,11 +203,9 @@ the acceptance package into the rootfs *before* the image is built from it
 (getting that order wrong yields an image that looks fine and has nothing to
 install), and then runs all four suites.
 
-**What it cannot do is look at the screen, or move the mouse.** Anything
-whose acceptance is visual — or that is *about* pointer input, like bug #7's
-press/release double-dispatch — needs `make build-release && make run` and a
-human. Note the rootfs stages need root, so a build cannot be fully
-automated either.
+The rootfs stages need root, so a full image build is still the user's to run
+(`SKIP_TESTS=1 bash scripts/rebuild-and-verify.sh`). Between builds, `--push`
+and `--kernel` cover most iteration.
 
 **The 2 GB reference VM will not run all 8 built-in apps at once.** At the
 `emulate.sh` default the guest saturates (1929/1987 MB) and the last apps to
