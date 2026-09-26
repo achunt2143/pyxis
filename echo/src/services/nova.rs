@@ -106,6 +106,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "filesystem:write",
     "power",
     "notifications",
+    "notifications:manage",
     "appManager:install",
     "appManager:manage",
 ];
@@ -118,7 +119,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
 /// `USER_APPS_ROOT` is writable and fed by `install()` from plain tarballs.
 /// Gating only the `appinfo.json` path would leave the identical escalation
 /// reachable by shipping the same app as a `.tar.gz` instead of an `.ipk`.
-pub const PRIVILEGED_CAPABILITIES: &[&str] = &["appManager:install", "appManager:manage"];
+pub const PRIVILEGED_CAPABILITIES: &[&str] = &["notifications:manage", "appManager:install", "appManager:manage"];
 
 /// The permission vocabulary an `appinfo.json` may declare in
 /// `requiredPermissions[]` (SDK/PDK spec §19.1, kept in lockstep with
@@ -140,19 +141,23 @@ pub const APPINFO_PERMISSIONS: &[&str] = &[
     "ipc",
     "background",
     "power",
+    "notifications.manage",
     "appmanager.install",
     "appmanager.manage",
 ];
 
-/// The privileged subset of [`APPINFO_PERMISSIONS`]: app-management rights,
-/// which let their holder install and remove *other* apps. Any `appinfo.json`
+/// The privileged subset of [`APPINFO_PERMISSIONS`]: rights over *other*
+/// apps. That means app management, which installs and removes them, and
+/// `notifications.manage`, which reads and dismisses every app's
+/// notifications (the shell's notification centre). Any `appinfo.json`
 /// may declare these (declaration is not the grant — spec §19.2), but they
 /// are translated into bridge capabilities only for apps on
 /// [`PRIVILEGED_APP_IDS`]. Without that gate an ipk-installed app could
 /// declare `appmanager.install` and self-elevate into the app-management
 /// surface simply by being installed, which is precisely the escalation the
 /// deny-by-default model exists to prevent.
-pub const PRIVILEGED_APPINFO_PERMISSIONS: &[&str] = &["appmanager.install", "appmanager.manage"];
+pub const PRIVILEGED_APPINFO_PERMISSIONS: &[&str] =
+    &["notifications.manage", "appmanager.install", "appmanager.manage"];
 
 /// Platform trust list for [`PRIVILEGED_APPINFO_PERMISSIONS`].
 ///
@@ -196,6 +201,7 @@ pub fn appinfo_permission_to_capability(perm: &str) -> Option<&'static str> {
         "filesystem.read" => Some("filesystem:read"),
         "filesystem.write" => Some("filesystem:write"),
         "notifications" => Some("notifications"),
+        "notifications.manage" => Some("notifications:manage"),
         "power" => Some("power"),
         "appmanager.install" => Some("appManager:install"),
         "appmanager.manage" => Some("appManager:manage"),
@@ -1258,6 +1264,14 @@ user_pref("media.gpu-process-decoder", false);
 user_pref("dom.ipc.processCount", 1);
 user_pref("browser.tabs.remote.autostart", false);
 user_pref("accessibility.force_disabled", 1);
+// Installed apps make sound the way native apps do, without first needing a
+// click. Firefox's default (media.autoplay.default = 1) blocks audible
+// autoplay to protect people from arbitrary websites. A pyxis:// app is
+// installed software, though, and a timer, chat or game app that could not
+// play a sound until touched would simply be broken. Web Audio has its own
+// switch for the same policy.
+user_pref("media.autoplay.default", 0);
+user_pref("media.autoplay.block-webaudio", false);
 // Single-purpose app window: never resurrect a previous session as a normal
 // browser window. A vela that didn't exit cleanly (e.g. the window was closed
 // out from under it) would otherwise crash-restore on next launch, opening a
@@ -1302,11 +1316,11 @@ user_pref("xpinstall.enabled", false);
 // no `chromeclass-*`, so not one of the chromehidden CSS rules can reach it.
 //
 // What it was showing: `sandbox-unprivileged-namespaces`, Firefox's warning
-// that unprivileged user namespaces are unavailable so the content sandbox
-// is weakened. That warning is CORRECT — the kernel is built with
-// `# CONFIG_USER_NS is not set` (scripts/.config), so the sandbox really is
-// degraded. Suppressing the bar does not fix the sandbox; see
-// PROJECT_STATUS for that as a separate, real security item.
+// that unprivileged user namespaces are unavailable, so the content sandbox
+// is weakened. That warning was CORRECT: the kernel was built with
+// `# CONFIG_USER_NS is not set`. Alpha 5 turns it on (build-kernel.sh), which
+// is the real fix, and the pref below stays as belt and braces. Suppressing
+// the bar never fixed the sandbox.
 //
 // And notification bars STACK, which is the whole "gets worse each launch"
 // symptom: measured toolbarH=48 on the first launch and 96.7 on the second,

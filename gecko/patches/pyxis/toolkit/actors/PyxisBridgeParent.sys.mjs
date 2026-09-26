@@ -666,7 +666,8 @@ export class PyxisBridgeParent extends JSWindowActorParent {
   }
 
   async _handleCallService(data) {
-    const { service, method, params } = data;
+    const { service, method } = data;
+    let { params } = data;
     const appId = this._appIdForThisActor();
 
     // --- Capability allow-list enforcement (the LS2-role-file check) ---
@@ -681,6 +682,14 @@ export class PyxisBridgeParent extends JSWindowActorParent {
         `Pyxis capability denied: app '${appId}' did not declare '${capability}' ` +
           `(required for ${service}.${method})`
       );
+    }
+
+    // Stamp who raised a notification. The store trusts `appId` only because
+    // this is the one place it gets written, so overwrite whatever the page
+    // sent: a page can put any appId it likes in its params, and the centre
+    // would then show another app's name and icon over this app's text.
+    if (service === "notification" && method === "show") {
+      params = { ...params, appId };
     }
 
     return this._echoRequest(service, method, params, appId);
@@ -770,8 +779,15 @@ export class PyxisBridgeParent extends JSWindowActorParent {
         setScreenBrightness: "power",
         setScreenTimeout: "power",
       },
+      // Raising a notification is an app's own business. Reading or
+      // dismissing the centre is the shell's: `list` returns every app's
+      // notifications, text included, so it is privileged
+      // (`notifications:manage`, which Nova grants only to PRIVILEGED_APP_IDS).
       notification: {
         show: "notifications",
+        list: "notifications:manage",
+        close: "notifications:manage",
+        closeAll: "notifications:manage",
       },
       appManager: {
         install: "appManager:install",

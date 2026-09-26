@@ -59,3 +59,6 @@ path = "src/bin/client.rs"
 [[bin]]
 name = "pyxis-appctl"
 path = "src/bin/appctl.rs"
+
+[dev-dependencies]
+tempfile = "3.8"

@@ -593,6 +593,8 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
 
     // ==================== NOTIFICATION SERVICE ====================
     register_notification_handlers(bus).await?;
+    register_sound_handlers(bus).await?;
+    register_audio_handlers(bus).await?;
 
     // ==================== PROCESS SERVICE ====================
     register_process_handlers(bus).await?;
@@ -864,6 +866,169 @@ async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// The shutdown sound, played to its end (at most 4 s) before the power goes.
+/// A missing sound or audio stack only means silence, never a failed
+/// shutdown.
+async fn play_shutdown_sound() {
+    if let Err(e) = services::sound::SoundService::system()
+        .play_and_wait("shutdown", std::time::Duration::from_secs(4))
+        .await
+    {
+        debug!("no shutdown sound: {e}");
+    }
+}
+
+// ==================== SOUND SERVICE HANDLERS ====================
+async fn register_sound_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    use services::sound::{SoundService, SOUND_IFACE};
+    info!("Registering sound service handlers");
+
+    bus.router().register_handler(
+        SOUND_IFACE,
+        "play",
+        handler(move |msg| {
+            Box::pin(async move {
+                let name = msg.body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                match SoundService::system().play(name).await {
+                    Ok(pid) => Ok(Message::method_return(
+                        msg.header.message_id,
+                        json!({ "success": true, "name": name, "pid": pid }),
+                    )),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        SOUND_IFACE,
+        "list",
+        handler(move |msg| {
+            Box::pin(async move {
+                Ok(Message::method_return(
+                    msg.header.message_id,
+                    json!({ "sounds": SoundService::system().list() }),
+                ))
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Sound service handlers registered");
+    Ok(())
+}
+
+// ==================== AUDIO SERVICE HANDLERS ====================
+async fn register_audio_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    use services::audio::{AudioService, AUDIO_IFACE, SIGNAL_OUTPUT_CHANGED, SIGNAL_VOLUME_CHANGED};
+    info!("Registering audio service handlers");
+
+    /// Reply with `result`, and on success also signal it under `signal`,
+    /// so every open view (the quick-settings slider, Settings) follows
+    /// a change made anywhere.
+    async fn reply<T: serde::Serialize>(
+        bus: &IPCBus,
+        message_id: String,
+        result: anyhow::Result<T>,
+        signal: Option<&str>,
+    ) -> anyhow::Result<Message> {
+        match result {
+            Ok(value) => {
+                let value = serde_json::to_value(value)?;
+                if let Some(signal) = signal {
+                    if let Err(e) = bus.emit_signal(AUDIO_IFACE, signal, value.clone()).await {
+                        warn!("audio signal {} failed: {}", signal, e);
+                    }
+                }
+                Ok(Message::method_return(message_id, value))
+            }
+            Err(e) => Ok(Message::error(message_id, &format!("{e:#}"))),
+        }
+    }
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "getVolume",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move { reply(&bus, msg.header.message_id, AudioService::volume().await, None).await })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "setVolume",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = match msg.body.get("volume").and_then(|v| v.as_u64()) {
+                    Some(volume) => AudioService::set_volume(volume.min(100) as u8).await,
+                    None => Err(anyhow::anyhow!("setVolume needs a numeric `volume`, 0-100")),
+                };
+                reply(&bus, msg.header.message_id, result, Some(SIGNAL_VOLUME_CHANGED)).await
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "setMute",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = match msg.body.get("muted").and_then(|v| v.as_bool()) {
+                    Some(muted) => AudioService::set_mute(muted).await,
+                    None => Err(anyhow::anyhow!("setMute needs a boolean `muted`")),
+                };
+                reply(&bus, msg.header.message_id, result, Some(SIGNAL_VOLUME_CHANGED)).await
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "listOutputs",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = AudioService::outputs().await.map(|outputs| json!({ "outputs": outputs }));
+                reply(&bus, msg.header.message_id, result, None).await
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "setDefaultOutput",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = match msg.body.get("id").and_then(|v| v.as_u64()) {
+                    Some(id) => AudioService::set_default_output(id as u32)
+                        .await
+                        .map(|outputs| json!({ "outputs": outputs })),
+                    None => Err(anyhow::anyhow!("setDefaultOutput needs a numeric `id`")),
+                };
+                reply(&bus, msg.header.message_id, result, Some(SIGNAL_OUTPUT_CHANGED)).await
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Audio service handlers registered");
+    Ok(())
+}
+
 // ==================== POWER SERVICE HANDLERS ====================
 async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
     info!("Registering power service handlers");
@@ -875,6 +1040,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
         handler(move |msg| {
             Box::pin(async move {
                 let delay = msg.body.get("delay").and_then(|v| v.as_u64());
+                play_shutdown_sound().await;
                 match services::power::PowerService::shutdown(delay) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
@@ -891,6 +1057,7 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
         handler(move |msg| {
             Box::pin(async move {
                 let delay = msg.body.get("delay").and_then(|v| v.as_u64());
+                play_shutdown_sound().await;
                 match services::power::PowerService::reboot(delay) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
@@ -1377,54 +1544,121 @@ async fn register_notification_handlers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Registering notification service handlers");
 
+    use services::notification::{NotificationStore, NOTIFICATION_IFACE, SIGNAL_CLOSED, SIGNAL_SHOWN};
+
+    // The notification sound follows the toast's rules (Bloom's
+    // NotificationToasts): a low-urgency notification is silent, Do Not
+    // Disturb silences the rest, and a critical one sounds regardless.
+    fn notification_should_sound(n: &services::notification::Notification) -> bool {
+        use services::notification::Urgency;
+        match n.urgency {
+            Urgency::Low => false,
+            Urgency::Critical => true,
+            Urgency::Normal => !services::SettingsService::get("pyxis.dnd")
+                .ok()
+                .and_then(|v| v["value"].as_bool())
+                .unwrap_or(false),
+        }
+    }
+
+    // Every change is signalled, so a shell never has to poll: Bloom draws
+    // its toast from `NotificationShown`, and every open view of the centre
+    // drops an entry on `NotificationClosed`. A signal that fails to send is
+    // logged, not returned: the store already changed, and the caller's
+    // `show` did succeed.
+    async fn notify_signal(bus: &IPCBus, name: &str, payload: serde_json::Value) {
+        if let Err(e) = bus.emit_signal(NOTIFICATION_IFACE, name, payload).await {
+            warn!("notification signal {} failed: {}", name, e);
+        }
+    }
+
+    let bus_clone = bus.clone();
     bus.router().register_handler(
-        "org.geckoOS.notification",
+        NOTIFICATION_IFACE,
         "show",
         handler(move |msg| {
+            let bus = bus_clone.clone();
             Box::pin(async move {
-                let title = msg
-                    .body
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Notification");
-                let options = msg.body.get("options").cloned();
-                match services::notification::NotificationService::show(title, options) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                let notification = NotificationStore::global().show(&msg.body);
+                if notification_should_sound(&notification) {
+                    if let Err(e) = services::sound::SoundService::system().play("notification").await {
+                        debug!("no notification sound: {e}");
+                    }
                 }
+                let value = serde_json::to_value(&notification)?;
+                notify_signal(&bus, SIGNAL_SHOWN, serde_json::json!({ "notification": value })).await;
+                Ok(Message::method_return(
+                    msg.header.message_id,
+                    serde_json::json!({
+                        "success": true,
+                        "notificationId": notification.id,
+                        "notification": value,
+                    }),
+                ))
             })
         })
         .into(),
     );
 
     bus.router().register_handler(
-        "org.geckoOS.notification",
+        NOTIFICATION_IFACE,
+        "list",
+        handler(move |msg| {
+            Box::pin(async move {
+                let notifications = NotificationStore::global().list();
+                Ok(Message::method_return(
+                    msg.header.message_id,
+                    serde_json::json!({ "notifications": notifications }),
+                ))
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        NOTIFICATION_IFACE,
         "close",
         handler(move |msg| {
+            let bus = bus_clone.clone();
             Box::pin(async move {
-                let notif_id = msg
+                // `notificationId` is what the SDK sends; `id` is what the
+                // entries themselves carry, so accept that too.
+                let id = msg
                     .body
                     .get("notificationId")
+                    .or_else(|| msg.body.get("id"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                match services::notification::NotificationService::close(notif_id) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                    .unwrap_or("")
+                    .to_owned();
+                let closed = NotificationStore::global().close(&id);
+                if closed {
+                    notify_signal(&bus, SIGNAL_CLOSED, serde_json::json!({ "notificationId": id })).await;
                 }
+                Ok(Message::method_return(
+                    msg.header.message_id,
+                    serde_json::json!({ "success": closed, "notificationId": id }),
+                ))
             })
         })
         .into(),
     );
 
+    let bus_clone = bus.clone();
     bus.router().register_handler(
-        "org.geckoOS.notification",
+        NOTIFICATION_IFACE,
         "closeAll",
         handler(move |msg| {
+            let bus = bus_clone.clone();
             Box::pin(async move {
-                match services::notification::NotificationService::close_all() {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                let ids = NotificationStore::global().close_all();
+                for id in &ids {
+                    notify_signal(&bus, SIGNAL_CLOSED, serde_json::json!({ "notificationId": id })).await;
                 }
+                Ok(Message::method_return(
+                    msg.header.message_id,
+                    serde_json::json!({ "success": true, "closed": ids.len() }),
+                ))
             })
         })
         .into(),

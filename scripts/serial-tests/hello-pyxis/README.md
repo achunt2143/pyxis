@@ -21,7 +21,14 @@ script ran, the bridge attached for a *third-party* origin, and Nova's
 `requiredPermissions` → capability mapping really granted
 `filesystem:write` to an ordinary opkg-tier app.
 
-`pyxis.json` declares `permissions: ["filesystem.read", "filesystem.write"]`
-— note the field is `permissions` there and comes out as
-`requiredPermissions` in the generated `appinfo.json`. Neither is
-privileged, so any opkg app is entitled to both.
+`pyxis.json` declares `permissions: ["filesystem.read", "filesystem.write",
+"notifications"]`. The field is `permissions` there and comes out as
+`requiredPermissions` in the generated `appinfo.json`. None of the three is
+privileged, so any opkg app is entitled to them.
+
+Since alpha 5 the page also raises one notification per launch through
+`window.geckoOS.notification.show`, and records `notify=ok <id>` (or the
+error) in the proof file. That is the app side of the exit criterion "an
+app-raised notification appears as a toast and lands in the centre". In
+the store, the notification must carry `appId: "com.pyxis.hello"`. The page
+never sends that id: the bridge stamps it from the `pyxis://` origin.

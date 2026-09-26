@@ -17,6 +17,7 @@
   "version": "0.2.0",
   "permissions": [
     "filesystem.read",
-    "filesystem.write"
+    "filesystem.write",
+    "notifications"
   ]
 }
