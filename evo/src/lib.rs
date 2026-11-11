@@ -8,12 +8,14 @@
 
 #[cfg(any(feature = "udev", feature = "xwayland"))]
 pub mod cursor;
+pub mod anim;
 pub mod drawing;
 pub mod focus;
 pub mod input_handler;
 pub mod render;
 pub mod shell;
 pub mod state;
+pub mod trust;
 
 #[cfg(feature = "udev")]
 pub mod udev;
@@ -26,22 +28,10 @@ pub use state::{EvoState, ClientState};
 
 // === GECKOOS ENHANCEMENTS ===
 // Conditionally compile enhancement modules
-#[cfg(any(
-    feature = "echo-ipc",
-    feature = "hotplug",
-    feature = "advanced-input",
-    feature = "damage-tracking",
-    feature = "decorations",
-    feature = "data-device"
-))]
+#[cfg(any(feature = "echo-ipc", feature = "decorations", feature = "screencopy"))]
 pub mod enhancements;
 
 // Re-export commonly used enhancements
 #[cfg(feature = "echo-ipc")]
 pub use enhancements::echo_ipc;
 
-#[cfg(feature = "hotplug")]
-pub use enhancements::hotplug;
-
-#[cfg(feature = "advanced-input")]
-pub use enhancements::input_advanced;

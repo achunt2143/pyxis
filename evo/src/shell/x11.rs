@@ -29,8 +29,9 @@ use tracing::{error, trace};
 use crate::{focus::KeyboardFocusTarget, state::Backend, EvoState};
 
 use super::{
-    place_new_window, FullscreenSurface, OldGeometry, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab,
-    ResizeData, ResizeState, SurfaceData, TouchMoveSurfaceGrab, WindowElement,
+    placement::{PreFullscreen, PreFullscreenState},
+    OldGeometry, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeState,
+    SurfaceData, TouchMoveSurfaceGrab, WindowElement, WindowLayout,
 };
 
 impl<BackendData: Backend> XWaylandShellHandler for EvoState<BackendData> {
@@ -50,13 +51,19 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         window.set_mapped(true).unwrap();
         let window = WindowElement(Window::new_x11_window(window));
-        place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
-        let bbox = self.space.element_bbox(&window).unwrap();
+        let location = self.compute_new_window_location(self.pointer.current_location(), &window);
+        // The same registration as an xdg toplevel: workspace record, space,
+        // `windows_by_id`, `WindowCreated`, and (once its class is known)
+        // the appHost binding. These windows used to bypass all of it, so
+        // their SSD minimize button hid a window nothing could ever find
+        // again.
+        self.add_window_to_workspace(window.clone(), location);
         let Some(xsurface) = window.0.x11_surface() else {
             unreachable!()
         };
-        xsurface.configure(Some(bbox)).unwrap();
+        let _ = xsurface.configure(Some(Rectangle::new(location, xsurface.geometry().size)));
         window.set_ssd(!xsurface.is_decorated());
+        self.focus_window(&window);
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -81,20 +88,18 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        let maybe = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-            .cloned();
-        if let Some(elem) = maybe {
-            self.space.unmap_elem(&elem)
-        }
+        // A client withdrawing its window. A managed one comes back through
+        // `map_window_request` as a new element, so this one goes entirely
+        // (`destroyed_window` is the same).
+        self.forget_x11_window(&window);
         if !window.is_override_redirect() {
-            window.set_mapped(false).unwrap();
+            let _ = window.set_mapped(false);
         }
     }
 
-    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.forget_x11_window(&window);
+    }
 
     fn configure_request(
         &mut self,
@@ -124,15 +129,10 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
         geometry: Rectangle<i32, Logical>,
         _above: Option<u32>,
     ) {
-        let Some(elem) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-            .cloned()
-        else {
+        let Some(elem) = self.tracked_window_for_x11(&window) else {
             return;
         };
-        self.space.map_element(elem, geometry.loc, false);
+        self.place_window(&elem, geometry.loc, false);
         // The class-level ordering bug this used to describe (override-
         // redirect windows sharing the same z-index tier as regular shell
         // windows, so a plain app re-map could bury a menu/tooltip) is fixed
@@ -159,53 +159,89 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(elem) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-        {
-            let outputs_for_window = self.space.outputs_for_element(elem);
-            let output = outputs_for_window
-                .first()
-                // The window hasn't been mapped yet, use the primary output instead
-                .or_else(|| self.space.outputs().next())
-                // Assumes that at least one output exists
-                .expect("No outputs found");
-            let geometry = self.space.output_geometry(output).unwrap();
+        let Some(elem) = self.tracked_window_for_x11(&window) else {
+            return;
+        };
+        // The window may not be on an output yet (a minimized one is on
+        // none): the primary output then.
+        let Some(output) = self.output_for_fullscreen(&elem, None) else {
+            return;
+        };
+        let Some(geometry) = self.space.output_geometry(&output) else {
+            return;
+        };
 
-            window.set_fullscreen(true).unwrap();
-            elem.set_ssd(false);
-            window.configure(geometry).unwrap();
-            output.user_data().insert_if_missing(FullscreenSurface::default);
-            output
-                .user_data()
-                .get::<FullscreenSurface>()
-                .unwrap()
-                .set(elem.clone());
-            trace!("Fullscreening: {:?}", elem);
+        let layout = self
+            .workspace_manager
+            .state(&elem)
+            .map_or(WindowLayout::Floating, |s| s.layout);
+        if layout != WindowLayout::Fullscreen {
+            self.begin_geometry_transition(&elem, Some(geometry.size));
+            if let Some(frame) = self.window_frame(&elem) {
+                elem.user_data().insert_if_missing(PreFullscreen::default);
+                if let Some(saved) = elem.user_data().get::<PreFullscreen>() {
+                    saved.save(PreFullscreenState {
+                        location: self.space.element_location(&elem).unwrap_or(frame.loc),
+                        size: elem.geometry().size,
+                        layout,
+                    });
+                }
+            }
         }
+
+        let _ = window.set_fullscreen(true);
+        elem.set_ssd_suppressed(true);
+        let _ = window.configure(geometry);
+        self.place_window(&elem, geometry.loc, true);
+        self.set_window_layout(&elem, WindowLayout::Fullscreen);
+        if self.is_window_mapped(&elem) {
+            self.set_exclusive_fullscreen(&elem, &output);
+            self.focus_window(&elem);
+        }
+        trace!("Fullscreening: {:?}", elem);
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(elem) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
+        let Some(elem) = self.tracked_window_for_x11(&window) else {
+            return;
+        };
+        if self
+            .workspace_manager
+            .state(&elem)
+            .is_some_and(|s| s.layout == WindowLayout::Fullscreen)
         {
-            window.set_fullscreen(false).unwrap();
-            elem.set_ssd(!window.is_decorated());
-            if let Some(output) = self.space.outputs().find(|o| {
-                o.user_data()
-                    .get::<FullscreenSurface>()
-                    .and_then(|f| f.get())
-                    .map(|w| &w == elem)
-                    .unwrap_or(false)
-            }) {
-                trace!("Unfullscreening: {:?}", elem);
-                output.user_data().get::<FullscreenSurface>().unwrap().clear();
-                window.configure(self.space.element_bbox(elem)).unwrap();
-                self.backend_data.reset_buffers(output);
+            self.begin_geometry_transition(&elem, None);
+        }
+        let _ = window.set_fullscreen(false);
+        elem.set_ssd(!window.is_decorated());
+        elem.set_ssd_suppressed(false);
+        self.clear_exclusive_fullscreen(&elem);
+
+        let saved = elem.user_data().get::<PreFullscreen>().and_then(PreFullscreen::take);
+        match saved {
+            Some(saved) => {
+                let header = elem.decoration_height();
+                let _ = window.configure(Rectangle::new(
+                    saved.location,
+                    (saved.size.w, (saved.size.h - header).max(1)).into(),
+                ));
+                self.place_window(&elem, saved.location, true);
+                self.set_window_layout(&elem, saved.layout);
             }
+            None => self.set_window_layout(&elem, WindowLayout::Floating),
+        }
+        trace!("Unfullscreening: {:?}", elem);
+    }
+
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(elem) = self.tracked_window_for_x11(&window) {
+            self.minimize_window(&elem);
+        }
+    }
+
+    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(elem) = self.tracked_window_for_x11(&window) {
+            self.focus_window(&elem);
         }
     }
 
@@ -213,19 +249,19 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
         // luckily Evo only supports one seat anyway...
         let start_data = self.pointer.grab_start_data().unwrap();
 
-        let Some(element) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-        else {
+        let Some(element) = self.tracked_window_for_x11(&window) else {
             return;
         };
-
+        let Some(loc) = self.space.element_location(&element) else {
+            return;
+        };
         let geometry = element.geometry();
-        let loc = self.space.element_location(element).unwrap();
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
-        with_states(&element.wl_surface().unwrap(), move |states| {
+        let Some(wl_surface) = element.wl_surface().map(|s| s.into_owned()) else {
+            return;
+        };
+        with_states(&wl_surface, move |states| {
             states
                 .data_map
                 .get::<RefCell<SurfaceData>>()
@@ -240,7 +276,7 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
 
         let grab = PointerResizeSurfaceGrab {
             start_data,
-            window: element.clone(),
+            window: element,
             edges: edges.into(),
             initial_window_location,
             initial_window_size,
@@ -321,31 +357,47 @@ impl<BackendData: Backend> XwmHandler for EvoState<BackendData> {
 }
 
 impl<BackendData: Backend> EvoState<BackendData> {
+    /// An X11 window is gone from the client's side (withdrawn or
+    /// destroyed): drop it from the workspace, the space, and Echo.
+    fn forget_x11_window(&mut self, window: &X11Surface) {
+        if let Some(elem) = self.tracked_window_for_x11(window) {
+            self.remove_window_from_workspace(&elem);
+        }
+    }
+
     pub fn maximize_request_x11(&mut self, window: &X11Surface) {
-        let Some(elem) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window))
-            .cloned()
-        else {
+        let Some(elem) = self.tracked_window_for_x11(window) else {
             return;
         };
+        let Some(output) = self.output_for_fullscreen(&elem, None) else {
+            return;
+        };
+        let Some(geometry) = self.space.output_geometry(&output).map(super::work_area::of_output) else {
+            return;
+        };
+        let layout = self
+            .workspace_manager
+            .state(&elem)
+            .map_or(WindowLayout::Floating, |s| s.layout);
+        if layout == WindowLayout::Fullscreen {
+            return;
+        }
 
-        let old_geo = self.space.element_bbox(&elem).unwrap();
-        let outputs_for_window = self.space.outputs_for_element(&elem);
-        let output = outputs_for_window
-            .first()
-            // The window hasn't been mapped yet, use the primary output instead
-            .or_else(|| self.space.outputs().next())
-            // Assumes that at least one output exists
-            .expect("No outputs found");
-        let geometry = self.space.output_geometry(output).unwrap();
-
-        window.set_maximized(true).unwrap();
-        window.configure(geometry).unwrap();
-        window.user_data().insert_if_missing(OldGeometry::default);
-        window.user_data().get::<OldGeometry>().unwrap().save(old_geo);
-        self.space.map_element(elem, geometry.loc, false);
+        // Not when already maximized: the frame on hand would overwrite the
+        // place worth restoring to.
+        if layout != WindowLayout::Maximized {
+            self.begin_geometry_transition(&elem, Some(geometry.size));
+            if let Some(old_geo) = self.window_frame(&elem) {
+                window.user_data().insert_if_missing(OldGeometry::default);
+                if let Some(saved) = window.user_data().get::<OldGeometry>() {
+                    saved.save(old_geo);
+                }
+            }
+        }
+        let _ = window.set_maximized(true);
+        let _ = window.configure(geometry);
+        self.place_window(&elem, geometry.loc, false);
+        self.set_window_layout(&elem, WindowLayout::Maximized);
     }
 
     /// Restores a window maximized via `maximize_request_x11` back to its
@@ -353,40 +405,44 @@ impl<BackendData: Backend> EvoState<BackendData> {
     /// (`XwmHandler::unmaximize_request`) and by the SSD maximize button
     /// toggling itself off.
     pub fn unmaximize_request_x11(&mut self, window: &X11Surface) {
-        let Some(elem) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window))
-            .cloned()
-        else {
+        let Some(elem) = self.tracked_window_for_x11(window) else {
             return;
         };
 
-        window.set_maximized(false).unwrap();
+        if self
+            .workspace_manager
+            .state(&elem)
+            .is_some_and(|s| s.layout == WindowLayout::Maximized)
+        {
+            // (Not the saved size: reading `OldGeometry` takes it.)
+            self.begin_geometry_transition(&elem, None);
+        }
+        let _ = window.set_maximized(false);
         if let Some(old_geo) = window
             .user_data()
             .get::<OldGeometry>()
             .and_then(|data| data.restore())
         {
-            window.configure(old_geo).unwrap();
-            self.space.map_element(elem, old_geo.loc, false);
+            let _ = window.configure(old_geo);
+            self.place_window(&elem, old_geo.loc, false);
         }
+        self.set_window_layout(&elem, WindowLayout::Floating);
     }
 
     pub fn move_request_x11(&mut self, window: &X11Surface) {
         if let Some(touch) = self.seat.get_touch() {
             if let Some(start_data) = touch.grab_start_data() {
-                let element = self
-                    .space
-                    .elements()
-                    .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window));
+                let element = self.tracked_window_for_x11(window);
 
                 if let Some(element) = element {
-                    let mut initial_window_location = self.space.element_location(element).unwrap();
+                    let Some(mut initial_window_location) = self.space.element_location(&element) else {
+                        return;
+                    };
 
                     // If surface is maximized then unmaximize it
                     if window.is_maximized() {
                         window.set_maximized(false).unwrap();
+                        self.set_window_layout(&element, WindowLayout::Floating);
                         let pos = start_data.location;
                         initial_window_location = (pos.x as i32, pos.y as i32).into();
                         if let Some(old_geo) = window
@@ -402,7 +458,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
 
                     let grab = TouchMoveSurfaceGrab {
                         start_data,
-                        window: element.clone(),
+                        window: element,
                         initial_window_location,
                     };
 
@@ -417,19 +473,18 @@ impl<BackendData: Backend> EvoState<BackendData> {
             return;
         };
 
-        let Some(element) = self
-            .space
-            .elements()
-            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == window))
-        else {
+        let Some(element) = self.tracked_window_for_x11(window) else {
             return;
         };
 
-        let mut initial_window_location = self.space.element_location(element).unwrap();
+        let Some(mut initial_window_location) = self.space.element_location(&element) else {
+            return;
+        };
 
         // If surface is maximized then unmaximize it
         if window.is_maximized() {
             window.set_maximized(false).unwrap();
+            self.set_window_layout(&element, WindowLayout::Floating);
             let pos = self.pointer.current_location();
             initial_window_location = (pos.x as i32, pos.y as i32).into();
             if let Some(old_geo) = window
@@ -445,7 +500,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
 
         let grab = PointerMoveSurfaceGrab {
             start_data,
-            window: element.clone(),
+            window: element,
             initial_window_location,
         };
 

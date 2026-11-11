@@ -32,8 +32,7 @@ use std::{
 
 use smithay::{
     backend::{
-        allocator::Fourcc,
-        renderer::{element::RenderElement, Color32F, ExportMem, Frame, Offscreen},
+        renderer::{element::RenderElement, Color32F, ExportMem, Offscreen},
     },
     output::Output,
     reexports::{
@@ -52,16 +51,23 @@ use smithay::{
 };
 use tracing::{debug, warn};
 
+use crate::anim::snapshot::{render_to_mem, OffscreenError};
+
 const VERSION: u32 = 3;
 
 /// The one wl_shm format offered. Every compositor must support it for
 /// wl_shm, so a client can always allocate it.
 const SHM_FORMAT: wl_shm::Format = wl_shm::Format::Xrgb8888;
 
-/// Readback format. `GL_RGBA`/`GL_UNSIGNED_BYTE` is the one combination every
-/// GLES implementation can read back, virgl included. It is converted to
-/// [`SHM_FORMAT`] on the CPU (see [`swizzle_rows`]).
-const READBACK_FORMAT: Fourcc = Fourcc::Abgr8888;
+// The readback format is `anim::snapshot::READBACK_FORMAT`: GL_RGBA /
+// GL_UNSIGNED_BYTE, the one combination every GLES implementation can read
+// back, virgl included. It is converted to `SHM_FORMAT` on the CPU (see
+// `swizzle_rows`).
+
+/// Global data of the manager: who may see it.
+pub struct ScreencopyGlobalData {
+    filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
+}
 
 pub struct ScreencopyManagerState {
     global: GlobalId,
@@ -69,14 +75,22 @@ pub struct ScreencopyManagerState {
 }
 
 impl ScreencopyManagerState {
-    pub fn new<D>(display: &DisplayHandle) -> Self
+    /// `filter` says which clients may see the global at all: a capture is
+    /// the whole screen, whatever any app has on it.
+    pub fn new<D, F>(display: &DisplayHandle, filter: F) -> Self
     where
-        D: GlobalDispatch<ZwlrScreencopyManagerV1, ()>
+        D: GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyGlobalData>
             + Dispatch<ZwlrScreencopyManagerV1, ()>
             + Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameState>
             + 'static,
+        F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
-        let global = display.create_global::<D, ZwlrScreencopyManagerV1, _>(VERSION, ());
+        let global = display.create_global::<D, ZwlrScreencopyManagerV1, _>(
+            VERSION,
+            ScreencopyGlobalData {
+                filter: Box::new(filter),
+            },
+        );
         Self {
             global,
             pending: Vec::new(),
@@ -213,43 +227,26 @@ impl PendingCapture {
         let scale = Scale::from(self.output.current_scale().fractional_scale());
         // As in smithay's damage tracker: the output transform is given in
         // surface rotation, so its inverse is how the output itself is
-        // drawn. The result is the buffer in scanout orientation, which is
-        // what the protocol hands out. Clients apply wl_output.transform.
-        let transform = self.output.current_transform().invert();
-        let output_geo = Rectangle::from_size(transform.transform_size(mode.size));
-        let buffer_size = Size::<i32, BufferCoords>::from((mode.size.w, mode.size.h));
-
-        let mut target = renderer
-            .create_buffer(READBACK_FORMAT, buffer_size)
-            .map_err(render_err)?;
-        let mut framebuffer = renderer.bind(&mut target).map_err(render_err)?;
-
-        let sync = {
-            let mut frame = renderer
-                .render(&mut framebuffer, mode.size, transform)
-                .map_err(render_err)?;
-            frame.clear(clear_color, &[output_geo]).map_err(render_err)?;
-            // Back to front, over the whole output: no damage tracking, since
-            // nothing of this target survives from one capture to the next.
-            for element in elements.iter().rev() {
-                let geometry = element.geometry(scale);
-                let Some(mut damage) = geometry.intersection(output_geo) else {
-                    continue;
-                };
-                damage.loc -= geometry.loc;
-                element
-                    .draw(&mut frame, element.src(), geometry, &[damage], &[])
-                    .map_err(render_err)?;
-            }
-            frame.finish().map_err(render_err)?
-        };
-        renderer.wait(&sync).map_err(render_err)?;
-
-        let mapping = renderer
-            .copy_framebuffer(&framebuffer, self.region, READBACK_FORMAT)
-            .map_err(render_err)?;
-        let pixels = renderer.map_texture(&mapping).map_err(render_err)?;
-        write_shm(&self.buffer, pixels, self.region.size)
+        // drawn (`render_to_mem` inverts it). The result is the buffer in
+        // scanout orientation, which is what the protocol hands out. Clients
+        // apply wl_output.transform.
+        let transform = self.output.current_transform();
+        // Drawing, readback and the format are the offscreen path every
+        // snapshot shares; only the client's buffer is this file's.
+        render_to_mem::<R, T, E, _>(
+            renderer,
+            elements,
+            scale,
+            mode.size,
+            transform,
+            clear_color,
+            self.region,
+            |pixels| {
+                write_shm(&self.buffer, pixels, self.region.size)
+                    .map_err(|e| OffscreenError(e.to_string()))
+            },
+        )
+        .map_err(|e| ScreencopyError::Render(e.0))
     }
 }
 
@@ -359,9 +356,9 @@ fn swizzle_rows(src: &[u8], dst: &mut [u8], width: usize, stride: usize) {
 
 // === PROTOCOL IMPLEMENTATIONS ===
 
-impl<D> GlobalDispatch<ZwlrScreencopyManagerV1, (), D> for ScreencopyManagerState
+impl<D> GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyGlobalData, D> for ScreencopyManagerState
 where
-    D: GlobalDispatch<ZwlrScreencopyManagerV1, ()>
+    D: GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyGlobalData>
         + Dispatch<ZwlrScreencopyManagerV1, ()>
         + Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameState>
         + ScreencopyHandler
@@ -372,10 +369,14 @@ where
         _handle: &DisplayHandle,
         _client: &Client,
         resource: New<ZwlrScreencopyManagerV1>,
-        _global_data: &(),
+        _global_data: &ScreencopyGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
         data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, global_data: &ScreencopyGlobalData) -> bool {
+        (global_data.filter)(&client)
     }
 }
 
@@ -513,7 +514,7 @@ where
 macro_rules! delegate_screencopy {
     ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
         smithay::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1: ()
+            smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1: $crate::enhancements::screencopy::ScreencopyGlobalData
         ] => $crate::enhancements::screencopy::ScreencopyManagerState);
 
         smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [

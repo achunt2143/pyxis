@@ -62,6 +62,8 @@ num_enum = "0.7"
 [dev-dependencies]
 tempfile = "3.8"
 mockall = "0.12"
+# `DummyRenderer`, to test what the damage tracker makes of an animated element.
+smithay = { workspace = true, features = ["renderer_test"] }
 
 [[bin]]
 name = "evo"
@@ -90,24 +92,10 @@ debug = []
 default = ["egl", "winit", "udev", "xwayland", "echo-ipc", "decorations", "screencopy"]
 
 # Individual features
-damage-tracking = []
 decorations = []
-hotplug = []
 echo-ipc = []
-advanced-input = []
-data-device = []
 # wlr-screencopy: what `grim`, and so the serial harness's screenshots, use.
 screencopy = []
-
-# Meta features
-all-features = [
-    "damage-tracking",
-    "decorations",
-    "hotplug",
-    "echo-ipc",
-    "advanced-input",
-    "data-device",
-]
 
 minimal = []  # Only core, no enhancements
 

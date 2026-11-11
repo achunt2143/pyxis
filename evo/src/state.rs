@@ -46,9 +46,12 @@ use smithay::{
     output::Output,
     reexports::{
         calloop::{generic::Generic, Interest, LoopHandle, Mode, PostAction},
-        wayland_protocols::xdg::decoration::{
-            self as xdg_decoration,
-            zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+        wayland_protocols::xdg::{
+            decoration::{
+                self as xdg_decoration,
+                zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+            },
+            shell::server::xdg_toplevel,
         },
         wayland_protocols_misc::server_decoration::server::{
             org_kde_kwin_server_decoration::{
@@ -62,7 +65,7 @@ use smithay::{
             Client, Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Time, SERIAL_COUNTER},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Time},
     wayland::{
         commit_timing::{CommitTimerBarrierStateUserData, CommitTimingManagerState},
         compositor::{
@@ -129,10 +132,10 @@ use wayland_client::protocol::wl_surface;
 
 #[cfg(feature = "xwayland")]
 use crate::cursor::Cursor;
+use crate::shell::recede::{MinimizeStyle, RestoreStyle};
 use crate::{
-    echo_ipc::CreateWindowRequest,
     focus::{KeyboardFocusTarget, PointerFocusTarget},
-    shell::{WindowElement, Workspace, WorkspaceId, WorkspaceManager},
+    shell::{WindowElement, WindowLayout, Workspace, WorkspaceId, WorkspaceManager},
 };
 #[cfg(feature = "xwayland")]
 use smithay::{
@@ -146,21 +149,20 @@ use smithay::{
 
 #[cfg(feature = "echo-ipc")]
 use crate::enhancements::echo_ipc::{GeckoEchoService, WindowAction, WindowInfo};
-#[cfg(feature = "hotplug")]
-use crate::enhancements::hotplug::HotPlugManager;
 #[cfg(feature = "screencopy")]
 use crate::enhancements::screencopy::{ScreencopyHandler, ScreencopyManagerState};
-#[cfg(feature = "advanced-input")]
-use crate::input::AdvancedInputManager;
-#[cfg(feature = "gecko-surface")]
-use crate::surface::GeckoSurface;
-#[cfg(feature = "gecko-window-manager")]
-use crate::window::WindowStateManager;
 
 #[derive(Debug, Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
     pub security_context: Option<SecurityContext>,
+}
+impl ClientState {
+    /// Whether this connection came in on Evo's own socket, as opposed to a
+    /// security-context socket made for an app (see `crate::trust`).
+    pub fn is_trusted(&self) -> bool {
+        self.security_context.is_none()
+    }
 }
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
@@ -214,6 +216,16 @@ pub struct EvoState<BackendData: Backend + 'static> {
 
     // input-related fields
     pub suppressed_keys: Vec<Keysym>,
+    /// App windows, most recently focused first. Alt+Tab walks it; unlike
+    /// the Space's stacking order it still holds minimized windows.
+    pub focus_history: Vec<WindowElement>,
+    /// The Alt+Tab in progress (shell/switcher.rs), by window id: the order
+    /// it froze when it started, so the focus changes it makes don't
+    /// reshuffle the list under it. Cleared when Alt is released.
+    pub alt_tab: Option<crate::shell::switcher::Switcher<u32>>,
+    /// Super went down and nothing else has happened since, so releasing it
+    /// is a tap (the launcher), not the start of a chord.
+    pub super_tap: bool,
     pub cursor_status: CursorImageStatus,
     pub seat_name: String,
     pub seat: Seat<EvoState<BackendData>>,
@@ -230,20 +242,8 @@ pub struct EvoState<BackendData: Backend + 'static> {
 
     pub show_window_preview: bool,
 
-    #[cfg(feature = "gecko-window-manager")]
-    pub window_manager: Arc<RwLock<WindowStateManager>>,
-
-    #[cfg(feature = "hotplug")]
-    pub hotplug_manager: Arc<RwLock<HotPlugManager>>,
-
     #[cfg(feature = "echo-ipc")]
     pub echo_service: Arc<RwLock<GeckoEchoService>>,
-
-    #[cfg(feature = "advanced-input")]
-    pub input_manager: Arc<RwLock<AdvancedInputManager>>,
-
-    #[cfg(feature = "gecko-surface")]
-    pub gecko_surfaces: Arc<RwLock<HashMap<u32, GeckoSurface>>>,
 
     pub start_time: Instant,
     pub workspace_manager: WorkspaceManager,
@@ -405,23 +405,15 @@ impl<BackendData: Backend> SeatHandler for EvoState<BackendData> {
         set_data_device_focus(dh, seat, focus.clone());
         set_primary_focus(dh, seat, focus);
 
-        #[cfg(feature = "gecko-window-manager")]
-        {
-            if let Some(surface) = wl_surface {
-                // Convert Cow<'_, WlSurface> to WlSurface by cloning the inner value
-                if let Some(window) = self.window_for_surface(surface.clone().into_owned()) {
-                    if let Some(window_id) =
-                        self.window_manager.read().id_for_smithay_window(&window)
-                    {
-                        self.window_manager.write().set_focus(Some(window_id));
-                    }
-                } else {
-                    self.window_manager.write().set_focus(None);
-                }
-            } else {
-                self.window_manager.write().set_focus(None);
-            }
+        let focused_window = wl_surface
+            .as_ref()
+            .and_then(|surface| self.tracked_window_for_surface(surface));
+        if let Some(window) = &focused_window {
+            self.note_focused(window);
         }
+        // Header tint and shadow depth crossfade between active and inactive.
+        crate::anim::depth::focus_changed(focused_window.as_ref());
+        self.note_overlay_keyboard(focused_window.as_ref().is_some_and(|w| w.is_overlay()));
 
         #[cfg(feature = "echo-ipc")]
         {
@@ -571,13 +563,14 @@ impl<BackendData: Backend> XdgActivationHandler for EvoState<BackendData> {
         surface: WlSurface,
     ) {
         if token_data.timestamp.elapsed().as_secs() < 10 {
-            let w = self
-                .space
-                .elements()
-                .find(|window| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
-                .cloned();
-            if let Some(window) = w {
-                self.space.raise_element(&window, true);
+            // A minimized window is out of the space, so look it up where
+            // minimized windows still are. `focus_window` restores it and
+            // raises, activates and focuses: raising in the space alone left
+            // the keyboard behind, and ignored a minimized window entirely.
+            // The overlay is always on top already, and activating it would
+            // mark the app being used as inactive (`focus_window` refuses it).
+            if let Some(window) = self.tracked_window_for_surface(&surface) {
+                self.focus_window(&window);
             }
         }
     }
@@ -924,11 +917,19 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
 
         let compositor_state = CompositorState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
-        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        // A layer surface can cover the screen above every window and take the
+        // keyboard exclusively: shell territory.
+        let layer_shell_state =
+            WlrLayerShellState::new_with_filter::<Self, _>(&dh, crate::trust::trusted_only);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
-            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+            // Data-control reads and writes the clipboard with no focus at all.
+            DataControlState::new::<Self, _>(
+                &dh,
+                Some(&primary_selection_state),
+                crate::trust::trusted_only,
+            );
         let mut seat_state = SeatState::new();
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
@@ -949,8 +950,10 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(&dh);
         let idle_notifier_state = IdleNotifierState::new(&dh, handle.clone());
         TextInputManagerState::new::<Self>(&dh);
-        InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
-        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
+        // Synthetic input and input methods act on whatever has the keyboard,
+        // including the root Terminal: not for apps.
+        InputMethodManagerState::new::<Self, _>(&dh, crate::trust::trusted_only);
+        VirtualKeyboardManagerState::new::<Self, _>(&dh, crate::trust::trusted_only);
         if BackendData::HAS_RELATIVE_MOTION {
             RelativePointerManagerState::new::<Self>(&dh);
         }
@@ -959,13 +962,10 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             PointerGesturesState::new::<Self>(&dh);
         }
         TabletManagerState::new::<Self>(&dh);
-        SecurityContextState::new::<Self, _>(&dh, |client| {
-            client
-                .get_data::<ClientState>()
-                .is_none_or(|client_state| client_state.security_context.is_none())
-        });
+        // Only the system mints contexts, or an app could make itself a
+        // trusted-looking one (and could mint one with any app id).
+        SecurityContextState::new::<Self, _>(&dh, crate::trust::trusted_only);
         FixesState::new::<Self>(&dh);
-        IdleNotifierState::new(&dh, handle.clone());
 
         let seat_name = backend_data.seat_name();
         let mut seat = seat_state.new_wl_seat(&dh, seat_name.clone());
@@ -983,15 +983,6 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         XWaylandKeyboardGrabState::new::<Self>(&dh.clone());
 
         let start_time = Instant::now();
-
-        #[cfg(feature = "gecko-window-manager")]
-        let window_manager = Arc::new(RwLock::new(WindowStateManager::new()));
-
-        #[cfg(feature = "hotplug")]
-        let hotplug_manager = Arc::new(RwLock::new(HotPlugManager::new()));
-
-        #[cfg(feature = "advanced-input")]
-        let input_manager = Arc::new(RwLock::new(AdvancedInputManager::new()));
 
         #[cfg(feature = "echo-ipc")]
         let echo_service = {
@@ -1018,84 +1009,11 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             }
         };
 
-        #[cfg(all(feature = "echo-ipc", feature = "gecko-surface"))]
-        let gecko_surfaces = Arc::new(RwLock::new(HashMap::new()));
-
         let workspace_manager = WorkspaceManager::new();
         let space = Space::default();
 
         #[cfg(feature = "screencopy")]
-        let screencopy_state = ScreencopyManagerState::new::<Self>(&dh);
-
-        #[cfg(feature = "echo-ipc")]
-        {
-            let wayland_display =
-                std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
-
-            echo_service.read().set_create_window_handler({
-                let display = wayland_display.clone();
-                move |req: &CreateWindowRequest| -> Result<u32, anyhow::Error> {
-                    debug!(
-                        "CreateWindow request: app_id='{}', app_type='{}', width={}, height={}",
-                        req.app_id, req.app_type, req.width, req.height
-                    );
-
-                    let executable = match req.app_id.as_str() {
-                        "gaia" | "gaia-shell" => "/usr/bin/gaia-shell".to_string(),
-                        "terminal" => "/usr/bin/geeko-terminal".to_string(),
-
-                        // Add test applications
-                        "test.gaia-app" => "/usr/bin/firefox".to_string(), // ✅ Test with Firefox
-                        "test" => "/usr/bin/firefox".to_string(),          // ✅ Or just "test"
-
-                        app_id if app_id.starts_with("native:") => {
-                            let name = app_id.trim_start_matches("native:");
-                            format!("/usr/bin/{}", name)
-                        }
-
-                        // For Gaia apps, try to launch them through gaia-shell
-                        app_id if app_id.contains(".gaia-app") => "/usr/bin/gaia-shell".to_string(),
-
-                        app_id => {
-                            warn!(
-                                "Unknown app_id: '{}', defaulting to Firefox for testing",
-                                app_id
-                            );
-                            "/usr/bin/firefox".to_string() // ✅ Default test app
-                        }
-                    };
-
-                    let mut cmd = std::process::Command::new(&executable);
-                    cmd.env("WAYLAND_DISPLAY", &display);
-                    cmd.env("GAIA_WIDTH", req.width.to_string());
-                    cmd.env("GAIA_HEIGHT", req.height.to_string());
-
-                    // Pass the app info to the launched app
-                    cmd.env("GAIA_APP_ID", &req.app_id);
-                    cmd.env("GAIA_APP_TYPE", &req.app_type);
-
-                    if let Some(url) = &req.url {
-                        cmd.env("GAIA_URL", url);
-                    }
-
-                    match cmd.spawn() {
-                        Ok(child) => {
-                            info!(
-                                "✓ Spawned {} (PID: {}) for app_id: {}",
-                                executable,
-                                child.id(),
-                                req.app_id
-                            );
-                            Ok(0)
-                        }
-                        Err(e) => {
-                            error!("✗ Failed to spawn {} for {}: {}", executable, req.app_id, e);
-                            Err(anyhow::anyhow!("Failed to spawn {}: {}", req.app_id, e))
-                        }
-                    }
-                }
-            });
-        }
+        let screencopy_state = ScreencopyManagerState::new::<Self, _>(&dh, crate::trust::trusted_only);
 
         EvoState {
             backend_data,
@@ -1128,6 +1046,9 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             idle_notifier_state,
             dnd_icon: None,
             suppressed_keys: Vec::new(),
+            focus_history: Vec::new(),
+            alt_tab: None,
+            super_tap: false,
             cursor_status: CursorImageStatus::default_named(),
             seat_name,
             seat,
@@ -1146,18 +1067,8 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             start_time,
             #[cfg(feature = "echo-ipc")]
             last_toplevel_sync: Instant::now(),
-            #[cfg(feature = "gecko-window-manager")]
-            window_manager,
-            #[cfg(feature = "hotplug")]
-            hotplug_manager,
-            #[cfg(feature = "advanced-input")]
-            input_manager,
             #[cfg(feature = "echo-ipc")]
             echo_service,
-            #[cfg(all(feature = "echo-ipc", feature = "gecko-surface"))]
-            gecko_surfaces,
-            #[cfg(all(not(feature = "echo-ipc"), feature = "gecko-surface"))]
-            gecko_surfaces: Arc::new(RwLock::new(HashMap::new())),
             workspace_manager,
             #[cfg(feature = "screencopy")]
             screencopy_state,
@@ -1554,24 +1465,9 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             .cloned()
     }
 
-    #[cfg(feature = "gecko-window-manager")]
-    pub fn window_manager(&self) -> Arc<RwLock<WindowStateManager>> {
-        self.window_manager.clone()
-    }
-
-    #[cfg(feature = "hotplug")]
-    pub fn hotplug_manager(&self) -> Arc<RwLock<HotPlugManager>> {
-        self.hotplug_manager.clone()
-    }
-
     #[cfg(feature = "echo-ipc")]
     pub fn echo_service(&self) -> Arc<RwLock<GeckoEchoService>> {
         self.echo_service.clone()
-    }
-
-    #[cfg(feature = "advanced-input")]
-    pub fn input_manager(&self) -> Arc<RwLock<AdvancedInputManager>> {
-        self.input_manager.clone()
     }
 
     pub fn switch_workspace(&mut self, workspace_id: WorkspaceId) -> bool {
@@ -1585,13 +1481,26 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             current_id, workspace_id
         );
 
-        if let Some(old_workspace) = self.workspace_manager.workspace(current_id) {
-            for window in old_workspace.windows() {
-                self.space.unmap_elem(window);
-                debug!("Unmapped window from Space");
+        // Snapshot where each window is before it leaves the space, so
+        // coming back to this workspace puts it where it was, not where it
+        // was born.
+        let leaving: Vec<WindowElement> = self
+            .workspace_manager
+            .workspace(current_id)
+            .map(|ws| ws.windows().to_vec())
+            .unwrap_or_default();
+        for window in &leaving {
+            if let Some(location) = self.space.element_location(window) {
+                self.workspace_manager.record_location(window, location);
             }
+            // Its fullscreen slot goes with it, or the output would keep
+            // drawing a window from the workspace we left.
+            self.clear_exclusive_fullscreen(window);
+            self.space.unmap_elem(window);
+            debug!("Unmapped window from Space");
         }
 
+        let mut fullscreen_arrivals = Vec::new();
         if let Some(new_workspace) = self.workspace_manager.workspace(workspace_id) {
             for window in new_workspace.visible_windows() {
                 if let Some(state) = new_workspace.window_state(window) {
@@ -1599,6 +1508,9 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                         self.space
                             .map_element(window.clone(), state.location, false);
                         debug!("Mapped window to Space at {:?}", state.location);
+                        if state.layout == WindowLayout::Fullscreen {
+                            fullscreen_arrivals.push(window.clone());
+                        }
                     }
                 }
             }
@@ -1607,6 +1519,12 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 if let Some(location) = self.workspace_manager.window_location(window) {
                     self.space.map_element((*window).clone(), location, false);
                 }
+            }
+        }
+
+        for window in fullscreen_arrivals {
+            if let Some(output) = self.output_for_fullscreen(&window, None) {
+                self.set_exclusive_fullscreen(&window, &output);
             }
         }
 
@@ -1655,6 +1573,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         let workspace_id = self.workspace_manager.active_workspace_id();
 
         self.workspace_manager.add_window(window.clone(), location);
+        self.workspace_manager.set_reported_location(&window, location);
         self.space.map_element(window.clone(), location, true);
 
         debug!(
@@ -1662,60 +1581,36 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             workspace_id, location
         );
 
+        // Xdg toplevels and X11 windows are registered the same way, so
+        // nothing downstream (ListWindows, WindowCreated/Closed, appHost)
+        // can tell which kind a window is.
         #[cfg(feature = "echo-ipc")]
         {
-            if let Some(_wl_surface) = window.wl_surface() {
-                if let Some(toplevel) = window.0.toplevel() {
-                    let geometry = window.geometry();
-                    let id = self.register_window(window.clone());
+            let geometry = window.geometry();
+            let id = self.register_window(window.clone());
 
-                    // ✅ Get app_id from the surface's XdgToplevelSurfaceData
-                    let app_id = with_states(toplevel.wl_surface(), |states| {
-                        use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+            // The app id is usually still unset at this point (GTK/vela set
+            // it later), so this is "unknown" for most Wayland windows; the
+            // X11 class is known from the start.
+            let app_id = window.app_id().unwrap_or_else(|| "unknown".to_string());
 
-                        states
-                            .data_map
-                            .get::<XdgToplevelSurfaceData>()
-                            .and_then(|data| {
-                                let data = data.lock().unwrap();
-                                data.app_id.clone()
-                            })
-                            .unwrap_or_else(|| "unknown".to_string())
-                    });
+            let _ = self.echo_service.read().emit_window_created(
+                id,
+                &app_id,
+                geometry.size.w.max(0) as u32,
+                geometry.size.h.max(0) as u32,
+            );
 
-                    let _ = self.echo_service.read().emit_window_created(
-                        id,
-                        &app_id,
-                        geometry.size.w as u32,
-                        geometry.size.h as u32,
-                    );
-
-                    // Bind the freshly mapped Wayland surface to its AppHost
-                    // session — over IPC, NOT via `AppHost::global()`.
-                    //
-                    // This used to call `geckoOS_echo::AppHost::global()`
-                    // directly, on the theory that it was a cheap same-process
-                    // call. It isn't: `global()` is a `OnceLock` *process*
-                    // global, and Evo is a separate process from echo-daemon,
-                    // so that bound the surface into an empty AppHost living
-                    // inside the compositor — invisible to the daemon, and
-                    // never `set_bus`'d, so it emitted no lifecycle signals
-                    // either. The daemon's session kept `surfaces: []` and
-                    // `nova.Focus` (which reads `surfaces.first()`) always
-                    // answered "no mapped compositor window yet" — alpha2 #10.
-                    //
-                    // NOTE: surface->session binding deliberately does NOT
-                    // happen here. At map time the xdg app_id is usually still
-                    // unset (GTK/vela assign it later, via `windowclass` ->
-                    // nsWindow::SetWindowClass), so this path saw the "unknown"
-                    // fallback above and `AppHost::bind_surface` synthesized a
-                    // junk session for it -- one bogus `appId: "unknown"`
-                    // session holding every surface, while the real app session
-                    // kept `surfaces: []`. Binding now lives in
-                    // `xdg.rs::ack_configure`, which is the first point where a
-                    // real app id is available. See the comment there.
-                }
-            }
+            // Binding the surface to its AppHost session deliberately does
+            // NOT happen here: at map time the app id is unset, so the bind
+            // saw "unknown" and `AppHost::bind_surface` synthesized a junk
+            // session for it (one bogus `appId: "unknown"` session holding
+            // every surface, while the real app's session kept
+            // `surfaces: []` and `nova.Focus` could never find a window).
+            // `sync_surface_binding` does it once the id is known, over IPC
+            // (not `AppHost::global()`: Evo is a separate process from
+            // echo-daemon, so that is an empty AppHost nobody else sees).
+            self.sync_surface_binding(&window);
         }
     }
 
@@ -1740,6 +1635,18 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     }
 
     pub fn remove_window_from_workspace(&mut self, window: &WindowElement) {
+        // Before anything is unmapped: a closing window is drawn from a
+        // snapshot taken while its buffer and place still exist.
+        self.begin_close_animation(window);
+        // Whatever the window itself was animating ends with it. A close
+        // cancels it when it makes a ghost, but a client killed mid-restore
+        // has no buffer left, so no close is made, and an animation completes
+        // (its count with it) only when drawn: the restore stayed active.
+        window.cancel_animation();
+        window.cancel_geometry();
+        // A window closed while still minimizing has nothing left to draw.
+        drop(crate::anim::ghosts::take_live(window));
+        self.clear_exclusive_fullscreen(window);
         self.workspace_manager.remove_window(window);
         self.space.unmap_elem(window);
         debug!("Removed window from workspace and Space");
@@ -1750,30 +1657,36 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 let _ = self.echo_service.read().emit_window_closed(id);
                 // Unbind from the AppHost session so its `surfaces` list
                 // and `AppSurfaceUnmapped` signal stay in sync. Over IPC for
-                // the same reason as the bind above — `AppHost::global()` in
-                // this process is not the daemon's registry.
+                // the same reason as the bind in `sync_surface_binding`.
                 let _ = self.echo_service.read().unbind_surface_remote(id);
             }
         }
+
+        // If it held the keyboard, someone else must. Last, so the window
+        // is already out of the stack the choice is made from.
+        self.refocus_after_loss(window);
     }
 
+    /// A user's move: records the place, marks the window user-positioned,
+    /// and announces it. Goes through `place_window` like everything else.
     pub fn set_window_location(&mut self, window: &WindowElement, location: Point<i32, Logical>) {
         self.workspace_manager.set_window_location(window, location);
+        self.place_window(window, location, false);
+        debug!("Updated window location to {:?}", location);
+        self.window_moved(window);
+    }
 
-        if self.space.elements().any(|w| w == window) {
-            self.space.map_element(window.clone(), location, false);
-            debug!("Updated window location to {:?}", location);
-        }
-
-        #[cfg(feature = "echo-ipc")]
-        if let Some(id) = self.window_id_for(window) {
-            let _ = self
-                .echo_service
-                .read()
-                .emit_window_moved(id, location.x, location.y);
+    /// Re-run orphan relocation after an output change (see
+    /// `shell::fixup_positions`), and record where each relocated window went.
+    pub fn fixup_positions(&mut self, pointer_location: Point<f64, Logical>) {
+        for (window, location) in crate::shell::fixup_positions(&mut self.space, pointer_location) {
+            self.workspace_manager.record_location(&window, location);
         }
     }
 
+    /// Raise a window to the top of its workspace and the space, restoring
+    /// it first if it was minimized. Does not move the keyboard: that is
+    /// `focus_window`, which calls this.
     pub fn raise_window(&mut self, window: &WindowElement) {
         // A minimized window was unmapped from `self.space` entirely (see
         // `minimize_window`), so `space.raise_element` below -- which only
@@ -1785,13 +1698,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         // caller of `raise_window` -- dock clicks, click-to-focus, whatever
         // else raises a window -- can't hit this, rather than special-casing
         // it only in the one call site that happened to surface it.
-        let is_minimized = self
-            .workspace_manager
-            .workspace_for_window(window)
-            .and_then(|ws_id| self.workspace_manager.workspace(ws_id))
-            .and_then(|ws| ws.window_state(window))
-            .is_some_and(|s| s.minimized);
-        if is_minimized {
+        if self.workspace_manager.is_minimized(window) {
             self.unminimize_window(window);
         }
         self.workspace_manager.raise_window(window);
@@ -1799,26 +1706,119 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         debug!("Raised window to top");
     }
 
+    /// Hide a window, keeping everything needed to bring it back exactly as
+    /// it was: where the space has it now goes into the record, and its
+    /// layout is already there. It stays in the workspace and in
+    /// `windows_by_id`, so it can still be found, restored, listed, and
+    /// closed.
     pub fn minimize_window(&mut self, window: &WindowElement) {
-        self.workspace_manager.minimize_window(window);
+        self.minimize_window_after(window, Duration::ZERO);
+    }
+
+    /// `minimize_window`, with the drawing starting `delay` from now (show
+    /// desktop staggers its windows). Placement is not delayed: the window is
+    /// out of the Space, and focus has moved on, at once.
+    pub fn minimize_window_after(&mut self, window: &WindowElement, delay: Duration) {
+        self.minimize_window_as(window, MinimizeStyle::Droplet(delay));
+    }
+
+    /// `minimize_window`, drawn as `style`: a Droplet into the dock icon, or
+    /// a show desktop's Recede (`shell/recede.rs`).
+    pub fn minimize_window_as(&mut self, window: &WindowElement, style: MinimizeStyle) {
+        // The desktop is never minimized, and an untracked window (an X11
+        // menu) has no record to come back from: hiding it would lose it.
+        if window.is_shell_window() || self.workspace_manager.state(window).is_none() {
+            return;
+        }
+        if self.workspace_manager.is_minimized(window) {
+            return;
+        }
+        let location = self.space.element_location(window);
+        // Its card in the overview shows this picture while it is away.
+        self.thumbnail_at_minimize(window);
+        // Drawn as a ghost springing into its dock icon (or receding); taken
+        // while the window is still in the Space, before it is unmapped below.
+        match style {
+            MinimizeStyle::Droplet(delay) => self.begin_minimize_animation(window, delay),
+            MinimizeStyle::Recede(delay) => self.begin_recede_animation(window, delay),
+        }
+        self.workspace_manager.minimize_window(window, location);
+        self.clear_exclusive_fullscreen(window);
         self.space.unmap_elem(window);
         info!("Minimized window");
+
+        // Tell the client it is hidden: it is no longer activated, and
+        // `Suspended` is the only background hint it gets (nothing stops or
+        // freezes the process any more).
+        match window.0.underlying_surface() {
+            smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                    state.states.set(xdg_toplevel::State::Suspended);
+                });
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_pending_configure();
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            smithay::desktop::WindowSurface::X11(surface) => {
+                let _ = surface.set_hidden(true);
+            }
+        }
 
         #[cfg(feature = "echo-ipc")]
         if let Some(id) = self.window_id_for(window) {
             let _ = self.echo_service.read().emit_window_minimized(id, true);
         }
+
+        self.refocus_after_loss(window);
     }
 
+    /// Bring a minimized window back where, and as, it was: its recorded
+    /// place, and maximized or fullscreen again if it was. Does not move
+    /// the keyboard; `focus_window` does that.
     pub fn unminimize_window(&mut self, window: &WindowElement) {
-        self.workspace_manager.unminimize_window(window);
+        self.unminimize_window_as(window, RestoreStyle::Rise);
+    }
 
-        if let Some(ws_id) = self.workspace_manager.workspace_for_window(window) {
-            if ws_id == self.workspace_manager.active_workspace_id() {
-                if let Some(location) = self.workspace_manager.window_location(window) {
-                    self.space.map_element(window.clone(), location, false);
-                    info!("Unminimized window");
+    /// `unminimize_window`, drawn as `style`: a Rise out of the dock icon, or
+    /// a second Super+D's Emerge (`shell/recede.rs`).
+    pub fn unminimize_window_as(&mut self, window: &WindowElement, style: RestoreStyle) {
+        if !self.workspace_manager.is_minimized(window) {
+            return;
+        }
+        // A minimize still being drawn is turned round, not restarted.
+        let ghost = crate::anim::ghosts::take_live(window);
+        let Some((location, layout)) = self.workspace_manager.unminimize_window(window) else {
+            return;
+        };
+
+        if self.workspace_manager.workspace_for_window(window) == Some(self.workspace_manager.active_workspace_id()) {
+            self.space.map_element(window.clone(), location, false);
+            if layout == WindowLayout::Fullscreen && !window.is_shell_window() {
+                if let Some(output) = self.output_for_fullscreen(window, None) {
+                    self.set_exclusive_fullscreen(window, &output);
                 }
+            }
+            info!("Unminimized window at {:?} as {:?}", location, layout);
+        }
+        match style {
+            RestoreStyle::Rise => self.begin_restore_animation(window, ghost),
+            RestoreStyle::Emerge(delay) => self.begin_emerge_animation(window, ghost, delay),
+        }
+
+        match window.0.underlying_surface() {
+            smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Suspended);
+                });
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_pending_configure();
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            smithay::desktop::WindowSurface::X11(surface) => {
+                let _ = surface.set_hidden(false);
             }
         }
 
@@ -1828,11 +1828,12 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         }
     }
 
-    /// Re-maps some currently-minimized window in the active workspace.
+    /// Restores some currently-minimized window in the active workspace and
+    /// focuses it.
     /// There's no taskbar to click a specific one back yet (see
     /// `KeyAction::RestoreMinimized`, Logo+Shift+U), so this is an interim
     /// stand-in -- once a real dock exists, it should call
-    /// `unminimize_window` directly for the window the user actually clicked.
+    /// `focus_window` directly for the window the user actually clicked.
     pub fn restore_last_minimized(&mut self) {
         let target = {
             let workspace = self.workspace_manager.active_workspace();
@@ -1844,7 +1845,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 .cloned()
         };
         if let Some(window) = target {
-            self.unminimize_window(&window);
+            self.focus_window(&window);
         } else {
             debug!("RestoreMinimized: no minimized windows in the active workspace");
         }
@@ -1878,6 +1879,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         let mut toplevels: Vec<WindowInfo> = self
             .windows_by_id
             .iter()
+            .filter(|(_, window)| !window.is_overlay())
             .map(|(&window_id, window)| {
                 let location = self.space.element_location(window);
                 let size = window.geometry().size;
@@ -1899,8 +1901,26 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
 
     #[cfg(feature = "echo-ipc")]
     pub fn process_pending_window_actions(&mut self) {
+        self.switcher_tick();
+        self.minimize_landed_tick();
+        self.serve_thumbnail_requests();
+        if self.echo_service.read().take_rebind_request() {
+            self.replay_surface_bindings();
+        }
         let actions = self.echo_service.read().take_pending_window_actions();
         for pending in actions {
+            // The shell's own requests are about no window.
+            match pending.action {
+                WindowAction::SetWorkArea(insets) => {
+                    self.set_work_area(insets);
+                    continue;
+                }
+                WindowAction::OverlayKeyboard(wanted) => {
+                    self.set_overlay_keyboard(wanted);
+                    continue;
+                }
+                _ => {}
+            }
             let Some(window) = self.windows_by_id.get(&pending.window_id).cloned() else {
                 warn!(
                     "Ignoring {:?} for unknown window {}",
@@ -1910,14 +1930,16 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             };
             match pending.action {
                 WindowAction::Focus => {
-                    self.raise_window(&window);
-                    if let Some(keyboard) = self.seat.get_keyboard() {
-                        let serial = SERIAL_COUNTER.next_serial();
-                        keyboard.set_focus(self, Some(window.into()), serial);
-                    }
+                    self.focus_window(&window);
+                    // A card clicked while Alt+Tab is on is its commit.
+                    self.switcher_chose(&window);
                 }
                 WindowAction::Minimize => self.minimize_window(&window),
-                WindowAction::Restore => self.unminimize_window(&window),
+                // Restoring a window presents it, so it takes focus too.
+                WindowAction::Restore => {
+                    self.focus_window(&window);
+                    self.switcher_chose(&window);
+                }
                 // Same call the SSD close button makes (shell/ssd.rs's
                 // handle_close): ask the client to close and let it run its
                 // own teardown, rather than signalling the process.
@@ -1942,13 +1964,8 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                         warn!("{:?} is only implemented for Wayland toplevels", pending.action);
                     }
                 }
-                WindowAction::Close => match window.0.underlying_surface() {
-                    smithay::desktop::WindowSurface::Wayland(w) => w.send_close(),
-                    #[cfg(feature = "xwayland")]
-                    smithay::desktop::WindowSurface::X11(w) => {
-                        let _ = w.close();
-                    }
-                },
+                WindowAction::Close => self.close_window(&window),
+                WindowAction::SetWorkArea(_) | WindowAction::OverlayKeyboard(_) => {}
             }
         }
     }
@@ -1999,7 +2016,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 let geo = self.space.output_geometry(&o)?;
                 let map = smithay::desktop::layer_map_for_output(&o);
                 let zone = map.non_exclusive_zone();
-                Some(Rectangle::new(geo.loc + zone.loc, zone.size))
+                Some(crate::shell::work_area::usable(geo, zone))
             })
             .unwrap_or_else(|| Rectangle::from_size((800, 800).into()));
 
@@ -2128,4 +2145,11 @@ pub trait Backend {
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
     fn update_led_state(&mut self, led_state: LedState);
+    /// Draw `window` (SSD included) to pixels, now, at output scale `scale`.
+    /// Needs the renderer, which only the backend holds. `None` means this
+    /// backend cannot, and the window then closes without an animation. Only
+    /// udev implements it today.
+    fn snapshot_window(&mut self, _window: &WindowElement, _scale: f64) -> Option<crate::anim::Snapshot> {
+        None
+    }
 }

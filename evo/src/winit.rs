@@ -225,7 +225,7 @@ pub fn run_winit() {
                 };
                 output.change_current_state(Some(mode), None, None, None);
                 output.set_preferred(mode);
-                crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+                state.fixup_positions(state.pointer.current_location());
             }
             WinitEvent::Input(event) => state.process_input_event_windowed(event, OUTPUT_NAME),
             _ => (),

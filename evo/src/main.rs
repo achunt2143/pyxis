@@ -119,8 +119,5 @@ fn print_usage() {
     #[cfg(feature = "xwayland")]
     println!("✨ XWayland support: ENABLED");
     
-    #[cfg(feature = "damage-tracking")]
-    println!("✨ Damage tracking: ENABLED");
-    
     println!();
 }

@@ -49,7 +49,7 @@ use smithay::{
             damage::Error as OutputDamageTrackerError,
             element::{memory::MemoryRenderBuffer, AsRenderElements, RenderElementStates},
             gles::{Capability, GlesRenderer, GlesTexture},
-            multigpu::{gbm::GbmGlesBackend, GpuManager, MultiRenderer},
+            multigpu::{gbm::GbmGlesBackend, Error as MultiError, GpuManager, MultiRenderer},
             DebugFlags, ImportDma, ImportMemWl,
         },
         session::{
@@ -123,6 +123,27 @@ type UdevRenderer<'a> = MultiRenderer<
     GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
     GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
 >;
+
+/// The udev backend reaches GLES through the multi-GPU renderer's `AsMut`.
+impl<'a> crate::anim::shader::GlesAccess for UdevRenderer<'a> {
+    fn gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
+        Some(self.as_mut())
+    }
+
+    fn with_gles_frame(
+        frame: &mut <Self as smithay::backend::renderer::RendererSuper>::Frame<'_, '_>,
+        f: &mut dyn FnMut(&mut smithay::backend::renderer::gles::GlesFrame<'_, '_>),
+    ) -> bool {
+        f(frame.as_mut());
+        true
+    }
+
+    fn gles_error(
+        err: smithay::backend::renderer::gles::GlesError,
+    ) -> <Self as smithay::backend::renderer::RendererSuper>::Error {
+        MultiError::Render(err)
+    }
+}
 
 #[derive(Debug, PartialEq)]
 struct UdevOutputId {
@@ -216,6 +237,17 @@ impl Backend for UdevData {
         for keyboard in self.keyboards.iter_mut() {
             keyboard.led_update(led_state.into());
         }
+    }
+
+    fn snapshot_window(&mut self, window: &WindowElement, scale: f64) -> Option<crate::anim::Snapshot> {
+        let mut renderer = self
+            .gpus
+            .single_renderer(&self.primary_gpu)
+            .map_err(|err| warn!("snapshot: no renderer: {err}"))
+            .ok()?;
+        crate::anim::snapshot::capture_window::<_, GlesTexture>(&mut renderer, window, Scale::from(scale))
+            .map_err(|err| warn!("snapshot failed: {err}"))
+            .ok()
     }
 }
 
@@ -1181,7 +1213,7 @@ impl EvoState<UdevData> {
         }
 
         // fixup window coordinates
-        crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+        self.fixup_positions(self.pointer.current_location());
     }
 
     fn device_removed(&mut self, node: DrmNode) {
@@ -1218,7 +1250,7 @@ impl EvoState<UdevData> {
             debug!("Dropping device");
         }
 
-        crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+        self.fixup_positions(self.pointer.current_location());
     }
 
     fn frame_finish(&mut self, dev_id: DrmNode, crtc: crtc::Handle, metadata: &mut Option<DrmEventMetadata>) {

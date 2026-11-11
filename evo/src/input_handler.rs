@@ -1,4 +1,4 @@
-use std::{convert::TryInto, process::Command, sync::atomic::Ordering};
+use std::convert::TryInto;
 
 use crate::{focus::PointerFocusTarget, shell::FullscreenSurface, EvoState};
 
@@ -12,14 +12,13 @@ use smithay::{
         self, Axis, AxisSource, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
         PointerAxisEvent, PointerButtonEvent,
     },
-    desktop::{layer_map_for_output, WindowSurfaceType},
+    desktop::{layer_map_for_output, space::SpaceElement, WindowSurfaceType},
     input::{
         keyboard::{keysyms as xkb, FilterResult, Keysym, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     output::Scale,
     reexports::{
-        wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1,
         wayland_server::protocol::wl_pointer,
     },
     utils::{Logical, Point, Serial, Transform, SERIAL_COUNTER as SCOUNTER},
@@ -71,38 +70,33 @@ impl<BackendData: Backend> EvoState<BackendData> {
         match action {
             KeyAction::None => (),
 
-            KeyAction::Quit => {
-                info!("Quitting.");
-                self.running.store(false, Ordering::SeqCst);
-            }
+            KeyAction::CloseWindow => self.close_focused_window(),
 
-            KeyAction::Run(cmd) => {
-                info!(cmd, "Starting program");
+            KeyAction::CycleWindows { reverse } => self.cycle_windows(reverse),
 
-                if let Err(e) = Command::new(&cmd)
-                    .envs(
-                        self.socket_name
-                            .clone()
-                            .map(|v| ("WAYLAND_DISPLAY", v))
-                            .into_iter()
-                            .chain(
-                                #[cfg(feature = "xwayland")]
-                                self.xdisplay.map(|v| ("DISPLAY", format!(":{v}"))),
-                                #[cfg(not(feature = "xwayland"))]
-                                None,
-                            ),
-                    )
-                    .spawn()
-                {
-                    error!(cmd, err = %e, "Failed to start program");
+            KeyAction::CancelSwitcher => self.switcher_cancel(),
+
+            KeyAction::Shell(name) => {
+                // Only Evo knows the stacking order show desktop staggers by,
+                // so it moves the windows itself; the shell hears the signal
+                // all the same.
+                if name == "show-desktop" {
+                    self.show_desktop();
                 }
+                #[cfg(feature = "echo-ipc")]
+                let _ = self.echo_service.read().emit_shortcut_triggered(name);
+                #[cfg(not(feature = "echo-ipc"))]
+                debug!(name, "shell shortcut with no Echo to tell");
             }
 
+            #[cfg(feature = "debug")]
             KeyAction::TogglePreview => {
                 self.show_window_preview = !self.show_window_preview;
             }
 
+            #[cfg(feature = "debug")]
             KeyAction::ToggleDecorations => {
+                use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
                 for element in self.space.elements() {
                     #[allow(irrefutable_let_patterns)]
                     if let Some(toplevel) = element.0.toplevel() {
@@ -169,15 +163,18 @@ impl<BackendData: Backend> EvoState<BackendData> {
             }
         }
 
-        let inhibited = self
-            .space
-            .element_under(self.pointer.current_location())
-            .and_then(|(window, _)| {
-                let surface = window.wl_surface()?;
-                self.seat.keyboard_shortcuts_inhibitor_for_surface(&surface)
-            })
+        // The client that has the keyboard decides, not the one under the
+        // pointer: shortcuts go to whoever is typing.
+        let inhibited = keyboard
+            .current_focus()
+            .and_then(|focus| focus.wl_surface().map(|s| s.into_owned()))
+            .and_then(|surface| self.seat.keyboard_shortcuts_inhibitor_for_surface(&surface))
             .map(|inhibitor| inhibitor.is_active())
             .unwrap_or(false);
+        let mut super_tap = self.super_tap && !inhibited;
+        let mut tapped = false;
+        // Escape while Alt+Tab is on cancels it (and is not the client's).
+        let switching = self.switcher_active() && !inhibited;
 
         let action = keyboard
             .input(self, keycode, state, serial, time, |_, modifiers, handle| {
@@ -195,9 +192,16 @@ impl<BackendData: Backend> EvoState<BackendData> {
                 // Additionally add the key to the suppressed keys
                 // so that we can decide on a release if the key
                 // should be forwarded to the client or not.
+                let is_super = matches!(keysym, Keysym::Super_L | Keysym::Super_R);
                 if let KeyState::Pressed = state {
+                    // Super then nothing else, released, is a tap.
+                    super_tap = is_super && !inhibited;
                     if !inhibited {
-                        let action = process_keyboard_shortcut(*modifiers, keysym);
+                        let action = if switching && keysym == Keysym::Escape {
+                            Some(KeyAction::CancelSwitcher)
+                        } else {
+                            process_keyboard_shortcut(*modifiers, keysym)
+                        };
 
                         if action.is_some() {
                             suppressed_keys.push(keysym);
@@ -210,6 +214,12 @@ impl<BackendData: Backend> EvoState<BackendData> {
                         FilterResult::Forward
                     }
                 } else {
+                    if is_super && super_tap {
+                        tapped = true;
+                    }
+                    if is_super {
+                        super_tap = false;
+                    }
                     let suppressed = suppressed_keys.contains(&keysym);
                     if suppressed {
                         suppressed_keys.retain(|k| *k != keysym);
@@ -222,6 +232,15 @@ impl<BackendData: Backend> EvoState<BackendData> {
             .unwrap_or(KeyAction::None);
 
         self.suppressed_keys = suppressed_keys;
+        self.super_tap = super_tap;
+        if tapped {
+            #[cfg(feature = "echo-ipc")]
+            let _ = self.echo_service.read().emit_shortcut_triggered("launcher");
+        }
+        // An Alt+Tab walk ends with Alt, and Alt's release is its commit.
+        if self.alt_tab.is_some() && !keyboard.modifier_state().alt {
+            self.switcher_release();
+        }
         action
     }
 
@@ -232,6 +251,8 @@ impl<BackendData: Backend> EvoState<BackendData> {
         let state = wl_pointer::ButtonState::from(evt.state());
 
         if wl_pointer::ButtonState::Pressed == state {
+            // Super+click is a chord, not a tap.
+            self.super_tap = false;
             self.update_keyboard_focus(self.pointer.current_location(), serial);
         };
         let pointer = self.pointer.clone();
@@ -267,11 +288,16 @@ impl<BackendData: Backend> EvoState<BackendData> {
             let output = self.space.output_under(location).next().cloned();
             if let Some(output) = output.as_ref() {
                 let output_geo = self.space.output_geometry(output).unwrap();
-                if let Some(window) = output
+                // A click on the shell overlay (a toast) over a fullscreen app
+                // is the overlay's, as it is over any window: no focus change.
+                let fullscreen = output
                     .user_data()
                     .get::<FullscreenSurface>()
-                    .and_then(|f| f.get())
-                {
+                    .and_then(|f| f.get());
+                if fullscreen.is_some() && self.overlay_surface_under(location).is_some() {
+                    return;
+                }
+                if let Some(window) = fullscreen {
                     if let Some((_, _)) =
                         window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
                     {
@@ -304,7 +330,15 @@ impl<BackendData: Backend> EvoState<BackendData> {
             }
 
             if let Some((window, _)) = self.space.element_under(location).map(|(w, p)| (w.clone(), p)) {
-                self.space.raise_element(&window, true);
+                if window.is_overlay() {
+                    // A click on a toast is for the overlay, which gets it as
+                    // pointer input. It must not take keyboard focus from the
+                    // app being typed into, and there is nothing to raise:
+                    // the overlay is always on top.
+                    return;
+                }
+                // Raises in the workspace's own order too, not just the space's.
+                self.raise_window(&window);
                 #[cfg(feature = "xwayland")]
                 if let Some(surface) = window.0.x11_surface() {
                     self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
@@ -335,6 +369,23 @@ impl<BackendData: Backend> EvoState<BackendData> {
         }
     }
 
+    /// What the shell overlay has under `pos`, if it takes input there. Only
+    /// asked while an app is fullscreen: otherwise the space finds it like any
+    /// window.
+    fn overlay_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(PointerFocusTarget, Point<i32, Logical>)> {
+        let overlay = self.space.elements().find(|w| w.is_overlay())?;
+        let render_loc = self.space.element_location(overlay)? - overlay.geometry().loc;
+        let point = pos - render_loc.to_f64();
+        if !overlay.is_in_input_region(&point) {
+            return None;
+        }
+        let (surface, loc) = overlay.surface_under(point, WindowSurfaceType::ALL)?;
+        Some((surface, loc + render_loc))
+    }
+
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
@@ -346,11 +397,20 @@ impl<BackendData: Backend> EvoState<BackendData> {
         let output_geo = self.space.output_geometry(output).unwrap();
         let layers = layer_map_for_output(output);
 
-        let mut under = None;
-        if let Some((surface, loc)) = output
+        let fullscreen = output
             .user_data()
             .get::<FullscreenSurface>()
-            .and_then(|f| f.get())
+            .and_then(|f| f.get());
+
+        let mut under = None;
+        // The overlay is drawn over a fullscreen app (render.rs), so it gets
+        // the pointer first, where Bloom said it takes input.
+        if let Some((surface, loc)) = fullscreen
+            .as_ref()
+            .and_then(|_| self.overlay_surface_under(pos))
+        {
+            under = Some((surface, loc));
+        } else if let Some((surface, loc)) = fullscreen
             .and_then(|w| w.surface_under(pos - output_geo.loc.to_f64(), WindowSurfaceType::ALL))
         {
             under = Some((surface, loc + output_geo.loc));
@@ -460,7 +520,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
                     let new_scale = current_scale + 0.25;
                     output.change_current_state(None, None, Some(Scale::Fractional(new_scale)), None);
 
-                    crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+                    self.fixup_positions(self.pointer.current_location());
                     self.backend_data.reset_buffers(&output);
                 }
 
@@ -476,7 +536,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
                     let new_scale = f64::max(1.0, current_scale - 0.25);
                     output.change_current_state(None, None, Some(Scale::Fractional(new_scale)), None);
 
-                    crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+                    self.fixup_positions(self.pointer.current_location());
                     self.backend_data.reset_buffers(&output);
                 }
 
@@ -501,14 +561,16 @@ impl<BackendData: Backend> EvoState<BackendData> {
                     };
                     tracing::info!(?current_transform, ?new_transform, output = ?output.name(), "changing output transform");
                     output.change_current_state(None, Some(new_transform), None, None);
-                    crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+                    self.fixup_positions(self.pointer.current_location());
                     self.backend_data.reset_buffers(&output);
                 }
 
                 action => match action {
                     KeyAction::None
-                    | KeyAction::Quit
-                    | KeyAction::Run(_)
+                    | KeyAction::CloseWindow
+                    | KeyAction::CycleWindows { .. }
+                    | KeyAction::CancelSwitcher
+                    | KeyAction::Shell(_)
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
                     | KeyAction::RestoreMinimized => self.process_common_key_action(action),
@@ -635,7 +697,7 @@ impl EvoState<UdevData> {
                         pointer_output_location.y *= rescale;
                         let pointer_location = output_location + pointer_output_location;
 
-                        crate::shell::fixup_positions(&mut self.space, pointer_location);
+                        self.fixup_positions(pointer_location);
                         let pointer = self.pointer.clone();
                         let under = self.surface_under(pointer_location);
                         pointer.motion(
@@ -674,7 +736,7 @@ impl EvoState<UdevData> {
                         pointer_output_location.y *= rescale;
                         let pointer_location = output_location + pointer_output_location;
 
-                        crate::shell::fixup_positions(&mut self.space, pointer_location);
+                        self.fixup_positions(pointer_location);
                         let pointer = self.pointer.clone();
                         let under = self.surface_under(pointer_location);
                         pointer.motion(
@@ -711,7 +773,7 @@ impl EvoState<UdevData> {
                             Transform::Flipped270 => Transform::Normal,
                         };
                         output.change_current_state(None, Some(new_transform), None, None);
-                        crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+                        self.fixup_positions(self.pointer.current_location());
                         self.backend_data.reset_buffers(&output);
                     }
                 }
@@ -723,8 +785,10 @@ impl EvoState<UdevData> {
 
                 action => match action {
                     KeyAction::None
-                    | KeyAction::Quit
-                    | KeyAction::Run(_)
+                    | KeyAction::CloseWindow
+                    | KeyAction::CycleWindows { .. }
+                    | KeyAction::CancelSwitcher
+                    | KeyAction::Shell(_)
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
                     | KeyAction::RestoreMinimized => self.process_common_key_action(action),
@@ -1281,17 +1345,22 @@ impl EvoState<UdevData> {
 }
 
 /// Possible results of a keyboard action
-#[allow(dead_code)] // some of these are only read if udev is enabled
+#[allow(dead_code)] // some of these are only read if udev is enabled, or with `debug`
 #[derive(Debug)]
 enum KeyAction {
-    /// Quit the compositor
-    Quit,
     /// Trigger a vt-switch
     VtSwitch(i32),
-    /// run a command
-    Run(String),
+    /// Super+Q: ask the focused app window to close
+    CloseWindow,
+    /// Alt+Tab, Shift+Alt+Tab
+    CycleWindows { reverse: bool },
+    /// Escape during Alt+Tab: close the switcher, focus stays
+    CancelSwitcher,
+    /// Tell the shell (`ShortcutTriggered`): it owns what these do
+    Shell(&'static str),
     /// Switch the current screen
     Screen(usize),
+    // Debug toggles, produced only by a build with the `debug` feature.
     ScaleUp,
     ScaleDown,
     TogglePreview,
@@ -1305,37 +1374,94 @@ enum KeyAction {
     None,
 }
 
+/// Nothing here may end the session: Evo is not restarted by anything, so a
+/// quit key would be a way to lose the desktop for good.
 fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Option<KeyAction> {
-    if modifiers.ctrl && modifiers.alt && keysym == Keysym::BackSpace || modifiers.logo && keysym == Keysym::q
-    {
-        // ctrl+alt+backspace = quit
-        // logo + q = quit
-        Some(KeyAction::Quit)
-    } else if (xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12).contains(&keysym.raw()) {
-        // VTSwitch
-        Some(KeyAction::VtSwitch(
-            (keysym.raw() - xkb::KEY_XF86Switch_VT_1 + 1) as i32,
-        ))
-    } else if modifiers.logo && keysym == Keysym::Return {
-        // run terminal
-        Some(KeyAction::Run("weston-terminal".into()))
-    } else if modifiers.logo && (xkb::KEY_1..=xkb::KEY_9).contains(&keysym.raw()) {
-        Some(KeyAction::Screen((keysym.raw() - xkb::KEY_1) as usize))
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::M {
-        Some(KeyAction::ScaleDown)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::P {
-        Some(KeyAction::ScaleUp)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::W {
-        Some(KeyAction::TogglePreview)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::R {
-        Some(KeyAction::RotateOutput)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::T {
-        Some(KeyAction::ToggleTint)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::D {
-        Some(KeyAction::ToggleDecorations)
-    } else if modifiers.logo && modifiers.shift && keysym == Keysym::U {
-        Some(KeyAction::RestoreMinimized)
-    } else {
-        None
+    let raw = keysym.raw();
+    if (xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12).contains(&raw) {
+        return Some(KeyAction::VtSwitch((raw - xkb::KEY_XF86Switch_VT_1 + 1) as i32));
+    }
+    let bare_alt = modifiers.alt && !modifiers.logo && !modifiers.ctrl;
+    // Shift turns Tab into ISO_Left_Tab, so both mean "Tab" here.
+    let tab = keysym == Keysym::Tab || raw == xkb::KEY_ISO_Left_Tab;
+    if bare_alt && tab {
+        return Some(KeyAction::CycleWindows { reverse: modifiers.shift });
+    }
+    if modifiers.logo && !modifiers.alt && !modifiers.ctrl && !modifiers.shift {
+        if keysym == Keysym::q {
+            return Some(KeyAction::CloseWindow);
+        }
+        if tab {
+            return Some(KeyAction::Shell("overview"));
+        }
+        if keysym == Keysym::space {
+            return Some(KeyAction::Shell("search"));
+        }
+        if keysym == Keysym::d {
+            return Some(KeyAction::Shell("show-desktop"));
+        }
+    }
+    if modifiers.logo && (xkb::KEY_1..=xkb::KEY_9).contains(&raw) {
+        return Some(KeyAction::Screen((raw - xkb::KEY_1) as usize));
+    }
+    if modifiers.logo && modifiers.shift && keysym == Keysym::U {
+        return Some(KeyAction::RestoreMinimized);
+    }
+    #[cfg(feature = "debug")]
+    if modifiers.logo && modifiers.shift {
+        return match keysym {
+            Keysym::M => Some(KeyAction::ScaleDown),
+            Keysym::P => Some(KeyAction::ScaleUp),
+            Keysym::W => Some(KeyAction::TogglePreview),
+            Keysym::R => Some(KeyAction::RotateOutput),
+            Keysym::T => Some(KeyAction::ToggleTint),
+            Keysym::D => Some(KeyAction::ToggleDecorations),
+            _ => None,
+        };
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(f: impl FnOnce(&mut ModifiersState)) -> ModifiersState {
+        let mut m = ModifiersState::default();
+        f(&mut m);
+        m
+    }
+
+    #[test]
+    fn no_shortcut_ends_the_session_or_runs_a_program() {
+        let ctrl_alt = mods(|m| {
+            m.ctrl = true;
+            m.alt = true;
+        });
+        assert!(process_keyboard_shortcut(ctrl_alt, Keysym::BackSpace).is_none());
+        let logo = mods(|m| m.logo = true);
+        assert!(process_keyboard_shortcut(logo, Keysym::Return).is_none());
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::q), Some(KeyAction::CloseWindow)));
+    }
+
+    #[test]
+    fn global_shortcuts_map_to_their_actions() {
+        let alt = mods(|m| m.alt = true);
+        let alt_shift = mods(|m| {
+            m.alt = true;
+            m.shift = true;
+        });
+        let logo = mods(|m| m.logo = true);
+        assert!(matches!(
+            process_keyboard_shortcut(alt, Keysym::Tab),
+            Some(KeyAction::CycleWindows { reverse: false })
+        ));
+        assert!(matches!(
+            process_keyboard_shortcut(alt_shift, Keysym::ISO_Left_Tab),
+            Some(KeyAction::CycleWindows { reverse: true })
+        ));
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::Tab), Some(KeyAction::Shell("overview"))));
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::space), Some(KeyAction::Shell("search"))));
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::d), Some(KeyAction::Shell("show-desktop"))));
     }
 }

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::net::unix::OwnedWriteHalf;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,45 +30,6 @@ use geckoOS_echo::{ArgumentDefinition, MethodDefinition, ServiceInterface, Signa
 // ============================================================================
 // TYPE DEFINITIONS
 // ============================================================================
-
-/// Callback for window creation requests from Echo IPC
-/// Returns (window_id_to_track, success) if handled
-pub type CreateWindowHandler =
-    dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync + 'static;
-
-/// Window creation request from Echo IPC
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateWindowRequest {
-    #[serde(alias = "appid", alias = "app_id")]
-    pub app_id: String,
-    
-    #[serde(alias = "apptype", alias = "app_type")]
-    pub app_type: String,
-    
-    pub width: u32,
-    pub height: u32,
-    
-    #[serde(default)]
-    pub url: Option<String>,
-}
-
-
-impl CreateWindowRequest {
-    pub fn new(app_id: &str, app_type: &str, width: u32, height: u32) -> Self {
-        CreateWindowRequest {
-            app_id: app_id.to_string(),
-            app_type: app_type.to_string(),
-            width,
-            height,
-            url: None,
-        }
-    }
-
-    pub fn with_url(mut self, url: &str) -> Self {
-        self.url = Some(url.to_string());
-        self
-    }
-}
 
 /// Window information exposed via IPC
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +77,12 @@ pub enum WindowAction {
     /// kiosk-on-relaunch report impossible to reproduce headlessly.
     Maximize,
     Unmaximize,
+    /// Bloom's `SetWorkArea`: not about any window (`window_id` is 0). The
+    /// edges apps must leave to the shell, see `shell/work_area.rs`.
+    SetWorkArea(crate::shell::work_area::Insets),
+    /// Bloom's `SetOverlayFocus` (`window_id` is 0): give the overlay the
+    /// keyboard, or take it back.
+    OverlayKeyboard(bool),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +220,9 @@ enum EchoCommand {
     /// Emit a signal. Fire-and-forget: nothing waits on the reply, so a
     /// signal can never stall the compositor thread (see `emit`).
     EmitSignal { signal_name: String, args: Value },
+    /// A method call nobody waits on. The broker logs how it turned out
+    /// (see `notify`).
+    Notify { message: EchoMessage, what: String },
 }
 
 /// Largest frame the broker will read. Anything larger means the stream is
@@ -273,6 +243,9 @@ enum PendingReply {
     /// `None` when the broker re-registers on its own, after a reconnect.
     Register(Option<tokio::sync::oneshot::Sender<Result<()>>>),
     Signal(String),
+    /// A call made with `notify`: the failure is reported here, since the
+    /// caller has gone.
+    Notify(String),
 }
 
 impl PendingReply {
@@ -306,6 +279,13 @@ impl PendingReply {
                     warn!("Signal {} failed: {:?}", name, reply.body);
                 }
             }
+            PendingReply::Notify(what) => {
+                if ok {
+                    debug!("✓ {} done", what);
+                } else {
+                    warn!("{} failed: {:?}", what, reply.body);
+                }
+            }
         }
     }
 
@@ -320,6 +300,7 @@ impl PendingReply {
             PendingReply::Register(Some(tx)) => {
                 let _ = tx.send(Err(lost()));
             }
+            PendingReply::Notify(what) => warn!("{} lost: Echo connection dropped first", what),
             PendingReply::Register(None) | PendingReply::Signal(_) => {}
         }
     }
@@ -336,23 +317,21 @@ impl PendingReply {
 pub struct GeckoEchoService {
     pub service_name: String,
     pub ready: Arc<RwLock<bool>>,
-    pub windows: Arc<RwLock<HashMap<u32, WindowInfo>>>,
     /// Every live toplevel, as the compositor last saw it: what
-    /// `ListWindows` and `GetRenderingStatus` report. `windows` above holds
-    /// only windows made through the create/claim contract, so a
-    /// Nova-launched app is never in it. Answering from it made
-    /// `ListWindows` empty on a real device, and froze each entry's
-    /// geometry at creation. Written by `EvoState::sync_toplevels`.
+    /// `ListWindows` and `GetRenderingStatus` report. Written by
+    /// `EvoState::sync_toplevels`.
     toplevels: Arc<RwLock<Vec<WindowInfo>>>,
-    pub next_window_id: Arc<RwLock<u32>>,
     pub command_tx: mpsc::Sender<EchoCommand>,
     pub runtime_handle: tokio::runtime::Handle,
-    // ✅ Change Box to Arc
-    pub create_window_cb: Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
 
     /// Queue of FocusWindow/MinimizeWindow/RestoreWindow requests received
     /// over Echo IPC, awaiting pickup by `EvoState::process_pending_window_actions`.
     pending_window_actions: Arc<RwLock<Vec<PendingWindowAction>>>,
+
+    /// Raised by the broker each time it has reconnected to echo-daemon and
+    /// re-registered. A restarted daemon's appHost has no bindings, so the
+    /// compositor thread replays them: see `take_rebind_request`.
+    rebind_requested: Arc<AtomicBool>,
 
     // ---- Real FPS tracking (see `record_frame`/`get_rendering_status`) ----
     // Frames rendered since `fps_window_start` was last reset. Plain atomic,
@@ -388,10 +367,7 @@ impl GeckoEchoService {
 
     let runtime_handle = runtime.handle().clone();
     let ready = Arc::new(RwLock::new(false));
-    let create_window_cb = Arc::new(RwLock::new(None));
-    let windows = Arc::new(RwLock::new(HashMap::new()));
     let toplevels = Arc::new(RwLock::new(Vec::new()));
-    let next_window_id = Arc::new(RwLock::new(1));
     let pending_window_actions = Arc::new(RwLock::new(Vec::new()));
     let last_fps = Arc::new(AtomicU32::new(0));
 
@@ -400,9 +376,9 @@ impl GeckoEchoService {
     // Clone for broker
     let toplevels_clone = Arc::clone(&toplevels);
     let last_fps_clone = Arc::clone(&last_fps);
-    let next_window_id_clone = Arc::clone(&next_window_id);
-    let create_window_cb_clone = Arc::clone(&create_window_cb);
     let pending_window_actions_clone = Arc::clone(&pending_window_actions);
+    let rebind_requested = Arc::new(AtomicBool::new(false));
+    let rebind_clone = Arc::clone(&rebind_requested);
 
     let socket_path = Self::echo_socket_path();
 
@@ -413,9 +389,8 @@ impl GeckoEchoService {
             socket_path,
             toplevels_clone,
             last_fps_clone,
-            next_window_id_clone,
-            create_window_cb_clone,
             pending_window_actions_clone,
+            rebind_clone,
         )
         .await;
     });
@@ -427,13 +402,11 @@ impl GeckoEchoService {
     Ok(GeckoEchoService {
         service_name: "org.geckoOS.evo".to_string(),
         ready,
-        windows,
         toplevels,
-        next_window_id,
         command_tx,
         runtime_handle,
-        create_window_cb,
         pending_window_actions,
+        rebind_requested,
         frame_count: Arc::new(AtomicU64::new(0)),
         fps_window_start: Arc::new(RwLock::new(Instant::now())),
         last_fps,
@@ -479,6 +452,19 @@ impl GeckoEchoService {
             .map_err(|e| anyhow!("Signal {} not queued: {}", signal_name, e))
     }
 
+    /// Queue a method call and return at once. Same as `emit` but for a call
+    /// to another service: the broker logs the outcome, nothing waits for it.
+    /// Calls queue in order with the signals, so a `BindSurface` still lands
+    /// before the `UnbindSurface` that follows it.
+    fn notify(&self, message: EchoMessage, what: &str) -> Result<()> {
+        self.command_tx
+            .try_send(EchoCommand::Notify {
+                message,
+                what: what.to_string(),
+            })
+            .map_err(|e| anyhow!("{} not queued: {}", what, e))
+    }
+
     /// Register service with Echo bus (SYNC). The broker remembers the
     /// interface and registers it again after any reconnect.
     pub fn register(&self) -> Result<()> {
@@ -493,56 +479,10 @@ impl GeckoEchoService {
         self.emit("GeckoReady", json!({}))
     }
 
-    /// Allocate a new window ID (SYNC)
-    pub fn allocate_window_id(&self) -> u32 {
-        let mut id_gen = self.next_window_id.write();
-        let id = *id_gen;
-        *id_gen = id.wrapping_add(1);
-        if id == 0 {
-            *id_gen = 1; // Never use 0
-        }
-        id
-    }
-
-    /// Track a window created by Evo (SYNC)
-    pub fn track_window(&self, window: WindowInfo) {
-        let mut windows = self.windows.write();
-        windows.insert(window.window_id, window.clone());
-        info!(
-            "✓ Window tracked: id={}, app_id={}",
-            window.window_id, window.app_id
-        );
-    }
-
-    /// Update window state (SYNC)
-    pub fn update_window(&self, window_id: u32, updates: WindowInfo) -> bool {
-        let mut windows = self.windows.write();
-        if windows.contains_key(&window_id) {
-            windows.insert(window_id, updates);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Remove a tracked window (SYNC)
-    pub fn untrack_window(&self, window_id: u32) -> bool {
-        let mut windows = self.windows.write();
-        let removed = windows.remove(&window_id).is_some();
-        if removed {
-            info!("✓ Window untracked: id={}", window_id);
-        }
-        removed
-    }
-
-    /// Get list of tracked windows (SYNC)
-    pub fn get_windows(&self) -> Vec<WindowInfo> {
-        self.windows.read().values().cloned().collect()
-    }
-
-    /// Get window count (SYNC)
-    pub fn window_count(&self) -> usize {
-        self.windows.read().len()
+    /// Whether the broker reconnected since the last call, so appHost's
+    /// bindings need replaying. Polled by `EvoState::process_pending_window_actions`.
+    pub fn take_rebind_request(&self) -> bool {
+        self.rebind_requested.swap(false, Ordering::AcqRel)
     }
 
     /// Check if ready (SYNC)
@@ -621,36 +561,83 @@ impl GeckoEchoService {
     /// never received `AppSurfaceMapped`, and `nova.Focus` — which does
     /// `session.surfaces.first()` — answered "app has no mapped compositor
     /// window yet", so restore-from-dock could never work.
-    pub fn bind_surface_remote(&self, app_id: &str, surface_id: u32) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::Call {
-            message: EchoMessage::method_call(
+    ///
+    /// Fire-and-forget (`notify`). This used to wait for the daemon's reply on
+    /// the compositor thread, up to 3 s, and `ack_configure` called it on
+    /// every configure ack. The caller now binds once per window, when its app
+    /// id becomes known or changes, and a failure is logged by the broker.
+    ///
+    /// `pid` is the client's, from the Wayland socket credentials. appHost
+    /// matches a surface to the session it launched by it.
+    pub fn bind_surface_remote(&self, app_id: &str, surface_id: u32, pid: Option<u32>) -> Result<()> {
+        self.notify(
+            EchoMessage::method_call(
                 "org.geckoOS.appHost".to_string(),
                 "org.geckoOS.appHost".to_string(),
                 "BindSurface".to_string(),
-                json!({ "appId": app_id, "surfaceId": surface_id }),
+                bind_surface_body(app_id, surface_id, pid),
             ),
-            reply: tx,
-        };
-
-        self.request(cmd, rx, "BindSurface").map(|_| ())
+            "BindSurface",
+        )
     }
 
     /// Detach a surface from its AppHost session. See `bind_surface_remote`
-    /// for why this must not touch `AppHost::global()`.
+    /// for why this must not touch `AppHost::global()`, and why it does not
+    /// wait.
     pub fn unbind_surface_remote(&self, surface_id: u32) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EchoCommand::Call {
-            message: EchoMessage::method_call(
+        self.notify(
+            EchoMessage::method_call(
                 "org.geckoOS.appHost".to_string(),
                 "org.geckoOS.appHost".to_string(),
                 "UnbindSurface".to_string(),
                 json!({ "surfaceId": surface_id }),
             ),
-            reply: tx,
-        };
+            "UnbindSurface",
+        )
+    }
 
-        self.request(cmd, rx, "UnbindSurface").map(|_| ())
+    /// A global shortcut the shell should act on: `launcher`, `overview`,
+    /// `search` or `show-desktop`. Evo sees the keys whichever app has the
+    /// keyboard, which Bloom's own hotkeys never do.
+    pub fn emit_shortcut_triggered(&self, action: &str) -> Result<()> {
+        self.emit("ShortcutTriggered", json!({
+                "action": action,
+                "timestamp": now_ms()
+            }))
+    }
+
+    /// Alt+Tab, for the shell to draw: `phase` is `open`, `step`, `commit` or
+    /// `cancel`, `selected` the window the walk is on and `order` every
+    /// switchable window, most recently used first (shell/switcher.rs).
+    pub fn emit_switcher_changed(&self, phase: &str, selected: u32, order: &[u32]) -> Result<()> {
+        self.emit("SwitcherChanged", json!({
+                "phase": phase,
+                "selected": selected,
+                "order": order,
+                "timestamp": now_ms()
+            }))
+    }
+
+    /// A minimize's orb reached its dock icon (`phase` `land`, at 90% of the
+    /// run) or a restore left it (`rise`, as it starts): Bloom ripples the
+    /// icon (shell/minimize.rs).
+    pub fn emit_minimize_landed(&self, app_id: &str, window_id: u32, phase: &str) -> Result<()> {
+        self.emit("MinimizeLanded", json!({
+                "app_id": app_id,
+                "window_id": window_id,
+                "phase": phase,
+                "timestamp": now_ms()
+            }))
+    }
+
+    /// The overlay gained or lost the keyboard. It loses it when Bloom gives
+    /// it back, and also when anything else takes it (an Alt+Tab, a dock
+    /// click on an app), which is how Bloom learns to close its panels.
+    pub fn emit_overlay_focus_changed(&self, focused: bool) -> Result<()> {
+        self.emit("OverlayFocusChanged", json!({
+                "focused": focused,
+                "timestamp": now_ms()
+            }))
     }
 
     /// Emit window closed signal (SYNC)
@@ -769,11 +756,10 @@ impl GeckoEchoService {
     ///
     /// **This validates the argument, not the window.** It deliberately does
     /// not check that the id names a live window, because the map reachable
-    /// from here is the wrong one: `EchoIpcService::windows` is populated
-    /// only by `track_window`, i.e. windows Evo *creates* through the
-    /// two-step create/claim contract. Ordinary client toplevels — every
-    /// Nova-launched app — live in `EvoState::windows_by_id` over in
-    /// `state.rs`, which this async broker task cannot reach. Checking the
+    /// from here is the wrong one: the broker task has no window map at
+    /// all. Client toplevels — every Nova-launched app — live in
+    /// `EvoState::windows_by_id` over in `state.rs`, which this async broker
+    /// task cannot reach. Checking the
     /// wrong map rejected every real window and broke `nova.Focus`
     /// outright (caught on-device 2026-09-20, fixed by deleting the check).
     ///
@@ -808,19 +794,6 @@ impl GeckoEchoService {
         std::mem::take(&mut *self.pending_window_actions.write())
     }
 
-    /// Register a handler for window creation requests from Echo
-    /// 
-    /// Handler should:
-    /// - Parse the CreateWindowRequest
-    /// - Spawn the appropriate application
-    /// - Return the assigned window_id that the application will eventually claim via new_toplevel
-    pub fn set_create_window_handler<F>(&self, handler: F)
-    where
-        F: Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync + 'static,
-    {
-        *self.create_window_cb.write() = Some(Arc::new(handler));
-    }
-
     // ========================================================================
     // ASYNC BROKER LOOP (runs in background runtime)
     // ========================================================================
@@ -830,11 +803,10 @@ impl GeckoEchoService {
     socket_path: PathBuf,
     toplevels: Arc<RwLock<Vec<WindowInfo>>>,
     last_fps: Arc<AtomicU32>,
-    next_window_id: Arc<RwLock<u32>>,
-    // ✅ Arc instead of Box
-    create_window_cb: Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
     pending_window_actions: Arc<RwLock<Vec<PendingWindowAction>>>,
+    rebind_requested: Arc<AtomicBool>,
 ) {
+    let mut connected_before = false;
     // The interface last registered, replayed after every reconnect.
     // echo-daemon drops a connection's service names when the connection
     // closes (IPCBus::remove_connection). A broker that reconnected without
@@ -891,9 +863,42 @@ impl GeckoEchoService {
                     }
                 }
 
+                // A connection after the first means echo-daemon restarted
+                // (or dropped us), and appHost's surface bindings went with
+                // it. The broker keeps no window list: it asks the
+                // compositor thread, which has the real one.
+                if connected_before {
+                    rebind_requested.store(true, Ordering::Release);
+                }
+                connected_before = true;
+
+                // Frames are read in a task of their own and the loop waits on
+                // its channel. Reading inside the `select!` was not
+                // cancel-safe: when a command (every signal Evo emits is one)
+                // won the select part-way through a frame, the bytes read so
+                // far were lost and the stream fell out of step. The task
+                // ends with this connection (aborted on drop).
+                let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<Result<Option<EchoMessage>>>(32);
+                let reader = tokio::spawn(async move {
+                    loop {
+                        let frame = Self::recv_frame(&mut read_half).await;
+                        let failed = frame.is_err();
+                        if frames_tx.send(frame).await.is_err() || failed {
+                            break;
+                        }
+                    }
+                });
+                struct AbortOnDrop(tokio::task::JoinHandle<()>);
+                impl Drop for AbortOnDrop {
+                    fn drop(&mut self) {
+                        self.0.abort();
+                    }
+                }
+                let _reader = AbortOnDrop(reader);
+
                 loop {
                     tokio::select! {
-                        incoming = Self::recv_frame(&mut read_half) => {
+                        Some(incoming) = frames_rx.recv() => {
                             let msg = match incoming {
                                 Ok(Some(msg)) => msg,
                                 // A frame that did not parse. It was read in
@@ -917,8 +922,6 @@ impl GeckoEchoService {
                                 msg,
                                 &toplevels,
                                 &last_fps,
-                                &next_window_id,
-                                &create_window_cb,
                                 &pending_window_actions,
                             )
                             .await
@@ -965,8 +968,6 @@ impl GeckoEchoService {
     msg: EchoMessage,
     toplevels: &Arc<RwLock<Vec<WindowInfo>>>,
     last_fps: &Arc<AtomicU32>,
-    next_window_id: &Arc<RwLock<u32>>,
-    create_window_cb: &Arc<RwLock<Option<Arc<dyn Fn(&CreateWindowRequest) -> Result<u32> + Send + Sync>>>>,
     pending_window_actions: &Arc<RwLock<Vec<PendingWindowAction>>>,
 ) -> Result<()> {
         // Only handle METHOD_CALL messages
@@ -1016,69 +1017,8 @@ impl GeckoEchoService {
                 EchoMessage::method_return(message_id, json!({ "status": status }))
             }
 
-            "CreateWindow" => {
-                let app_id = msg
-                    .body
-                    .get("app_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let app_type = msg
-                    .body
-                    .get("app_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("native")
-                    .to_string();
-                let width = msg.body.get("width").and_then(|v| v.as_u64()).unwrap_or(800) as u32;
-                let height = msg.body.get("height").and_then(|v| v.as_u64()).unwrap_or(600) as u32;
-                let url = msg.body.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-                let request = CreateWindowRequest {
-                    app_id: app_id.clone(),
-                    app_type,
-                    width,
-                    height,
-                    url,
-                };
-
-                // Call the Evo callback that was registered
-                let response_msg = {
-                    // let service_locked = service.read();
-                    let x = if let Some(ref callback) = *create_window_cb.read() {
-                        match callback(&request) {
-                            Ok(assigned_window_id) => {
-                                info!(
-                                    "✓ Window creation request handled for {} with ID {}",
-                                    app_id, assigned_window_id
-                                );
-                                EchoMessage::method_return(
-                                    message_id,
-                                    json!({
-                                        "success": true,
-                                        "window_id": assigned_window_id,
-                                        "app_id": app_id
-                                    }),
-                                )
-                            }
-                            Err(e) => {
-                                warn!("✗ Window creation failed for {}: {}", app_id, e);
-                                EchoMessage::method_error(message_id, &format!("Creation failed: {}", e))
-                            }
-                        }
-                    } else {
-                        EchoMessage::method_error(message_id, "No window creation handler registered")
-                    }; x
-                };
-                response_msg
-            }
-
-            // Was a stub: it removed the id from `EchoIpcService::windows`
-            // and reported success from whether that map happened to hold
-            // it. That map only ever contains windows Evo *created* via the
-            // two-step create/claim contract (see resolve_window_arg), so
-            // for an ordinary app window it removed nothing, answered
-            // `{"success": false}`, and — the actual problem — never told
-            // the client anything. There was no way to close an app window
+            // Was a stub that answered from a map holding only windows Evo
+            // itself created, so an ordinary app window could not be closed
             // from the shell at all; only nova.Close, which signals the
             // process rather than asking the window to go away.
             //
@@ -1131,18 +1071,320 @@ impl GeckoEchoService {
                 }
             }
 
-            "SwitchWorkspace" => {
-                let workspace_id = msg
-                    .body
-                    .get("workspace_id")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
+            // Where Bloom's overlay window currently draws, and so takes
+            // input (see shell/overlay.rs). Bloom sends it whenever its toast
+            // stack changes. Every other point of the overlay passes clicks
+            // through to the window beneath.
+            "SetOverlayRegion" => {
+                let rects = msg.body.get("rects").cloned().unwrap_or_else(|| json!([]));
+                match crate::shell::overlay::parse_rects(&rects) {
+                    Ok(rects) => {
+                        let count = rects.len();
+                        crate::shell::overlay::set_region(rects);
+                        debug!("Overlay input region: {} rect(s)", count);
+                        EchoMessage::method_return(
+                            message_id,
+                            json!({ "success": true, "rects": count }),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("SetOverlayRegion: {}", e);
+                        EchoMessage::method_error(message_id, &e)
+                    }
+                }
+            }
 
-                info!("Switched to workspace {}", workspace_id);
+            // The edges of the output the shell occupies (top bar, dock).
+            // Apps are kept out of them: maximize, first placement and the
+            // move/resize clamp all use the output minus these. Applied on
+            // the compositor thread, which also re-fits open windows.
+            "SetWorkArea" => match crate::shell::work_area::parse_insets(&msg.body) {
+                Ok(insets) => {
+                    pending_window_actions.write().push(PendingWindowAction {
+                        window_id: 0,
+                        action: WindowAction::SetWorkArea(insets),
+                    });
+                    EchoMessage::method_return(
+                        message_id,
+                        json!({
+                            "success": true,
+                            "top": insets.top,
+                            "bottom": insets.bottom,
+                            "left": insets.left,
+                            "right": insets.right,
+                        }),
+                    )
+                }
+                Err(e) => {
+                    warn!("SetWorkArea: {}", e);
+                    EchoMessage::method_error(message_id, &e)
+                }
+            },
+
+            // Where each running app's dock icon is (output-logical pixels,
+            // from the output's origin), so a window can minimize into it and
+            // restore out of it (shell/minimize.rs). Bloom's dock sends the
+            // whole table whenever its icons move; it replaces the last one.
+            // An app with no entry minimizes toward the bottom centre. The
+            // table is only read when a window minimizes, so it is set here
+            // like the overlay's region rather than queued.
+            // Each entry may carry the app's `accent` ("#rrggbb"), the colour
+            // of its Lumen Droplet; a bad or missing one falls back to the
+            // window's own average colour.
+            "SetMinimizeTargets" => match crate::shell::minimize::parse_targets(&msg.body) {
+                Ok(targets) => {
+                    let count = targets.len();
+                    crate::shell::minimize::set_targets(targets);
+                    crate::shell::minimize::set_accents(crate::shell::minimize::parse_accents(&msg.body));
+                    debug!("Minimize targets: {} app(s)", count);
+                    EchoMessage::method_return(message_id, json!({ "ok": true, "targets": count }))
+                }
+                Err(e) => {
+                    warn!("SetMinimizeTargets: {}", e);
+                    EchoMessage::method_error(message_id, &e)
+                }
+            },
+
+            // The only way the overlay gets the keyboard, or gives it back
+            // (shell/overlay.rs). Panels that take typing ask for it while
+            // open. `OverlayFocusChanged` reports what actually happened.
+            "SetOverlayFocus" => match msg.body.get("focused").and_then(Value::as_bool) {
+                Some(focused) => {
+                    pending_window_actions.write().push(PendingWindowAction {
+                        window_id: 0,
+                        action: WindowAction::OverlayKeyboard(focused),
+                    });
+                    EchoMessage::method_return(message_id, json!({ "success": true, "focused": focused }))
+                }
+                None => {
+                    warn!("SetOverlayFocus: focused must be a boolean");
+                    EchoMessage::method_error(message_id, "focused must be a boolean")
+                }
+            },
+
+            // What the overlay currently has: the keyboard, the input
+            // region and the reserved edges. Read-only, for the shell and
+            // for on-device tests.
+            "GetOverlayState" => {
+                let insets = crate::shell::work_area::insets();
+                let rects: Vec<Value> = crate::shell::overlay::region()
+                    .iter()
+                    .map(|r| json!({ "x": r.loc.x, "y": r.loc.y, "width": r.size.w, "height": r.size.h }))
+                    .collect();
                 EchoMessage::method_return(
                     message_id,
-                    json!({ "success": true, "workspace_id": workspace_id }),
+                    json!({
+                        "keyboard": crate::shell::overlay::keyboard_held(),
+                        "rects": rects,
+                        "workArea": {
+                            "top": insets.top,
+                            "bottom": insets.bottom,
+                            "left": insets.left,
+                            "right": insets.right,
+                        },
+                    }),
                 )
+            }
+
+            // A picture of each window for Bloom's overview and switcher
+            // (shell/thumbnails.rs). Drawn on the compositor thread at card
+            // size, encoded here on a blocking worker, cached per window.
+            // A window with nothing drawn yet is left out, so the reply has
+            // at most one entry per window asked for.
+            "GetWindowThumbnails" => match crate::shell::thumbnails::parse_request(&msg.body) {
+                Ok((ids, bounds)) => {
+                    let started = std::time::Instant::now();
+                    let rx = crate::shell::thumbnails::submit(ids, bounds);
+                    match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+                        Ok(Ok(slots)) => {
+                            let jobs: Vec<_> = slots
+                                .into_iter()
+                                .map(|slot| match slot {
+                                    crate::shell::thumbnails::Slot::Ready(id, t) => {
+                                        tokio::task::spawn_blocking(move || Ok((id, t)))
+                                    }
+                                    crate::shell::thumbnails::Slot::Raw(raw) => {
+                                        tokio::task::spawn_blocking(move || crate::shell::thumbnails::encode(raw))
+                                    }
+                                })
+                                .collect();
+                            let mut thumbnails = Vec::new();
+                            for job in jobs {
+                                match job.await {
+                                    Ok(Ok((id, t))) => thumbnails.push(json!({
+                                        "window_id": id,
+                                        "width": t.width,
+                                        "height": t.height,
+                                        "data": t.data,
+                                    })),
+                                    Ok(Err(e)) => warn!("GetWindowThumbnails: {}", e),
+                                    Err(e) => warn!("GetWindowThumbnails: encoder died: {}", e),
+                                }
+                            }
+                            debug!(
+                                "GetWindowThumbnails: {} in {} ms",
+                                thumbnails.len(),
+                                started.elapsed().as_millis()
+                            );
+                            EchoMessage::method_return(message_id, json!({ "thumbnails": thumbnails }))
+                        }
+                        _ => EchoMessage::method_error(message_id, "compositor did not answer in time"),
+                    }
+                }
+                Err(e) => {
+                    warn!("GetWindowThumbnails: {}", e);
+                    EchoMessage::method_error(message_id, &e)
+                }
+            },
+
+            // Where Alt+Tab is (shell/switcher.rs): whether a walk is on,
+            // whether the shell was told to show it, the selection and order,
+            // and how many of each `SwitcherChanged` phase went out. Read-only,
+            // for on-device tests.
+            "GetSwitcherState" => {
+                let s = crate::shell::switcher::snapshot();
+                EchoMessage::method_return(
+                    message_id,
+                    json!({
+                        "active": s.active,
+                        "shown": s.shown,
+                        "selected": s.selected,
+                        "order": s.order,
+                        "lastPhase": s.last_phase,
+                        "lastCommit": s.last_commit,
+                        "counts": {
+                            "open": s.counts[0],
+                            "step": s.counts[1],
+                            "commit": s.counts[2],
+                            "cancel": s.counts[3],
+                        },
+                    }),
+                )
+            }
+
+            // Window animation mode and speed (see `crate::anim`). Either
+            // field may be left out. Applies to animations started from now
+            // on. Process-wide state like the overlay's region, so it is set
+            // here, not queued for the compositor thread.
+            "SetAnimationSettings" => {
+                let mode = match msg.body.get("mode") {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(v) => v
+                        .as_str()
+                        .and_then(crate::anim::Mode::parse)
+                        .map(Some)
+                        .ok_or_else(|| "mode must be \"full\", \"reduced\" or \"off\"".to_string()),
+                };
+                let scale = match msg.body.get("scale") {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(v) => v
+                        .as_f64()
+                        .and_then(crate::anim::settings::clamp_scale)
+                        .map(Some)
+                        .ok_or_else(|| "scale must be a finite number".to_string()),
+                };
+                match mode.and_then(|m| scale.map(|s| (m, s))) {
+                    Ok((mode, scale)) => {
+                        let now = crate::anim::settings::update(mode, scale);
+                        info!("animation settings: {} x{}", now.mode.as_str(), now.scale);
+                        EchoMessage::method_return(
+                            message_id,
+                            json!({ "ok": true, "mode": now.mode.as_str(), "scale": now.scale }),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("SetAnimationSettings: {}", e);
+                        EchoMessage::method_error(message_id, &e)
+                    }
+                }
+            }
+
+            // The settings in force and the animation counters, which exist
+            // for the on-device suite: `started` and `completed` per kind,
+            // and `active`, the animations in flight now.
+            "GetAnimationState" => {
+                let settings = crate::anim::settings();
+                let stats = crate::anim::stats();
+                let per_kind = |count: &dyn Fn(crate::anim::AnimKind) -> u64| {
+                    let mut map = serde_json::Map::new();
+                    for kind in crate::anim::AnimKind::ALL {
+                        map.insert(kind.name().to_string(), json!(count(kind)));
+                    }
+                    Value::Object(map)
+                };
+                EchoMessage::method_return(
+                    message_id,
+                    json!({
+                        "mode": settings.mode.as_str(),
+                        "scale": settings.scale,
+                        "active": stats.active(),
+                        "started": per_kind(&|k| stats.started(k)),
+                        "completed": per_kind(&|k| stats.completed(k)),
+                    }),
+                )
+            }
+
+            // Depth (drop shadows, rounded bottom corners) on or off, and
+            // whether its shaders compiled. For the on-device suite and the
+            // before/after frame rate; off is also what a failed compile draws.
+            "SetDepth" => match msg.body.get("enabled").and_then(Value::as_bool) {
+                Some(enabled) => {
+                    crate::anim::shader::set_depth_enabled(enabled);
+                    info!("depth: {}", if enabled { "on" } else { "off" });
+                    EchoMessage::method_return(
+                        message_id,
+                        json!({ "ok": true, "enabled": enabled, "shaders": crate::anim::shader::shader_status() }),
+                    )
+                }
+                None => EchoMessage::method_error(message_id, "enabled must be a boolean"),
+            },
+            "GetDepthState" => EchoMessage::method_return(
+                message_id,
+                json!({
+                    "enabled": crate::anim::shader::depth_enabled(),
+                    "shaders": crate::anim::shader::shader_status(),
+                }),
+            ),
+
+            // Lumen on or off (off, every effect draws its plain fallback:
+            // genie-lite for minimize), and whether its program built, how
+            // many frames went through each effect, each effect's last
+            // progress and the MinimizeLanded signals sent. For the suites
+            // and the fps comparison; echo-cli only (no bridge entry).
+            "SetLumen" => match msg.body.get("enabled").and_then(Value::as_bool) {
+                Some(enabled) => {
+                    if let Some(mips) = msg.body.get("mipmaps").and_then(Value::as_bool) {
+                        crate::anim::lumen::set_mipmaps(mips);
+                    }
+                    // Bloom's live-surface blur on its own (lane L3), for the
+                    // fps comparison.
+                    if let Some(blur) = msg.body.get("bloom_blur").and_then(Value::as_bool) {
+                        crate::anim::bloom::set_blur_enabled(blur);
+                    }
+                    crate::anim::lumen::set_enabled(enabled);
+                    EchoMessage::method_return(
+                        message_id,
+                        json!({ "ok": true, "enabled": enabled, "program": crate::anim::lumen::status() }),
+                    )
+                }
+                None => EchoMessage::method_error(message_id, "enabled must be a boolean"),
+            },
+            "GetLumenState" => {
+                let mut state = crate::anim::lumen::state_json();
+                let (land, rise) = crate::shell::minimize::landed_counts();
+                state["landed"] = json!({ "land": land, "rise": rise });
+                // Show desktop (L4): the Recede/Emerge set and order, and the
+                // Settle glint's own program (frames are under `frames.glint`).
+                state["recede"] = crate::shell::recede::state_json();
+                state["glint_program"] = json!(crate::anim::glint::program_status());
+                // Evaporate draws through its own program (lane L2).
+                state["evaporate_program"] = json!(crate::anim::evaporate::status());
+                // Bloom's texture shader (lane L3): {bloom_program, bloom_blur,
+                // bloom_blurred_frames}, merged in at the top level.
+                if let (Some(obj), Value::Object(bloom)) = (state.as_object_mut(), crate::anim::bloom::state_json()) {
+                    obj.extend(bloom);
+                }
+                EchoMessage::method_return(message_id, state)
             }
 
             "FocusWindow" => {
@@ -1205,22 +1447,13 @@ impl GeckoEchoService {
                 }
             }
 
-            "CreateWorkspace" => {
-                let workspace_name = msg
-                    .body
-                    .get("workspace_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("New Workspace")
-                    .to_string();
-
-                let workspace_id = 1 + (rand::random::<u32>() % 10);
-
-                info!("Created workspace {}: {}", workspace_id, workspace_name);
-                EchoMessage::method_return(
-                    message_id,
-                    json!({ "workspace_id": workspace_id, "success": true }),
-                )
-            }
+            // No workspace is real yet (EvoState has one active workspace and
+            // nothing moves windows between them), so these refuse instead of
+            // reporting a switch that never happened.
+            "SwitchWorkspace" | "CreateWorkspace" => EchoMessage::method_error(
+                message_id,
+                &format!("{method} is not implemented: workspaces are not real yet"),
+            ),
 
             _ => {
                 warn!("Unhandled method call: {}", method);
@@ -1261,6 +1494,7 @@ impl GeckoEchoService {
                 ),
                 PendingReply::Signal(signal_name),
             ),
+            EchoCommand::Notify { message, what } => (message, PendingReply::Notify(what)),
         };
         let id = message.header.message_id.clone();
         Self::send_echo_message(write_half, &message).await?;
@@ -1350,31 +1584,6 @@ impl GeckoEchoService {
             name: self.service_name.clone(),
             methods: vec![
                 MethodDefinition {
-                    name: "CreateWindow".to_string(),
-                    input_args: vec![
-                        ArgumentDefinition {
-                            name: "app_id".to_string(),
-                            arg_type: "s".to_string(),
-                        },
-                        ArgumentDefinition {
-                            name: "app_type".to_string(),
-                            arg_type: "s".to_string(),
-                        },
-                        ArgumentDefinition {
-                            name: "width".to_string(),
-                            arg_type: "u".to_string(),
-                        },
-                        ArgumentDefinition {
-                            name: "height".to_string(),
-                            arg_type: "u".to_string(),
-                        },
-                    ],
-                    output_args: vec![ArgumentDefinition {
-                        name: "window_id".to_string(),
-                        arg_type: "u".to_string(),
-                    }],
-                },
-                MethodDefinition {
                     name: "CloseWindow".to_string(),
                     input_args: vec![ArgumentDefinition {
                         name: "window_id".to_string(),
@@ -1396,28 +1605,6 @@ impl GeckoEchoService {
                     output_args: vec![ArgumentDefinition {
                         name: "status".to_string(),
                         arg_type: "v".to_string(),
-                    }],
-                },
-                MethodDefinition {
-                    name: "SwitchWorkspace".to_string(),
-                    input_args: vec![ArgumentDefinition {
-                        name: "workspace_id".to_string(),
-                        arg_type: "u".to_string(),
-                    }],
-                    output_args: vec![ArgumentDefinition {
-                        name: "success".to_string(),
-                        arg_type: "b".to_string(),
-                    }],
-                },
-                MethodDefinition {
-                    name: "CreateWorkspace".to_string(),
-                    input_args: vec![ArgumentDefinition {
-                        name: "workspace_name".to_string(),
-                        arg_type: "s".to_string(),
-                    }],
-                    output_args: vec![ArgumentDefinition {
-                        name: "workspace_id".to_string(),
-                        arg_type: "u".to_string(),
                     }],
                 },
                 MethodDefinition {
@@ -1452,6 +1639,109 @@ impl GeckoEchoService {
                         name: "workspace_id".to_string(),
                         arg_type: "u".to_string(),
                     }],
+                },
+                MethodDefinition {
+                    name: "SetOverlayRegion".to_string(),
+                    input_args: vec![ArgumentDefinition {
+                        name: "rects".to_string(),
+                        arg_type: "a(iiii)".to_string(),
+                    }],
+                    output_args: vec![ArgumentDefinition {
+                        name: "success".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "SetWorkArea".to_string(),
+                    input_args: vec![
+                        ArgumentDefinition { name: "top".to_string(), arg_type: "i".to_string() },
+                        ArgumentDefinition { name: "bottom".to_string(), arg_type: "i".to_string() },
+                        ArgumentDefinition { name: "left".to_string(), arg_type: "i".to_string() },
+                        ArgumentDefinition { name: "right".to_string(), arg_type: "i".to_string() },
+                    ],
+                    output_args: vec![ArgumentDefinition {
+                        name: "success".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "SetMinimizeTargets".to_string(),
+                    input_args: vec![ArgumentDefinition {
+                        name: "targets".to_string(),
+                        arg_type: "a(siiii)".to_string(),
+                    }],
+                    output_args: vec![ArgumentDefinition {
+                        name: "ok".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "SetOverlayFocus".to_string(),
+                    input_args: vec![ArgumentDefinition {
+                        name: "focused".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                    output_args: vec![ArgumentDefinition {
+                        name: "success".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "GetOverlayState".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition {
+                        name: "keyboard".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "GetWindowThumbnails".to_string(),
+                    input_args: vec![
+                        ArgumentDefinition { name: "window_ids".to_string(), arg_type: "au".to_string() },
+                        ArgumentDefinition { name: "max_width".to_string(), arg_type: "u".to_string() },
+                        ArgumentDefinition { name: "max_height".to_string(), arg_type: "u".to_string() },
+                    ],
+                    output_args: vec![ArgumentDefinition {
+                        name: "thumbnails".to_string(),
+                        arg_type: "a(uuus)".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "GetSwitcherState".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition {
+                        name: "active".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "SetAnimationSettings".to_string(),
+                    input_args: vec![
+                        ArgumentDefinition { name: "mode".to_string(), arg_type: "s".to_string() },
+                        ArgumentDefinition { name: "scale".to_string(), arg_type: "d".to_string() },
+                    ],
+                    output_args: vec![ArgumentDefinition {
+                        name: "ok".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "GetAnimationState".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition {
+                        name: "active".to_string(),
+                        arg_type: "u".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "SetLumen".to_string(),
+                    input_args: vec![ArgumentDefinition { name: "enabled".to_string(), arg_type: "b".to_string() }],
+                    output_args: vec![ArgumentDefinition { name: "ok".to_string(), arg_type: "b".to_string() }],
+                },
+                MethodDefinition {
+                    name: "GetLumenState".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition { name: "program".to_string(), arg_type: "s".to_string() }],
                 },
                 MethodDefinition {
                     name: "FocusWindow".to_string(),
@@ -1510,6 +1800,19 @@ impl GeckoEchoService {
                         ArgumentDefinition {
                             name: "height".to_string(),
                             arg_type: "u".to_string(),
+                        },
+                    ],
+                },
+                SignalDefinition {
+                    name: "ShortcutTriggered".to_string(),
+                    arguments: vec![
+                        ArgumentDefinition {
+                            name: "action".to_string(),
+                            arg_type: "s".to_string(),
+                        },
+                        ArgumentDefinition {
+                            name: "timestamp".to_string(),
+                            arg_type: "t".to_string(),
                         },
                     ],
                 },
@@ -1631,6 +1934,49 @@ impl GeckoEchoService {
                     ],
                 },
                 SignalDefinition {
+                    name: "SwitcherChanged".to_string(),
+                    arguments: vec![
+                        ArgumentDefinition {
+                            name: "phase".to_string(),
+                            arg_type: "s".to_string(),
+                        },
+                        ArgumentDefinition {
+                            name: "selected".to_string(),
+                            arg_type: "u".to_string(),
+                        },
+                        ArgumentDefinition {
+                            name: "order".to_string(),
+                            arg_type: "au".to_string(),
+                        },
+                        ArgumentDefinition {
+                            name: "timestamp".to_string(),
+                            arg_type: "t".to_string(),
+                        },
+                    ],
+                },
+                SignalDefinition {
+                    name: "MinimizeLanded".to_string(),
+                    arguments: vec![
+                        ArgumentDefinition { name: "app_id".to_string(), arg_type: "s".to_string() },
+                        ArgumentDefinition { name: "window_id".to_string(), arg_type: "u".to_string() },
+                        ArgumentDefinition { name: "phase".to_string(), arg_type: "s".to_string() },
+                        ArgumentDefinition { name: "timestamp".to_string(), arg_type: "t".to_string() },
+                    ],
+                },
+                SignalDefinition {
+                    name: "OverlayFocusChanged".to_string(),
+                    arguments: vec![
+                        ArgumentDefinition {
+                            name: "focused".to_string(),
+                            arg_type: "b".to_string(),
+                        },
+                        ArgumentDefinition {
+                            name: "timestamp".to_string(),
+                            arg_type: "t".to_string(),
+                        },
+                    ],
+                },
+                SignalDefinition {
                     name: "WindowMaximized".to_string(),
                     arguments: vec![
                         ArgumentDefinition {
@@ -1705,13 +2051,11 @@ impl Clone for GeckoEchoService {
         GeckoEchoService {
             service_name: self.service_name.clone(),
             ready: Arc::clone(&self.ready),
-            windows: Arc::clone(&self.windows),
             toplevels: Arc::clone(&self.toplevels),
-            next_window_id: Arc::clone(&self.next_window_id),
             command_tx: self.command_tx.clone(),
             runtime_handle: self.runtime_handle.clone(),
-            create_window_cb: Arc::clone(&self.create_window_cb),
             pending_window_actions: Arc::clone(&self.pending_window_actions),
+            rebind_requested: Arc::clone(&self.rebind_requested),
             frame_count: Arc::clone(&self.frame_count),
             fps_window_start: Arc::clone(&self.fps_window_start),
             last_fps: Arc::clone(&self.last_fps),
@@ -1728,6 +2072,16 @@ impl Default for GeckoEchoService {
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/// The `BindSurface` arguments. `pid` is left out when unknown, since the
+/// daemon reads an absent one as "match by app id alone".
+fn bind_surface_body(app_id: &str, surface_id: u32, pid: Option<u32>) -> Value {
+    let mut body = json!({ "appId": app_id, "surfaceId": surface_id });
+    if let Some(pid) = pid {
+        body["pid"] = json!(pid);
+    }
+    body
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1817,14 +2171,14 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
 
         let (command_tx, command_rx) = mpsc::channel(8);
+        let rebind = Arc::new(AtomicBool::new(false));
         tokio::spawn(GeckoEchoService::echo_broker_loop(
             command_rx,
             path.clone(),
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(AtomicU32::new(0)),
-            Arc::new(RwLock::new(1)),
-            Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(Vec::new())),
+            Arc::clone(&rebind),
         ));
 
         let (mut daemon, _) = listener.accept().await.unwrap();
@@ -1860,6 +2214,7 @@ mod tests {
         assert_eq!(answer["body"]["windows"], json!([]));
         // ...and the registration got its own reply.
         reply_rx.await.unwrap().unwrap();
+        assert!(!rebind.load(Ordering::Acquire), "first connection is not a reconnect");
 
         // Drop the connection. The broker must come back and register again
         // without being asked.
@@ -1869,7 +2224,84 @@ mod tests {
         write_frame(&mut daemon, &frame("METHOD_RETURN", json!({}))).await;
         let again = read_frame(&mut daemon).await;
         assert_eq!(again["header"]["method"], "RegisterService");
+        // The restarted daemon's appHost has no bindings: the broker asks the
+        // compositor thread to replay them, and only after a *re*connect.
+        assert!(rebind.swap(false, Ordering::AcqRel), "no rebind request after reconnect");
         assert_eq!(again["body"]["name"], "org.geckoOS.evo");
+    }
+
+    /// A frame that arrives in pieces, with a signal of Evo's sent while it
+    /// is half read. Reading inside the broker's `select!` lost the half that
+    /// was read when the signal won, so the next "length" came from the middle
+    /// of the frame and the connection was dropped (echo-daemon had the same
+    /// bug the other way round).
+    #[tokio::test]
+    async fn broker_keeps_a_frame_split_by_its_own_signal() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("echo.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let rebind = Arc::new(AtomicBool::new(false));
+            tokio::spawn(GeckoEchoService::echo_broker_loop(
+                command_rx,
+                path.clone(),
+                Arc::new(RwLock::new(Vec::new())),
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(RwLock::new(Vec::new())),
+                Arc::clone(&rebind),
+            ));
+            let (mut daemon, _) = listener.accept().await.unwrap();
+            assert_eq!(read_frame(&mut daemon).await["header"]["message_type"], "HANDSHAKE");
+            write_frame(&mut daemon, &frame("METHOD_RETURN", json!({}))).await;
+
+            // A ListWindows call, written as its length and first half...
+            let list = frame("METHOD_CALL", json!({ "destination": "org.geckoOS.evo", "interface": "org.geckoOS.evo", "method": "ListWindows" }));
+            let list_id = list["header"]["message_id"].clone();
+            let data = serde_json::to_vec(&list).unwrap();
+            let (first, rest) = data.split_at(data.len() / 2);
+            daemon.write_u32_le(data.len() as u32).await.unwrap();
+            daemon.write_all(first).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // ...then Evo emits a signal while the broker waits for the rest...
+            command_tx
+                .send(EchoCommand::EmitSignal { signal_name: "WindowFocused".into(), args: json!({}) })
+                .await
+                .unwrap();
+            assert_eq!(read_frame(&mut daemon).await["header"]["method"], "EmitSignal");
+            // ...and only then the second half.
+            daemon.write_all(rest).await.unwrap();
+
+            let answer = read_frame(&mut daemon).await;
+            assert_eq!(answer["header"]["reply_to"], list_id, "the split call was answered");
+            assert!(!rebind.load(Ordering::Acquire), "the broker did not reconnect");
+        })
+        .await
+        .expect("the broker lost the split frame");
+    }
+
+    #[test]
+    fn bind_surface_carries_the_pid_when_it_has_one() {
+        assert_eq!(
+            bind_surface_body("com.pyxis.notes", 7, Some(4242)),
+            json!({ "appId": "com.pyxis.notes", "surfaceId": 7, "pid": 4242 })
+        );
+        assert_eq!(
+            bind_surface_body("com.pyxis.notes", 7, None),
+            json!({ "appId": "com.pyxis.notes", "surfaceId": 7 })
+        );
+    }
+
+    /// Binding used to wait up to 3 s for the daemon on the compositor
+    /// thread. With no daemon at all it must return at once.
+    #[test]
+    fn binding_a_surface_does_not_wait_for_a_reply() {
+        std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir().join("evo-no-echo-daemon"));
+        let echo = GeckoEchoService::new().unwrap();
+        let start = Instant::now();
+        echo.bind_surface_remote("com.pyxis.notes", 1, Some(1)).unwrap();
+        echo.unbind_surface_remote(1).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_millis(500), "waited {:?}", start.elapsed());
     }
 
     #[test]
@@ -1877,23 +2309,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         PendingReply::Call(tx).fail();
         assert!(rx.try_recv().unwrap().is_err());
-    }
-
-    #[test]
-    fn test_create_window_request() {
-        let req = CreateWindowRequest::new("test.app", "native", 1280, 720);
-        assert_eq!(req.app_id, "test.app");
-        assert_eq!(req.app_type, "native");
-        assert_eq!(req.width, 1280);
-        assert_eq!(req.height, 720);
-        assert!(req.url.is_none());
-    }
-
-    #[test]
-    fn test_create_window_request_with_url() {
-        let req = CreateWindowRequest::new("gaia.app", "gaia", 800, 600)
-            .with_url("https://example.com");
-        assert_eq!(req.url, Some("https://example.com".to_string()));
     }
 
     #[test]

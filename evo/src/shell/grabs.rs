@@ -41,11 +41,15 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerMoveSur
         // While the grab is active, no client has pointer focus
         handle.motion(data, None, event);
 
+        // The window is in the hand once it moves (a press that goes nowhere
+        // doesn't lift it): its shadow grows, over the `lift` token.
+        self.window.set_lifted(true);
+
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
 
-        data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+        let new_location = data.clamp_to_work_area(&self.window, new_location.to_i32_round());
+        data.place_window(&self.window, new_location, true);
     }
 
     fn relative_motion(
@@ -164,7 +168,12 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerMoveSur
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut EvoState<BackendData>) {}
+    // The move is over: say where the window ended up. During the drag
+    // nothing is announced, because motion arrives faster than anyone can use.
+    fn unset(&mut self, data: &mut EvoState<BackendData>) {
+        self.window.set_lifted(false);
+        data.window_moved(&self.window);
+    }
 }
 
 pub struct TouchMoveSurfaceGrab<BackendData: Backend + 'static> {
@@ -217,10 +226,11 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchMoveSurface
             return;
         }
 
+        self.window.set_lifted(true);
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-        data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+        let new_location = data.clamp_to_work_area(&self.window, new_location.to_i32_round());
+        data.place_window(&self.window, new_location, true);
     }
 
     fn frame(
@@ -265,7 +275,10 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchMoveSurface
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut EvoState<BackendData>) {}
+    fn unset(&mut self, data: &mut EvoState<BackendData>) {
+        self.window.set_lifted(false);
+        data.window_moved(&self.window);
+    }
 }
 
 bitflags::bitflags! {
@@ -424,6 +437,16 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
         let min_height = (min_size.h + header).max(frame_min.1);
         let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
         let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h + header };
+        // Nor may a drag push an edge of the frame out of the work area (under
+        // the shell's top bar or dock, say).
+        let limit = data.max_resize_frame(
+            &self.window,
+            self.edges,
+            self.initial_window_location,
+            self.initial_window_size,
+        );
+        let max_width = max_width.min(limit.w);
+        let max_height = max_height.min(limit.h);
 
         new_window_width = new_window_width.max(min_width).min(max_width);
         new_window_height = new_window_height.max(min_height).min(max_height);
@@ -493,7 +516,8 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
                                 + (self.initial_window_size.h - geometry.size.h);
                         }
 
-                        data.space.map_element(self.window.clone(), location, true);
+                        data.place_window(&self.window, location, true);
+                        data.window_moved(&self.window);
                     }
 
                     with_states(&self.window.wl_surface().unwrap(), |states| {
@@ -524,7 +548,8 @@ impl<BackendData: Backend> PointerGrab<EvoState<BackendData>> for PointerResizeS
                                 + (self.initial_window_size.h - geometry.size.h);
                         }
 
-                        data.space.map_element(self.window.clone(), location, true);
+                        data.place_window(&self.window, location, true);
+                        data.window_moved(&self.window);
                     }
                     x11.configure(Rectangle::new(location, self.last_window_size))
                         .unwrap();
@@ -706,7 +731,8 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
                             self.initial_window_location.y + (self.initial_window_size.h - geometry.size.h);
                     }
 
-                    data.space.map_element(self.window.clone(), location, true);
+                    data.place_window(&self.window, location, true);
+                    data.window_moved(&self.window);
                 }
 
                 with_states(&self.window.wl_surface().unwrap(), |states| {
@@ -737,7 +763,8 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
                             self.initial_window_location.y + (self.initial_window_size.h - geometry.size.h);
                     }
 
-                    data.space.map_element(self.window.clone(), location, true);
+                    data.place_window(&self.window, location, true);
+                    data.window_moved(&self.window);
                 }
                 x11.configure(Rectangle::new(location, self.last_window_size))
                     .unwrap();
@@ -826,6 +853,16 @@ impl<BackendData: Backend> TouchGrab<EvoState<BackendData>> for TouchResizeSurfa
         let min_height = (min_size.h + header).max(frame_min.1);
         let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
         let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h + header };
+        // Nor may a drag push an edge of the frame out of the work area (under
+        // the shell's top bar or dock, say).
+        let limit = data.max_resize_frame(
+            &self.window,
+            self.edges,
+            self.initial_window_location,
+            self.initial_window_size,
+        );
+        let max_width = max_width.min(limit.w);
+        let max_height = max_height.min(limit.h);
 
         new_window_width = new_window_width.max(min_width).min(max_width);
         new_window_height = new_window_height.max(min_height).min(max_height);

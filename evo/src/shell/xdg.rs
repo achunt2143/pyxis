@@ -7,7 +7,6 @@ use smithay::{
         Space, Window, WindowSurfaceType,
     },
     input::{pointer::Focus, Seat},
-    output::Output,
     reexports::{
         wayland_protocols::xdg::{decoration as xdg_decoration, shell::server::xdg_toplevel},
         wayland_server::{
@@ -17,7 +16,7 @@ use smithay::{
     },
     utils::{Logical, Point, Rectangle, Serial, Size},
     wayland::{
-        compositor::{self, with_states},
+        compositor::{self, with_states, BufferAssignment, SurfaceAttributes},
         seat::WaylandFocus,
         shell::xdg::{
             Configure, PopupSurface, PositionerState, ToplevelCachedState, ToplevelSurface,
@@ -34,8 +33,9 @@ use crate::{
 };
 
 use super::{
-    fullscreen_output_geometry, place_new_window, FullscreenSurface, OldGeometry, PointerMoveSurfaceGrab,
-    PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState, SurfaceData, WindowElement,
+    placement::{PreFullscreen, PreFullscreenState},
+    OldGeometry, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge,
+    ResizeState, SurfaceData, WindowElement, WindowLayout,
 };
 
 /// Wayland `xdg_toplevel` app_id of the desktop shell (Bloom), stamped by
@@ -48,6 +48,11 @@ use super::{
 /// `ack_configure` to *initiate* that fullscreen from the compositor side.
 pub(crate) const SHELL_APP_ID: &str = "bloom";
 
+/// app_id of Bloom's overlay window, the transparent second shell window
+/// that holds what must be seen over apps (see `super::overlay`). vela stamps
+/// it `<shell app id>-overlay`.
+pub(crate) const OVERLAY_APP_ID: &str = "bloom-overlay";
+
 /// Marker stored in a shell window's `user_data` once Evo has issued its
 /// one compositor-initiated fullscreen for it (see `ack_configure`), so the
 /// trigger fires exactly once rather than on every configure ack.
@@ -59,34 +64,82 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-    let window = WindowElement(Window::new_wayland_window(surface.clone()));
+        let window = WindowElement(Window::new_wayland_window(surface.clone()));
+        // Who is on the other end is fixed by how it connected, and is known
+        // before it has said anything. Everything about the window's role
+        // and identity hangs on this, so it is recorded before the window is
+        // registered anywhere.
+        let (trusted, context_app_id) = self
+            .display_handle
+            .get_client(surface.wl_surface().id())
+            .ok()
+            .map(|client| {
+                (
+                    crate::trust::client_is_trusted(&client),
+                    client
+                        .get_data::<crate::state::ClientState>()
+                        .and_then(|state| state.security_context.as_ref())
+                        .and_then(|context| context.app_id.clone()),
+                )
+            })
+            .unwrap_or((false, None));
+        window.set_origin(trusted, context_app_id);
 
-    // Compute placement location
-    let pointer_location = self.pointer.current_location();
-    let location = self.compute_new_window_location(pointer_location, &window);
+        // Compute placement location
+        let pointer_location = self.pointer.current_location();
+        let location = self.compute_new_window_location(pointer_location, &window);
 
-    // Add to workspace manager which will also register with Echo and map to space
-    self.add_window_to_workspace(window.clone(), location);
-    // That location was picked before the window had a size; the first
-    // commit that gives it one places it for real.
-    window.set_placement_pending(true);
+        // Add to workspace manager which will also register with Echo and map to space
+        self.add_window_to_workspace(window.clone(), location);
+        // That location was picked before the window had a size; the first
+        // commit that gives it one places it for real.
+        window.set_placement_pending(true);
+        // Nor is it known yet whether this is an app or the shell: the first
+        // commit that maps it decides whether it takes the keyboard.
+        window.set_focus_pending(true);
 
-    debug!("Created new XDG toplevel window at {:?}", location);
+        debug!("Created new XDG toplevel window at {:?}", location);
 
-    // Set up commit handler for window resize/move updates
-    compositor::add_post_commit_hook::<EvoState<BackendData>, _>(
-        surface.wl_surface(),
-        |state, _, surface| {
-            handle_toplevel_commit(&mut state.space, surface);
-            // Also (re)check whether this is the shell that needs its
-            // compositor-driven fullscreen -- app_id is often set AFTER the
-            // initial configures, so ack_configure alone can miss it; commits
-            // keep coming, so this catches it whenever set_app_id lands.
-            state.maybe_init_shell_fullscreen(surface);
-        },
-    );
-}
+        // A client can unmap its window by committing a null buffer without
+        // destroying it. The snapshot a close animation draws has to be taken
+        // before that commit drops the buffer, so it is taken here, in the
+        // pre-commit hook, which runs before the pending state is applied.
+        compositor::add_pre_commit_hook::<EvoState<BackendData>, _>(
+            surface.wl_surface(),
+            |state, _, surface| {
+                let unmapping = with_states(surface, |states| {
+                    matches!(
+                        states.cached_state.get::<SurfaceAttributes>().pending().buffer,
+                        Some(BufferAssignment::Removed)
+                    )
+                });
+                if unmapping {
+                    if let Some(window) = state.tracked_window_for_surface(surface) {
+                        state.begin_close_animation(&window);
+                    }
+                }
+            },
+        );
 
+        // Set up commit handler for window resize/move updates
+        compositor::add_post_commit_hook::<EvoState<BackendData>, _>(
+            surface.wl_surface(),
+            |state, _, surface| {
+                state.handle_toplevel_commit(surface);
+                // Also (re)check whether this is the shell that needs its
+                // compositor-driven fullscreen -- app_id is often set AFTER the
+                // initial configures, so ack_configure alone can miss it; commits
+                // keep coming, so this catches it whenever set_app_id lands.
+                state.maybe_init_shell_fullscreen(surface);
+                // Likewise the appHost binding: it follows the app id, which
+                // can arrive or change on any commit.
+                #[cfg(feature = "echo-ipc")]
+                if let Some(window) = state.tracked_window_for_surface(surface) {
+                    state.sync_surface_binding(&window);
+                }
+            },
+        );
+    }
 
     /// A client destroyed its toplevel. Take the window out of the
     /// workspace, the Space, and the Echo registries.
@@ -111,17 +164,25 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     /// `vela-default` (no `pyxisApp` stamp) and then never leaves. It read
     /// as "kiosk mode was ignored on relaunch"; the window was real, just
     /// nobody's.
+    ///
+    /// The lookup used to be the Space's alone, and a minimized window is
+    /// out of the Space: closing one left a ghost in `ListWindows`, no
+    /// `WindowClosed`, and a surface appHost never unbound. It now looks
+    /// wherever a minimized window still is.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|w| w.0.toplevel().map(|t| t == &surface).unwrap_or(false))
-            .cloned()
-        else {
-            // Already gone, or never made it into the Space.
+        let Some(window) = self.tracked_window_for_toplevel(&surface) else {
+            // Already gone, or never tracked.
             debug!("toplevel_destroyed: no tracked window for this surface");
             return;
         };
+        if window.is_overlay() {
+            // The shell's layer is gone: what it reserved and grabbed goes
+            // with it, or apps stay squeezed under a bar nobody draws.
+            super::overlay::reset();
+            super::minimize::reset_targets();
+            self.note_overlay_keyboard(false);
+            self.set_work_area(super::work_area::Insets::default());
+        }
         self.remove_window_from_workspace(&window);
     }
 
@@ -203,11 +264,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                 }
             }
 
-            let window = self
-                .space
-                .elements()
-                .find(|element| element.wl_surface().as_deref() == Some(&surface));
-            if let Some(window) = window.cloned() {
+            if let Some(window) = self.tracked_window_for_surface(&surface) {
                 use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
                 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode as KdeMode;
 
@@ -250,7 +307,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                 // BOOT_DISPLAY_MODE=fullscreen -- so without this guard a
                 // windowed-mode boot would put an Evo header bar across the
                 // top of the desktop.
-                let is_shell = app_id.as_deref() == Some(SHELL_APP_ID);
+                let is_shell = window.is_shell_window();
                 let is_ssd = !is_shell && (xdg_ssd || kde_mode == Some(KdeMode::Server));
 
                 tracing::debug!(
@@ -260,7 +317,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                     kde_mode,
                     is_ssd
                 );
-                let was_ssd = window.decoration_height() > 0;
+                let was_ssd = window.ssd_negotiated();
                 window.set_ssd(is_ssd);
 
                 // Re-fit a maximized window when its decoration changes.
@@ -289,70 +346,15 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                     }
                 }
 
-                // Bind the surface to its AppHost session HERE, not at map
-                // time, because this is the first point at which the app id is
-                // actually known.
-                //
-                // The map path (state.rs) reads `XdgToplevelSurfaceData.app_id`
-                // while the toplevel is still being set up, and GTK/vela don't
-                // set it until later (it arrives via `windowclass` ->
-                // SyncAttributesToWidget -> nsWindow::SetWindowClass ->
-                // gdk_wayland_window_set_application_id). Binding there
-                // therefore saw `None`, fell back to the literal "unknown",
-                // and `AppHost::bind_surface` *synthesized* a session for it --
-                // measured on-device as one bogus `appId: "unknown"` session
-                // holding surfaces [1,2,3] while the real `files` session had
-                // `surfaces: []`. That empty list is why `nova.Focus` (which
-                // reads `surfaces.first()`) always answered "no mapped
-                // compositor window yet" and restore-from-dock never worked.
-                //
-                // `bind_surface` is idempotent (it skips a surface already in
-                // the session's list), so re-running on every configure ack is
-                // cheap and self-healing: whichever ack first carries a real
-                // app id is the one that binds.
+                // Bind the surface to its AppHost session once its app id is
+                // known -- which this ack is among the first points of, and
+                // never at map time (see `add_window_to_workspace`).
+                // `sync_surface_binding` sends nothing when the id is the one
+                // already bound, so this is cheap on every ack. It used to
+                // call `bind_surface_remote` here unconditionally, which
+                // waited on the daemon's reply, on this thread.
                 #[cfg(feature = "echo-ipc")]
-                {
-                    if let Some(app_id) = app_id.as_deref() {
-                        // Only bind toplevels that are actually apps.
-                        //
-                        // `AppHost::bind_surface` SYNTHESIZES a session for any
-                        // app id it doesn't already know, and the shell renders
-                        // every session as a dock entry — so anything bound
-                        // here that isn't a real app becomes a phantom running
-                        // app the user never launched. Excluded:
-                        //   - `bloom`, the shell itself: it's the desktop, not
-                        //     an app, and has no appHost session to bind to;
-                        //   - `unknown`, the fallback for a toplevel with no
-                        //     xdg app_id at all;
-                        //   - `vela-default`, vela's own default app id, which
-                        //     is what any window that never ran browser-init's
-                        //     PYXIS block reports. Nova's profile prefs now
-                        //     disable the WebExtensions dummy window that was
-                        //     producing these, but this stays as a backstop:
-                        //     any future stray vela toplevel must not be able
-                        //     to invent a dock entry.
-                        let bindable = !app_id.is_empty()
-                            && app_id != SHELL_APP_ID
-                            && app_id != "unknown"
-                            && app_id != "vela-default";
-                        if bindable {
-                            if let Some(window_id) = self.window_id_for(&window) {
-                                if let Err(e) = self
-                                    .echo_service
-                                    .read()
-                                    .bind_surface_remote(app_id, window_id)
-                                {
-                                    tracing::warn!(
-                                        "bind_surface({}, {}) failed: {}",
-                                        app_id,
-                                        window_id,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                self.sync_surface_binding(&window);
             }
             self.maybe_init_shell_fullscreen(&surface);
         }
@@ -361,81 +363,120 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     fn fullscreen_request(
         &mut self,
         surface: ToplevelSurface,
-        mut wl_output: Option<wl_output::WlOutput>,
+        wl_output: Option<wl_output::WlOutput>,
     ) {
-        let wl_surface = surface.wl_surface();
+        // Looked up where minimized windows still are, and every step is an
+        // early return rather than an unwrap: a minimized window can ask for
+        // fullscreen, and the lookup used to panic the compositor on it.
+        let Some(window) = self.tracked_window_for_toplevel(&surface) else {
+            return;
+        };
+        let is_shell = window.is_shell_window();
 
-        let output_geometry =
-            fullscreen_output_geometry(wl_surface, wl_output.as_ref(), &mut self.space);
-
-        if let Some(geometry) = output_geometry {
-            let output = wl_output
-                .as_ref()
-                .and_then(Output::from_resource)
-                .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
-            let client = match self.display_handle.get_client(wl_surface.id()) {
-                Ok(client) => client,
-                Err(_) => return,
-            };
-            for output in output.client_outputs(&client) {
-                wl_output = Some(output);
+        // A window that is not on any output yet is one still being set up,
+        // and its app id is not known either, so it can't be told from the
+        // shell. The shell asks for fullscreen at birth, and must not take
+        // the output exclusively: guessing "an app" here put the whole screen
+        // under a blank window. So the request waits (the shell is driven
+        // from the compositor side once its id lands, see
+        // `maybe_init_shell_fullscreen`). Not so for a minimized window, which
+        // is on no output either, but is known: it takes the primary one.
+        let known = is_shell
+            || wl_output.is_some()
+            || !self.space.outputs_for_element(&window).is_empty()
+            || self.workspace_manager.is_minimized(&window);
+        let output = known
+            .then(|| self.output_for_fullscreen(&window, wl_output.as_ref()))
+            .flatten();
+        let Some(geometry) = output.as_ref().and_then(|o| self.space.output_geometry(o)) else {
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
             }
-            // Clone out of the space so the immutable `elements()` borrow is
-            // released before the `map_element` below needs `&mut self.space`.
-            let window = self
-                .space
-                .elements()
-                .find(|window| {
-                    window
-                        .wl_surface()
-                        .map(|s| &*s == wl_surface)
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .unwrap();
+            return;
+        };
+        let Some(output) = output else {
+            return;
+        };
+        // The client's own handle on that output, if it has bound one.
+        let client_output = self
+            .display_handle
+            .get_client(surface.wl_surface().id())
+            .ok()
+            .and_then(|client| output.client_outputs(&client).next());
 
-            surface.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-                state.size = Some(geometry.size);
-                state.fullscreen_output = wl_output;
-            });
-
-            // The desktop shell (Bloom) is launched PYXIS_DISPLAY_MODE=
-            // fullscreen purely so GTK drops its titlebar (a Wayland toplevel
-            // is only chromeless when fullscreen/kiosk/undecorated -- see
-            // vela-gtk-titlebar-decoration). But unlike a real fullscreen app
-            // the shell must sit BEHIND ordinary app windows, not take over
-            // the output. Evo's exclusive-fullscreen render path (render.rs's
-            // FullscreenSurface) draws ONLY that one surface, which is exactly
-            // what made every app launched from the shell invisible. So for
-            // the shell we still send the fullscreen state+size above (that's
-            // what makes Firefox undecorate), but instead of registering it as
-            // the output's exclusive FullscreenSurface we map it at the output
-            // origin as an ordinary bottom-of-stack space window
-            // (activate=false, so app windows raised later stay on top).
-            // Real fullscreen apps (anything that isn't the shell) keep the
-            // exclusive scanout path. See evo-firefox-decoration-arch.
-            let app_id = with_states(wl_surface, |states| {
-                use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .and_then(|data| data.lock().unwrap().app_id.clone())
-            });
-            if app_id.as_deref() == Some(SHELL_APP_ID) {
-                self.space.map_element(window.clone(), geometry.loc, false);
-                trace!("Shell fullscreen (non-exclusive): {:?}", window);
-            } else {
-                output
-                    .user_data()
-                    .insert_if_missing(FullscreenSurface::default);
-                output
-                    .user_data()
-                    .get::<FullscreenSurface>()
-                    .unwrap()
-                    .set(window.clone());
-                trace!("Fullscreening: {:?}", window);
+        // The desktop shell (Bloom) is launched PYXIS_DISPLAY_MODE=
+        // fullscreen purely so GTK drops its titlebar (a Wayland toplevel
+        // is only chromeless when fullscreen/kiosk/undecorated -- see
+        // vela-gtk-titlebar-decoration). But unlike a real fullscreen app
+        // the shell must sit BEHIND ordinary app windows, not take over
+        // the output. Evo's exclusive-fullscreen render path (render.rs's
+        // FullscreenSurface) draws ONLY that one surface, which is exactly
+        // what made every app launched from the shell invisible. So for
+        // the shell we still send the fullscreen state+size below (that's
+        // what makes Firefox undecorate), but instead of registering it as
+        // the output's exclusive FullscreenSurface we map it at the output
+        // origin as an ordinary bottom-of-stack space window
+        // (activate=false, so app windows raised later stay on top).
+        // Real fullscreen apps (anything that isn't the shell) keep the
+        // exclusive scanout path. See evo-firefox-decoration-arch.
+        if !is_shell {
+            // The snapshot of the frame it is leaving, header included (which
+            // is suppressed below).
+            if self
+                .workspace_manager
+                .state(&window)
+                .map_or(WindowLayout::Floating, |s| s.layout)
+                != WindowLayout::Fullscreen
+            {
+                self.begin_geometry_transition(&window, Some(geometry.size));
             }
+            // Remember where it was and what it was, so leaving fullscreen
+            // puts it back. Before the header is suppressed below: the frame
+            // size includes it. Not for a window that has never had a real
+            // place (born fullscreen): there is nothing to go back to.
+            let layout = self
+                .workspace_manager
+                .state(&window)
+                .map_or(WindowLayout::Floating, |s| s.layout);
+            if layout != WindowLayout::Fullscreen && !window.placement_pending() {
+                if let Some(frame) = self.window_frame(&window) {
+                    window.user_data().insert_if_missing(PreFullscreen::default);
+                    if let Some(saved) = window.user_data().get::<PreFullscreen>() {
+                        saved.save(PreFullscreenState {
+                            location: self
+                                .space
+                                .element_location(&window)
+                                .unwrap_or(frame.loc),
+                            size: window.geometry().size,
+                            layout,
+                        });
+                    }
+                }
+            }
+            // A fullscreen window is bare: no header, and the client gets the
+            // whole output.
+            window.set_ssd_suppressed(true);
+            self.set_window_layout(&window, WindowLayout::Fullscreen);
+        }
+
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Fullscreen);
+            state.size = Some(geometry.size);
+            state.fullscreen_output = client_output;
+        });
+
+        if is_shell {
+            self.place_window(&window, geometry.loc, false);
+            trace!("Shell fullscreen (non-exclusive): {:?}", window);
+        } else {
+            self.place_window(&window, geometry.loc, true);
+            // A minimized window is only marked: it takes the output when it
+            // is restored (`unminimize_window`).
+            if self.is_window_mapped(&window) {
+                self.set_exclusive_fullscreen(&window, &output);
+                self.focus_window(&window);
+            }
+            trace!("Fullscreening: {:?}", window);
         }
 
         if surface.is_initial_configure_sent() {
@@ -444,17 +485,54 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let ret = surface.with_pending_state(|state| {
+        let window = self.tracked_window_for_toplevel(&surface);
+        let saved = window
+            .as_ref()
+            .and_then(|w| w.user_data().get::<PreFullscreen>().and_then(PreFullscreen::take));
+        if let Some(window) = &window {
+            if self
+                .workspace_manager
+                .state(window)
+                .is_some_and(|s| s.layout == WindowLayout::Fullscreen)
+            {
+                // Before the header comes back and the output is released.
+                self.begin_geometry_transition(window, None);
+            }
+            self.clear_exclusive_fullscreen(window);
+            window.set_ssd_suppressed(false);
+        }
+
+        surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
+            state.fullscreen_output.take();
+            // "You choose": a client that was never placed (born
+            // fullscreen) or has nothing saved picks its own size.
             state.size = None;
-            state.fullscreen_output.take()
         });
-        if let Some(output) = ret {
-            let output = Output::from_resource(&output).unwrap();
-            if let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() {
-                trace!("Unfullscreening: {:?}", fullscreen.get());
-                fullscreen.clear();
-                self.backend_data.reset_buffers(&output);
+
+        if let Some(window) = window {
+            trace!("Unfullscreening: {:?}", window);
+            window.begin_settling();
+            match saved {
+                Some(saved) if saved.layout == WindowLayout::Maximized => {
+                    // It was maximized before it went fullscreen, so it
+                    // goes back to maximized, not to a floating place.
+                    if let Some(target) = self.maximize_target(&window) {
+                        let client_size = maximized_client_size(&window, target.size);
+                        surface.with_pending_state(|state| state.size = Some(client_size));
+                        self.place_window(&window, target.loc, true);
+                    }
+                    self.set_window_layout(&window, WindowLayout::Maximized);
+                }
+                Some(saved) => {
+                    let header = window.decoration_height();
+                    let client_size = (saved.size.w, (saved.size.h - header).max(1)).into();
+                    surface.with_pending_state(|state| state.size = Some(client_size));
+                    let location = self.pull_into_work_area(&window, saved.location);
+                    self.place_window(&window, location, true);
+                    self.set_window_layout(&window, WindowLayout::Floating);
+                }
+                None => self.set_window_layout(&window, WindowLayout::Floating),
             }
         }
 
@@ -476,20 +554,37 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         // Evo's own `HeaderBar::handle_maximize`, deferred through
         // `insert_idle` to avoid a decoration_state double-borrow. Both must
         // be bulletproof; the SSD path is the one alpha2 #7 reports crashing.
-        let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+        let Some(window) = self.tracked_window_for_toplevel(&surface) else {
             return;
         };
         let Some(geometry) = self.maximize_target(&window) else {
             return;
         };
+        let layout = self
+            .workspace_manager
+            .state(&window)
+            .map_or(WindowLayout::Floating, |s| s.layout);
+        if layout == WindowLayout::Fullscreen {
+            // Already filling the output, and leaving fullscreen is the
+            // client's to ask for.
+            return;
+        }
+
+        // Draw the frame growing out of the old one: the snapshot is taken
+        // here, before anything below changes the window.
+        if layout != WindowLayout::Maximized {
+            self.begin_geometry_transition(&window, Some(geometry.size));
+        }
 
         // Remember pre-maximize geometry so unmaximize_request can put the
         // window back where it was. Not for a window that has never had a
-        // real place (PlacementPending). One maximized at birth would
-        // otherwise "restore" to the blind guess it was created at.
-        if window.placement_pending() {
+        // real place (PlacementPending): one maximized at birth would
+        // otherwise "restore" to the blind guess it was created at. And not
+        // when it is already maximized, where the frame on hand is the
+        // maximized one and would overwrite the place worth going back to.
+        if window.placement_pending() || layout == WindowLayout::Maximized {
             // Nothing worth remembering.
-        } else if let Some(old_geo) = self.space.element_bbox(&window) {
+        } else if let Some(old_geo) = self.window_frame(&window) {
             window.user_data().insert_if_missing(OldGeometry::default);
             if let Some(saved) = window.user_data().get::<OldGeometry>() {
                 saved.save(old_geo);
@@ -500,7 +595,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         tracing::info!(
             "maximize_request: output_size={:?} is_ssd={} client_size={:?}",
             geometry.size,
-            window.decoration_height() > 0,
+            window.is_ssd(),
             client_size
         );
 
@@ -508,7 +603,8 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = Some(client_size);
         });
-        self.space.map_element(window, geometry.loc, true);
+        self.place_window(&window, geometry.loc, true);
+        self.set_window_layout(&window, WindowLayout::Maximized);
 
         if surface.is_initial_configure_sent() {
             surface.send_configure();
@@ -517,9 +613,33 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
         // Defensive early-return (see maximize_request): never panic here.
-        let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+        let Some(window) = self.tracked_window_for_toplevel(&surface) else {
             return;
         };
+        if self
+            .workspace_manager
+            .state(&window)
+            .is_some_and(|s| s.layout == WindowLayout::Fullscreen)
+        {
+            // Fullscreen outranks it; the client only lets go of the flag.
+            surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            });
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
+            return;
+        }
+        // Only a window that is maximized has a frame to leave: a client that
+        // lets go of a flag it never had must not freeze its picture waiting
+        // for a size that will not change.
+        if self
+            .workspace_manager
+            .state(&window)
+            .is_some_and(|s| s.layout == WindowLayout::Maximized)
+        {
+            self.begin_geometry_transition(&window, None);
+        }
         let restored = window
             .user_data()
             .get::<OldGeometry>()
@@ -540,6 +660,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             restored.is_some()
         );
 
+        window.begin_settling();
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
             state.size = None;
@@ -569,11 +690,10 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
                 .first()
                 .cloned()
                 .or_else(|| self.space.outputs().next().cloned())?;
-            let output_geo = self.space.output_geometry(&output)?;
+            let output_geo = super::work_area::of_output(self.space.output_geometry(&output)?);
             let size = self
-                .space
-                .element_bbox(&window)
-                .map(|bbox| bbox.size)
+                .window_frame(&window)
+                .map(|frame| frame.size)
                 .unwrap_or(output_geo.size);
             // Centre, clamped so the titlebar can never land off-screen.
             Some(
@@ -592,8 +712,14 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         );
 
         if let Some(loc) = restore_loc {
-            self.space.map_element(window, loc, true);
+            // Where it was before may be under the shell's top bar now (it
+            // was placed before Bloom reported a work area). Only its
+            // top-left is moved here: its size is the client's to choose, and
+            // `fit_to_work_area` fits the rest when it commits.
+            let loc = self.pull_into_work_area(&window, loc);
+            self.place_window(&window, loc, true);
         }
+        self.set_window_layout(&window, WindowLayout::Floating);
 
         if surface.is_initial_configure_sent() {
             surface.send_configure();
@@ -609,7 +735,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         // `minimize_window`. Without this override smithay's default no-op
         // `minimize_request` swallows the CSD click and the window never
         // hides.
-        let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
+        let Some(window) = self.tracked_window_for_toplevel(&surface) else {
             return;
         };
         self.minimize_window(&window);
@@ -685,14 +811,9 @@ impl<BackendData: Backend> EvoState<BackendData> {
         if window.user_data().get::<ShellFullscreenedMarker>().is_some() {
             return;
         }
-        let app_id = with_states(surface, |states| {
-            use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .and_then(|d| d.lock().unwrap().app_id.clone())
-        });
-        if app_id.as_deref() != Some(SHELL_APP_ID) {
+        // Trusted clients only: a window that merely claims to be the shell
+        // gets no fullscreen of its own choosing.
+        if !window.is_shell_window() {
             return;
         }
         window
@@ -706,17 +827,20 @@ impl<BackendData: Backend> EvoState<BackendData> {
         }
     }
 
-    /// The output geometry a maximized `window` fills: its own output, or
-    /// the first one if it has none yet (a window maximized before it was
+    /// The area a maximized `window` fills: its own output's work area (the
+    /// output minus the edges the shell reserves, see `work_area`), or the
+    /// first output's if it has none yet (a window maximized before it was
     /// ever mapped onto an output).
-    fn maximize_target(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
+    pub(super) fn maximize_target(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
         let output = self
             .space
             .outputs_for_element(window)
             .first()
             .cloned()
             .or_else(|| self.space.outputs().next().cloned())?;
-        self.space.output_geometry(&output)
+        self.space
+            .output_geometry(&output)
+            .map(super::work_area::of_output)
     }
 
     /// Start an interactive resize of `surface` from the press that `serial`
@@ -879,6 +1003,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
                 if changed {
                     surface.send_configure();
                     initial_window_location = start_data.location.to_i32_round();
+                    self.set_window_layout(&window, WindowLayout::Floating);
                 }
 
                 let grab = TouchMoveSurfaceGrab {
@@ -929,6 +1054,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
             surface.send_configure();
             let pos = pointer.current_location();
             initial_window_location = (pos.x as i32, pos.y as i32).into();
+            self.set_window_layout(&window, WindowLayout::Floating);
         }
 
         let grab = PointerMoveSurfaceGrab {
@@ -973,27 +1099,79 @@ impl<BackendData: Backend> EvoState<BackendData> {
     }
 }
 
-/// Give a window with a guessed location (PlacementPending) its real place,
-/// once it has a size and floats. The compositor's commit handler calls this
-/// right after `Window::on_commit`. That is the one point where the size is
-/// current: in a post-commit hook, which runs first, the first buffer's size
-/// is not in yet. vela paints into a subsurface and rarely commits its
-/// toplevel again, so the hook version never placed a vela window at all
-/// (found on device, 2026-09-25).
-pub(crate) fn settle_placement(space: &mut Space<WindowElement>, window: &WindowElement) {
-    if window.is_shell() {
-        // The shell places itself (fullscreen, see
-        // maybe_init_shell_fullscreen). Never centre it.
-        window.set_placement_pending(false);
-    } else if let Some(location) = first_real_placement(space, window) {
-        tracing::info!(
-            "placing {:?} ({:?}) at {:?}, now that it has a size",
-            window.app_id(),
-            window.geometry().size,
-            location
-        );
-        window.set_placement_pending(false);
-        space.map_element(window.clone(), location, false);
+impl<BackendData: Backend> EvoState<BackendData> {
+    /// Give a window with a guessed location (PlacementPending) its real
+    /// place, once it has a size and floats. The compositor's commit handler
+    /// calls this right after `Window::on_commit`. That is the one point
+    /// where the size is current: in a post-commit hook, which runs first,
+    /// the first buffer's size is not in yet. vela paints into a subsurface
+    /// and rarely commits its toplevel again, so the hook version never
+    /// placed a vela window at all (found on device, 2026-09-25).
+    pub(crate) fn settle_placement(&mut self, window: &WindowElement) {
+        if window.is_shell() || window.is_overlay() {
+            // The shell places itself (fullscreen, see
+            // maybe_init_shell_fullscreen). Never centre it.
+            window.set_placement_pending(false);
+        } else if let Some(location) = first_real_placement(&self.space, window) {
+            tracing::info!(
+                "placing {:?} ({:?}) at {:?}, now that it has a size",
+                window.app_id(),
+                window.geometry().size,
+                location
+            );
+            window.set_placement_pending(false);
+            self.place_window_initially(window, location);
+        }
+    }
+
+    /// Follow a top-left resize: when the window's left or top edge is the
+    /// one being dragged, its location moves as its size changes.
+    pub(crate) fn handle_toplevel_commit(&mut self, surface: &WlSurface) -> Option<()> {
+        let window = self.tracked_window_for_surface(surface)?;
+
+        let mut window_loc = self.space.element_location(&window)?;
+        let geometry = window.geometry();
+
+        let new_loc: Point<Option<i32>, Logical> =
+            with_states(window.wl_surface().as_deref()?, |states| {
+                let data = states
+                    .data_map
+                    .get::<RefCell<SurfaceData>>()?
+                    .borrow_mut();
+
+                if let ResizeState::Resizing(resize_data) = data.resize_state {
+                    let edges = resize_data.edges;
+                    let loc = resize_data.initial_window_location;
+                    let size = resize_data.initial_window_size;
+
+                    edges.intersects(ResizeEdge::TOP_LEFT).then(|| {
+                        let new_x = edges
+                            .intersects(ResizeEdge::LEFT)
+                            .then_some(loc.x + (size.w - geometry.size.w));
+
+                        let new_y = edges
+                            .intersects(ResizeEdge::TOP)
+                            .then_some(loc.y + (size.h - geometry.size.h));
+
+                        (new_x, new_y).into()
+                    })
+                } else {
+                    None
+                }
+            })?;
+
+        if let Some(new_x) = new_loc.x {
+            window_loc.x = new_x;
+        }
+        if let Some(new_y) = new_loc.y {
+            window_loc.y = new_y;
+        }
+
+        if new_loc.x.is_some() || new_loc.y.is_some() {
+            self.place_window(&window, window_loc, false);
+        }
+
+        Some(())
     }
 }
 
@@ -1022,7 +1200,7 @@ fn first_real_placement(space: &Space<WindowElement>, window: &WindowElement) ->
         .first()
         .cloned()
         .or_else(|| space.outputs().next().cloned())?;
-    let area = space.output_geometry(&output)?;
+    let area = super::work_area::of_output(space.output_geometry(&output)?);
     // Clamped at the top-left, so a window bigger than its output keeps its
     // title bar and buttons on screen.
     Some(Point::from((
@@ -1037,59 +1215,8 @@ fn first_real_placement(space: &Space<WindowElement>, window: &WindowElement) ->
 /// header, and the render path pushes the client down by it). So the client
 /// must be that much shorter than the output, or header and client together
 /// overflow the screen and the client's bottom rows fall off.
-fn maximized_client_size(window: &WindowElement, output_size: Size<i32, Logical>) -> Size<i32, Logical> {
+pub(super) fn maximized_client_size(window: &WindowElement, output_size: Size<i32, Logical>) -> Size<i32, Logical> {
     let mut client_size = output_size;
     client_size.h = (client_size.h - window.decoration_height()).max(1);
     client_size
-}
-
-fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface) -> Option<()> {
-    let window = space
-        .elements()
-        .find(|w| w.wl_surface().as_deref() == Some(surface))
-        .cloned()?;
-
-    let mut window_loc = space.element_location(&window)?;
-    let geometry = window.geometry();
-
-    let new_loc: Point<Option<i32>, Logical> =
-        with_states(window.wl_surface().as_deref()?, |states| {
-            let data = states
-                .data_map
-                .get::<RefCell<SurfaceData>>()?
-                .borrow_mut();
-
-            if let ResizeState::Resizing(resize_data) = data.resize_state {
-                let edges = resize_data.edges;
-                let loc = resize_data.initial_window_location;
-                let size = resize_data.initial_window_size;
-
-                edges.intersects(ResizeEdge::TOP_LEFT).then(|| {
-                    let new_x = edges
-                        .intersects(ResizeEdge::LEFT)
-                        .then_some(loc.x + (size.w - geometry.size.w));
-
-                    let new_y = edges
-                        .intersects(ResizeEdge::TOP)
-                        .then_some(loc.y + (size.h - geometry.size.h));
-
-                    (new_x, new_y).into()
-                })
-            } else {
-                None
-            }
-        })?;
-
-    if let Some(new_x) = new_loc.x {
-        window_loc.x = new_x;
-    }
-    if let Some(new_y) = new_loc.y {
-        window_loc.y = new_y;
-    }
-
-    if new_loc.x.is_some() || new_loc.y.is_some() {
-        space.map_element(window, window_loc, false);
-    }
-
-    Some(())
 }

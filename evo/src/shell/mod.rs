@@ -47,7 +47,16 @@ use crate::{
 
 mod element;
 mod grabs;
+mod animation;
+mod geometry_anim;
+pub(crate) mod minimize;
+pub(crate) mod overlay;
+pub(crate) mod placement;
+pub(crate) mod recede;
+pub(crate) mod switcher;
+pub(crate) mod thumbnails;
 pub(crate) mod ssd;
+pub(crate) mod work_area;
 #[cfg(feature = "xwayland")]
 mod x11;
 mod xdg;
@@ -56,25 +65,7 @@ pub mod workspace;
 pub use self::element::*;
 pub use self::grabs::*;
 pub use workspace::*;
-
-fn fullscreen_output_geometry(
-    wl_surface: &WlSurface,
-    wl_output: Option<&wl_output::WlOutput>,
-    space: &mut Space<WindowElement>,
-) -> Option<Rectangle<i32, Logical>> {
-    // First test if a specific output has been requested
-    // if the requested output is not found ignore the request
-    wl_output
-        .and_then(Output::from_resource)
-        .or_else(|| {
-            let w = space
-                .elements()
-                .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false));
-            w.and_then(|w| space.outputs_for_element(w).first().cloned())
-        })
-        .as_ref()
-        .and_then(|o| space.output_geometry(o))
-}
+pub(crate) use xdg::{OVERLAY_APP_ID, SHELL_APP_ID};
 
 #[derive(Default)]
 pub struct FullscreenSurface(RefCell<Option<WindowElement>>);
@@ -181,10 +172,23 @@ impl<BackendData: Backend> CompositorHandler for EvoState<BackendData> {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(window) = self.window_for_surface(root.clone()) {
+            // Tracked, not just mapped: a minimized window keeps committing,
+            // and skipping `on_commit` for it left its geometry stale for
+            // when it came back.
+            if let Some(window) = self.tracked_window_for_surface(&root) {
                 window.0.on_commit();
-                if window.placement_pending() {
-                    xdg::settle_placement(&mut self.space, &window);
+                let mapped = self.is_window_mapped(&window);
+                if window.placement_pending() && mapped {
+                    self.settle_placement(&window);
+                }
+                if mapped {
+                    // A floating window bigger than the work area (or outside
+                    // it) is shrunk and moved in; a no-op once it fits.
+                    self.fit_to_work_area(&window);
+                    self.maybe_start_open_animation(&window, &root);
+                }
+                if window.focus_pending() {
+                    self.focus_new_window_if_mapped(&window, &root);
                 }
 
                 if &root == surface {
@@ -198,8 +202,13 @@ impl<BackendData: Backend> CompositorHandler for EvoState<BackendData> {
                     });
 
                     if let Some(buffer_offset) = buffer_offset {
-                        let current_loc = self.space.element_location(&window).unwrap();
-                        self.space.map_element(window.clone(), current_loc + buffer_offset, false);
+                        let current_loc = self
+                            .space
+                            .element_location(&window)
+                            .or_else(|| self.workspace_manager.state(&window).map(|s| s.location));
+                        if let Some(current_loc) = current_loc {
+                            self.place_window(&window, current_loc + buffer_offset, false);
+                        }
                     }
                 }
                 if !&root.alive() {
@@ -406,7 +415,7 @@ fn place_new_window(
     pointer_location: Point<f64, Logical>,
     window: &WindowElement,
     activate: bool,
-) {
+) -> Point<i32, Logical> {
     // place the window at a random location on same output as pointer
     // or if there is not output in a [0;800]x[0;800] square
     use rand::distributions::{Distribution, Uniform};
@@ -421,7 +430,7 @@ fn place_new_window(
             let geo = space.output_geometry(&o)?;
             let map = layer_map_for_output(&o);
             let zone = map.non_exclusive_zone();
-            Some(Rectangle::new(geo.loc + zone.loc, zone.size))
+            Some(work_area::usable(geo, zone))
         })
         .unwrap_or_else(|| Rectangle::from_size((800, 800).into()));
 
@@ -442,9 +451,16 @@ fn place_new_window(
     let y = y_range.sample(&mut rng);
 
     space.map_element(window.clone(), (x, y), activate);
+    (x, y).into()
 }
 
-pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {
+/// Pull outputs back into a row and re-place windows stranded off every
+/// output. Returns the windows it moved, so the caller (`EvoState::
+/// fixup_positions`) can record their new places: this has only the space.
+pub fn fixup_positions(
+    space: &mut Space<WindowElement>,
+    pointer_location: Point<f64, Logical>,
+) -> Vec<(WindowElement, Point<i32, Logical>)> {
     // fixup outputs
     let mut offset = Point::<i32, Logical>::from((0, 0));
     for output in space.outputs().cloned().collect::<Vec<_>>().into_iter() {
@@ -479,7 +495,11 @@ pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point
             orphaned_windows.push(window.clone());
         }
     }
-    for window in orphaned_windows.into_iter() {
-        place_new_window(space, pointer_location, &window, false);
-    }
+    orphaned_windows
+        .into_iter()
+        .map(|window| {
+            let location = place_new_window(space, pointer_location, &window, false);
+            (window, location)
+        })
+        .collect()
 }

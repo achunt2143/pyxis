@@ -42,11 +42,12 @@ const MAXIMIZE_HOVER_RGB: [u8; 3] = [0x19, 0x76, 0xD2];
 const MINIMIZE_RGB: [u8; 3] = [0xFF, 0xC1, 0x07];
 const MINIMIZE_HOVER_RGB: [u8; 3] = [0xFF, 0xB3, 0x00];
 const GLASS_RGBA: [u8; 4] = [0xFF, 0xFF, 0xFF, 0x33];
-const GLASS_CORNER_RADIUS: f32 = 16.0;
+const GLASS_CORNER_RADIUS: f32 = crate::anim::depth::FRAME_RADIUS as f32;
 
 // === WINDOW BORDER (item #8: see overlapping windows) ===
-// Evo draws no drop shadow, so a thin outer border is the only edge cue when
-// windows overlap. Pure black keeps it premultiplied-safe (premult == straight
+// A thin outer border, over the drop shadow (`anim::depth`) that gives windows
+// their depth, so the edge stays crisp where a light window meets a light one.
+// Pure black keeps it premultiplied-safe (premult == straight
 // for black), so it blends correctly whatever the renderer's alpha convention.
 const BORDER_THICKNESS: i32 = 1;
 const BORDER_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
@@ -285,12 +286,19 @@ use crate::enhancements::decorations::{
 
 /// Window decoration state stored in window user data
 pub struct SSDState {
-    pub is_ssd: bool,
     pub header_bar: HeaderBar,
     
     // GeckoOS decoration metadata (themes, hit testing, etc.)
     #[cfg(feature = "decorations")]
     pub decoration: Option<WindowDecoration>,
+}
+
+/// The decoration answers that geometry and hit-testing need. See
+/// `WindowElement::is_ssd`.
+#[derive(Default)]
+struct SsdFlags {
+    negotiated: std::cell::Cell<bool>,
+    suppressed: std::cell::Cell<bool>,
 }
 
 /// Header bar rendering state
@@ -316,6 +324,21 @@ pub struct HeaderBar {
     // Rounded top corners (constant arcs); straight edges run between/below them.
     pub border_corner_tl: MemoryRenderBuffer,
     pub border_corner_tr: MemoryRenderBuffer,
+    // Rounded bottom corners, to match the client content's clip.
+    pub border_corner_bl: MemoryRenderBuffer,
+    pub border_corner_br: MemoryRenderBuffer,
+    /// Maximized or fullscreen: square corners all round. Set by the caller
+    /// before `redraw`, which reshapes the frame when it changes.
+    pub square: bool,
+    /// Whether the client content is clipped to round bottom corners. Without
+    /// it (depth off, or the shaders failed) the bottom stays square, as it
+    /// was before depth, and the border follows.
+    pub bottom_round: bool,
+    /// The shape `redraw` last drew, so a change is noticed.
+    shaped_square: bool,
+    shaped_bottom: bool,
+    /// 0 (inactive) ..= 1 (active): how bright the glass, title and buttons are.
+    pub focus: f32,
     pub border_top: SolidColorBuffer,
     pub border_bottom: SolidColorBuffer,
     pub border_left: SolidColorBuffer,
@@ -393,6 +416,26 @@ impl HeaderBar {
                     [0, 0, 0, BORDER_ALPHA_U8],
                 ),
             ),
+            border_corner_bl: memory_buffer(
+                BORDER_CORNER_SIZE,
+                BORDER_CORNER_SIZE,
+                rasterize_corner(
+                    BORDER_CORNER_SIZE,
+                    GLASS_CORNER_RADIUS,
+                    (GLASS_CORNER_RADIUS, 0.0),
+                    [0, 0, 0, BORDER_ALPHA_U8],
+                ),
+            ),
+            border_corner_br: memory_buffer(
+                BORDER_CORNER_SIZE,
+                BORDER_CORNER_SIZE,
+                rasterize_corner(BORDER_CORNER_SIZE, GLASS_CORNER_RADIUS, (0.0, 0.0), [0, 0, 0, BORDER_ALPHA_U8]),
+            ),
+            square: false,
+            bottom_round: true,
+            shaped_square: false,
+            shaped_bottom: true,
+            focus: 1.0,
             border_top: SolidColorBuffer::default(),
             border_bottom: SolidColorBuffer::default(),
             border_left: SolidColorBuffer::default(),
@@ -404,6 +447,14 @@ impl HeaderBar {
             #[cfg(feature = "decorations")]
             theme: Theme::default(),
         }
+    }
+
+    /// The top and bottom corner radii the frame was last shaped with.
+    fn corner_radii(&self) -> (i32, i32) {
+        let r = GLASS_CORNER_RADIUS as i32;
+        let top = if self.shaped_square { 0 } else { r };
+        let bottom = if self.shaped_square || !self.shaped_bottom { 0 } else { r };
+        (top, bottom)
     }
 
     /// Set theme and trigger redraw
@@ -641,13 +692,15 @@ impl HeaderBar {
 
     /// Handle minimize button action. Minimizing is purely a compositor-side
     /// visibility choice (no client protocol round-trip needed, unlike
-    /// close/maximize) -- `EvoState::minimize_window` already implements
-    /// this correctly via the workspace manager, it just wasn't wired up to
-    /// the SSD button before now.
+    /// close/maximize) -- `EvoState::minimize_window` keeps the window in
+    /// its workspace with everything needed to restore it. Deferred to an
+    /// idle callback like the other buttons: it moves keyboard focus, and the
+    /// click that got us here is still inside the pointer-button dispatch.
     fn handle_minimize<B: Backend>(&self, state: &mut EvoState<B>, window: &WindowElement) {
-        state.minimize_window(window);
+        let window = window.clone();
+        state.handle.insert_idle(move |data| data.minimize_window(&window));
     }
-    
+
     /// Start an interactive resize from a press in the band around the
     /// frame. Deferred to an idle callback for the same reason as
     /// `handle_move` and `handle_maximize`: this runs inside the SSD click's
@@ -750,15 +803,20 @@ impl HeaderBar {
             return;
         }
 
-        let needs_redraw_buttons = width != self.width;
+        let reshaped = self.square != self.shaped_square || self.bottom_round != self.shaped_bottom;
+        let needs_redraw_buttons = width != self.width || reshaped;
+        // A square frame (maximized, fullscreen) has no corner radius.
+        let corner = if self.square { 0.0 } else { GLASS_CORNER_RADIUS };
         if needs_redraw_buttons {
             self.width = width;
+            self.shaped_square = self.square;
+            self.shaped_bottom = self.bottom_round;
             // Only the glass bar depends on window width -- (re)rasterize it
             // now rather than on every hover-triggered redraw.
             self.background = memory_buffer(
                 width,
                 HEADER_BAR_HEIGHT as u32,
-                rasterize_glass_bar(width, HEADER_BAR_HEIGHT as u32, GLASS_CORNER_RADIUS, GLASS_RGBA),
+                rasterize_glass_bar(width, HEADER_BAR_HEIGHT as u32, corner, GLASS_RGBA),
             );
         }
 
@@ -767,20 +825,21 @@ impl HeaderBar {
         // real size change so damage tracking sees stable buffers otherwise.
         if needs_redraw_buttons || window_height != self.window_height {
             self.window_height = window_height;
-            let r = GLASS_CORNER_RADIUS as i32;
+            let (rt, rb) = self.corner_radii();
             let w = width as i32;
             let h = window_height.max(1) as i32;
-            // Top edge runs BETWEEN the two rounded top corners; the side edges
-            // start BELOW them. The bottom corners are square (the client
-            // content isn't rounded there), so the bottom edge spans the full
-            // width and the sides run all the way down.
+            // The top and bottom edges run BETWEEN the rounded corners, the
+            // side edges BETWEEN the top and bottom ones. The client content is
+            // clipped to the same radius at its bottom (`anim::shader`), so the
+            // frame reads as one rounded card. A square frame has no radius.
             self.border_top
-                .update(((w - 2 * r).max(0), BORDER_THICKNESS), BORDER_COLOR);
-            self.border_bottom.update((w, BORDER_THICKNESS), BORDER_COLOR);
+                .update(((w - 2 * rt).max(0), BORDER_THICKNESS), BORDER_COLOR);
+            self.border_bottom
+                .update(((w - 2 * rb).max(0), BORDER_THICKNESS), BORDER_COLOR);
             self.border_left
-                .update((BORDER_THICKNESS, (h - r).max(0)), BORDER_COLOR);
+                .update((BORDER_THICKNESS, (h - rt - rb).max(0)), BORDER_COLOR);
             self.border_right
-                .update((BORDER_THICKNESS, (h - r).max(0)), BORDER_COLOR);
+                .update((BORDER_THICKNESS, (h - rt - rb).max(0)), BORDER_COLOR);
         }
 
         // === TITLE === re-rasterize only when the text or the space available
@@ -885,12 +944,15 @@ where
         // between/below them.
         let full_h = self.window_height.max(HEADER_BAR_HEIGHT as u32) as i32;
         let w_i = self.width as i32;
-        let r_i = GLASS_CORNER_RADIUS as i32;
+        let (rt, rb) = self.corner_radii();
+        // The header's own brightness, dimmed while the window is inactive.
+        let dim = crate::anim::depth::HEADER_INACTIVE;
+        let head = alpha * (dim + (1.0 - dim) * self.focus.clamp(0.0, 1.0));
         for (buf, off) in [
-            (&self.border_top, Point::<i32, Logical>::from((r_i, 0))),
-            (&self.border_bottom, Point::from((0, full_h - BORDER_THICKNESS))),
-            (&self.border_left, Point::from((0, r_i))),
-            (&self.border_right, Point::from((w_i - BORDER_THICKNESS, r_i))),
+            (&self.border_top, Point::<i32, Logical>::from((rt, 0))),
+            (&self.border_bottom, Point::from((rb, full_h - BORDER_THICKNESS))),
+            (&self.border_left, Point::from((0, rt))),
+            (&self.border_right, Point::from((w_i - BORDER_THICKNESS, rt))),
         ] {
             elements.push(
                 DecorationRenderElement::from(SolidColorRenderElement::from_buffer(
@@ -903,11 +965,17 @@ where
                 .into(),
             );
         }
-        // Rounded top corners (arcs matching the glass radius).
-        for (corner, off) in [
-            (&self.border_corner_tl, Point::<i32, Logical>::from((0, 0))),
-            (&self.border_corner_tr, Point::from((w_i - r_i, 0))),
-        ] {
+        // Rounded corners (arcs matching the glass radius), none when square.
+        let mut corners: Vec<(&MemoryRenderBuffer, Point<i32, Logical>)> = Vec::with_capacity(4);
+        if rt > 0 {
+            corners.push((&self.border_corner_tl, Point::from((0, 0))));
+            corners.push((&self.border_corner_tr, Point::from((w_i - rt, 0))));
+        }
+        if rb > 0 {
+            corners.push((&self.border_corner_bl, Point::from((0, full_h - rb))));
+            corners.push((&self.border_corner_br, Point::from((w_i - rb, full_h - rb))));
+        }
+        for (corner, off) in corners {
             if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
                 (location + off.to_physical_precise_round(scale)).to_f64(),
@@ -938,7 +1006,7 @@ where
             renderer,
             close_loc.to_f64(),
             &self.close_button,
-            Some(alpha),
+            Some(head),
             None,
             None,
             Kind::Unspecified,
@@ -954,7 +1022,7 @@ where
                 &self.maximize_button,
                 location + (header_end_offset - button_offset.upscale(2)).to_physical_precise_round(scale),
                 scale,
-                alpha,
+                head,
                 Kind::Unspecified,
             ))
             .into(),
@@ -966,7 +1034,7 @@ where
             renderer,
             minimize_loc.to_f64(),
             &self.minimize_button,
-            Some(alpha),
+            Some(head),
             None,
             None,
             Kind::Unspecified,
@@ -986,7 +1054,7 @@ where
                 renderer,
                 (location + title_off.to_physical_precise_round(scale)).to_f64(),
                 title_buf,
-                Some(alpha),
+                Some(head),
                 None,
                 None,
                 Kind::Unspecified,
@@ -1002,7 +1070,7 @@ where
             renderer,
             location.to_f64(),
             &self.background,
-            Some(alpha),
+            Some(head),
             None,
             None,
             Kind::Unspecified,
@@ -1022,7 +1090,6 @@ impl WindowElement {
     pub fn decoration_state(&self) -> RefMut<'_, SSDState> {
         self.user_data().insert_if_missing(|| {
             RefCell::new(SSDState {
-                is_ssd: false,
                 header_bar: HeaderBar::new(),
                 #[cfg(feature = "decorations")]
                 decoration: None,
@@ -1035,9 +1102,58 @@ impl WindowElement {
             .borrow_mut()
     }
     
+    /// Whether Evo draws this window's frame right now.
+    ///
+    /// This is what `SpaceElement::geometry`/`bbox`/`is_in_input_region` ask,
+    /// and Space calls those from inside `map_element`, which several
+    /// header-bar paths reach while they still hold `decoration_state()`'s
+    /// `RefMut` (alpha2 #7 was that panic). So the answer lives in `Cell`s,
+    /// outside the `RefCell`: reading it can never conflict with a borrow.
+    pub fn is_ssd(&self) -> bool {
+        self.user_data()
+            .get::<SsdFlags>()
+            .is_some_and(|flags| flags.negotiated.get() && !flags.suppressed.get())
+    }
+
+    /// Whether the window fills its space (maximized or fullscreen): it is
+    /// drawn square, with no shadow. The committed state, i.e. what is on
+    /// screen now, like `ssd_resizable_frame`.
+    pub fn is_square(&self) -> bool {
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => toplevel.with_committed_state(|state| {
+                state.is_some_and(|state| {
+                    state.states.contains(xdg_toplevel::State::Maximized)
+                        || state.states.contains(xdg_toplevel::State::Fullscreen)
+                })
+            }),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => surface.is_maximized() || surface.is_fullscreen(),
+        }
+    }
+
+    /// Whether the client negotiated server-side decoration, whether or not
+    /// Evo is drawing it at the moment (it isn't while fullscreen).
+    pub fn ssd_negotiated(&self) -> bool {
+        self.user_data()
+            .get::<SsdFlags>()
+            .is_some_and(|flags| flags.negotiated.get())
+    }
+
     /// Enable or disable server-side decorations
     pub fn set_ssd(&self, ssd: bool) {
-        self.decoration_state().is_ssd = ssd;
+        self.user_data().insert_if_missing(SsdFlags::default);
+        if let Some(flags) = self.user_data().get::<SsdFlags>() {
+            flags.negotiated.set(ssd);
+        }
+    }
+
+    /// Hide the frame without forgetting that it was negotiated: a
+    /// fullscreen window is bare, and gets its header back when it leaves.
+    pub fn set_ssd_suppressed(&self, suppressed: bool) {
+        self.user_data().insert_if_missing(SsdFlags::default);
+        if let Some(flags) = self.user_data().get::<SsdFlags>() {
+            flags.suppressed.set(suppressed);
+        }
     }
     
     /// Set decoration theme (GeckoOS enhancement)
