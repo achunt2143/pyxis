@@ -37,6 +37,19 @@ chrome flags rewritten ~2s later, so every check made at window open reports a
 correct window, and there is no other way to observe the settled state (serial
 console only; QMP screendump reports "no surface" on Evo's GL scanout).
 Asserted by scripts/serial-tests/kiosk-relaunch.txt.
+UPDATE (2026-09-27): the shell's overlay window. A window opened with the
+`pyxisOverlay` key (openPyxisAppWindow's `overlay` option, in the
+BrowserContentHandler patch) gets the app id `<appId>-overlay` instead of
+`<appId>`, a `pyxisoverlay` root attribute, and a USER sheet that makes its
+chrome paint nothing (user !important outranks any !important background in
+browser chrome's author sheets). Evo stacks that app id above app windows and
+passes clicks through it except where Bloom reports it draws
+(evo/src/shell/overlay.rs). The window is only transparent if the profile
+also sets mozilla.widget.use-argb-visuals (an alpha visual, which Gecko
+decides at widget creation) and browser.tabs.allow_transparent_browser;
+geckoOS-boot sets both for the shell. Verified on device 2026-09-27: the
+desktop shows through the overlay, and the overlay's drawing sits above a
+maximized app.
 
 ════════════════════════════════════════════════════════════════════════
 The unified diff below is generated from the checkout and is applied with
@@ -46,7 +59,7 @@ git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
 ════════════════════════════════════════════════════════════════════════
 
 diff --git a/browser/base/content/browser-init.js b/browser/base/content/browser-init.js
-index c32b781be079..ff623747d677 100644
+index c32b781be079..bff5d7d7167d 100644
 --- a/browser/base/content/browser-init.js
 +++ b/browser/base/content/browser-init.js
 @@ -101,6 +101,23 @@ var gBrowserInit = {
@@ -73,7 +86,7 @@ index c32b781be079..ff623747d677 100644
      // If opening a Taskbar Tab window, add an attribute to the top-level element
      // to inform window styling.
      if (window.arguments && window.arguments[1]) {
-@@ -114,6 +131,48 @@ var gBrowserInit = {
+@@ -114,6 +131,73 @@ var gBrowserInit = {
            extraOptions.getPropertyAsAString("taskbartab")
          );
        }
@@ -116,13 +129,38 @@ index c32b781be079..ff623747d677 100644
 +        // xulWinType-derived path in SetWindowClass (which uppercases the
 +        // first letter and replaces non-alphanumeric characters), passing
 +        // `windowclass` directly bypasses that transform entirely.
-+        root.setAttribute("windowclass", appId);
-+        root.setAttribute("windowname", appId);
++        // The shell's overlay window (openPyxisAppWindow's `overlay`
++        // option) gets its own app id, `<appId>-overlay`, which is how Evo
++        // knows to stack it above app windows and pass clicks through it
++        // (evo/src/shell/overlay.rs). It is transparent wherever its page
++        // draws nothing. Three things make it so: an alpha visual
++        // (`mozilla.widget.use-argb-visuals`, a user pref, set for the shell
++        // only), a transparent <browser> (`browser.tabs.allow_transparent_browser`),
++        // and the chrome below painting nothing at all. The last is a USER
++        // sheet because user !important outranks any !important background in
++        // browser chrome's own (author) sheets.
++        let windowClass = appId;
++        if (extraOptions.hasKey("pyxisOverlay")) {
++          windowClass = `${appId}-overlay`;
++          root.setAttribute("pyxisoverlay", "true");
++          window.windowUtils.loadSheetUsingURIString(
++            "data:text/css," +
++              encodeURIComponent(
++                ":root[pyxisoverlay], :root[pyxisoverlay] * {" +
++                  " background: transparent !important;" +
++                  " appearance: none !important;" +
++                  " box-shadow: none !important; }"
++              ),
++            window.windowUtils.USER_SHEET
++          );
++        }
++        root.setAttribute("windowclass", windowClass);
++        root.setAttribute("windowname", windowClass);
 +      }
      }
  
      // Run menubar initialization first, to avoid CustomTitlebar code picking
-@@ -524,6 +583,77 @@ var gBrowserInit = {
+@@ -524,6 +608,77 @@ var gBrowserInit = {
        }
      }
  

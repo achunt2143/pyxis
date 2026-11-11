@@ -116,20 +116,16 @@ ChromeUtils.defineLazyGetter(lazy, "socketTransportService", () => {
   );
 });
 
-// In-memory subscription table: browsingContextId -> Set("service:event").
-// Used so Echo signal fan-out (once wired) only pushes to actors that
-// actually asked for a given service:event pair (PyxisBridgeChild's
-// _addEventListener sends "PyxisBridge:Subscribe" on first listener add).
-const gSubscriptions = new Map();
-
-// Process-wide table of live PyxisBridgeParent instances, keyed by
-// browsingContext id, so a Signal message arriving on ANY actor's Echo
-// connection can be fanned out to every subscribed actor rather than only
-// the one that happens to own that particular socket. Populated in
-// actorCreated()/didDestroy() (see below). This is what
-// forwardEventToContent's TODO asked for: a real registry to dispatch
-// through once the transport exists.
-const gLiveActors = new Map();
+// Every live PyxisBridgeParent, so that a signal arriving on the shared Echo
+// connection is offered to each of them (dispatchSignalToSubscribers).
+// Populated in actorCreated()/didDestroy().
+//
+// Each actor holds its own subscriptions (`_subscriptions`). They used to
+// live in one table keyed by browsing context id. But a browsing context
+// outlives its documents, and a subscription is allowed or refused by the
+// app id of the document that asked for it (_handleSubscribe), so it has to
+// go when that document goes. There is one actor per document.
+const gLiveActors = new Set();
 
 // Process-wide cache of app-id -> declared permissions[], populated by
 // _getDeclaredPermissions() below. Deliberately process-lifetime (not
@@ -595,28 +591,24 @@ function tracingLog(...args) {
 
 // --- Signal fan-out ---
 //
-// Echo signals are broadcast, not per-connection-filtered (see
-// echo/src/signals.rs's SignalBus::broadcast and daemon.rs's handling of
-// MessageType::Signal, which just calls signal_bus().broadcast() with no
-// subscriber-list concept on the wire) — so EVERY EchoConnection that has
-// ever sent a Signal message would in principle see it echoed back only if
-// it re-subscribes; determining whether unsolicited SIGNAL messages arrive
-// on a plain method-call connection without an explicit subscribe step is
-// left for the follow-up wiring this stretch-goal section describes below.
-// For now, any SIGNAL message that does arrive on a connection is fanned
-// out to every live actor whose subscription table matches
-// interface:method, mirroring gSubscriptions' existing per-actor filtering.
+// Echo sends every signal to every connection it has
+// (IPCBus::broadcast_to_all_connections in echo/src/lib.rs), with no
+// subscriber list, so this process's one connection hears all of them:
+// every app's notifications, the root shell's output, which apps run. What
+// reaches content is decided here alone. Each actor delivers a signal only
+// if its document subscribed to it, and only if BRIDGE_SIGNALS lists it
+// with a capability the document's app holds (forwardEventToContent).
 function dispatchSignalToSubscribers(message) {
   const service = message.header.interface?.replace(/^org\.geckoOS\./, "");
   const eventName = message.header.method;
-  if (!service || !eventName) {
-    return;
-  }
-  const key = `${service}:${eventName}`;
-  for (const actor of gLiveActors.values()) {
-    const bcId = actor.browsingContext?.id;
-    if (bcId != null && gSubscriptions.get(bcId)?.has(key)) {
+  for (const actor of gLiveActors) {
+    // A document that is going away can throw here. That must not cost the
+    // others the signal, or escape into _onInputReady, which would take it
+    // for a lost connection and fail every call in flight.
+    try {
       actor.forwardEventToContent(service, eventName, message.body);
+    } catch (e) {
+      console.error(`[PyxisBridge] could not deliver ${service}.${eventName}:`, e);
     }
   }
 }
@@ -636,20 +628,457 @@ function getEchoConnection() {
   return gEchoConnection;
 }
 
+// --- Capability allow-list ---
+//
+// Every (service, method) this bridge forwards to Echo, with the capability
+// an app must hold to call it, or `null` where the call needs none. The
+// strings are Nova's capability vocabulary: what an app holds is the
+// `permissions` Nova's GetInfo returns for it (see _getDeclaredPermissions).
+//
+// Deny by default: a pair that is not listed is refused, the same way as a
+// capability the app did not declare. Until 2026-09-27 it was the other way
+// round. The table had only filesystem, power, notification and appManager,
+// an unlisted pair came back as `null`, and `null` meant allowed. So every
+// other service was open to every pyxis:// app, a third-party .ipk
+// included: a root shell (terminal), any command as root (process.spawn),
+// other apps' windows (evo), launching and killing apps (nova, appHost),
+// package installs (installer), volume and output (audio), settings
+// writes, and the bus's own RegisterService and EmitSignal. Now a new Echo
+// method, or a whole new service, stays out of apps' reach until someone
+// decides here what it needs.
+//
+// `null` is for calls that change nothing and expose nothing about the user
+// or other apps: readings like the OS version or the battery level.
+// Everything else names a capability, even where every app that calls it
+// today holds that capability anyway.
+//
+// The vocabulary lives in three places that must change together: this
+// table; Nova (echo/src/services/nova.rs: KNOWN_CAPABILITIES, its
+// privileged subset PRIVILEGED_CAPABILITIES, and the dotted appinfo names
+// that map onto them); and vroom (src/config.rs and
+// schemas/{appinfo,pyxis}.schema.json), which checks the dotted names in
+// packages. A test in nova.rs reads this table and fails on a capability
+// Nova does not know.
+//
+// The privileged capabilities are notifications:manage, appManager:install,
+// appManager:manage, settings:write, windows:manage and terminal, and the
+// three that widen a filesystem call's reach, filesystem:user,
+// filesystem:system and filesystem:apps (FILESYSTEM_SCOPES, below). Nova
+// grants them only to an app on its trust list (PRIVILEGED_APP_IDS) at a
+// root-mediated tier, so declaring one does not get it.
+//
+// Deliberately absent, so that no app can call them:
+//   - process.*, which spawns any command, and signals any pid, as root;
+//   - Echo.*, the bus itself: RegisterService would let an app take over a
+//     service's name, and EmitSignal would let it forge any signal;
+//   - Rockhopper.* and Shift.*, which those daemons register on the bus
+//     (Rockhopper's ExecuteApplication runs the executable it is given);
+//   - evo.SwitchWorkspace and evo.CreateWorkspace, which Evo refuses until
+//     workspaces are real (evo.CreateWindow is gone: it spawned a program
+//     as root for whatever app id the caller named);
+//   - deviceInfo.getSerial and deviceInfo.getUUID, the DMI serial and
+//     /etc/machine-id: stable identifiers that no app needs;
+//   - windowManager.*, which PyxisBridgeChild exposes and no service
+//     implements.
+const BRIDGE_CAPABILITIES = {
+  // What the OS is, and whether the bus answers. getInfo includes the
+  // hostname, so deviceInfo.getHostname needs nothing either.
+  system: {
+    getInfo: null,
+    ping: null,
+    listServices: null,
+  },
+  // Files. Every call is also confined to one directory tree, its scope,
+  // which _scopeFilesystemCall stamps on it (FILESYSTEM_SCOPES, below).
+  filesystem: {
+    readFile: "filesystem:read",
+    readDirectory: "filesystem:read",
+    exists: "filesystem:read",
+    stat: "filesystem:read",
+    writeFile: "filesystem:write",
+    appendFile: "filesystem:write",
+    deleteFile: "filesystem:write",
+    deleteDirectory: "filesystem:write",
+    createDirectory: "filesystem:write",
+    copy: "filesystem:write",
+    move: "filesystem:write",
+    chmod: "filesystem:write",
+  },
+  power: {
+    shutdown: "power",
+    reboot: "power",
+    sleep: "power",
+    wake: "power",
+    setScreenBrightness: "power",
+    setScreenTimeout: "power",
+    getBatteryStatus: null,
+    getScreenBrightness: null,
+    getScreenTimeout: null,
+  },
+  deviceInfo: {
+    getOS: null,
+    getKernel: null,
+    getModel: null,
+    getManufacturer: null,
+    getHardware: null,
+    getHostname: null,
+    getMemoryInfo: null,
+    getCPUInfo: null,
+    // The root filesystem's size and free space. The caller used to name
+    // the path `df` ran on, which told any app whether a path existed, so
+    // _handleCallService drops whatever the page sends.
+    getStorageInfo: null,
+  },
+  // Connection state and addresses. getStatus carries the Wi-Fi SSID, which
+  // says where the device is.
+  network: {
+    getStatus: "network",
+    getType: "network",
+    getInterfaces: "network",
+    getIPAddress: "network",
+    getGateway: "network",
+    getDNS: "network",
+  },
+  // Every app reads pyxis.theme as it starts (the SDK's AppShell), so
+  // reading is open. That is only safe because writing is privileged: the
+  // store holds what the shell and Settings put in it, UI preferences.
+  // Nothing secret may ever be kept there.
+  settings: {
+    get: null,
+    getAll: null,
+    set: "settings:write",
+    delete: "settings:write",
+    clear: "settings:write",
+    reset: "settings:write",
+  },
+  // The clock in the device's time zone, the zones there are, and where the
+  // device is for the sun (a location the user set, else the zone's city).
+  // Pages take the offset from here because vela keeps the zone it started
+  // with. Changing the zone is a system setting, so settings:write.
+  time: {
+    getClock: null,
+    listTimezones: null,
+    getLocation: null,
+    setTimezone: "settings:write",
+  },
+  // Raising a notification is an app's own business. Reading or
+  // dismissing the centre is the shell's: `list` returns every app's
+  // notifications, text included, so it is privileged
+  // (`notifications:manage`, which Nova grants only to PRIVILEGED_APP_IDS).
+  notification: {
+    show: "notifications",
+    list: "notifications:manage",
+    close: "notifications:manage",
+    closeAll: "notifications:manage",
+  },
+  // The system's volume, mute and output device, and its named sounds.
+  audio: {
+    getVolume: "audio",
+    setVolume: "audio",
+    setMute: "audio",
+    listOutputs: "audio",
+    setDefaultOutput: "audio",
+  },
+  sound: {
+    play: "audio",
+    list: "audio",
+  },
+  // Other apps: launching, closing and raising them, and the registry of
+  // what is installed, each app's permissions included.
+  nova: {
+    Launch: "appManager:manage",
+    Close: "appManager:manage",
+    Focus: "appManager:manage",
+    List: "appManager:manage",
+    GetInfo: "appManager:manage",
+    Install: "appManager:install",
+    Uninstall: "appManager:install",
+    Reload: "appManager:install",
+    // Opens an http(s) URL (Nova refuses any other scheme) in a new browser
+    // window. No click is needed, so this is more than following a link.
+    OpenExternalBrowser: "browser",
+  },
+  appHost: {
+    LaunchApp: "appManager:manage",
+    CloseApp: "appManager:manage",
+    KillApp: "appManager:manage",
+    RestartApp: "appManager:manage",
+    ListApps: "appManager:manage",
+    ListRunningApps: "appManager:manage",
+    GetAppState: "appManager:manage",
+    BindSurface: "appManager:manage",
+    UnbindSurface: "appManager:manage",
+    ListSurfaceSessions: "appManager:manage",
+    SubscribeAppLifecycle: "appManager:manage",
+  },
+  // The pre-AppHost shim over the same lifecycle.
+  appManager: {
+    launch: "appManager:manage",
+    close: "appManager:manage",
+    list: "appManager:manage",
+    getInfo: "appManager:manage",
+    kill: "appManager:manage",
+    restart: "appManager:manage",
+    setActive: "appManager:manage",
+    getActive: "appManager:manage",
+    install: "appManager:install",
+    uninstall: "appManager:install",
+  },
+  installer: {
+    ListAvailable: "appManager:install",
+    Inspect: "appManager:install",
+    ListInstalled: "appManager:install",
+    Install: "appManager:install",
+    Remove: "appManager:install",
+  },
+  // A root shell: echo-daemon runs as root and forks the shell itself.
+  terminal: {
+    Open: "terminal",
+    Write: "terminal",
+    Resize: "terminal",
+    Close: "terminal",
+  },
+  // Evo's control of any app's windows, and the shell's hold on the screen:
+  // the overlay's input region and keyboard (SetOverlayRegion,
+  // SetOverlayFocus, GetOverlayState) and the edges apps must leave to the
+  // top bar and dock (SetWorkArea). All of it is windows:manage, which only
+  // the shell's own trust-listed ids hold, so no app can reserve the screen,
+  // take the keyboard for the overlay, or learn what the overlay covers.
+  evo: {
+    ListWindows: "windows:manage",
+    GetRenderingStatus: "windows:manage",
+    FocusWindow: "windows:manage",
+    MinimizeWindow: "windows:manage",
+    RestoreWindow: "windows:manage",
+    MaximizeWindow: "windows:manage",
+    UnmaximizeWindow: "windows:manage",
+    CloseWindow: "windows:manage",
+    SetOverlayRegion: "windows:manage",
+    SetOverlayFocus: "windows:manage",
+    SetWorkArea: "windows:manage",
+    // Where each running app's dock icon is, so a window minimizes into it
+    // and restores out of it. The shell's dock reports it.
+    SetMinimizeTargets: "windows:manage",
+    GetOverlayState: "windows:manage",
+    // A picture of each window, for the overview's and the switcher's cards.
+    // What an app draws is its own business: only the shell may see others'.
+    GetWindowThumbnails: "windows:manage",
+    // Window animation (evo/src/anim): the mode is a user setting, so
+    // writing it is settings:write; reading the mode and the counters
+    // reveals nothing about any app, so it needs nothing.
+    SetAnimationSettings: "settings:write",
+    GetAnimationState: null,
+  },
+};
+
+// --- Signal allow-list ---
+//
+// Every (service, event) this bridge delivers to apps, with the capability
+// an app must hold to receive it. The vocabulary is BRIDGE_CAPABILITIES',
+// and the nova.rs test that checks that table reads this one too. `null`
+// means the signal needs no capability: settings.SettingChanged carries a key
+// and its value, and every key is already readable with settings.get, which
+// needs none.
+//
+// Deny by default, since 2026-09-28. Before, an app could subscribe to any
+// service:event, and Echo sends every signal to every connection, so any
+// pyxis:// app, a third-party .ipk included, heard all of them: every app's
+// notifications, title and body included, which notification.list keeps to
+// notifications:manage; the Terminal app's root shell, its output and the
+// keystrokes it echoes back; which apps run, and what gets installed. Now a
+// subscription is checked when it is made (_handleSubscribe) and each signal
+// again as it is delivered (forwardEventToContent), so a signal that is not
+// listed here reaches no app.
+//
+// A signal needs what the calls on the same data need: whoever may list the
+// notifications, run the shell, manage apps or windows, or set the volume
+// may hear them change. The listeners today are Bloom (the notification
+// centre and toasts, the dock and launcher through appHost and nova, volume
+// in quick settings), the Terminal app, Settings' Sound page and the
+// Installer app. evo's window events have no listener yet.
+//
+// Deliberately absent, so that no app hears them:
+//   - Echo's own (Shutdown), and Shift's process events (pids and app ids);
+//   - evo's GeckoReady, and the events PyxisBridgeChild's namespace helpers
+//     name (appManager.onLaunched, power.onBatteryLow, filesystem.watch
+//     and the rest), which no service emits. settings.onChange is one of
+//     those names; the signal settings actually emits is SettingChanged;
+//   - any other interface. Echo passes a raw SIGNAL frame, or
+//     Echo.EmitSignal, from any client on to every connection, under
+//     whatever interface the client names.
+const BRIDGE_SIGNALS = {
+  notification: {
+    NotificationShown: "notifications:manage",
+    NotificationClosed: "notifications:manage",
+  },
+  audio: {
+    VolumeChanged: "audio",
+    OutputChanged: "audio",
+  },
+  // One per key a set/delete/clear/reset changed: {key, value, previous,
+  // exists}. The Settings app and the shell are different origins, so a
+  // BroadcastChannel can't carry a change between them; this does.
+  settings: {
+    SettingChanged: null,
+  },
+  // The zone changed: {timezone, utc_offset_minutes}. Needs nothing, like
+  // time.getClock, which tells any app the same.
+  time: {
+    TimezoneChanged: null,
+  },
+  terminal: {
+    TerminalOpened: "terminal",
+    TerminalOutput: "terminal",
+    TerminalClosed: "terminal",
+  },
+  appHost: {
+    AppStarting: "appManager:manage",
+    AppRunning: "appManager:manage",
+    AppSuspended: "appManager:manage",
+    AppStopped: "appManager:manage",
+    AppCrashed: "appManager:manage",
+    AppSurfaceMapped: "appManager:manage",
+    AppSurfaceUnmapped: "appManager:manage",
+  },
+  nova: {
+    RegistryChanged: "appManager:manage",
+    AppInstalled: "appManager:manage",
+    AppUninstalled: "appManager:manage",
+    AppLaunched: "appManager:manage",
+    AppSuspended: "appManager:manage",
+    AppResumed: "appManager:manage",
+  },
+  installer: {
+    InstallStarted: "appManager:install",
+    InstallProgress: "appManager:install",
+    InstallCompleted: "appManager:install",
+    InstallFailed: "appManager:install",
+    RemoveCompleted: "appManager:install",
+    RemoveFailed: "appManager:install",
+  },
+  evo: {
+    WindowCreated: "windows:manage",
+    WindowClosed: "windows:manage",
+    WindowMoved: "windows:manage",
+    WindowMovedToWorkspace: "windows:manage",
+    WindowFocusChanged: "windows:manage",
+    WindowMinimized: "windows:manage",
+    WindowMaximized: "windows:manage",
+    WindowFullscreen: "windows:manage",
+    // A global shortcut Evo caught (Super tap, Super+Tab, Super+Space,
+    // Super+D). Gated like the window signals: it says what the user is
+    // doing while another app has the keyboard.
+    ShortcutTriggered: "windows:manage",
+    OverlayFocusChanged: "windows:manage",
+    // Alt+Tab, for Bloom's overview to draw (open/step/commit/cancel with
+    // the selected window and the MRU order). Evo owns the keys and the
+    // order; this is how the shell hears them.
+    SwitcherChanged: "windows:manage",
+    // A minimize's orb reached its dock icon ("land") or a restore left it
+    // ("rise"): Bloom ripples the icon. Says which windows come and go.
+    MinimizeLanded: "windows:manage",
+    WorkspaceChanged: "windows:manage",
+    WorkspaceCreated: "windows:manage",
+    WorkspaceDeleted: "windows:manage",
+  },
+};
+
+// --- Filesystem scopes ---
+//
+// Where an app's filesystem calls can reach. Echo can't tell apps apart (a
+// connection carries no credentials, and a message's sender is whatever the
+// client wrote), so this bridge, which can, stamps every filesystem call
+// with a `scope`, and echo confines the call to it: it resolves each path
+// beneath the scope's root with openat2(RESOLVE_BENEATH), and runs the call
+// as geckouser, not root (echo/src/services/filesystem/scope.rs). The scope
+// is written over anything the page sent, as notification.show's appId is.
+//
+// An app's scope is its own data, `app:<id>`, which echo keeps in
+// /var/lib/pyxis/data/<id> and the app sees as `~`. Holding a capability
+// here widens it:
+//   - user: the user's home, which the app then sees as `~` instead;
+//   - system: the whole root filesystem, read-only, reached with absolute
+//     paths. /proc, /sys, /dev, /run and /tmp are other mounts, and stay out
+//     of reach;
+//   - apps: another app's own data, named by the call's `app` field. The
+//     shell's desktop search reads Notes, Contacts and Tasks this way, and
+//     adds notes and tasks.
+// All three are privileged. The Files app holds user and system, and Bloom
+// holds apps. Writing outside the home needs a capability that does not
+// exist yet: it is to come with a "privileged access" unlock
+// (docs/internal/pyxis-privileged-access-plan.md).
+//
+// Until 2026-10-06 there were no scopes. Echo ran every filesystem call as
+// root on whatever path the page sent, so any app holding filesystem:write,
+// a third-party .ipk included, could rewrite /etc/shadow, set a setuid bit
+// or delete /usr/bin.
+const FILESYSTEM_SCOPES = {
+  user: "filesystem:user",
+  system: "filesystem:system",
+  apps: "filesystem:apps",
+};
+
+// The capability `table` (BRIDGE_CAPABILITIES or BRIDGE_SIGNALS) names for
+// `member` of `service`: a string, `null` when it needs none, or `undefined`
+// when the table does not list it, which the bridge refuses. Own properties
+// only, so a name like `constructor` or `__proto__` can't find anything on
+// Object.prototype.
+function tableCapability(table, service, member) {
+  if (typeof service !== "string" || typeof member !== "string") {
+    return undefined;
+  }
+  if (!Object.hasOwn(table, service)) {
+    return undefined;
+  }
+  const members = table[service];
+  return Object.hasOwn(members, member) ? members[member] : undefined;
+}
+
+// Content chooses `service` and `method`, so they are cut short before they
+// go into an error message or the log. A non-string is shown only by its
+// type. String() would call the value's own toString, and a cloned object
+// can carry a toString that is not a function ({ toString: null }), which
+// makes String() throw.
+function clip(value) {
+  const text = typeof value === "string" ? value : `(${typeof value})`;
+  return text.length > 64 ? `${text.slice(0, 64)}…` : text;
+}
+
+// A refusal is logged, and a refused call is thrown as well. The SDK's
+// EchoClient answers a failed native call from its mock, so to the app a
+// refusal can look like success, and a refused subscription tells the app
+// nothing at all: its listener just never fires. This line is where either
+// shows on a device: the shell's vela writes to /var/log/vela.log, and a
+// Nova-launched app's to /var/log/echo.log (AppHost's children inherit
+// echo-daemon's stdout). Each distinct refusal is logged once, and only the
+// first DENIAL_LOG_LIMIT of them, so an app calling in a loop can't fill the
+// disk.
+const DENIAL_LOG_LIMIT = 200;
+const gLoggedDenials = new Set();
+function logDenial(detail) {
+  if (!gLoggedDenials.has(detail) && gLoggedDenials.size < DENIAL_LOG_LIMIT) {
+    gLoggedDenials.add(detail);
+    console.warn(`[PyxisBridge] Pyxis capability denied: ${detail}`);
+  }
+}
+
+function capabilityDenied(detail) {
+  logDenial(detail);
+  return new Error(`Pyxis capability denied: ${detail}`);
+}
+
 export class PyxisBridgeParent extends JSWindowActorParent {
   actorCreated() {
-    const bcId = this.browsingContext?.id;
-    if (bcId != null) {
-      gLiveActors.set(bcId, this);
-    }
+    // "service:event" keys this document subscribed to that passed the
+    // check in _handleSubscribe.
+    this._subscriptions = new Set();
+    gLiveActors.add(this);
   }
 
   didDestroy() {
-    const bcId = this.browsingContext?.id;
-    if (bcId != null) {
-      gLiveActors.delete(bcId);
-      gSubscriptions.delete(bcId);
-    }
+    this._destroyed = true;
+    this._subscriptions.clear();
+    gLiveActors.delete(this);
   }
 
   async receiveMessage(msg) {
@@ -657,8 +1086,7 @@ export class PyxisBridgeParent extends JSWindowActorParent {
       case "PyxisBridge:CallService":
         return this._handleCallService(msg.data);
       case "PyxisBridge:Subscribe":
-        this._handleSubscribe(msg.data);
-        return undefined;
+        return this._handleSubscribe(msg.data);
       default:
         console.error(`[PyxisBridge] unknown message: ${msg.name}`);
         return undefined;
@@ -676,12 +1104,24 @@ export class PyxisBridgeParent extends JSWindowActorParent {
     // enforcement model that pyxis-webos-parity-analysis.md and
     // nova-runtime-host-plan.md §5 both call out as the gap to close.
     const capability = this._capabilityFor(service, method);
-    const declared = await this._getDeclaredPermissions(appId);
-    if (capability && !declared.includes(capability)) {
-      throw new Error(
-        `Pyxis capability denied: app '${appId}' did not declare '${capability}' ` +
-          `(required for ${service}.${method})`
-      );
+    const call = `${clip(service)}.${clip(method)}`;
+    if (capability === undefined) {
+      throw capabilityDenied(`app '${appId}' called ${call}, which no app may call`);
+    }
+    if (capability !== null) {
+      const declared = await this._getDeclaredPermissions(appId);
+      if (!declared.includes(capability)) {
+        throw capabilityDenied(
+          `app '${appId}' did not declare '${capability}' (required for ${call})`
+        );
+      }
+    }
+
+    if (service === "filesystem") {
+      params = await this._scopeFilesystemCall(appId, call, capability, params);
+    }
+    if (service === "deviceInfo" && method === "getStorageInfo") {
+      params = {};
     }
 
     // Stamp who raised a notification. The store trusts `appId` only because
@@ -695,33 +1135,125 @@ export class PyxisBridgeParent extends JSWindowActorParent {
     return this._echoRequest(service, method, params, appId);
   }
 
-  _handleSubscribe({ service, eventName }) {
-    const bcId = this.browsingContext?.id;
-    if (bcId == null) {
-      return;
+  // Stamps `scope` on a filesystem call (FILESYSTEM_SCOPES): another app's
+  // own data when the call names one in `app`, which needs filesystem:apps;
+  // `system` when it names an absolute path, which needs filesystem:system
+  // and may only read; otherwise the user's home, for an app holding
+  // filesystem:user, or else the app's own data. A path that is not a string
+  // is refused, so that echo can never read a path this check did not see.
+  async _scopeFilesystemCall(appId, call, capability, params) {
+    const { app: target, ...fields } =
+      params && typeof params === "object" ? params : {};
+    let absolute = false;
+    for (const key of ["path", "source", "destination"]) {
+      if (!Object.hasOwn(fields, key) || fields[key] === undefined) {
+        continue;
+      }
+      if (typeof fields[key] !== "string") {
+        throw new Error(`${call}: ${key} must be a string`);
+      }
+      absolute ||= fields[key].startsWith("/");
     }
-    const key = `${service}:${eventName}`;
-    if (!gSubscriptions.has(bcId)) {
-      gSubscriptions.set(bcId, new Set());
+
+    const declared = await this._getDeclaredPermissions(appId);
+    let scope;
+    if (target !== undefined && target !== appId) {
+      const needed = FILESYSTEM_SCOPES.apps;
+      if (typeof target !== "string" || !declared.includes(needed)) {
+        throw capabilityDenied(
+          `app '${appId}' did not declare '${needed}' (required for another app's data in ${call})`
+        );
+      }
+      if (absolute) {
+        throw new Error(`${call}: another app's data is reached with ~ paths, not absolute ones`);
+      }
+      // Echo checks the id is one, and refuses the call if not.
+      scope = `app:${target}`;
+    } else if (absolute) {
+      const needed = FILESYSTEM_SCOPES.system;
+      if (!declared.includes(needed)) {
+        throw capabilityDenied(
+          `app '${appId}' did not declare '${needed}' (required for an absolute path in ${call})`
+        );
+      }
+      if (capability === "filesystem:write") {
+        throw capabilityDenied(
+          `app '${appId}' called ${call} on an absolute path, and outside the home files are read-only`
+        );
+      }
+      scope = "system";
+    } else {
+      scope = declared.includes(FILESYSTEM_SCOPES.user) ? "user" : `app:${appId}`;
     }
-    gSubscriptions.get(bcId).add(key);
-    // Signal delivery: Echo's SignalBus broadcasts unconditionally (see
-    // echo/src/signals.rs) rather than requiring per-client subscription
-    // registration on the bus itself, so there is nothing further to
-    // register with Echo — the filtering this table performs is entirely
-    // local. If a future Echo version adds server-side subscriber lists
-    // (an EchoSubscribe MessageType already exists in message.rs's enum,
-    // unused today), this would be the place to send it.
+    return { ...fields, scope };
   }
 
-  // Called by dispatchSignalToSubscribers() (this file, above) when a
-  // `org.geckoOS.*` signal arrives that matches a subscribed service:event
-  // for this actor's browsing context.
-  forwardEventToContent(service, eventName, data) {
-    const bcId = this.browsingContext?.id;
-    const key = `${service}:${eventName}`;
-    if (bcId == null || !gSubscriptions.get(bcId)?.has(key)) {
+  // PyxisBridgeChild sends a subscription the first time its page listens
+  // to a service:event. It is kept only if BRIDGE_SIGNALS lists the pair and
+  // the app holds the capability the table names; a refusal is logged. The
+  // child never learns the answer (it sends with sendAsyncMessage), so a
+  // refused listener simply never fires. Nothing is registered with Echo,
+  // which sends every signal to every connection anyway: the filtering is
+  // all in this file.
+  async _handleSubscribe({ service, eventName }) {
+    let appId;
+    try {
+      appId = this._appIdForThisActor();
+    } catch (e) {
+      console.error(`[PyxisBridge] ${e.message}`);
       return;
+    }
+    const capability = tableCapability(BRIDGE_SIGNALS, service, eventName);
+    const signal = `${clip(service)}.${clip(eventName)}`;
+    if (capability === undefined) {
+      logDenial(`app '${appId}' subscribed to ${signal}, which no app may receive`);
+      return;
+    }
+    if (capability !== null) {
+      const declared = await this._getDeclaredPermissions(appId);
+      // A failed lookup also answers with an empty list, but is not cached.
+      // Refuse only on Nova's actual answer. While that is unknown the
+      // subscription is kept, and forwardEventToContent delivers nothing on
+      // it until the app's permissions are known: the child sends each
+      // subscription once, so refusing now would lose it for good.
+      if (!declared.includes(capability) && gPermissionsCache.has(appId)) {
+        logDenial(
+          `app '${appId}' did not declare '${capability}' (required to receive ${signal})`
+        );
+        return;
+      }
+    }
+    // The document may have gone while Nova answered.
+    if (!this._destroyed) {
+      this._subscriptions.add(`${service}:${eventName}`);
+    }
+  }
+
+  // Called by dispatchSignalToSubscribers() (this file, above) for every
+  // signal that arrives. The subscription was checked when it was made; the
+  // capability is checked again here, against the permissions Nova last
+  // gave for this app. So a subscription kept while those were unknown
+  // delivers nothing until they are known, and no signal reaches content on
+  // the strength of the subscription alone.
+  forwardEventToContent(service, eventName, data) {
+    if (!this._subscriptions.has(`${service}:${eventName}`)) {
+      return;
+    }
+    const capability = tableCapability(BRIDGE_SIGNALS, service, eventName);
+    if (capability === undefined) {
+      return;
+    }
+    if (capability !== null) {
+      const appId = this._appIdForThisActor();
+      const held = gPermissionsCache.get(appId);
+      if (!held?.includes(capability)) {
+        if (held) {
+          logDenial(
+            `app '${appId}' did not declare '${capability}' (required to receive ${service}.${eventName})`
+          );
+        }
+        return;
+      }
     }
     this.sendAsyncMessage("PyxisBridge:Event", { service, eventName, data });
   }
@@ -743,60 +1275,12 @@ export class PyxisBridgeParent extends JSWindowActorParent {
 
   // --- Capability allow-list ---
   //
-  // Maps (service, method) -> a capability string from the vocabulary
-  // nova-runtime-host-plan.md §3 defines in manifest.webapp's
-  // `permissions[]` (e.g. "filesystem:read", "filesystem:write", "power",
-  // "notifications"). Returns null/undefined for calls that need no
-  // declared capability (e.g. harmless read-only introspection) — err on
-  // the side of gating anything that touches the filesystem, power state,
-  // or app lifecycle, per the plan's security posture.
-  //
-  // This table is intentionally small and hand-maintained here rather than
-  // derived automatically from gaia-bridge.js's method list, so that adding
-  // a new bridge method requires a deliberate, reviewable decision about
-  // its capability requirement rather than silently inheriting "no
-  // permission needed."
+  // The capability an app must hold to call `service.method`: a string
+  // from BRIDGE_CAPABILITIES (above this class), `null` when the call needs
+  // none, or `undefined` when the bridge does not forward it at all, which
+  // _handleCallService refuses.
   _capabilityFor(service, method) {
-    const table = {
-      filesystem: {
-        readFile: "filesystem:read",
-        readDirectory: "filesystem:read",
-        exists: "filesystem:read",
-        stat: "filesystem:read",
-        writeFile: "filesystem:write",
-        appendFile: "filesystem:write",
-        deleteFile: "filesystem:write",
-        deleteDirectory: "filesystem:write",
-        createDirectory: "filesystem:write",
-        copy: "filesystem:write",
-        move: "filesystem:write",
-        chmod: "filesystem:write",
-      },
-      power: {
-        shutdown: "power",
-        reboot: "power",
-        sleep: "power",
-        setScreenBrightness: "power",
-        setScreenTimeout: "power",
-      },
-      // Raising a notification is an app's own business. Reading or
-      // dismissing the centre is the shell's: `list` returns every app's
-      // notifications, text included, so it is privileged
-      // (`notifications:manage`, which Nova grants only to PRIVILEGED_APP_IDS).
-      notification: {
-        show: "notifications",
-        list: "notifications:manage",
-        close: "notifications:manage",
-        closeAll: "notifications:manage",
-      },
-      appManager: {
-        install: "appManager:install",
-        uninstall: "appManager:install",
-        kill: "appManager:manage",
-        restart: "appManager:manage",
-      },
-    };
-    return table[service]?.[method] ?? null;
+    return tableCapability(BRIDGE_CAPABILITIES, service, method);
   }
 
   // Resolves an app-id's declared permissions[] from Nova's registry (now a

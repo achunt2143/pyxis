@@ -40,6 +40,11 @@ widget-creation time; Evo composites that fullscreen NON-exclusively
 does NOT set window.fullScreen/sizemode from the opener callback (that raced
 the widget realize and was silently lost); openPyxisAppWindow just opens the
 window. See evo-firefox-decoration-arch.
+UPDATE (2026-09-27): `--pyxis-overlay <entry>` also opens the app's overlay
+window (openPyxisAppWindow's `overlay` option) once the main window is open.
+Only the shell passes it: geckoOS-boot does, when the shell ships
+overlay.html. The browser-init.js patch covers what makes that window
+transparent, and evo/src/shell/overlay.rs covers how Evo stacks it.
 
 ════════════════════════════════════════════════════════════════════════
 The unified diff below is generated from the checkout and is applied with
@@ -49,7 +54,7 @@ git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
 ════════════════════════════════════════════════════════════════════════
 
 diff --git a/browser/components/BrowserContentHandler.sys.mjs b/browser/components/BrowserContentHandler.sys.mjs
-index daaa2dae0015..d0553a56eb5a 100644
+index daaa2dae0015..122fcd80625c 100644
 --- a/browser/components/BrowserContentHandler.sys.mjs
 +++ b/browser/components/BrowserContentHandler.sys.mjs
 @@ -101,6 +101,15 @@ let gMajorUpgrade = false;
@@ -68,7 +73,7 @@ index daaa2dae0015..d0553a56eb5a 100644
  const OVERRIDE_NONE = 0;
  const OVERRIDE_NEW_PROFILE = 1;
  const OVERRIDE_NEW_MSTONE = 2;
-@@ -363,6 +372,133 @@ function openBrowserWindow(
+@@ -363,6 +372,143 @@ function openBrowserWindow(
    });
  }
  
@@ -139,9 +144,16 @@ index daaa2dae0015..d0553a56eb5a 100644
 + * @param {nsICommandLine} cmdLine
 + * @param {string} appId - PYXIS_APP_ID; also the pyxis:// origin host.
 + * @param {string} entry - path portion resolved against pyxis://<appId>/.
++ * @param {object} [options]
++ * @param {boolean} [options.overlay] - open the app's overlay window instead
++ *   of its main one: the shell's transparent, full-screen second window that
++ *   Evo stacks ABOVE app windows (evo/src/shell/overlay.rs). browser-init.js
++ *   gives it the app id `<appId>-overlay` and transparent chrome. Its page
++ *   is served from the same pyxis://<appId> origin, so it has the app's own
++ *   bridge capabilities.
 + * @returns {Promise<ChromeWindow>}
 + */
-+function openPyxisAppWindow(cmdLine, appId, entry) {
++function openPyxisAppWindow(cmdLine, appId, entry, { overlay = false } = {}) {
 +  // pyxis:// URIs are only resolvable once the PyxisProtocolHandler /
 +  // PyxisOriginMap (netwerk/protocol/pyxis/, owned by a parallel
 +  // workstream - not touched here) can map `appId` to a real webroot. This
@@ -163,6 +175,9 @@ index daaa2dae0015..d0553a56eb5a 100644
 +    Ci.nsIWritablePropertyBag2
 +  );
 +  extraOptions.setPropertyAsAString("pyxisApp", appId);
++  if (overlay) {
++    extraOptions.setPropertyAsBool("pyxisOverlay", true);
++  }
 +
 +  let args = Cc["@mozilla.org/array;1"].createInstance(Ci.nsIMutableArray);
 +  args.appendElement(urlString);
@@ -202,7 +217,7 @@ index daaa2dae0015..d0553a56eb5a 100644
  function openPreferences(cmdLine) {
    openBrowserWindow(cmdLine, lazy.gSystemPrincipal, "about:preferences");
  }
-@@ -451,6 +587,184 @@ nsBrowserContentHandler.prototype = {
+@@ -451,6 +597,197 @@ nsBrowserContentHandler.prototype = {
        gKiosk = true;
        Glean.browserStartup.kioskMode.set(true);
      }
@@ -380,14 +395,27 @@ index daaa2dae0015..d0553a56eb5a 100644
 +      // (PYXIS_DISPLAY_MODE=fullscreen) actually goes chromeless-fullscreen.
 +      // `displayMode`/`isBackground` are still read above for validation and
 +      // the background-app warning. See evo-firefox-decoration-arch.
-+      openPyxisAppWindow(cmdLine, pyxisAppIdParam, entry).then(() => {}, console.error);
++      // `--pyxis-overlay <entry>`: also open the app's overlay window (see
++      // openPyxisAppWindow's `overlay` option). Only the shell passes it
++      // (create-rootfs.sh's geckoOS-boot). Opened once the main window is,
++      // so the desktop comes up first.
++      let overlayEntry = cmdLine.handleFlagWithParam("pyxis-overlay", false);
++      openPyxisAppWindow(cmdLine, pyxisAppIdParam, entry)
++        .then(() =>
++          overlayEntry
++            ? openPyxisAppWindow(cmdLine, pyxisAppIdParam, overlayEntry, {
++                overlay: true,
++              })
++            : null
++        )
++        .then(() => {}, console.error);
 +      cmdLine.preventDefault = true;
 +    }
 +
      if (cmdLine.handleFlag("disable-pinch", false)) {
        let defaults = Services.prefs.getDefaultBranch(null);
        defaults.setBoolPref("apz.allow_zooming", false);
-@@ -687,6 +1001,12 @@ nsBrowserContentHandler.prototype = {
+@@ -687,6 +1024,14 @@ nsBrowserContentHandler.prototype = {
        "  --kiosk-monitor <num> Place kiosk browser window on given monitor.\n";
      info +=
        "  --disable-pinch    Disable touch-screen and touch-pad pinch gestures.\n";
@@ -395,12 +423,14 @@ index daaa2dae0015..d0553a56eb5a 100644
 +      "  --pyxis-app <id>   [Pyxis] Launch a single pyxis:// web app in a " +
 +      "chromeless kiosk window (also read from PYXIS_APP_ID env var).\n";
 +    info +=
++      "  --pyxis-overlay <path> [Pyxis] Also open the app's transparent " +
++      "overlay window (the shell's layer above apps) at this entry.\n" +
 +      "  --app-entry <path> [Pyxis] Entry path under pyxis://<id>/ to " +
 +      "load (default: index.html; Nova will own this once it exists).\n";
      return info;
    },
  
-@@ -1095,6 +1415,21 @@ nsBrowserContentHandler.prototype = {
+@@ -1095,6 +1440,21 @@ nsBrowserContentHandler.prototype = {
      return gKiosk;
    },
  
