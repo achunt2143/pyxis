@@ -314,10 +314,37 @@ async fn handle_connection(
     // Track if we've completed handshake
     let mut handshake_completed = false;
 
+    // The socket is read in a task of its own, and the loop below waits on its
+    // channel. Reading a frame inside the `select!` was not cancel-safe: a
+    // large frame arrives in pieces (an Evo thumbnail reply), and when a signal
+    // or a forwarded call won the select part-way through, the bytes read so
+    // far were dropped, the next "length" came from the middle of the frame,
+    // and the connection was closed. Evo re-registered, and the call waiting on
+    // it failed with "Connection task dropped the request". A channel's recv
+    // is cancel-safe.
+    let (mut read_half, mut stream) = stream.into_split();
+    let (frames_tx, mut frames_rx) = mpsc::channel::<anyhow::Result<Vec<u8>>>(32);
+    let reader = tokio::spawn(async move {
+        loop {
+            let frame = UnixSocketTransport::recv_message(&mut read_half).await;
+            let failed = frame.is_err();
+            if frames_tx.send(frame).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _reader = AbortOnDrop(reader);
+
     loop {
         tokio::select! {
             // CASE 1: Data arriving from the socket (this process -> daemon)
-            socket_res = UnixSocketTransport::recv_message(&mut stream) => {
+            Some(socket_res) = frames_rx.recv() => {
                 let data = match socket_res {
                     Ok(d) => d,
                     Err(e) => {
@@ -596,6 +623,9 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
     register_sound_handlers(bus).await?;
     register_audio_handlers(bus).await?;
 
+    // ==================== TIME SERVICE ====================
+    register_time_handlers(bus).await?;
+
     // ==================== PROCESS SERVICE ====================
     register_process_handlers(bus).await?;
 
@@ -608,259 +638,27 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
 
 // ==================== FILESYSTEM SERVICE HANDLERS ====================
 async fn register_filesystem_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    use services::filesystem::{FilesystemService, METHODS};
     info!("Registering filesystem service handlers");
 
-    // readDirectory
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "readDirectory",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                match services::filesystem::FilesystemService::read_directory(path) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
+    // One handler for every method. FilesystemService::call reads a call's
+    // scope before anything else, so no method can skip the confinement an
+    // app's calls carry (services/filesystem/scope.rs).
+    for &method in METHODS {
+        bus.router().register_handler(
+            "org.geckoOS.filesystem",
+            method,
+            handler(move |msg| {
+                Box::pin(async move {
+                    match FilesystemService::call(method, &msg.body).await {
+                        Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                        Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                    }
+                })
             })
-        })
-        .into(),
-    );
-
-    // readFile
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "readFile",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                let encoding = msg
-                    .body
-                    .get("encoding")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("utf-8");
-                let max_bytes = msg.body.get("maxBytes").and_then(|v| v.as_u64());
-                match services::filesystem::FilesystemService::read_file(path, encoding, max_bytes) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // writeFile
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "writeFile",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let content = msg
-                    .body
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let encoding = msg
-                    .body
-                    .get("encoding")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("utf-8");
-                match services::filesystem::FilesystemService::write_file(path, content, encoding) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // appendFile
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "appendFile",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let content = msg
-                    .body
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let encoding = msg
-                    .body
-                    .get("encoding")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("utf-8");
-                match services::filesystem::FilesystemService::append_file(path, content, encoding)
-                {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // deleteFile
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "deleteFile",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                match services::filesystem::FilesystemService::delete_file(path) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // deleteDirectory
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "deleteDirectory",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let recursive = msg
-                    .body
-                    .get("recursive")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                match services::filesystem::FilesystemService::delete_directory(path, recursive) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // createDirectory
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "createDirectory",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let mode = msg
-                    .body
-                    .get("mode")
-                    .and_then(|v| v.as_u64())
-                    .map(|m| m as u32);
-                match services::filesystem::FilesystemService::create_directory(path, mode) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // exists
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "exists",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                match services::filesystem::FilesystemService::exists(path) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // stat
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "stat",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                match services::filesystem::FilesystemService::stat(path) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // copy
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "copy",
-        handler(move |msg| {
-            Box::pin(async move {
-                let source = msg
-                    .body
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let destination = msg
-                    .body
-                    .get("destination")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                match services::filesystem::FilesystemService::copy(source, destination) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // move
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "move",
-        handler(move |msg| {
-            Box::pin(async move {
-                let source = msg
-                    .body
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let destination = msg
-                    .body
-                    .get("destination")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                match services::filesystem::FilesystemService::move_file(source, destination) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
-
-    // chmod
-    bus.router().register_handler(
-        "org.geckoOS.filesystem",
-        "chmod",
-        handler(move |msg| {
-            Box::pin(async move {
-                let path = msg.body.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let mode = msg
-                    .body
-                    .get("mode")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0o755) as u32;
-                match services::filesystem::FilesystemService::chmod(path, mode) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
-        })
-        .into(),
-    );
+            .into(),
+        );
+    }
 
     info!("✓ Filesystem service handlers registered");
     Ok(())
@@ -1029,6 +827,77 @@ async fn register_audio_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+// ==================== TIME SERVICE HANDLERS ====================
+async fn register_time_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    use services::time::{TimeService, SIGNAL_TIMEZONE_CHANGED, TIME_IFACE};
+    info!("Registering time service handlers");
+
+    fn reply<T: serde::Serialize>(message_id: String, result: anyhow::Result<T>) -> anyhow::Result<Message> {
+        match result.and_then(|value| Ok(serde_json::to_value(value)?)) {
+            Ok(value) => Ok(Message::method_return(message_id, value)),
+            Err(e) => Ok(Message::error(message_id, &format!("{e:#}"))),
+        }
+    }
+
+    bus.router().register_handler(
+        TIME_IFACE,
+        "getClock",
+        handler(move |msg| {
+            Box::pin(async move { reply(msg.header.message_id, Ok(TimeService::system().clock())) })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        TIME_IFACE,
+        "listTimezones",
+        handler(move |msg| {
+            Box::pin(async move {
+                let result = TimeService::system().list_timezones().map(|timezones| json!({ "timezones": timezones }));
+                reply(msg.header.message_id, result)
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        TIME_IFACE,
+        "getLocation",
+        handler(move |msg| {
+            Box::pin(async move { reply(msg.header.message_id, Ok(TimeService::system().location())) })
+        })
+        .into(),
+    );
+
+    // Relinks /etc/localtime, then tells every view (Bloom's clock, the
+    // wallpaper, Settings) the new zone and offset.
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        TIME_IFACE,
+        "setTimezone",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = match msg.body.get("timezone").and_then(|v| v.as_str()) {
+                    Some(zone) => TimeService::system().set_timezone(zone),
+                    None => Err(anyhow::anyhow!("setTimezone needs a string `timezone`")),
+                };
+                if let Ok(change) = &result {
+                    let body = serde_json::to_value(change)?;
+                    if let Err(e) = bus.emit_signal(TIME_IFACE, SIGNAL_TIMEZONE_CHANGED, body).await {
+                        warn!("time signal {} failed: {}", SIGNAL_TIMEZONE_CHANGED, e);
+                    }
+                }
+                reply(msg.header.message_id, result)
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Time service handlers registered");
+    Ok(())
+}
+
 // ==================== POWER SERVICE HANDLERS ====================
 async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
     info!("Registering power service handlers");
@@ -1188,15 +1057,33 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
 
 // ==================== SETTINGS SERVICE HANDLERS ====================
 async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+    use services::settings::{Outcome, SettingsService, SETTINGS_IFACE, SIGNAL_SETTING_CHANGED};
     info!("Registering settings service handlers");
 
+    /// Reply to a write, and on success signal `SettingChanged` once per key
+    /// it changed. The Settings app and the shell are different origins, so
+    /// this signal is how a change made in one reaches the other live.
+    async fn reply_write(bus: &IPCBus, message_id: String, result: anyhow::Result<Outcome>) -> anyhow::Result<Message> {
+        match result {
+            Ok(outcome) => {
+                for change in &outcome.changes {
+                    if let Err(e) = bus.emit_signal(SETTINGS_IFACE, SIGNAL_SETTING_CHANGED, change.signal_body()).await {
+                        warn!("settings signal for {} failed: {}", change.key, e);
+                    }
+                }
+                Ok(Message::method_return(message_id, outcome.reply))
+            }
+            Err(e) => Ok(Message::error(message_id, &format!("{e:#}"))),
+        }
+    }
+
     bus.router().register_handler(
-        "org.geckoOS.settings",
+        SETTINGS_IFACE,
         "get",
         handler(move |msg| {
             Box::pin(async move {
                 let key = msg.body.get("key").and_then(|v| v.as_str()).unwrap_or("");
-                match services::settings::SettingsService::get(key) {
+                match SettingsService::get(key) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
@@ -1205,28 +1092,27 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
         .into(),
     );
 
+    let bus_clone = bus.clone();
     bus.router().register_handler(
-        "org.geckoOS.settings",
+        SETTINGS_IFACE,
         "set",
         handler(move |msg| {
+            let bus = bus_clone.clone();
             Box::pin(async move {
                 let key = msg.body.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 let value = msg.body.get("value").cloned().unwrap_or_default();
-                match services::settings::SettingsService::set(key, value) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
+                reply_write(&bus, msg.header.message_id, SettingsService::set(key, value)).await
             })
         })
         .into(),
     );
 
     bus.router().register_handler(
-        "org.geckoOS.settings",
+        SETTINGS_IFACE,
         "getAll",
         handler(move |msg| {
             Box::pin(async move {
-                match services::settings::SettingsService::get_all() {
+                match SettingsService::get_all() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
@@ -1235,45 +1121,38 @@ async fn register_settings_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std
         .into(),
     );
 
+    let bus_clone = bus.clone();
     bus.router().register_handler(
-        "org.geckoOS.settings",
+        SETTINGS_IFACE,
         "delete",
         handler(move |msg| {
+            let bus = bus_clone.clone();
             Box::pin(async move {
                 let key = msg.body.get("key").and_then(|v| v.as_str()).unwrap_or("");
-                match services::settings::SettingsService::delete(key) {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
+                reply_write(&bus, msg.header.message_id, SettingsService::delete(key)).await
             })
         })
         .into(),
     );
 
+    let bus_clone = bus.clone();
     bus.router().register_handler(
-        "org.geckoOS.settings",
+        SETTINGS_IFACE,
         "clear",
         handler(move |msg| {
-            Box::pin(async move {
-                match services::settings::SettingsService::clear() {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
+            let bus = bus_clone.clone();
+            Box::pin(async move { reply_write(&bus, msg.header.message_id, SettingsService::clear()).await })
         })
         .into(),
     );
 
+    let bus_clone = bus.clone();
     bus.router().register_handler(
-        "org.geckoOS.settings",
+        SETTINGS_IFACE,
         "reset",
         handler(move |msg| {
-            Box::pin(async move {
-                match services::settings::SettingsService::reset() {
-                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
-                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
-                }
-            })
+            let bus = bus_clone.clone();
+            Box::pin(async move { reply_write(&bus, msg.header.message_id, SettingsService::reset()).await })
         })
         .into(),
     );
@@ -2243,51 +2122,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
         tracing::warn!("nova: initial registry scan failed: {}", e);
     }
 
-    // Lifecycle: subscribe to Evo's real `WindowMinimized` signal (interface
-    // "org.geckoOS.evo", see evo/src/enhancements/echo_ipc.rs's
-    // emit_window_minimized) so backgrounding/restoring a card actually
-    // suspends/resumes its process — see Nova::handle_window_minimized/
-    // handle_window_restored's doc comment for the full rationale. This
-    // works in-process (no separate socket connection needed) because Evo,
-    // as an external client, emits signals via a MethodCall to THIS
-    // daemon's "org.geckoOS.Echo"/"EmitSignal" handler, which broadcasts
-    // through this same `SignalBus` — so subscribing here really does
-    // observe Evo's real signals, not a separate/parallel channel.
-    bus.signal_bus()
-        .subscribe(
-            "org.geckoOS.evo",
-            "nova-lifecycle".to_string(),
-            handler(move |msg| {
-                Box::pin(async move {
-                    if msg.header.method == "WindowMinimized" {
-                        let window_id = msg
-                            .body
-                            .get("window_id")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32);
-                        let minimized = msg
-                            .body
-                            .get("minimized")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if let Some(window_id) = window_id {
-                            if minimized {
-                                services::Nova::global().handle_window_minimized(window_id);
-                            } else {
-                                services::Nova::global().handle_window_restored(window_id);
-                            }
-                        }
-                    }
-                    // Signal subscribers' return value is discarded (see
-                    // SignalBus::broadcast) — this is never sent anywhere.
-                    Ok(Message::method_return(msg.header.message_id, json!({})))
-                })
-            })
-            .into(),
-        )
-        .await?;
-
-    // Launch(appId, params?) -> { sessionId, appId, raised }
+    // Launch(appId, params?) -> { sessionId, appId, raised, windowId? }
     bus.router().register_handler(
         "org.geckoOS.nova",
         "Launch",
@@ -2295,7 +2130,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
             Box::pin(async move {
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 let params = msg.body.get("params").cloned();
-                match services::Nova::global().launch(app_id, params) {
+                match services::Nova::global().launch(app_id, params).await {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
@@ -2408,19 +2243,26 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
         .into(),
     );
 
-    // Uninstall(appId, purgeData?) -> { appId }
+    // Uninstall(appId) -> { appId, removed }. The app's data and profile
+    // always go with it (`purgeData`, which chose that, is gone).
     bus.router().register_handler(
         "org.geckoOS.nova",
         "Uninstall",
         handler(move |msg| {
             Box::pin(async move {
-                let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
-                let purge = msg
+                let app_id = msg
                     .body
-                    .get("purgeData")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                match services::Nova::global().uninstall(app_id, purge) {
+                    .get("appId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // It waits for a running app to exit before the profile
+                // goes, so it runs off the runtime's threads.
+                let uninstalled =
+                    tokio::task::spawn_blocking(move || services::Nova::global().uninstall(&app_id))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("uninstall failed: {e}")));
+                match uninstalled {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }

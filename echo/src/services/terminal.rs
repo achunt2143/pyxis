@@ -189,8 +189,15 @@ impl TerminalService {
                     }
                 }
                 service.emit("TerminalClosed", json!({ "terminalId": terminal_id }));
-                if let Ok(mut sessions) = service.sessions.write() {
-                    sessions.remove(&terminal_id);
+                let session = service
+                    .sessions
+                    .write()
+                    .ok()
+                    .and_then(|mut sessions| sessions.remove(&terminal_id));
+                // The pty closed, so the shell has exited or is about to.
+                // Reap it here: nothing else waits on it.
+                if let Some(mut session) = session {
+                    let _ = session.child.wait();
                 }
             })
             .expect("spawn pty reader thread");

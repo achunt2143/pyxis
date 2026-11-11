@@ -81,6 +81,7 @@ goblin = "0.8"
 # System
 libc = "0.2"
 nix = { version = "0.27", features = ["process", "signal", "resource", "mount", "user"] }
+rustix = "1.1"
 
 # Graphics/Rendering
 wgpu = "27.0.1"

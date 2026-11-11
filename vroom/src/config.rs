@@ -37,9 +37,17 @@ pub const PERMISSIONS: &[&str] = &[
     "ipc",
     "background",
     "power",
+    "audio",
+    "browser",
     "notifications.manage",
     "appmanager.install",
     "appmanager.manage",
+    "settings.write",
+    "windows.manage",
+    "terminal",
+    "filesystem.user",
+    "filesystem.system",
+    "filesystem.apps",
 ];
 
 /// The subset of [`PERMISSIONS`] that is *privileged*: declaring it is legal
@@ -48,7 +56,17 @@ pub const PERMISSIONS: &[&str] = &[
 /// `.ipk` may therefore declare these and still build — it just won't be
 /// granted them at runtime. Packaging emits a warning so the author learns
 /// this at build time rather than by silent no-op on device.
-pub const PRIVILEGED_PERMISSIONS: &[&str] = &["notifications.manage", "appmanager.install", "appmanager.manage"];
+pub const PRIVILEGED_PERMISSIONS: &[&str] = &[
+    "notifications.manage",
+    "appmanager.install",
+    "appmanager.manage",
+    "settings.write",
+    "windows.manage",
+    "terminal",
+    "filesystem.user",
+    "filesystem.system",
+    "filesystem.apps",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

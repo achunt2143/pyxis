@@ -22,6 +22,13 @@ impl ProcessService {
             .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
 
         let pid = child.id();
+        // Nothing else waits on this child, so a thread does, or it would
+        // stay a zombie for echo-daemon's lifetime. (AppHost's reaper waits
+        // only on the apps it launched.)
+        let mut child = child;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
 
         Ok(json!({
             "success": true,

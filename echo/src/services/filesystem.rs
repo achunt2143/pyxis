@@ -1,7 +1,16 @@
 //! Filesystem Service
-//! 
-//! Provides file and directory operations.
-//! All paths should be absolute or relative to the user's home directory.
+//!
+//! Provides file and directory operations, in two halves.
+//!
+//! A call that carries a `scope` is confined to one directory tree and runs
+//! as geckouser: see `scope.rs`. Every call from an app carries one, because
+//! the bridge stamps it.
+//!
+//! A call without one is the unconfined service below, run as root, with
+//! paths absolute or relative to the daemon's `$HOME` (which is `/` on the
+//! device). Only a client holding the Echo socket can make such a call.
+
+pub mod scope;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -9,9 +18,76 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use anyhow::{Result, anyhow};
 
+/// Every method of `org.geckoOS.filesystem`, for daemon.rs to register.
+pub const METHODS: &[&str] = &[
+    "readDirectory",
+    "readFile",
+    "writeFile",
+    "appendFile",
+    "deleteFile",
+    "deleteDirectory",
+    "createDirectory",
+    "exists",
+    "stat",
+    "copy",
+    "move",
+    "chmod",
+];
+
 pub struct FilesystemService;
 
 impl FilesystemService {
+    /// Answers one call. With a `scope`, the call is confined to that scope
+    /// and runs as geckouser (scope.rs); without one, it is the unconfined
+    /// service below. A `scope` that is present but not understood is
+    /// refused, never taken for no scope at all.
+    pub async fn call(method: &str, body: &Value) -> Result<Value> {
+        match body.get("scope") {
+            Some(scope) => {
+                let scope = scope
+                    .as_str()
+                    .ok_or_else(|| anyhow!("a filesystem scope is a string, not {scope}"))?;
+                scope::call(scope::Scope::parse(scope)?, method, body).await
+            }
+            None => Self::call_unscoped(method, body),
+        }
+    }
+
+    /// The unconfined service, with the defaults its handlers in daemon.rs
+    /// have always had.
+    fn call_unscoped(method: &str, body: &Value) -> Result<Value> {
+        let encoding = field(body, "encoding", "utf-8");
+        let mode = body.get("mode").and_then(Value::as_u64);
+        match method {
+            "readDirectory" => Self::read_directory(field(body, "path", "/")),
+            "readFile" => Self::read_file(
+                field(body, "path", "/"),
+                encoding,
+                body.get("maxBytes").and_then(Value::as_u64),
+            ),
+            "writeFile" => {
+                Self::write_file(field(body, "path", ""), field(body, "content", ""), encoding)
+            }
+            "appendFile" => {
+                Self::append_file(field(body, "path", ""), field(body, "content", ""), encoding)
+            }
+            "deleteFile" => Self::delete_file(field(body, "path", "")),
+            "deleteDirectory" => Self::delete_directory(
+                field(body, "path", ""),
+                body.get("recursive").and_then(Value::as_bool).unwrap_or(false),
+            ),
+            "createDirectory" => {
+                Self::create_directory(field(body, "path", ""), mode.map(|m| m as u32))
+            }
+            "exists" => Self::exists(field(body, "path", "")),
+            "stat" => Self::stat(field(body, "path", "")),
+            "copy" => Self::copy(field(body, "source", ""), field(body, "destination", "")),
+            "move" => Self::move_file(field(body, "source", ""), field(body, "destination", "")),
+            "chmod" => Self::chmod(field(body, "path", ""), mode.unwrap_or(0o755) as u32),
+            other => Err(anyhow!("org.geckoOS.filesystem has no method {other:?}")),
+        }
+    }
+
     /// Read directory contents and return file list
     pub fn read_directory(path: &str) -> Result<Value> {
         let path = PathBuf::from(expand_path(path)?);
@@ -105,33 +181,12 @@ impl FilesystemService {
         let limit = max_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES);
         let len = fs::metadata(&path)?.len();
         if len > limit {
-            return Err(anyhow!(
-                "File is {} bytes, which exceeds the {} byte read limit for {}; \
-                 pass a larger maxBytes to override",
-                len,
-                limit,
-                path.display()
-            ));
+            return Err(over_read_limit(len, limit, &path.display().to_string()));
         }
 
         let bytes = fs::read(&path)?;
         let size = bytes.len();
-
-        let content = match encoding.to_ascii_lowercase().as_str() {
-            "base64" => base64_encode(&bytes),
-            "utf-8" | "utf8" | "" => String::from_utf8(bytes).map_err(|_| {
-                anyhow!(
-                    "{} is not valid UTF-8; request encoding \"base64\" to read it as binary",
-                    path.display()
-                )
-            })?,
-            other => {
-                return Err(anyhow!(
-                    "Unsupported encoding \"{}\"; expected \"utf-8\" or \"base64\"",
-                    other
-                ))
-            }
-        };
+        let content = encode_content(bytes, encoding, &path.display().to_string())?;
 
         Ok(json!({
             "content": content,
@@ -265,6 +320,7 @@ impl FilesystemService {
         }
 
         let metadata = fs::metadata(&path)?;
+        use std::os::unix::fs::FileTypeExt;
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -274,10 +330,10 @@ impl FilesystemService {
             "isFile": metadata.is_file(),
             "isDirectory": metadata.is_dir(),
             "isSymlink": metadata.is_symlink(),
-            "isBlockDevice": metadata.dev(),
-            "isCharDevice": metadata.is_symlink(),
-            "isFifo": metadata.is_symlink(),
-            "isSocket": metadata.is_symlink(),
+            "isBlockDevice": metadata.file_type().is_block_device(),
+            "isCharDevice": metadata.file_type().is_char_device(),
+            "isFifo": metadata.file_type().is_fifo(),
+            "isSocket": metadata.file_type().is_socket(),
             "permissions": format!("{:o}", metadata.permissions().mode()),
             "owner": metadata.uid(),
             "group": metadata.gid(),
@@ -350,6 +406,40 @@ impl FilesystemService {
 /// Default cap for a single `readFile`, in bytes (8 MiB). Callers that
 /// genuinely want more can pass `maxBytes`.
 const DEFAULT_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A string field of a call's body, or `default` when it is missing.
+fn field<'a>(body: &'a Value, key: &str, default: &'a str) -> &'a str {
+    body.get(key).and_then(Value::as_str).unwrap_or(default)
+}
+
+/// A read refused for its size, in the words both halves of the service use.
+fn over_read_limit(len: u64, limit: u64, path: &str) -> anyhow::Error {
+    anyhow!(
+        "File is {} bytes, which exceeds the {} byte read limit for {}; \
+         pass a larger maxBytes to override",
+        len,
+        limit,
+        path
+    )
+}
+
+/// A file's bytes as `encoding` asks for them: the text itself for utf-8,
+/// which the bytes must then be, or base64.
+fn encode_content(bytes: Vec<u8>, encoding: &str, path: &str) -> Result<String> {
+    match encoding.to_ascii_lowercase().as_str() {
+        "base64" => Ok(base64_encode(&bytes)),
+        "utf-8" | "utf8" | "" => String::from_utf8(bytes).map_err(|_| {
+            anyhow!(
+                "{} is not valid UTF-8; request encoding \"base64\" to read it as binary",
+                path
+            )
+        }),
+        other => Err(anyhow!(
+            "Unsupported encoding \"{}\"; expected \"utf-8\" or \"base64\"",
+            other
+        )),
+    }
+}
 
 /// Seconds since the Unix epoch, or `None` if the platform didn't supply the
 /// timestamp. Serializes to JSON `null`.
@@ -567,5 +657,27 @@ mod tests {
         assert!(err.contains("Unsupported encoding"), "unexpected error: {err}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A call naming a scope the service doesn't understand is refused.
+    /// Treating it as unscoped would hand a mangled app call root's view of
+    /// the whole filesystem.
+    #[tokio::test]
+    async fn a_scope_that_is_not_understood_is_refused_not_ignored() {
+        for scope in [json!(5), json!(null), json!("root"), json!("app:../etc")] {
+            let err = FilesystemService::call("exists", &json!({ "path": "/", "scope": scope }))
+                .await
+                .expect_err("an unknown scope must be refused")
+                .to_string();
+            assert!(err.contains("scope") || err.contains("app id"), "{scope}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_without_a_scope_is_the_service_it_always_was() {
+        let res = FilesystemService::call("exists", &json!({ "path": "/proc" }))
+            .await
+            .expect("an unscoped exists");
+        assert_eq!(res["exists"], true);
     }
 }

@@ -18,6 +18,7 @@ pub mod audio;
 pub mod process;
 pub mod system;
 pub mod terminal;
+pub mod time;
 
 // Re-exports for convenience
 pub use filesystem::FilesystemService;

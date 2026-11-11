@@ -72,6 +72,28 @@ enum Commands {
     /// Ping the Echo daemon
     #[command(name = "ping")]
     Ping,
+
+    /// Print signals as they arrive (one JSON line each: interface, signal,
+    /// body), optionally only those named, for `seconds` or until `count`
+    /// have been printed. For suites that need to see a signal go out.
+    #[command(name = "watch")]
+    Watch {
+        /// Only this signal name (any if empty)
+        #[arg(short, long, default_value = "")]
+        signal: String,
+
+        /// Only signals from this interface (any if empty)
+        #[arg(short, long, default_value = "")]
+        interface: String,
+
+        /// Stop after this many seconds
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+
+        /// Stop after this many signals (0: no limit)
+        #[arg(long, default_value_t = 0)]
+        count: usize,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +125,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Commands::Status => show_status(&client).await?,
         Commands::RegisterService { name } => register_service(&client, &name).await?,
         Commands::Ping => ping(&client).await?,
+        Commands::Watch { signal, interface, seconds, count } => {
+            watch(&client, &signal, &interface, seconds, count).await?
+        }
     }
 
     Ok(())
@@ -399,5 +424,39 @@ async fn ping(client: &EchoClient) -> Result<(), Box<dyn Error>> {
     let elapsed = start.elapsed();
 
     println!("✓ Pong! ({:.2}ms)", elapsed.as_secs_f64() * 1000.0);
+    Ok(())
+}
+
+async fn watch(
+    client: &EchoClient,
+    signal: &str,
+    interface: &str,
+    seconds: u64,
+    count: usize,
+) -> Result<(), Box<dyn Error>> {
+    use geckoOS_echo::message::MessageType;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut seen = 0;
+    loop {
+        let msg = match tokio::time::timeout_at(deadline, client.next_message()).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => break,
+        };
+        if msg.header.message_type != MessageType::Signal
+            || (!signal.is_empty() && msg.header.method != signal)
+            || (!interface.is_empty() && msg.header.interface != interface)
+        {
+            continue;
+        }
+        println!(
+            "{}",
+            serde_json::json!({ "interface": msg.header.interface, "signal": msg.header.method, "body": msg.body })
+        );
+        seen += 1;
+        if count > 0 && seen >= count {
+            break;
+        }
+    }
     Ok(())
 }

@@ -62,7 +62,7 @@
     },
     "requiredPermissions": {
       "type": "array",
-      "description": "Declared app permissions (spec §19.1). `notifications.manage`, `appmanager.install` and `appmanager.manage` are privileged: declaring them is always valid, but Nova grants the corresponding capability only to apps on the platform trust list (spec §19.2).",
+      "description": "Declared app permissions (spec §19.1). `notifications.manage`, `appmanager.install`, `appmanager.manage`, `settings.write`, `windows.manage`, `terminal`, `filesystem.user`, `filesystem.system` and `filesystem.apps` are privileged: declaring them is always valid, but Nova grants the corresponding capability only to apps on the platform trust list (spec §19.2).",
       "items": {
         "type": "string",
         "enum": [
@@ -77,9 +77,17 @@
           "ipc",
           "background",
           "power",
+          "audio",
+          "browser",
           "notifications.manage",
           "appmanager.install",
-          "appmanager.manage"
+          "appmanager.manage",
+          "settings.write",
+          "windows.manage",
+          "terminal",
+          "filesystem.user",
+          "filesystem.system",
+          "filesystem.apps"
         ]
       },
       "uniqueItems": true

@@ -27,7 +27,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use crate::services::nova::Nova;
+use crate::services::apphost::AppHost;
+use crate::services::nova::{forget_app_state, AppTier, Nova, APP_EXIT_LIMIT};
 use crate::IPCBus;
 
 /// Interface name for installer IPC + signals.
@@ -451,11 +452,18 @@ impl InstallerService {
     /// `installer.Remove(package, purge?)` — `opkg remove`, then refresh the
     /// registry. This is the supported removal path for ipk apps (Nova's
     /// own `Uninstall` refuses them so it never desyncs opkg's status db).
+    ///
+    /// The apps the package took off the registry lose what they kept too,
+    /// their own data and their Gecko profile (`nova::forget_app_state`), so
+    /// a package that later claims one of their ids starts empty. A package
+    /// removed with `opkg remove` directly keeps both, the way `apt remove`
+    /// keeps configuration.
     pub async fn remove(&self, package: &str, purge: bool) -> Result<Value> {
         if package.trim().is_empty() {
             return Err(anyhow!("package name is required"));
         }
         Self::require_opkg()?;
+        let before = Nova::global().app_ids_in_tier(AppTier::Opkg);
 
         self.progress(package, "removing", "Running opkg remove");
         let mut cmd = tokio::process::Command::new("opkg");
@@ -482,7 +490,27 @@ impl InstallerService {
         }
 
         let registered = Nova::global().reload().unwrap_or(0);
-        let result = json!({ "package": package, "registeredApps": registered });
+        // A failed reload leaves the registry as it was, so nothing looks
+        // removed and no data goes.
+        let after = Nova::global().app_ids_in_tier(AppTier::Opkg);
+        let gone: Vec<String> = before.into_iter().filter(|id| !after.contains(id)).collect();
+        // A removed app may still be running. Wait for each to exit, off the
+        // runtime's threads, before its profile goes.
+        let data_removed = tokio::task::spawn_blocking(move || {
+            gone.into_iter()
+                .filter(|id| {
+                    AppHost::global().close_and_wait(id, APP_EXIT_LIMIT);
+                    !forget_app_state(id).is_empty()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let result = json!({
+            "package": package,
+            "registeredApps": registered,
+            "dataRemoved": data_removed,
+        });
         self.emit("RemoveCompleted", result.clone());
         tracing::info!("installer: removed '{}'", package);
         Ok(result)

@@ -466,6 +466,14 @@ impl EchoClient {
         })
     }
 
+    /// The next message the daemon sends this connection unasked: the bus
+    /// broadcasts every signal to every connection. For `echo-cli watch`.
+    pub async fn next_message(&self) -> Result<Message> {
+        let mut stream = self.stream.lock().await;
+        let data = UnixSocketTransport::recv_message(&mut *stream).await?;
+        Ok(serde_json::from_slice(&data)?)
+    }
+
     /// Get default socket path
     pub fn default_socket_path() -> PathBuf {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -486,9 +494,9 @@ impl EchoClient {
         let message = Message::method_call(service, interface, method, args)?;
         let mut stream = self.stream.lock().await;
         let data = serde_json::to_vec(&message)?;
-        UnixSocketTransport::send_message(&mut stream, &data).await?;
+        UnixSocketTransport::send_message(&mut *stream, &data).await?;
 
-        let response_data = UnixSocketTransport::recv_message(&mut stream).await?;
+        let response_data = UnixSocketTransport::recv_message(&mut *stream).await?;
         let response: Message = serde_json::from_slice(&response_data)?;
 
         match response.header.message_type {

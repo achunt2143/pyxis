@@ -43,7 +43,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use crate::services::apphost::AppHost;
+use crate::services::apphost::{AppHost, AppSession};
+use crate::services::filesystem::scope::{chown_tree, remove_app_data, valid_app_id};
 use crate::IPCBus;
 
 /// Interface name for Nova IPC + signals.
@@ -76,39 +77,113 @@ const ORIGINS_MAP_FILE: &str = "/run/pyxis/nova/origins.map";
 /// location).
 const VELA_BIN: &str = "/usr/lib/pyxis-gecko/vela";
 
-// --- Unprivileged launch (mirrors scripts/create-rootfs.sh's boot-script
-// setpriv drop). AppHost runs inside echo-daemon as root, but Gecko/vela
-// refuses to run as root, so Nova composes the launch command through
-// `setpriv` to drop to the unprivileged geckouser before exec'ing vela. The
-// `--groups video,render` membership is what grants DRI/GPU access (hardware
-// GL instead of a software fallback). These MUST stay in lockstep with the
-// user/group/paths create-rootfs.sh sets up.
-const GECKO_UID: u32 = 1000;
-const GECKO_GID: u32 = 1000;
-const GECKO_HOME: &str = "/home/geckouser";
-const SETPRIV_BIN: &str = "/usr/bin/setpriv";
+// --- Who an app runs as. Two users, on purpose:
+//
+// - **geckouser** (1000) is the shell: the boot script's vela, Bloom and its
+//   overlay, PipeWire. It owns Evo's host Wayland socket (mode 0600) and the
+//   runtime dir. The filesystem service's `user` and `system` scopes run as it.
+// - **pyxisapp** (1001) is every app Nova launches. It can't connect to the
+//   host socket, so it can only reach Evo through the security-context socket
+//   `pyxis-wlctx` made for it (and arrive as an app), and it can't ptrace the
+//   shell or read its profile. Gecko refuses to run as root, so the drop is
+//   needed anyway; it is done by `pyxis-wlctx`, not `setpriv` (see
+//   `echo/src/bin/wlctx.rs` for why the order matters).
+//
+// All apps share the one uid, so apps are not isolated from *each other* by
+// the kernel (that stays the bridge's and the filesystem service's job); a
+// uid per app is the next step and touches only the constants and
+// `app_uid` below.
+//
+// These MUST stay in lockstep with the users, groups and paths
+// scripts/create-rootfs.sh sets up. `--groups video,render` is what grants
+// DRI/GPU access (hardware GL instead of a software fallback).
+pub(crate) const GECKO_UID: u32 = 1000;
+pub(crate) const GECKO_GID: u32 = 1000;
+pub(crate) const GECKO_HOME: &str = "/home/geckouser";
+/// The user every Nova-launched app runs as.
+pub(crate) const APP_UID: u32 = 1001;
+pub(crate) const APP_GID: u32 = 1001;
+pub(crate) const APP_HOME: &str = "/home/pyxisapp";
+/// Apps' `$XDG_RUNTIME_DIR`: theirs, so Gecko can keep what it wants there.
+/// `pyxis-wlctx` makes it. The shell's own runtime dir is not one an app can
+/// list or write (see `SHELL_RUNTIME_DIR`).
+const APP_RUNTIME_DIR: &str = "/run/user/1001";
+/// Gives the launched app its own Wayland socket (a `wp_security_context_v1`
+/// listener carrying its app id), so Evo can tell it from the system, and
+/// drops to the app user itself. Every app launch goes through it as the
+/// first program: it is the program the launch runs, and the app has no way
+/// to skip it. See `evo/src/trust.rs` and `echo/src/bin/wlctx.rs`.
+const WLCTX_BIN: &str = "/usr/bin/pyxis-wlctx";
 /// Comma-separated supplementary groups for DRI/GPU device access.
-const GECKO_GROUPS: &str = "video,render";
-/// Session runtime dir + Wayland socket name Evo creates (see the boot
-/// script, which chown's both to geckouser so the dropped vela can connect).
-const XDG_RUNTIME_DIR: &str = "/run/user/1000";
-const WAYLAND_DISPLAY: &str = "wayland-0";
+const APP_GROUPS: &str = "video,render";
+/// The shell's session runtime dir: Evo's host socket, Echo's socket and the
+/// Pulse socket live here. Mode 0711, so an app can reach a path it knows
+/// (Echo's socket, which is mode 0666; the Pulse socket) but not list it.
+const SHELL_RUNTIME_DIR: &str = "/run/user/1000";
+/// Evo's own socket: geckouser's and mode 0600, so only the shell and root can
+/// open it. Apps get it hidden from their mount namespace too.
+const HOST_SOCKET: &str = "/run/user/1000/wayland-0";
+/// What an app finds under its runtime dir as links into the shell's: the
+/// bridge (compiled into vela) reads `$XDG_RUNTIME_DIR/geckoOS/echo.sock`.
+const APP_RUNTIME_LINKS: &[(&str, &str)] = &[("geckoOS", "/run/user/1000/geckoOS")];
+/// Where vela's PulseAudio client finds PipeWire's Pulse server: the second
+/// address it listens on (`10-pyxis-apps.conf`, which `create-rootfs.sh`
+/// writes), in a directory of its own. The default one, under the shell's
+/// runtime dir, is 0700 and put back to 0700 by every libpulse client of
+/// geckouser's (the shell's vela), so apps can't depend on it. The socket is
+/// 0777, as pipewire-pulse makes it.
+const PULSE_SERVER: &str = "unix:/run/pyxis/pulse/native";
+/// Apps the boot script starts as the shell's user. Nova never launches
+/// these, so it must not hand their state to the app user either. The boot
+/// script names its own boot app in `PYXIS_SHELL_APPS` for echo-daemon.
+const SHELL_APP_IDS: &[&str] = &["bloom"];
+
+/// Whether `app_id` is part of the shell, run by the boot script as
+/// geckouser. Its profile stays geckouser's.
+pub(crate) fn is_shell_app(app_id: &str) -> bool {
+    SHELL_APP_IDS.contains(&app_id)
+        || std::env::var("PYXIS_SHELL_APPS")
+            .map(|v| v.split(',').any(|id| id == app_id))
+            .unwrap_or(false)
+}
+
+/// The user and group an app's own files (profile, data dir) belong to.
+pub(crate) fn app_owner(app_id: &str) -> (u32, u32) {
+    if is_shell_app(app_id) {
+        (GECKO_UID, GECKO_GID)
+    } else {
+        (APP_UID, APP_GID)
+    }
+}
 
 /// The full capability vocabulary a `manifest.webapp` may declare in
-/// `permissions[]`. Kept in lockstep with
-/// `PyxisBridgeParent.sys.mjs`'s `_capabilityFor()` table — that table maps
-/// bridge (service, method) pairs to one of these strings; this is the
-/// vocabulary those strings must come from. Unknown permissions are a hard
-/// validation error at parse time (fail loudly at install/discovery, not
-/// silently at first use).
+/// `permissions[]`. Kept in lockstep with `PyxisBridgeParent.sys.mjs`'s
+/// `BRIDGE_CAPABILITIES` table, which maps every (service, method) the
+/// bridge forwards to one of these strings, or to none. The bridge refuses
+/// any pair the table does not list, so a capability here gates something
+/// only once the table names it. `filesystem:user`, `filesystem:system` and
+/// `filesystem:apps` gate no method: they widen where filesystem calls
+/// reach, through the bridge's `FILESYSTEM_SCOPES` table instead.
+/// `bridge_table_and_nova_share_one_vocabulary` checks both directions.
+/// Unknown permissions are a hard validation error at parse time (fail
+/// loudly at install/discovery, not silently at first use).
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "filesystem:read",
     "filesystem:write",
     "power",
     "notifications",
+    "audio",
+    "network",
+    "browser",
     "notifications:manage",
     "appManager:install",
     "appManager:manage",
+    "settings:write",
+    "windows:manage",
+    "terminal",
+    "filesystem:user",
+    "filesystem:system",
+    "filesystem:apps",
 ];
 
 /// The privileged subset of [`KNOWN_CAPABILITIES`] — the colon-vocabulary
@@ -119,7 +194,17 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
 /// `USER_APPS_ROOT` is writable and fed by `install()` from plain tarballs.
 /// Gating only the `appinfo.json` path would leave the identical escalation
 /// reachable by shipping the same app as a `.tar.gz` instead of an `.ipk`.
-pub const PRIVILEGED_CAPABILITIES: &[&str] = &["notifications:manage", "appManager:install", "appManager:manage"];
+pub const PRIVILEGED_CAPABILITIES: &[&str] = &[
+    "notifications:manage",
+    "appManager:install",
+    "appManager:manage",
+    "settings:write",
+    "windows:manage",
+    "terminal",
+    "filesystem:user",
+    "filesystem:system",
+    "filesystem:apps",
+];
 
 /// The permission vocabulary an `appinfo.json` may declare in
 /// `requiredPermissions[]` (SDK/PDK spec §19.1, kept in lockstep with
@@ -141,23 +226,46 @@ pub const APPINFO_PERMISSIONS: &[&str] = &[
     "ipc",
     "background",
     "power",
+    "audio",
+    "browser",
     "notifications.manage",
     "appmanager.install",
     "appmanager.manage",
+    "settings.write",
+    "windows.manage",
+    "terminal",
+    "filesystem.user",
+    "filesystem.system",
+    "filesystem.apps",
 ];
 
 /// The privileged subset of [`APPINFO_PERMISSIONS`]: rights over *other*
-/// apps. That means app management, which installs and removes them, and
-/// `notifications.manage`, which reads and dismisses every app's
-/// notifications (the shell's notification centre). Any `appinfo.json`
-/// may declare these (declaration is not the grant — spec §19.2), but they
-/// are translated into bridge capabilities only for apps on
-/// [`PRIVILEGED_APP_IDS`]. Without that gate an ipk-installed app could
-/// declare `appmanager.install` and self-elevate into the app-management
-/// surface simply by being installed, which is precisely the escalation the
-/// deny-by-default model exists to prevent.
-pub const PRIVILEGED_APPINFO_PERMISSIONS: &[&str] =
-    &["notifications.manage", "appmanager.install", "appmanager.manage"];
+/// apps, or over the whole system. That means app management, which
+/// installs and removes them; `notifications.manage`, which reads and
+/// dismisses every app's notifications (the shell's notification centre);
+/// `windows.manage`, which moves, closes and lists every app's windows;
+/// `settings.write`, which changes settings every app reads;
+/// `terminal`, a root shell; and `filesystem.user`, `filesystem.system` and
+/// `filesystem.apps`, which turn an app's filesystem calls from its own data
+/// to the user's home, to the whole root filesystem (read-only), and to
+/// another app's data. Any `appinfo.json` may declare these
+/// (declaration is not the grant — spec §19.2), but they are translated
+/// into bridge capabilities only for apps on [`PRIVILEGED_APP_IDS`].
+/// Without that gate an ipk-installed app could declare `appmanager.install`
+/// and self-elevate into the app-management surface simply by being
+/// installed, which is precisely the escalation the deny-by-default model
+/// exists to prevent.
+pub const PRIVILEGED_APPINFO_PERMISSIONS: &[&str] = &[
+    "notifications.manage",
+    "appmanager.install",
+    "appmanager.manage",
+    "settings.write",
+    "windows.manage",
+    "terminal",
+    "filesystem.user",
+    "filesystem.system",
+    "filesystem.apps",
+];
 
 /// Platform trust list for [`PRIVILEGED_APPINFO_PERMISSIONS`].
 ///
@@ -172,13 +280,29 @@ pub const PRIVILEGED_APPINFO_PERMISSIONS: &[&str] =
 /// comment), this should become "the signing key chains to a platform trust
 /// root" and the hard-coded id list should go away.
 ///
-/// Must stay in lockstep with the `permissions[]` the staged app manifests in
-/// `scripts/create-rootfs.sh` declare: an app that declares `appManager:*`
-/// but is missing here silently loses the capability (the withholding is
-/// logged, but the app just stops working). Currently:
-/// - `bloom` — the desktop shell, which surfaces install/uninstall in the UI.
+/// Trust is per app, not per capability: an id on this list may hold every
+/// privileged capability its manifest declares. That is coarser than it
+/// could be, and tolerable only because every id here is an app the image
+/// ships, whose manifest the image controls.
+///
+/// Must stay in lockstep with the `permissions[]` of the manifests
+/// `scripts/create-rootfs.sh` stages (Bloom's is written there; each app's
+/// comes from `pyxis-experience/packages/apps/<id>/manifest.webapp`): an app
+/// that declares a privileged capability but is missing here silently loses
+/// it (the withholding is logged, but the app just stops working).
+/// Currently:
+/// - `bloom` — the desktop shell: it launches, raises and closes apps, runs
+///   the notification centre, sets the overlay's input region, writes
+///   settings from quick settings, and reads and adds to the Notes,
+///   Contacts and Tasks apps' documents from desktop search
+///   (`filesystem:apps`).
 /// - `installer` — drives `org.geckoOS.installer` for `.ipk` install/remove.
-pub const PRIVILEGED_APP_IDS: &[&str] = &["bloom", "installer"];
+/// - `settings` — the Settings app, which writes the user's settings.
+/// - `terminal` — the Terminal app, whose shell is the terminal service.
+/// - `files` — the Files app, which browses the user's home
+///   (`filesystem:user`) and, read-only, the whole root filesystem
+///   (`filesystem:system`).
+pub const PRIVILEGED_APP_IDS: &[&str] = &["bloom", "installer", "settings", "terminal", "files"];
 
 /// Whether `app_id` is on the platform trust list. This is necessary but not
 /// sufficient for a privileged grant — the app's tier must also permit it
@@ -203,8 +327,17 @@ pub fn appinfo_permission_to_capability(perm: &str) -> Option<&'static str> {
         "notifications" => Some("notifications"),
         "notifications.manage" => Some("notifications:manage"),
         "power" => Some("power"),
+        "audio" => Some("audio"),
+        "network" => Some("network"),
+        "browser" => Some("browser"),
         "appmanager.install" => Some("appManager:install"),
         "appmanager.manage" => Some("appManager:manage"),
+        "settings.write" => Some("settings:write"),
+        "windows.manage" => Some("windows:manage"),
+        "terminal" => Some("terminal"),
+        "filesystem.user" => Some("filesystem:user"),
+        "filesystem.system" => Some("filesystem:system"),
+        "filesystem.apps" => Some("filesystem:apps"),
         _ => None,
     }
 }
@@ -959,7 +1092,7 @@ impl Nova {
             .get(app_id)
             .ok_or_else(|| anyhow!("app '{}' is not installed", app_id))?;
         let mut info = entry.info_json();
-        let running = AppHost::global().find_session_by_app(app_id);
+        let running = AppHost::global().find_live_session_by_app(app_id);
         info["running"] = json!(running.is_some());
         if let Some(s) = running {
             info["sessionId"] = json!(s.session_id);
@@ -979,13 +1112,28 @@ impl Nova {
             .unwrap_or_default()
     }
 
+    /// The ids of the registered apps of one tier. The installer compares
+    /// the opkg tier's before and after `opkg remove` to learn which apps a
+    /// package took with it.
+    pub fn app_ids_in_tier(&self, tier: AppTier) -> Vec<String> {
+        self.registry
+            .read()
+            .map(|reg| {
+                reg.values()
+                    .filter(|e| e.tier == tier)
+                    .map(|e| e.manifest.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     // ---------- Launch composition ----------
 
     /// `nova.Launch(appId, params)` — resolve the manifest, enforce
     /// single-instance policy, ensure the runtime prerequisites (profile
     /// dir, derived native manifest, origins map) exist, then delegate to
     /// `AppHost::launch` unchanged. See `nova-runtime-host-plan.md` §6.
-    pub fn launch(&self, app_id: &str, params: Option<Value>) -> Result<Value> {
+    pub async fn launch(&self, app_id: &str, params: Option<Value>) -> Result<Value> {
         let entry = {
             let reg = self
                 .registry
@@ -996,15 +1144,21 @@ impl Nova {
                 .ok_or_else(|| anyhow!("app '{}' is not installed", app_id))?
         };
 
-        // Single-instance: raise existing session instead of spawning.
+        // Single-instance: raise the live session instead of spawning. A
+        // session `close` has stopped but not yet drained doesn't count, or
+        // relaunching right after a close would be swallowed.
         if entry.manifest.single_instance {
-            if let Some(existing) = AppHost::global().find_session_by_app(app_id) {
-                AppHost::global().set_active(&existing.session_id)?;
-                return Ok(json!({
+            if let Some(existing) = AppHost::global().find_live_session_by_app(app_id) {
+                let window_id = self.raise_session(&existing).await?;
+                let mut out = json!({
                     "sessionId": existing.session_id,
                     "appId": app_id,
                     "raised": true,
-                }));
+                });
+                if let Some(id) = window_id {
+                    out["windowId"] = json!(id);
+                }
+                return Ok(out);
             }
         }
 
@@ -1027,33 +1181,21 @@ impl Nova {
 
     pub fn close(&self, app_id: &str) -> Result<Value> {
         let session = AppHost::global()
-            .find_session_by_app(app_id)
+            .find_live_session_by_app(app_id)
             .ok_or_else(|| anyhow!("app '{}' is not running", app_id))?;
         let closed = AppHost::global().close(&session.session_id)?;
         Ok(json!({ "appId": app_id, "sessionId": closed.session_id }))
     }
 
-    /// `nova.Focus(appId)` — raise and give keyboard focus to an already-running
-    /// app's compositor window. This is the real counterpart to `launch`'s
-    /// single-instance raise path: that path only updates `AppHost::set_active`
-    /// bookkeeping (which session is "the active one"), it never told Evo to
-    /// actually move input focus or restack the window — there was no incoming
-    /// Echo IPC command for that at all (see evo/src/enhancements/echo_ipc.rs's
-    /// `FocusWindow`, added alongside this). Bloom's dock (an "orphan session"
-    /// icon in BottomDock.tsx) calls this when clicking an already-running
-    /// app, instead of re-issuing `Launch` and hoping the bookkeeping-only
-    /// raise is enough.
-    pub async fn focus(&self, app_id: &str) -> Result<Value> {
-        let session = AppHost::global()
-            .find_session_by_app(app_id)
-            .ok_or_else(|| anyhow!("app '{}' is not running", app_id))?;
-        let window_id = *session
-            .surfaces
-            .first()
-            .ok_or_else(|| anyhow!("app '{}' has no mapped compositor window yet", app_id))?;
-
+    /// Make `session` the active one and, if it has a mapped window, have Evo
+    /// raise and focus it. Returns that window id; `None` means the app has
+    /// no surface yet (still starting), which is not an error: there is
+    /// nothing to raise until it maps, and it will appear on top then.
+    async fn raise_session(&self, session: &AppSession) -> Result<Option<u32>> {
         AppHost::global().set_active(&session.session_id)?;
-
+        let Some(window_id) = session.surfaces.first().copied() else {
+            return Ok(None);
+        };
         let bus = self
             .bus_snapshot()
             .ok_or_else(|| anyhow!("nova: no IPC bus available"))?;
@@ -1064,7 +1206,23 @@ impl Nova {
             json!({ "window_id": window_id }),
         )
         .await?;
+        Ok(Some(window_id))
+    }
 
+    /// `nova.Focus(appId)` — raise and give keyboard focus to an already-running
+    /// app's compositor window. `launch`'s single-instance path does the same
+    /// through `raise_session`; Focus differs in refusing, rather than
+    /// succeeding quietly, when there is no window to focus yet. Evo's
+    /// `FocusWindow` (evo/src/enhancements/echo_ipc.rs) does the real work:
+    /// moving input focus and restacking. Bloom's dock calls this for an
+    /// "orphan session" icon.
+    pub async fn focus(&self, app_id: &str) -> Result<Value> {
+        let session = AppHost::global()
+            .find_live_session_by_app(app_id)
+            .ok_or_else(|| anyhow!("app '{}' is not running", app_id))?;
+        let window_id = self.raise_session(&session).await?.ok_or_else(|| {
+            anyhow!("app '{}' has no mapped compositor window yet", app_id)
+        })?;
         Ok(json!({
             "appId": app_id,
             "sessionId": session.session_id,
@@ -1117,23 +1275,20 @@ impl Nova {
             .to_string_lossy()
             .to_string();
 
-        let args = vec![
-            format!("--reuid={}", GECKO_UID),
-            format!("--regid={}", GECKO_GID),
-            "--groups".to_string(),
-            GECKO_GROUPS.to_string(),
-            VELA_BIN.to_string(),
-            "--profile".to_string(),
-            profile_dir,
-            url.to_string(),
-        ];
+        let (exec, args) = Self::contained_launch(
+            Self::EXTERNAL_BROWSER_APP_ID,
+            vec![
+                VELA_BIN.to_string(),
+                "--profile".to_string(),
+                profile_dir,
+                url.to_string(),
+            ],
+        );
 
         let mut env = HashMap::new();
         env.insert("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string());
         env.insert("GDK_BACKEND".to_string(), "wayland".to_string());
-        env.insert("XDG_RUNTIME_DIR".to_string(), XDG_RUNTIME_DIR.to_string());
-        env.insert("WAYLAND_DISPLAY".to_string(), WAYLAND_DISPLAY.to_string());
-        env.insert("HOME".to_string(), GECKO_HOME.to_string());
+        Self::insert_app_session_env(&mut env);
         // Same decoration handoff every other vela launch uses (Evo draws
         // no SSD; GTK draws its own titlebar) — see evo-firefox-decoration
         // notes / write_native_manifest above.
@@ -1145,7 +1300,7 @@ impl Nova {
 
         let session = AppHost::global().launch_raw(
             Self::EXTERNAL_BROWSER_APP_ID,
-            Path::new(SETPRIV_BIN),
+            Path::new(exec),
             &args,
             &env,
         )?;
@@ -1160,83 +1315,38 @@ impl Nova {
         }))
     }
 
-    // ---------- Lifecycle: suspend/resume driven by Evo visibility ----------
-    //
-    // Ports gaia's `suspend_app`/`resume_app` intent (a real gap called out
-    // in CLAUDE.md as "worth porting into Nova/appHost rather than
-    // discarding") — but gaia's version only flipped an in-memory status
-    // enum with no actual process effect. This drives `AppHost::suspend`/
-    // `resume` (real SIGSTOP/SIGCONT, see apphost.rs) off Evo's real
-    // `WindowMinimized` signal (subscribed in
-    // `daemon.rs::register_nova_handlers`), and re-emits app-identity-
-    // correlated `AppSuspended`/`AppResumed` signals on `org.geckoOS.nova`,
-    // per nova-runtime-host-plan.md §5's "Nova subscribes to evo visibility/
-    // focus events and adds app-identity context the shell wants."
-
-    /// Called when Evo's `WindowMinimized{window_id, minimized: true}`
-    /// fires. Resolves the window to its owning session via
-    /// `AppHost::session_for_surface` and suspends it. Errors (unknown
-    /// window, already suspended) are logged, not propagated — this runs
-    /// from a signal handler with no caller to return them to.
-    pub fn handle_window_minimized(&self, window_id: u32) {
-        let Some(session) = AppHost::global().session_for_surface(window_id) else {
-            return;
-        };
-        match AppHost::global().suspend(&session.session_id) {
-            Ok(_) => {
-                self.emit(
-                    "AppSuspended",
-                    json!({ "appId": session.app_id, "sessionId": session.session_id }),
-                );
-            }
-            Err(e) => tracing::debug!(
-                "nova: suspend for window {} (app '{}') skipped: {}",
-                window_id,
-                session.app_id,
-                e
-            ),
-        }
-    }
-
-    /// Called when Evo's `WindowMinimized{window_id, minimized: false}`
-    /// (i.e. restored) fires.
-    pub fn handle_window_restored(&self, window_id: u32) {
-        let Some(session) = AppHost::global().session_for_surface(window_id) else {
-            return;
-        };
-        match AppHost::global().resume(&session.session_id) {
-            Ok(_) => {
-                self.emit(
-                    "AppResumed",
-                    json!({ "appId": session.app_id, "sessionId": session.session_id }),
-                );
-            }
-            Err(e) => tracing::debug!(
-                "nova: resume for window {} (app '{}') skipped: {}",
-                window_id,
-                session.app_id,
-                e
-            ),
-        }
-    }
+    // Minimizing a window does not suspend its app. Nova used to SIGSTOP the
+    // process on Evo's `WindowMinimized`, which silenced a minimized music
+    // player and left a minimized app unable to handle SIGTERM. Background
+    // state now comes from the xdg `suspended` hint Evo sends the client;
+    // `AppHost::suspend`/`resume` remain as explicit calls.
 
     fn ensure_profile_dir(&self, app_id: &str) -> Result<()> {
         let dir = Path::new(PROFILES_ROOT).join(app_id);
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let mut perms = fs::metadata(&dir)?.permissions();
             perms.set_mode(0o700);
             fs::set_permissions(&dir, perms)?;
-            // vela runs as geckouser (uid/gid 1000) via the setpriv drop the
-            // generated manifest encodes; the profile dir must be owned by
-            // that user or Gecko can't write its profile (prefs, storage,
-            // startupCache) — the same ownership the boot script's
-            // `chown 1000:1000` establishes for the kiosk app's profile.
-            let _ = std::os::unix::fs::chown(&dir, Some(GECKO_UID), Some(GECKO_GID));
+            // vela runs as the app user (see `contained_launch`); the profile
+            // dir must be owned by that user or Gecko can't write its profile
+            // (prefs, storage, startupCache). The shell's own profile is the
+            // boot script's, and stays geckouser's: its vela is not Nova's.
+            if !is_shell_app(app_id) {
+                let (uid, gid) = app_owner(app_id);
+                if fs::metadata(&dir)?.uid() != uid || fs::metadata(&dir)?.gid() != gid {
+                    // First launch as the app user, or a profile left by an
+                    // image from before apps had a user of their own: its
+                    // files are geckouser's and the app could not write them.
+                    if let Err(e) = chown_tree(&dir, uid, gid) {
+                        tracing::warn!("nova: giving {} to the app user: {:#}", dir.display(), e);
+                    }
+                }
+            }
         }
-        self.write_profile_prefs(&dir)?;
+        self.write_profile_prefs(&dir, app_id)?;
         Ok(())
     }
 
@@ -1250,10 +1360,10 @@ impl Nova {
     /// garbled/blank. Forcing hardware WebRender on + disabling the GPU
     /// process (single-process rendering is more robust in this constrained
     /// VM) matches what already made the boot app render correctly. Written
-    /// as `user.js` (re-applied every startup) owned by geckouser so the
+    /// as `user.js` (re-applied every startup) owned by the app user so the
     /// unprivileged vela process can read it. Kept in lockstep with
     /// create-rootfs.sh's PREFS heredoc.
-    fn write_profile_prefs(&self, dir: &Path) -> Result<()> {
+    fn write_profile_prefs(&self, dir: &Path, app_id: &str) -> Result<()> {
         let prefs = r#"// Pyxis rendering prefs -- kept in lockstep with scripts/create-rootfs.sh.
 user_pref("gfx.webrender.all", true);
 user_pref("gfx.webrender.software", false);
@@ -1280,6 +1390,13 @@ user_pref("media.autoplay.block-webaudio", false);
 // remoting, is handled by MOZ_NO_REMOTE in write_native_manifest).
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.sessionstore.max_resumed_crashes", 0);
+// Never fall into automatic safe mode. Gecko counts every start that didn't
+// reach its "startup finished" mark as a crash (toolkit.startup.recent_crashes),
+// and an app closed during start-up is one; past 3 it starts in safe mode,
+// which a chromeless app window can't show, so vela exits at once, every time,
+// and nothing ever resets the count: the app could never be launched again.
+// -1 turns the check off, and the next good start clears the count.
+user_pref("toolkit.startup.max_resumed_crashes", -1);
 user_pref("browser.startup.page", 0);
 // No WebExtensions in a single-purpose app profile.
 //
@@ -1334,15 +1451,74 @@ user_pref("datareporting.policy.firstRunURL", "");
 user_pref("browser.startup.homepage_override.mstone", "ignore");
 "#;
         let path = dir.join("user.js");
-        fs::write(&path, prefs).with_context(|| format!("write {}", path.display()))?;
+        // The profile dir is the app user's, and root writes into it, so the
+        // app can have left anything at `user.js`, a symlink included. Remove
+        // whatever is there (a symlink is unlinked, never followed) and create
+        // it new, which refuses to follow one planted in between. Ownership is
+        // set on the open file, not the path, for the same reason.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("replace {}", path.display())),
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("write {}", path.display()))?;
+        std::io::Write::write_all(&mut file, prefs.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
         #[cfg(unix)]
         {
-            // Readable by the geckouser vela runs as (the profile dir is 0700
-            // and owned by geckouser, so the file must be too or vela can't
-            // read its own prefs).
-            let _ = std::os::unix::fs::chown(&path, Some(GECKO_UID), Some(GECKO_GID));
+            // Readable by the user vela runs as (the profile dir is 0700 and
+            // that user's, so the file must be too or vela can't read its own
+            // prefs).
+            let (uid, gid) = app_owner(app_id);
+            let _ = std::os::unix::fs::fchown(&file, Some(uid), Some(gid));
         }
         Ok(())
+    }
+
+    /// The environment every app launch shares, besides what the app is: the
+    /// app user's runtime dir and home, and where PipeWire's Pulse server is.
+    /// `pyxis-wlctx` adds `WAYLAND_DISPLAY` (a path to the app's own socket).
+    fn insert_app_session_env(env: &mut HashMap<String, String>) {
+        env.insert("XDG_RUNTIME_DIR".to_string(), APP_RUNTIME_DIR.to_string());
+        env.insert("HOME".to_string(), APP_HOME.to_string());
+        env.insert("PULSE_SERVER".to_string(), PULSE_SERVER.to_string());
+    }
+
+    /// The `exec` and `args` that launch `command` as `app_id`:
+    /// `pyxis-wlctx`, as root. It makes the app's Wayland socket, hides the
+    /// host socket from the app, drops to the app user (`--uid`/`--gid`/
+    /// `--groups`) and runs `command`. The drop is the helper's and not
+    /// `setpriv`'s because a credential change clears the parent-death signal
+    /// that makes a kill of the session pid take the app with it; the helper
+    /// sets it after dropping. See `echo/src/bin/wlctx.rs`.
+    fn contained_launch(app_id: &str, command: Vec<String>) -> (&'static str, Vec<String>) {
+        let mut args = vec![
+            "--app-id".to_string(),
+            app_id.to_string(),
+            "--uid".to_string(),
+            APP_UID.to_string(),
+            "--gid".to_string(),
+            APP_GID.to_string(),
+            "--groups".to_string(),
+            APP_GROUPS.to_string(),
+            "--runtime-dir".to_string(),
+            APP_RUNTIME_DIR.to_string(),
+            "--host-socket".to_string(),
+            HOST_SOCKET.to_string(),
+            "--hide".to_string(),
+            HOST_SOCKET.to_string(),
+        ];
+        for (name, target) in APP_RUNTIME_LINKS {
+            args.push("--link".to_string());
+            args.push(format!("{name}={target}"));
+        }
+        args.push("--".to_string());
+        args.extend(command);
+        (WLCTX_BIN, args)
     }
 
     /// Generate the derived native `manifest.json` `AppHost::launch` reads,
@@ -1360,15 +1536,10 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
         let mut env = HashMap::new();
         env.insert("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string());
         env.insert("GDK_BACKEND".to_string(), "wayland".to_string());
-        // Session env vela needs to find Evo's Wayland socket and its own
-        // $HOME. setpriv preserves the environment (no --clear-env), so these
-        // — applied by AppHost via Command::env — are inherited by vela after
-        // the privilege drop. The boot script sets the identical set for the
-        // kiosk app; shell-launched apps need them too since AppHost's own
-        // environment isn't guaranteed to carry HOME=/home/geckouser.
-        env.insert("XDG_RUNTIME_DIR".to_string(), XDG_RUNTIME_DIR.to_string());
-        env.insert("WAYLAND_DISPLAY".to_string(), WAYLAND_DISPLAY.to_string());
-        env.insert("HOME".to_string(), GECKO_HOME.to_string());
+        // Session env vela needs: its runtime dir, its $HOME and the Pulse
+        // server. They are applied by AppHost via Command::env and inherited
+        // through pyxis-wlctx, which adds WAYLAND_DISPLAY (the app's own socket).
+        Self::insert_app_session_env(&mut env);
         env.insert("PYXIS_APP_ID".to_string(), entry.manifest.id.clone());
         env.insert("PYXIS_PROFILE_DIR".to_string(), profile_arg.clone());
         env.insert(
@@ -1401,22 +1572,13 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
             env.insert("PYXIS_BACKGROUND".to_string(), "1".to_string());
         }
 
-        // exec = setpriv (as root) which drops to geckouser + grants the
-        // video/render groups, then execs vela. See the GECKO_* consts above
+        // exec = pyxis-wlctx (as root), which drops to the app user + grants
+        // the video/render groups, then execs vela. See the APP_* consts above
         // and scripts/create-rootfs.sh for why this indirection is required
         // (Gecko refuses to run as root; GPU access needs group membership).
-        let native = json!({
-            "id": entry.manifest.id,
-            "name": entry.manifest.name,
-            "exec": SETPRIV_BIN,
-            "icon": entry.manifest.icons.get("64").cloned().unwrap_or_default(),
-            "version": entry.manifest.version,
-            "category": entry.manifest.category,
-            "args": [
-                format!("--reuid={}", GECKO_UID),
-                format!("--regid={}", GECKO_GID),
-                "--groups".to_string(),
-                GECKO_GROUPS.to_string(),
+        let (exec, args) = Self::contained_launch(
+            &entry.manifest.id,
+            vec![
                 VELA_BIN.to_string(),
                 "--profile".to_string(),
                 profile_arg,
@@ -1425,6 +1587,15 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
                 "--app-entry".to_string(),
                 entry.manifest.entry.clone(),
             ],
+        );
+        let native = json!({
+            "id": entry.manifest.id,
+            "name": entry.manifest.name,
+            "exec": exec,
+            "icon": entry.manifest.icons.get("64").cloned().unwrap_or_default(),
+            "version": entry.manifest.version,
+            "category": entry.manifest.category,
+            "args": args,
             "env": env,
         });
 
@@ -1443,30 +1614,23 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
             .ok_or_else(|| anyhow!("app '{}' has no native main", entry.manifest.id))?;
 
         let mut env = HashMap::new();
-        env.insert("XDG_RUNTIME_DIR".to_string(), XDG_RUNTIME_DIR.to_string());
-        env.insert("WAYLAND_DISPLAY".to_string(), WAYLAND_DISPLAY.to_string());
+        Self::insert_app_session_env(&mut env);
         env.insert("GDK_BACKEND".to_string(), "wayland".to_string());
         env.insert("QT_QPA_PLATFORM".to_string(), "wayland".to_string());
-        env.insert("HOME".to_string(), GECKO_HOME.to_string());
         env.insert("PYXIS_APP_ID".to_string(), entry.manifest.id.clone());
         env.insert(
             "PYXIS_DISPLAY_MODE".to_string(),
             entry.manifest.display.clone(),
         );
 
-        let mut args = vec![
-            format!("--reuid={}", GECKO_UID),
-            format!("--regid={}", GECKO_GID),
-            "--groups".to_string(),
-            GECKO_GROUPS.to_string(),
-            main.to_string(),
-        ];
+        let mut args = vec![main.to_string()];
         args.extend(entry.entry_args.iter().cloned());
+        let (exec, args) = Self::contained_launch(&entry.manifest.id, args);
 
         let native = json!({
             "id": entry.manifest.id,
             "name": entry.manifest.name,
-            "exec": SETPRIV_BIN,
+            "exec": exec,
             "icon": entry.manifest.icons.get("64").cloned().unwrap_or_default(),
             "version": entry.manifest.version,
             "category": entry.manifest.category,
@@ -1613,10 +1777,9 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
         Ok(json!({ "appId": manifest.id, "version": manifest.version }))
     }
 
-    /// Uninstall: stop any live session, remove the app dir, optionally
-    /// purge its profile (storage/cookies/service-worker cache) — never
-    /// silently, only when `purge_data` is explicitly true.
-    pub fn uninstall(&self, app_id: &str, purge_data: bool) -> Result<Value> {
+    /// Uninstall: stop any live session, remove the app dir, and forget what
+    /// the app kept (see [`forget_app_state`]).
+    pub fn uninstall(&self, app_id: &str) -> Result<Value> {
         let (dir, tier) = {
             let reg = self
                 .registry
@@ -1646,22 +1809,50 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
                 )),
             };
         }
-        if let Some(session) = AppHost::global().find_session_by_app(app_id) {
-            let _ = AppHost::global().close(&session.session_id);
-        }
+        AppHost::global().close_and_wait(app_id, APP_EXIT_LIMIT);
         fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-        if purge_data {
-            let profile = Path::new(PROFILES_ROOT).join(app_id);
-            if profile.exists() {
-                fs::remove_dir_all(&profile)
-                    .with_context(|| format!("purge {}", profile.display()))?;
-            }
-        }
+        let forgotten = forget_app_state(app_id);
         let count = self.reload()?;
         self.emit("AppUninstalled", json!({ "appId": app_id }));
         tracing::info!("nova: uninstalled '{}' ({} apps remain)", app_id, count);
-        Ok(json!({ "appId": app_id }))
+        Ok(json!({ "appId": app_id, "removed": forgotten }))
     }
+}
+
+/// How long uninstalling waits for a running app to exit. AppHost sends
+/// SIGKILL 5 s after SIGTERM, so this leaves it room to land.
+pub const APP_EXIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// Deletes what an uninstalled app kept, and says what there was: its own
+/// files (`"data"`, `/var/lib/pyxis/data/<id>`) and its Gecko profile
+/// (`"profile"`, `/var/lib/pyxis/profiles/<id>`: localStorage, IndexedDB,
+/// cookies and caches). Both go, so a package that later takes the same id
+/// starts empty instead of inheriting them. The app must have exited
+/// (`AppHost::close_and_wait`): a vela still shutting down writes its
+/// profile on the way out, and would leave part of it behind.
+///
+/// Runs as root. Both parents are root's, so no app can swap either
+/// directory for a symlink, and `remove_dir_all` removes a symlink inside
+/// rather than following it.
+pub fn forget_app_state(app_id: &str) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    // Each is one path component under its root.
+    if !valid_app_id(app_id) {
+        tracing::warn!("nova: '{}' is not an app id; kept what it stored", app_id);
+        return removed;
+    }
+    match remove_app_data(app_id) {
+        Ok(true) => removed.push("data"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("nova: kept '{}''s data: {:#}", app_id, e),
+    }
+    let profile = Path::new(PROFILES_ROOT).join(app_id);
+    match fs::remove_dir_all(&profile) {
+        Ok(()) => removed.push("profile"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("nova: kept {}: {}", profile.display(), e),
+    }
+    removed
 }
 
 /// `sha256sum <path>` — shells out rather than adding a new crate
@@ -1697,6 +1888,115 @@ impl CloneEntry for Option<&RegistryEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launches_run_through_the_context_helper_which_drops_the_privileges() {
+        let (exec, args) = Nova::contained_launch(
+            "com.test.app",
+            vec!["/usr/bin/app".to_string(), "--flag".to_string()],
+        );
+        // The helper is the program the launch runs, as root, so the app
+        // can't be started without it, and it is the helper that drops (a
+        // `setpriv` in front would clear the parent-death signal the helper
+        // sets). It names the app: the identity comes from here, not from
+        // the app.
+        assert_eq!(exec, WLCTX_BIN);
+        assert_eq!(
+            args,
+            [
+                "--app-id",
+                "com.test.app",
+                "--uid",
+                "1001",
+                "--gid",
+                "1001",
+                "--groups",
+                APP_GROUPS,
+                "--runtime-dir",
+                APP_RUNTIME_DIR,
+                "--host-socket",
+                HOST_SOCKET,
+                "--hide",
+                HOST_SOCKET,
+                "--link",
+                "geckoOS=/run/user/1000/geckoOS",
+                "--",
+                "/usr/bin/app",
+                "--flag",
+            ]
+        );
+        assert!(!args.iter().any(|a| a.contains("setpriv")));
+    }
+
+    #[test]
+    fn apps_are_not_the_shells_user() {
+        // The point of the split: an app that is the shell's user could open
+        // the host socket and arrive as trusted.
+        assert_ne!(APP_UID, GECKO_UID);
+        assert_ne!(APP_GID, GECKO_GID);
+        assert_ne!(APP_HOME, GECKO_HOME);
+        assert_ne!(APP_RUNTIME_DIR, SHELL_RUNTIME_DIR);
+        assert!(HOST_SOCKET.starts_with(SHELL_RUNTIME_DIR));
+        assert_eq!(app_owner("com.test.app"), (APP_UID, APP_GID));
+        assert_eq!(app_owner("browser-window"), (APP_UID, APP_GID));
+        // The shell's own state stays the shell's.
+        assert_eq!(app_owner("bloom"), (GECKO_UID, GECKO_GID));
+    }
+
+    #[test]
+    fn every_manifest_launches_through_the_helper_with_the_app_session_env() {
+        // Whichever way an app is composed (vela, native, external browser),
+        // the app user's runtime dir and home are in its env, and the shell's
+        // are nowhere.
+        let mut env = HashMap::new();
+        Nova::insert_app_session_env(&mut env);
+        assert_eq!(env["XDG_RUNTIME_DIR"], APP_RUNTIME_DIR);
+        assert_eq!(env["HOME"], APP_HOME);
+        assert_eq!(env["PULSE_SERVER"], PULSE_SERVER);
+        assert!(!env.values().any(|v| v == GECKO_HOME || v == SHELL_RUNTIME_DIR));
+        let src = include_str!("nova.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert_eq!(
+            body.matches("Self::contained_launch(").count(),
+            3,
+            "a new launch path must go through contained_launch"
+        );
+        assert_eq!(
+            body.matches("Self::insert_app_session_env(").count(),
+            3,
+            "and give its app the app session env"
+        );
+        assert!(!body.contains("--reuid"), "the drop is pyxis-wlctx's, not setpriv's");
+    }
+
+    #[test]
+    fn the_context_helper_is_configured_with_what_the_rootfs_makes() {
+        // create-rootfs.sh must make the user, group, home and runtime-dir
+        // permissions these constants name: the drop is a fatal error
+        // otherwise, and so is an app that can't reach Echo.
+        let script = include_str!("../../../scripts/create-rootfs.sh");
+        assert!(script.contains(&format!("pyxisapp:x:{APP_UID}:{APP_GID}:")));
+        assert!(script.contains(&format!("pyxisapp:x:{APP_GID}:")));
+        assert!(script.contains(APP_HOME));
+        for group in APP_GROUPS.split(',') {
+            assert!(script.contains(&format!("\n{group}:x:")), "group {group}");
+        }
+        assert!(script.contains("chmod 711 /run/user/1000"));
+        assert!(script.contains("\"unix:/run/pyxis/pulse/native\""));
+        assert!(script.contains("mkdir -p /run/pyxis/pulse"));
+        assert!(script.contains("chmod 600 \"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\""));
+    }
+
+    #[test]
+    fn no_profile_can_fall_into_safe_mode() {
+        // An app closed during start-up counts as a start-up crash; past
+        // Gecko's limit a chromeless vela exits at once on every launch after.
+        let pref = r#"user_pref("toolkit.startup.max_resumed_crashes", -1);"#;
+        let source = include_str!("nova.rs");
+        let body = &source[source.find("fn write_profile_prefs").unwrap()..];
+        assert!(body[..body.find("\n    }\n").unwrap()].contains(pref), "app profiles");
+        assert!(include_str!("../../../scripts/create-rootfs.sh").contains(pref), "the shell's profile");
+    }
 
     #[test]
     fn rejects_unknown_permission() {
@@ -1893,20 +2193,217 @@ mod tests {
     }
 
     #[test]
-    fn in_image_apps_declaring_app_management_are_trusted() {
-        // Regression guard for the trust list itself. `bloom` (the shell) and
-        // `installer` are staged by scripts/create-rootfs.sh with
-        // appManager:* in their manifest.webapp permissions[]. An id missing
-        // from PRIVILEGED_APP_IDS would have its capabilities silently
-        // stripped at load and the app would break on device, which is a
-        // failure mode no other test would catch.
-        for id in ["bloom", "installer"] {
+    fn in_image_apps_declaring_privileged_capabilities_are_trusted() {
+        // Regression guard for the trust list itself. These apps are staged
+        // by scripts/create-rootfs.sh with privileged capabilities in their
+        // manifest.webapp permissions[]: bloom (the shell) and installer hold
+        // appManager:*, settings holds settings:write, terminal holds
+        // terminal, files holds filesystem:user and filesystem:system, and
+        // bloom holds filesystem:apps.
+        // An id missing from PRIVILEGED_APP_IDS would have its
+        // capabilities silently stripped at load and the app would break on
+        // device, which is a failure mode no other test would catch.
+        for id in ["bloom", "installer", "settings", "terminal", "files"] {
             assert!(
                 app_id_is_privileged(id),
-                "'{id}' declares appManager:* in its staged manifest but is not on \
-                 the trust list; it would lose the capability at load"
+                "'{id}' declares a privileged capability in its staged manifest but \
+                 is not on the trust list; it would lose the capability at load"
             );
         }
+    }
+
+    /// The quoted strings of a `&[&str]` const in Rust source text, e.g.
+    /// vroom's `PERMISSIONS`. Enough for a flat list of literals, which is
+    /// all these consts are.
+    fn str_array_const(src: &str, name: &str) -> Vec<String> {
+        let prefix = format!("pub const {name}: &[&str] = &[");
+        let start = src
+            .find(&prefix)
+            .unwrap_or_else(|| panic!("no `pub const {name}` found"))
+            + prefix.len();
+        let body = &src[start..];
+        let body = &body[..body.find("];").unwrap_or_else(|| panic!("unterminated {name}"))];
+        body.split('"').skip(1).step_by(2).map(str::to_string).collect()
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    fn repo_file(rel: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(rel);
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The rows of a capability table in PyxisBridgeParent.sys.mjs, `const
+    /// NAME = { service: { member: "capability" | null, ... }, ... };`, as
+    /// (service, member, capability), with `None` for `null`. A flat table,
+    /// `const NAME = { key: "capability", ... };`, gives rows with an empty
+    /// service. Line-based, which the tables' layout allows: one entry per
+    /// line, `//` comments, and the closing `};` on a line of its own.
+    fn js_capability_table(src: &str, name: &str) -> Vec<(String, String, Option<String>)> {
+        let head = format!("const {name} = {{");
+        let start = src
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} not found in PyxisBridgeParent.sys.mjs"))
+            + head.len();
+        let table = &src[start..];
+        let table = &table[..table.find("\n};").unwrap_or_else(|| panic!("unterminated {name}"))];
+
+        let mut rows = Vec::new();
+        let mut service: Option<String> = None;
+        for line in table.lines() {
+            let code = line.split("//").next().unwrap_or("").trim();
+            // `service: {` opens a service, `member: "capability",` and
+            // `member: null,` are its rows, and `},` closes it.
+            let Some((key, value)) = code.split_once(':') else { continue };
+            let (key, value) = (key.trim(), value.trim().trim_end_matches(',').trim());
+            if value == "{" {
+                service = Some(key.to_string());
+                continue;
+            }
+            let service = service.clone().unwrap_or_default();
+            let capability = (value != "null").then(|| value.trim_matches('"').to_string());
+            rows.push((service, key.to_string(), capability));
+        }
+        rows
+    }
+
+    #[test]
+    fn bridge_table_and_nova_share_one_vocabulary() {
+        // The bridge decides which (service, method) needs which capability,
+        // which signals an app may hear (BRIDGE_SIGNALS), and which
+        // capabilities widen where filesystem calls reach
+        // (FILESYSTEM_SCOPES); Nova decides which capabilities an app holds.
+        // A string in any of the tables that Nova does not know can never be
+        // held, so what it guards is refused for everyone. A capability Nova
+        // knows but no table names gates nothing, so declaring it does
+        // nothing. Read from the patch series, the durable copy of the fork
+        // (scripts/regen-gecko-patches.sh keeps it equal to the checkout).
+        let src = repo_file("gecko/patches/pyxis/toolkit/actors/PyxisBridgeParent.sys.mjs");
+        let calls = js_capability_table(&src, "BRIDGE_CAPABILITIES");
+        let signals = js_capability_table(&src, "BRIDGE_SIGNALS");
+        let scopes = js_capability_table(&src, "FILESYSTEM_SCOPES");
+        // A parse that found nothing would pass the loops below vacuously.
+        assert!(calls.len() > 50, "parsed only {} BRIDGE_CAPABILITIES entries", calls.len());
+        assert!(signals.len() > 30, "parsed only {} BRIDGE_SIGNALS entries", signals.len());
+        assert_eq!(scopes.len(), 3, "parsed {} FILESYSTEM_SCOPES entries", scopes.len());
+
+        for (table, rows) in [
+            ("BRIDGE_CAPABILITIES", &calls),
+            ("BRIDGE_SIGNALS", &signals),
+            ("FILESYSTEM_SCOPES", &scopes),
+        ] {
+            for (service, member, capability) in rows.iter() {
+                let Some(cap) = capability else { continue };
+                assert!(
+                    KNOWN_CAPABILITIES.contains(&cap.as_str()),
+                    "{table} requires '{cap}' for {service}.{member}, which is not in \
+                     KNOWN_CAPABILITIES; no app could ever hold it"
+                );
+            }
+        }
+        for cap in KNOWN_CAPABILITIES {
+            assert!(
+                calls
+                    .iter()
+                    .chain(signals.iter())
+                    .chain(scopes.iter())
+                    .any(|(_, _, c)| c.as_deref() == Some(*cap)),
+                "'{cap}' is in KNOWN_CAPABILITIES but no bridge table requires it, \
+                 so declaring it grants nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bridge_and_echo_agree_on_the_filesystem_methods_and_which_ones_write() {
+        // The read-only system scope refuses a write twice over: the bridge
+        // by the capability its table names, echo by scope::WRITES. A write
+        // the table gates on filesystem:read, or one WRITES leaves out, gets
+        // past one of the two. And a method the bridge forwards but echo
+        // doesn't answer, or the other way round, is a gap in one table.
+        let src = repo_file("gecko/patches/pyxis/toolkit/actors/PyxisBridgeParent.sys.mjs");
+        let rows: Vec<_> = js_capability_table(&src, "BRIDGE_CAPABILITIES")
+            .into_iter()
+            .filter(|(service, _, _)| service == "filesystem")
+            .collect();
+        let writes = rows
+            .iter()
+            .filter(|(_, _, cap)| cap.as_deref() == Some("filesystem:write"))
+            .map(|(_, method, _)| method.clone())
+            .collect();
+        let owned = |list: &[&str]| sorted(list.iter().map(|s| s.to_string()).collect());
+        assert_eq!(sorted(writes), owned(crate::services::filesystem::scope::WRITES));
+        let methods = rows.into_iter().map(|(_, method, _)| method).collect();
+        assert_eq!(sorted(methods), owned(crate::services::filesystem::METHODS));
+    }
+
+    #[test]
+    fn signals_carrying_other_apps_data_need_privileged_capabilities() {
+        // Echo sends every signal to every connection, so BRIDGE_SIGNALS is
+        // all that stops an app hearing every other app's notifications, the
+        // root shell's output, which apps run and what gets installed. These
+        // services' signals carry that, as their calls do, so each must need
+        // a privileged capability: an ordinary one would hand the data to any
+        // installed app.
+        let src = repo_file("gecko/patches/pyxis/toolkit/actors/PyxisBridgeParent.sys.mjs");
+        let signals = js_capability_table(&src, "BRIDGE_SIGNALS");
+        for service in ["notification", "terminal", "appHost", "nova", "installer", "evo"] {
+            let rows: Vec<_> = signals.iter().filter(|(s, _, _)| s == service).collect();
+            assert!(!rows.is_empty(), "BRIDGE_SIGNALS lists nothing for {service}");
+            for (_, event, capability) in rows {
+                let cap = capability.as_deref().unwrap_or("null");
+                assert!(
+                    PRIVILEGED_CAPABILITIES.contains(&cap),
+                    "{service}.{event} needs '{cap}', which is not privileged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vroom_and_nova_share_the_appinfo_vocabulary() {
+        // vroom validates the dotted names when a package is built; Nova
+        // validates them again when it loads appinfo.json. A name one knows
+        // and the other doesn't is a package that builds and then fails to
+        // load (or the reverse), so the four lists must be the same set.
+        let config = repo_file("vroom/src/config.rs");
+        let want = sorted(APPINFO_PERMISSIONS.iter().map(|s| s.to_string()).collect());
+        assert_eq!(sorted(str_array_const(&config, "PERMISSIONS")), want, "vroom config::PERMISSIONS");
+        assert_eq!(
+            sorted(str_array_const(&config, "PRIVILEGED_PERMISSIONS")),
+            sorted(PRIVILEGED_APPINFO_PERMISSIONS.iter().map(|s| s.to_string()).collect()),
+            "vroom config::PRIVILEGED_PERMISSIONS"
+        );
+        for (schema, property) in [
+            ("vroom/schemas/appinfo.schema.json", "requiredPermissions"),
+            ("vroom/schemas/pyxis.schema.json", "permissions"),
+        ] {
+            let json: Value = serde_json::from_str(&repo_file(schema)).expect(schema);
+            let listed: Vec<String> = json["properties"][property]["items"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{schema}: no {property}.items.enum"))
+                .iter()
+                .map(|v| v.as_str().expect("enum entries are strings").to_string())
+                .collect();
+            assert_eq!(sorted(listed), want, "{schema} {property}");
+        }
+    }
+
+    #[test]
+    fn privileged_capabilities_are_withheld_from_an_opkg_app() {
+        // The new privileged entries behave like the old ones: an ordinary
+        // ipk that declares them builds, loads, and gets none of them.
+        let declared: Vec<String> = ["audio", "settings.write", "windows.manage", "terminal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            appinfo_capabilities_for("com.example.app", AppTier::Opkg, &declared),
+            vec!["audio"]
+        );
     }
 
     #[test]

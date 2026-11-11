@@ -53,13 +53,9 @@ enum Command {
     Close { app_id: String },
     /// Raise + focus an already-running app's window
     Focus { app_id: String },
-    /// Uninstall a Nova-managed app (ipk apps: use `opkg remove` instead)
-    Uninstall {
-        app_id: String,
-        /// Also purge the app's profile/data
-        #[arg(long)]
-        purge: bool,
-    },
+    /// Uninstall a Nova-managed app, with its data and profile (ipk apps:
+    /// use the installer's Remove, or `opkg remove`, instead)
+    Uninstall { app_id: String },
 }
 
 #[tokio::main]
@@ -135,14 +131,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 .await?;
             println!("focused {app_id}");
         }
-        Command::Uninstall { app_id, purge } => {
+        Command::Uninstall { app_id } => {
             client
-                .call_method(
-                    NOVA,
-                    NOVA,
-                    "Uninstall",
-                    json!({ "appId": app_id, "purgeData": purge }),
-                )
+                .call_method(NOVA, NOVA, "Uninstall", json!({ "appId": app_id }))
                 .await?;
             println!("uninstalled {app_id}");
         }

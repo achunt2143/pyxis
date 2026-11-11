@@ -600,6 +600,24 @@ impl Default for GeckoAppLauncher {
 mod tests {
     use super::*;
 
+    #[test]
+    fn launcher_spawns_nothing() {
+        // See the crate docs: starting a process here would start it outside
+        // pyxis-wlctx, on Evo's host socket, trusted. Building the needles
+        // from pieces keeps this file from matching itself.
+        let src = include_str!("gecko_app_launcher.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        for needle in [
+            concat!("std::process", "::Command"),
+            concat!("Command", "::new"),
+            concat!("tokio::process", "::Command"),
+            concat!("libc::", "fork"),
+            concat!(".spa", "wn("),
+        ] {
+            assert!(!body.contains(needle), "gecko_app_launcher.rs now contains {needle}");
+        }
+    }
+
     fn test_request() -> LaunchAppRequest {
         LaunchAppRequest {
             app_name: "test-app".to_string(),

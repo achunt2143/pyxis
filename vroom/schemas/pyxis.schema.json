@@ -99,7 +99,7 @@
     },
     "permissions": {
       "type": "array",
-      "description": "Requested app permissions (spec §19.1). `notifications.manage`, `appmanager.install` and `appmanager.manage` are privileged: any app may declare them, but they are granted only to apps on the platform trust list (spec §19.2).",
+      "description": "Requested app permissions (spec §19.1). `notifications.manage`, `appmanager.install`, `appmanager.manage`, `settings.write`, `windows.manage`, `terminal`, `filesystem.user`, `filesystem.system` and `filesystem.apps` are privileged: any app may declare them, but they are granted only to apps on the platform trust list (spec §19.2).",
       "items": {
         "type": "string",
         "enum": [
@@ -114,9 +114,17 @@
           "ipc",
           "background",
           "power",
+          "audio",
+          "browser",
           "notifications.manage",
           "appmanager.install",
-          "appmanager.manage"
+          "appmanager.manage",
+          "settings.write",
+          "windows.manage",
+          "terminal",
+          "filesystem.user",
+          "filesystem.system",
+          "filesystem.apps"
         ]
       },
       "uniqueItems": true

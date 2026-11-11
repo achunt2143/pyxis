@@ -26,6 +26,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["v4"] }
 # Time
 chrono = { workspace = true }
+# Time zones for the time service (services/time.rs): offsets and DST from
+# the image's own TZif files. Already in the lockfile through env_logger;
+# no bundled tz database, so Echo agrees with the image's tzdata.
+jiff = { version = "0.2.18", default-features = false, features = ["std"] }
 # Message queue
 crossbeam-channel = { workspace = true }
 # Pattern matching
@@ -40,6 +44,18 @@ clap = { workspace = true, features = ["derive"] }
 # services/terminal.rs) on top of the workspace's base feature set.
 nix = { workspace = true, features = ["term"] }
 libc = { workspace = true }
+# openat2(RESOLVE_BENEATH) and per-thread credentials for the filesystem
+# service's confined calls (services/filesystem/scope.rs). Already in the
+# lockfile through tempfile and smithay.
+rustix = { workspace = true, features = ["fs", "process", "thread"] }
+
+# pyxis-wlctx (the launcher that gives each app its own Wayland socket) and
+# pyxis-wlprobe (its on-device test client) speak the client side of Wayland.
+# Already in the lockfile through evo.
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["client"] }
+wayland-protocols-wlr = { workspace = true, features = ["client"] }
+wayland-protocols-misc = { workspace = true, features = ["client"] }
 
 [lib]
 name = "geckoOS_echo"
@@ -59,6 +75,18 @@ path = "src/bin/client.rs"
 [[bin]]
 name = "pyxis-appctl"
 path = "src/bin/appctl.rs"
+
+# Gives an app its own Wayland socket, carrying its identity, so Evo can tell
+# an app from the system (evo/src/trust.rs). Nova wraps every app launch in it.
+[[bin]]
+name = "pyxis-wlctx"
+path = "src/bin/wlctx.rs"
+
+# Test client for the above: lists the globals it can see, tries to bind
+# privileged ones, and opens a toplevel claiming an app id.
+[[bin]]
+name = "pyxis-wlprobe"
+path = "src/bin/wlprobe.rs"
 
 [dev-dependencies]
 tempfile = "3.8"

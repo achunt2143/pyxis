@@ -2,7 +2,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use std::path::{Path, PathBuf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -98,7 +98,7 @@ impl UnixSocketTransport {
 
     /// Send a message with length prefix (4 bytes, LITTLE-ENDIAN - CRITICAL!)
     /// MUST MATCH: native-host and daemon must both use little-endian
-    pub async fn send_message(stream: &mut UnixStream, data: &[u8]) -> Result<()> {
+    pub async fn send_message<W: AsyncWrite + Unpin>(stream: &mut W, data: &[u8]) -> Result<()> {
         // Send length prefix (4 bytes, little-endian - u32)
         let len = data.len() as u32;
         stream.write_u32_le(len).await?;
@@ -112,7 +112,12 @@ impl UnixSocketTransport {
     }
 
     /// Receive a message with length prefix (4 bytes, LITTLE-ENDIAN - CRITICAL!)
-    pub async fn recv_message(stream: &mut UnixStream) -> Result<Vec<u8>> {
+    ///
+    /// Not cancel-safe: dropped part-way (a losing `select!` branch), the bytes
+    /// already read are lost and the stream is out of step. Read in a task of
+    /// its own when anything else must be waited on too (see echo-daemon's
+    /// `handle_connection`).
+    pub async fn recv_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>> {
         // Read length prefix (4 bytes, little-endian)
         let len = stream.read_u32_le().await? as usize;
 

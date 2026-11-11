@@ -23,9 +23,10 @@
 //!   - tarball signature verification
 //!
 //! Crash detection: a single tokio task started in `start_child_reaper` listens
-//! for SIGCHLD and calls `waitpid(-1, WNOHANG)` in a loop, mapping reaped pids
-//! back to sessions. Non-zero exit / signal termination -> `AppCrashed`; clean
-//! exit (or pre-recorded `Stopped` from CloseApp/KillApp) -> `AppStopped`.
+//! for SIGCHLD and calls `waitpid(pid, WNOHANG)` for each app it launched,
+//! mapping reaped pids back to sessions. Non-zero exit / signal termination ->
+//! `AppCrashed`; clean exit (or pre-recorded `Stopped` from CloseApp/KillApp)
+//! -> `AppStopped`. It never waits on `-1`: see `reap_once`.
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
@@ -93,10 +94,10 @@ pub struct AppManifest {
 pub enum AppState {
     Starting,
     Running,
-    /// Frozen via `SIGSTOP` — the webOS-style "card backgrounded" state
-    /// (see `suspend`/`resume`), driven by Nova reacting to Evo's
-    /// `WindowMinimized` signal. The process is alive but not scheduled;
-    /// distinct from `Stopped` (process gone, session draining).
+    /// Frozen via `SIGSTOP` (see `suspend`/`resume`), only on an explicit
+    /// Suspend call: minimizing a window no longer freezes its app. The
+    /// process is alive but not scheduled; distinct from `Stopped` (process
+    /// gone, session draining).
     Suspended,
     Stopped,
     Crashed,
@@ -122,6 +123,10 @@ pub struct AppSession {
     pub pid: u32,
     /// Seconds since UNIX_EPOCH.
     pub started_at: u64,
+    /// Orders sessions finer than `started_at`'s whole seconds, so "the
+    /// newest session" is never a tie. Not part of the wire format.
+    #[serde(skip)]
+    seq: u64,
     pub state: AppState,
     /// Compositor surfaces (Wayland window ids in evo) currently bound to
     /// this session. A session may have 0..N surfaces; 0 means the process
@@ -131,7 +136,23 @@ pub struct AppSession {
     pub surfaces: Vec<u32>,
 }
 
+/// Next `AppSession::seq`; process-wide so it orders across hosts too.
+fn next_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl AppSession {
+    /// Starting, running or suspended: the process is meant to be there. A
+    /// `Stopped` session is still in the map while it drains (up to 5 s
+    /// until the reaper collects it) and is not "running" to anyone.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.state,
+            AppState::Starting | AppState::Running | AppState::Suspended
+        )
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "sessionId": self.session_id,
@@ -344,6 +365,7 @@ impl AppHost {
     /// Crashed lifecycle signals.
     fn spawn_and_track(&self, app_id: &str, mut cmd: Command) -> Result<AppSession> {
         let session_id = Uuid::new_v4().to_string();
+        let seq = next_seq();
         let started_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -356,6 +378,7 @@ impl AppHost {
             app_id: app_id.to_string(),
             pid: 0,
             started_at,
+            seq,
             state: AppState::Starting,
             surfaces: Vec::new(),
         };
@@ -409,8 +432,8 @@ impl AppHost {
         };
 
         let pid = child.id();
-        // We hand the OS the responsibility of reaping; the SIGCHLD task
-        // (see `start_child_reaper`) will pick up exits via waitpid(WNOHANG).
+        // The SIGCHLD task (see `start_child_reaper`) reaps this pid, and only
+        // this pid, via waitpid(pid, WNOHANG).
         // The Child handle is forgotten so its Drop doesn't try to wait().
         std::mem::forget(child);
         // Track pid -> session_id so the reaper can look it up O(1).
@@ -423,6 +446,7 @@ impl AppHost {
             app_id: app_id.to_string(),
             pid,
             started_at,
+            seq,
             state: AppState::Running,
             surfaces: Vec::new(),
         };
@@ -437,19 +461,58 @@ impl AppHost {
         Ok(running)
     }
 
-    /// Find the most recent session for `app_id`, if any.
+    /// Find the most recent session for `app_id`, draining ones included.
+    /// Use `find_live_session_by_app` to ask whether the app is running.
     pub fn find_session_by_app(&self, app_id: &str) -> Option<AppSession> {
-        let mut latest: Option<AppSession> = None;
-        for s in self.sessions.iter() {
-            if s.value().app_id == app_id {
-                let candidate = s.value().clone();
-                latest = match latest {
-                    Some(prev) if prev.started_at >= candidate.started_at => Some(prev),
-                    _ => Some(candidate),
-                };
-            }
+        self.newest_session(|s| s.app_id == app_id)
+    }
+
+    /// The most recent session for `app_id` that is still live. A session
+    /// `close` has stopped is not one, so relaunching right after a close
+    /// spawns instead of being taken for a raise of the dying instance.
+    pub fn find_live_session_by_app(&self, app_id: &str) -> Option<AppSession> {
+        self.newest_session(|s| s.app_id == app_id && s.is_live())
+    }
+
+    fn newest_session(&self, keep: impl Fn(&AppSession) -> bool) -> Option<AppSession> {
+        self.sessions
+            .iter()
+            .filter(|s| keep(s.value()))
+            .max_by_key(|s| s.value().seq)
+            .map(|s| s.value().clone())
+    }
+
+    /// Closes `app_id`'s session, if it has one, and waits until nothing in
+    /// its process group is left, for at most `limit`. Returns whether the
+    /// app is gone. `close` only asks (SIGTERM now, SIGKILL after 5 s, from
+    /// a thread of its own), so a caller about to delete what the app has
+    /// open, its profile, must wait here first: a vela still shutting down
+    /// writes the profile on its way out.
+    pub fn close_and_wait(&self, app_id: &str, limit: std::time::Duration) -> bool {
+        let Some(session) = self.find_session_by_app(app_id) else {
+            return true;
+        };
+        if Self::session_gone(session.pid) {
+            return true;
         }
-        latest
+        let _ = self.close(&session.session_id);
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if Self::session_gone(session.pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let gone = Self::session_gone(session.pid);
+        if !gone {
+            tracing::warn!(
+                "'{}' (pid {}) still runs {:?} after it was closed; going on without it",
+                app_id,
+                session.pid,
+                limit
+            );
+        }
+        gone
     }
 
     /// SIGTERM a session; updates state to `Stopped`. The session stays in
@@ -469,6 +532,12 @@ impl AppHost {
             // pid used to leave an orphaned vela owning a window (see
             // `signal_session`); escalation guarantees the app is actually gone
             // rather than merely asked to leave.
+            //
+            // A stopped process holds SIGTERM pending and never runs its
+            // handler, so a suspended app is continued first.
+            if session.state == AppState::Suspended {
+                Self::signal_session(session.pid, Signal::SIGCONT);
+            }
             Self::signal_session(session.pid, Signal::SIGTERM);
 
             let pid = session.pid;
@@ -488,7 +557,8 @@ impl AppHost {
                 );
                 Self::signal_session(pid, Signal::SIGKILL);
             });
-        } else {
+        }
+        if !self.is_spawned(&session) {
             // Foreign-synthesized or pre-spawn sessions never had a child;
             // finalize immediately since SIGCHLD won't fire.
             self.finalize_exit(session_id, AppState::Stopped);
@@ -515,9 +585,14 @@ impl AppHost {
         if session.pid > 0 {
             // Group-wide, same reasoning as `close`: a re-exec'd vela has a
             // different pid and would otherwise survive a kill aimed at the
-            // recorded one.
+            // recorded one. Continued first so a stopped group is never left
+            // stopped by a kill that lands late.
+            if session.state == AppState::Suspended {
+                Self::signal_session(session.pid, Signal::SIGCONT);
+            }
             Self::signal_session(session.pid, Signal::SIGKILL);
-        } else {
+        }
+        if !self.is_spawned(&session) {
             self.finalize_exit(session_id, AppState::Crashed);
         }
         let crashed = self.transition(session_id, AppState::Crashed);
@@ -529,7 +604,21 @@ impl AppHost {
         Ok(crashed.unwrap_or(session))
     }
 
-    /// Freeze a running session with `SIGSTOP` — the webOS "card
+    /// Whether AppHost spawned this session's process, so that the reaper
+    /// will see it exit. Foreign sessions (a window bound with no launch
+    /// behind it) never get a SIGCHLD.
+    fn is_spawned(&self, session: &AppSession) -> bool {
+        session.pid > 0
+            && self
+                .pid_index
+                .read()
+                .map(|idx| idx.contains_key(&session.pid))
+                .unwrap_or(false)
+    }
+
+    /// Freeze a running session with `SIGSTOP`, on the whole process group
+    /// (a vela that re-exec'd has a different pid). Only an explicit call
+    /// does this; nothing freezes an app on minimize. The webOS "card
     /// backgrounded" freeze/thaw model ported from `gaia`'s
     /// `suspend_app`/`resume_app` (which only flipped an in-memory status
     /// flag with no real process effect) into a genuine OS-level pause:
@@ -552,7 +641,7 @@ impl AppHost {
             ));
         }
         if session.pid > 0 {
-            Self::send_signal(session.pid, Signal::SIGSTOP)?;
+            Self::send_group_signal(session.pid, Signal::SIGSTOP)?;
         }
         let suspended = self.transition(session_id, AppState::Suspended);
         Ok(suspended.unwrap_or(session))
@@ -573,7 +662,7 @@ impl AppHost {
             ));
         }
         if session.pid > 0 {
-            Self::send_signal(session.pid, Signal::SIGCONT)?;
+            Self::send_group_signal(session.pid, Signal::SIGCONT)?;
         }
         let resumed = self.transition(session_id, AppState::Running);
         Ok(resumed.unwrap_or(session))
@@ -631,11 +720,6 @@ impl AppHost {
 
     // ---------- Child reaping ----------
 
-    /// Look up a session by pid (used by the SIGCHLD reaper).
-    fn session_id_for_pid(&self, pid: u32) -> Option<String> {
-        self.pid_index.read().ok()?.get(&pid).cloned()
-    }
-
     /// Apply terminal lifecycle bookkeeping for `session_id`: emit the
     /// matching signal, drop pid_index + expected_stops entries, drop the
     /// session from the live map, and clear `active` if necessary.
@@ -669,34 +753,54 @@ impl AppHost {
         }
     }
 
-    /// Reap any zombie children non-blocking. Called from the SIGCHLD task
-    /// (and exposed for tests). Returns the number of children reaped.
+    /// Reap the apps that have exited, non-blocking. Called from the SIGCHLD
+    /// task, and directly by tests.
+    ///
+    /// It waits on each pid AppHost launched and on nothing else. It used to
+    /// call `waitpid(-1)`, which reaps ANY child of the process, and
+    /// echo-daemon has many children that are not apps: `wpctl`, `pw-play`,
+    /// `opkg`, each awaited by the code that ran it. Whenever this reaper got
+    /// to one first, that code's own wait failed with ECHILD. So on device,
+    /// `audio.setVolume` changed the volume and then answered "wpctl: No child
+    /// processes (os error 10)", and any opkg run could fail the same way.
     pub fn reap_once(&self) -> usize {
+        let pids: Vec<u32> = match self.pid_index.read() {
+            Ok(idx) => idx.keys().copied().collect(),
+            Err(_) => return 0,
+        };
         let mut reaped = 0usize;
-        loop {
-            match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => break,
-                Ok(WaitStatus::Exited(pid, code)) => {
-                    let pid = pid.as_raw() as u32;
+        for pid in pids {
+            match waitpid(Some(Pid::from_raw(pid as i32)), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, code)) => {
                     self.handle_reaped(pid, code == 0);
                     reaped += 1;
                 }
-                Ok(WaitStatus::Signaled(pid, _, _)) => {
-                    let pid = pid.as_raw() as u32;
+                Ok(WaitStatus::Signaled(..)) => {
                     // Treat signal-termination as crash unless the user
                     // initiated it (CloseApp/KillApp set expected_stops).
                     self.handle_reaped(pid, false);
                     reaped += 1;
                 }
-                Ok(_) => continue,
-                Err(_) => break,
+                // Still running, or stopped/continued (SIGSTOP from suspend).
+                Ok(_) => {}
+                // ECHILD: not our child, e.g. a pid bound from a surface
+                // rather than launched here. Nothing to reap.
+                Err(_) => {}
             }
         }
         reaped
     }
 
     fn handle_reaped(&self, pid: u32, clean_exit: bool) {
-        let Some(session_id) = self.session_id_for_pid(pid) else {
+        // Reaped, so the pid is no longer ours to wait on, whatever becomes of
+        // the session. Left in the index, a recycled pid could make this
+        // reaper steal some other command's child again.
+        let Some(session_id) = self
+            .pid_index
+            .write()
+            .ok()
+            .and_then(|mut idx| idx.remove(&pid))
+        else {
             return;
         };
         let was_expected = self
@@ -760,10 +864,18 @@ impl AppHost {
     // safe to issue from the compositor's hot path.
 
     /// Attach a compositor surface (Wayland window id) to a session.
-    /// If `session_id` is `None`, the most recent session for `app_id` is
-    /// used; if no session exists yet, a synthetic one is created in the
-    /// `Running` state so external windows (e.g. system X11 clients started
-    /// outside the host) can still appear in the registry.
+    /// With no `session_id`, the owner is the live session whose process is
+    /// the client's (`pid`) or whose process group the client belongs to;
+    /// failing that, the most recent live session for `app_id`. Matching by
+    /// pid matters when one app id has several instances, such as every
+    /// `browser-window` external-browser window: the app id alone would bind
+    /// them all to the newest. If nothing matches, a synthetic session is
+    /// created in the `Running` state, keeping `pid`, so external windows
+    /// (e.g. system X11 clients started outside the host) can still appear
+    /// in the registry and be closed.
+    ///
+    /// `AppSurfaceMapped` is emitted only when the surface is newly bound;
+    /// the compositor re-reports surfaces it already has.
     ///
     /// Returns the (possibly synthesized) session.
     pub fn bind_surface(
@@ -773,9 +885,22 @@ impl AppHost {
         session_id: Option<&str>,
         pid: Option<u32>,
     ) -> AppSession {
+        self.bind_surface_inner(app_id, surface_id, session_id, pid).0
+    }
+
+    /// `bind_surface`, also reporting whether the surface was newly bound
+    /// (and so `AppSurfaceMapped` went out).
+    fn bind_surface_inner(
+        &self,
+        app_id: &str,
+        surface_id: u32,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+    ) -> (AppSession, bool) {
         let target_id = session_id
             .map(|s| s.to_string())
-            .or_else(|| self.find_session_by_app(app_id).map(|s| s.session_id))
+            .or_else(|| self.find_session_by_client(pid).map(|s| s.session_id))
+            .or_else(|| self.find_live_session_by_app(app_id).map(|s| s.session_id))
             .unwrap_or_else(|| {
                 // Synthesize a foreign-process session so the compositor can
                 // still surface the window in the lifecycle stream.
@@ -789,6 +914,7 @@ impl AppHost {
                     app_id: app_id.to_string(),
                     pid: pid.unwrap_or(0),
                     started_at,
+                    seq: next_seq(),
                     state: AppState::Running,
                     surfaces: Vec::new(),
                 };
@@ -797,9 +923,10 @@ impl AppHost {
                 session_id
             });
 
-        let mut updated: Option<AppSession> = None;
+        let mut updated: Option<(AppSession, bool)> = None;
         if let Some(mut entry) = self.sessions.get_mut(&target_id) {
-            if !entry.surfaces.contains(&surface_id) {
+            let added = !entry.surfaces.contains(&surface_id);
+            if added {
                 entry.surfaces.push(surface_id);
             }
             if let Some(p) = pid {
@@ -807,19 +934,49 @@ impl AppHost {
                     entry.pid = p;
                 }
             }
-            updated = Some(entry.clone());
+            updated = Some((entry.clone(), added));
         }
 
-        let session = updated.unwrap_or_else(|| AppSession {
-            session_id: target_id.clone(),
-            app_id: app_id.to_string(),
-            pid: pid.unwrap_or(0),
-            started_at: 0,
-            state: AppState::Running,
-            surfaces: vec![surface_id],
+        let (session, added) = updated.unwrap_or_else(|| {
+            (
+                AppSession {
+                    session_id: target_id.clone(),
+                    app_id: app_id.to_string(),
+                    pid: pid.unwrap_or(0),
+                    started_at: 0,
+                    seq: 0,
+                    state: AppState::Running,
+                    surfaces: vec![surface_id],
+                },
+                true,
+            )
         });
-        self.emit_lifecycle("AppSurfaceMapped", &session);
-        session
+        if added {
+            self.emit_lifecycle("AppSurfaceMapped", &session);
+        }
+        (session, added)
+    }
+
+    /// The live session a Wayland client belongs to: the one whose pid is the
+    /// client's, else the one whose process group the client is in. Apps are
+    /// spawned as group leaders (pgid == recorded pid), and vela may re-exec
+    /// into a new pid inside that group.
+    fn find_session_by_client(&self, pid: Option<u32>) -> Option<AppSession> {
+        let pid = pid.filter(|p| *p > 0)?;
+        if let Some(s) = self.newest_session(|s| s.is_live() && s.pid == pid) {
+            return Some(s);
+        }
+        let pgid = Self::process_group_of(pid)?;
+        self.newest_session(|s| s.is_live() && s.pid == pgid)
+    }
+
+    /// Process group of `pid`, from `/proc/<pid>/stat` (field 5, after the
+    /// parenthesised command name, which may itself hold spaces and parens).
+    fn process_group_of(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, rest) = stat.rsplit_once(") ")?;
+        // rest: state ppid pgrp ...
+        rest.split(' ').nth(2)?.parse().ok()
     }
 
     /// Detach a surface from whichever session currently owns it. If the
@@ -844,8 +1001,9 @@ impl AppHost {
         self.emit_lifecycle("AppSurfaceUnmapped", &session);
 
         // Drop synthesized foreign-process sessions when their last surface
-        // goes away. We detect those as pid==0 sessions that hold no surfaces.
-        if session.surfaces.is_empty() && session.pid == 0 {
+        // goes away. Those are the ones with no child of ours to reap: no pid
+        // at all, or a pid AppHost never spawned.
+        if session.surfaces.is_empty() && !self.is_spawned(&session) {
             self.sessions.remove(&owner);
         }
         Some(session)
@@ -920,7 +1078,12 @@ impl AppHost {
         PathBuf::from(NOVA_NATIVE_ROOT)
     }
 
-    fn send_signal(pid: u32, signal: Signal) -> Result<()> {
+    /// Signal a session's process group, falling back to the bare pid, and
+    /// report failure only if neither exists.
+    fn send_group_signal(pid: u32, signal: Signal) -> Result<()> {
+        if kill(Pid::from_raw(-(pid as i32)), signal).is_ok() {
+            return Ok(());
+        }
         kill(Pid::from_raw(pid as i32), signal)
             .with_context(|| format!("kill({:?}) on pid {}", signal, pid))?;
         Ok(())
@@ -1109,6 +1272,27 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_bind_after_a_daemon_restart_is_idempotent() {
+        // A restarted daemon's AppHost has an empty session table, so the
+        // compositor's replayed bind finds no session for the window and
+        // synthesizes a foreign one carrying the client's pid. The session
+        // the old daemon launched is gone, and no app is still "its" child:
+        // the window is treated as an external one (closable, registry
+        // entry dropped with its last surface). Replaying again, or two
+        // windows of one client, must find that session and not add another.
+        let host = AppHost::new();
+        let first = host.bind_surface("com.pyxis.notes", 4, None, Some(900));
+        let again = host.bind_surface("com.pyxis.notes", 4, None, Some(900));
+        assert_eq!(first.session_id, again.session_id);
+        assert_eq!(again.surfaces, vec![4]);
+        let second_window = host.bind_surface("com.pyxis.notes", 6, None, Some(900));
+        assert_eq!(second_window.session_id, first.session_id);
+        assert_eq!(host.list_surface_sessions().len(), 1);
+        // And a launch of the same app now sees a live session to raise.
+        assert!(host.find_live_session_by_app("com.pyxis.notes").is_some());
+    }
+
+    #[test]
     fn unbind_surface_drops_foreign_session_when_last() {
         let host = AppHost::new();
         let s = host.bind_surface("foreign.app", 7, None, None);
@@ -1139,6 +1323,7 @@ mod tests {
                 app_id: app_id.into(),
                 pid,
                 started_at: 0,
+                seq: next_seq(),
                 state: AppState::Running,
                 surfaces: vec![],
             },
@@ -1158,14 +1343,183 @@ mod tests {
         pid
     }
 
-    /// Both reaper outcomes are asserted in **one** test on purpose.
-    ///
-    /// `reap_once` calls `waitpid(-1)`, which is process-wide, and cargo runs
-    /// tests as parallel threads of a single process. As two separate tests
-    /// these raced: whichever called `reap_once` first consumed *both*
-    /// children's exit statuses, so the loser's session was never finalized and
-    /// it failed on every full-suite run while passing in isolation. One test,
-    /// one reap, both assertions -- no cross-test interference to lose to.
+    /// Block until `pid` has exited, without reaping it: /proc shows it as a
+    /// zombie ("123 (sh) Z ...") until someone waits on it.
+    fn wait_until_zombie(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z')) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("child {pid} never exited");
+    }
+
+    /// Launch `script` under sh as an app of its own process group.
+    fn launch_sh(host: &AppHost, app_id: &str, script: &str) -> AppSession {
+        host.launch_raw(
+            app_id,
+            Path::new("/bin/sh"),
+            &["-c".to_string(), script.to_string()],
+            &HashMap::new(),
+        )
+        .expect("spawn /bin/sh")
+    }
+
+    fn cleanup(host: &AppHost, sessions: &[&AppSession]) {
+        for s in sessions {
+            let _ = host.kill(&s.session_id);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !host.list_running().is_empty() {
+            host.reap_once();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn live_lookup_skips_draining_sessions_and_orders_finely() {
+        let host = AppHost::new();
+        // Same app, same started_at (0): only `seq` can order them.
+        track_session(&host, "old", "app", 0);
+        track_session(&host, "new", "app", 0);
+        assert_eq!(host.find_live_session_by_app("app").unwrap().session_id, "new");
+        assert_eq!(host.find_session_by_app("app").unwrap().session_id, "new");
+
+        // The newest is draining after a close: the live one is the older.
+        host.sessions.get_mut("new").unwrap().state = AppState::Stopped;
+        assert_eq!(host.find_session_by_app("app").unwrap().session_id, "new");
+        assert_eq!(host.find_live_session_by_app("app").unwrap().session_id, "old");
+
+        host.sessions.get_mut("old").unwrap().state = AppState::Suspended;
+        assert_eq!(host.find_live_session_by_app("app").unwrap().session_id, "old");
+        host.sessions.get_mut("old").unwrap().state = AppState::Crashed;
+        assert!(host.find_live_session_by_app("app").is_none());
+        assert!(host.find_live_session_by_app("other").is_none());
+    }
+
+    #[test]
+    fn bind_surface_prefers_the_clients_pid_over_the_newest_session() {
+        let host = AppHost::new();
+        let a = launch_sh(&host, "browser-window", "sleep 30");
+        let b = launch_sh(&host, "browser-window", "sleep 30");
+        // The app id alone would pick b, the newest.
+        let bound = host.bind_surface("browser-window", 1, None, Some(a.pid));
+        assert_eq!(bound.session_id, a.session_id);
+        let bound = host.bind_surface("browser-window", 2, None, Some(b.pid));
+        assert_eq!(bound.session_id, b.session_id);
+        assert_eq!(host.session_for_surface(1).unwrap().session_id, a.session_id);
+        cleanup(&host, &[&a, &b]);
+    }
+
+    #[test]
+    fn bind_surface_matches_a_process_in_the_sessions_group() {
+        let host = AppHost::new();
+        // vela re-exec: the window's client is a descendant with its own pid,
+        // in the group the app was spawned as leader of. Its pid is written
+        // out so the test can bind as it.
+        let a = launch_sh(&host, "app", "sleep 30 & echo $! > /dev/null; wait");
+        let b = launch_sh(&host, "app", "sleep 30");
+        let child = loop {
+            let kids =
+                std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", a.pid)).unwrap();
+            if let Some(k) = kids.split_whitespace().next() {
+                break k.parse::<u32>().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_ne!(child, a.pid);
+        assert_eq!(AppHost::process_group_of(child), Some(a.pid));
+        let bound = host.bind_surface("app", 1, None, Some(child));
+        assert_eq!(bound.session_id, a.session_id);
+        cleanup(&host, &[&a, &b]);
+    }
+
+    #[test]
+    fn bind_surface_falls_back_to_app_id_then_synthesizes_with_pid() {
+        let host = AppHost::new();
+        let a = launch_sh(&host, "app", "sleep 30");
+        // A pid that is nobody's, and none at all: both fall back to the
+        // newest live session of the app id.
+        let bound = host.bind_surface("app", 1, None, Some(u32::MAX - 1));
+        assert_eq!(bound.session_id, a.session_id);
+        let bound = host.bind_surface("app", 2, None, None);
+        assert_eq!(bound.session_id, a.session_id);
+
+        // No session for the id: a foreign one, which keeps the pid so Close
+        // can signal it, and is finalized (not left Stopped) on close.
+        let foreign = host.bind_surface("elsewhere", 3, None, Some(u32::MAX - 1));
+        assert_eq!(foreign.pid, u32::MAX - 1);
+        // A second window of the same client joins it rather than splitting.
+        let second = host.bind_surface("elsewhere", 4, None, Some(u32::MAX - 1));
+        assert_eq!(second.session_id, foreign.session_id);
+        let _ = host.close(&foreign.session_id);
+        assert!(host.get_state(&foreign.session_id).is_none());
+        cleanup(&host, &[&a]);
+    }
+
+    #[test]
+    fn surface_mapped_is_reported_once_per_surface() {
+        let host = AppHost::new();
+        let (_, first) = host.bind_surface_inner("a", 1, None, None);
+        let (_, again) = host.bind_surface_inner("a", 1, None, None);
+        let (_, other) = host.bind_surface_inner("a", 2, None, None);
+        assert!(first);
+        assert!(!again, "a surface that is already bound is not newly mapped");
+        assert!(other);
+    }
+
+    /// A stopped process leaves SIGTERM pending, so closing a suspended app
+    /// has to continue it first or the handler never runs (and the app dies
+    /// to the 5 s SIGKILL instead, without cleaning up).
+    #[test]
+    fn close_continues_a_suspended_app_so_it_handles_sigterm() {
+        let host = AppHost::new();
+        let marker = std::env::temp_dir().join(format!("apphost-term-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "trap ': > {}; exit 0' TERM; while :; do sleep 0.05; done",
+            marker.display()
+        );
+        let s = launch_sh(&host, "app", &script);
+        // Let the shell install its trap before anything signals it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        host.suspend(&s.session_id).expect("suspend");
+        assert_eq!(host.get_state(&s.session_id), Some(AppState::Suspended));
+
+        host.close(&s.session_id).expect("close");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !marker.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let handled = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        cleanup(&host, &[&s]);
+        assert!(handled, "SIGTERM handler never ran: the app was left stopped");
+    }
+
+    /// The reaper waits on apps only. A child that other code is waiting on
+    /// (echo-daemon's wpctl, opkg, pw-play) must still be there to collect
+    /// after a reap. When the reaper called waitpid(-1), it could take that
+    /// exit first, and `audio.setVolume` answered "No child processes".
+    #[test]
+    fn reaper_leaves_other_code_s_children_alone() {
+        let host = AppHost::new();
+        let mut other = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("spawn /bin/sh");
+        wait_until_zombie(other.id());
+        host.reap_once();
+        let status = other.wait().expect("the exit is still ours to collect");
+        assert_eq!(status.code(), Some(3));
+    }
+
+    /// Both reaper outcomes, crashed and stopped, in one test. (They were
+    /// merged when `reap_once` still waited on `-1` and two tests stole each
+    /// other's children; it now waits only on its own pids.)
     #[test]
     fn reaper_reports_crashed_and_stopped_exits_distinctly() {
         let host = AppHost::new();

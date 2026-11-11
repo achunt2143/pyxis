@@ -811,7 +811,7 @@ The packaging vocabulary (`pyxis.json` `permissions[]`, copied verbatim into
 
 | Permission | Bridge capability | Privileged |
 | --- | --- | --- |
-| `network` | — | no |
+| `network` | `network` | no |
 | `notifications` | `notifications` | no |
 | `camera` | — | no |
 | `microphone` | — | no |
@@ -822,8 +822,17 @@ The packaging vocabulary (`pyxis.json` `permissions[]`, copied verbatim into
 | `ipc` | — | no |
 | `background` | — | no |
 | `power` | `power` | no |
+| `audio` | `audio` | no |
+| `browser` | `browser` | no |
+| `notifications.manage` | `notifications:manage` | **yes** |
 | `appmanager.install` | `appManager:install` | **yes** |
 | `appmanager.manage` | `appManager:manage` | **yes** |
+| `settings.write` | `settings:write` | **yes** |
+| `windows.manage` | `windows:manage` | **yes** |
+| `terminal` | `terminal` | **yes** |
+| `filesystem.user` | `filesystem:user` | **yes** |
+| `filesystem.system` | `filesystem:system` | **yes** |
+| `filesystem.apps` | `filesystem:apps` | **yes** |
 
 Two vocabularies exist and must stay in correspondence. The dotted names above
 are the *packaging* vocabulary. The runtime bridge uses colon-separated
@@ -838,11 +847,76 @@ capability must be reachable from some dotted permission, so that an
 ipk-packaged app is never second-class next to an in-image one — this is
 enforced by a test in `echo/src/services/nova.rs`.
 
+What each capability covers is decided by the bridge
+(`PyxisBridgeParent.sys.mjs`'s `BRIDGE_CAPABILITIES`), which lists every
+(service, method) a `pyxis://` app can reach and the capability it needs:
+
+| Capability | Covers |
+| --- | --- |
+| `filesystem:read` / `filesystem:write` | `filesystem.*` reads / writes, in the app's own data (see *Where filesystem calls reach*, below) |
+| `power` | shutdown, reboot, sleep, wake, screen brightness and timeout |
+| `notifications` | raising a notification (`notification.show`) |
+| `audio` | `audio.*` (volume, mute, outputs) and `sound.*` (system sounds) |
+| `network` | `network.*`, whose status includes the Wi-Fi SSID |
+| `browser` | opening an http(s) URL in a browser window (`nova.OpenExternalBrowser`) |
+| `notifications:manage` | reading and dismissing every app's notifications |
+| `appManager:manage` | launching, closing, raising and listing other apps (`nova`, `appHost`, legacy `appManager`) |
+| `appManager:install` | installing and removing apps (`installer.*`, `nova.Install`/`Uninstall`/`Reload`) |
+| `settings:write` | `settings.set`/`delete`/`clear`/`reset` |
+| `windows:manage` | Evo's control of any app's windows, and the shell overlay's input region |
+| `terminal` | the terminal service, a root shell |
+| `filesystem:user` | `filesystem.*` reaching the user's home instead of the app's own data |
+| `filesystem:system` | `filesystem.*` reads of the whole root filesystem, by absolute path |
+| `filesystem:apps` | `filesystem.*` reaching another app's own data, named by the call's `app` |
+
+A few calls need no capability: `system.getInfo`/`ping`/`listServices`,
+`settings.get`/`getAll` (every app reads its theme), and readings such as the
+battery level, the OS version and the root filesystem's free space
+(`deviceInfo.getStorageInfo`). A call the table does not list is refused
+whatever the app declares; `process.*` and the bus's own `org.geckoOS.Echo`
+methods are left out on purpose. Two more tests in `nova.rs` keep the three
+copies of this vocabulary in step: the bridge's table, Nova's, and vroom's
+(`src/config.rs` and both schemas).
+
+#### Where filesystem calls reach
+
+An app's `filesystem.*` calls reach its own data and nothing else, unless it
+holds one of the two privileged filesystem capabilities. The bridge stamps
+every call with a *scope*, and Echo confines the call to it: the kernel
+resolves each path beneath the scope's root (`openat2` with
+`RESOLVE_BENEATH`), so neither `..` nor a symlink can leave it, and the call
+runs as the user, never as root.
+
+| Scope | Root | Who | Paths |
+| --- | --- | --- | --- |
+| the app's own | `/var/lib/pyxis/data/<id>` | every app | `~`, `~/notes.json`, `notes.json` |
+| the user's | `/home/geckouser` | `filesystem:user` | `~`, `~/Documents/a.txt` |
+| the system's, read-only | `/` (the root filesystem only) | `filesystem:system` | `/etc/os-release` |
+| another app's own | `/var/lib/pyxis/data/<other id>` | `filesystem:apps`, with `app: "<other id>"` | `~/notes.json` |
+
+- `~` is the root of the app's scope, and replies give paths back the same
+  way, so an app never depends on where its data lives. An absolute path
+  needs `filesystem:system`, and can only be read; `..` is refused in every
+  scope.
+- An app's own directory is made on first use, owned by the user, mode
+  0700. Removing the app (`installer.Remove`, `nova.Uninstall`) deletes it,
+  and the app's Gecko profile (its localStorage, IndexedDB and cookies), so
+  a package that later takes the same id starts empty. A package removed
+  with `opkg remove` directly keeps both.
+- The system scope stops at the root filesystem: `/proc`, `/sys`, `/dev`,
+  `/run` and `/tmp` are other mounts and stay out of reach.
+- Writing outside the home has no capability yet. It is to come with a
+  user-approved "privileged access" unlock.
+
 ### 19.2 Policy
 
 - `requiredPermissions` in `appinfo.json` declares requested capabilities.
 - The launcher or runtime enforces user-facing permissions.
 - `opkg` installation alone does not imply runtime authorization.
+- The bridge is deny-by-default: it forwards only the (service, method)
+  pairs it lists, and refuses the rest with the same `Pyxis capability
+  denied` error as an undeclared capability. A new service is out of apps'
+  reach until the bridge's table names it.
 
 #### App tiers
 
@@ -884,7 +958,12 @@ could restore it.
 
 `appmanager.install` and `appmanager.manage` confer the right to install and
 remove *other* apps. They are **privileged**: declaration and grant are
-separate steps.
+separate steps. So are the other rights over other apps or the whole system:
+`notifications.manage` (every app's notifications), `windows.manage` (every
+app's windows), `settings.write` (settings every app reads), `terminal` (a
+root shell), and `filesystem.user`, `filesystem.system` and `filesystem.apps`
+(the user's files, the whole root filesystem, and other apps' data).
+Everything below applies to all nine.
 
 - **Any app may declare them.** Declaring is not an error at package time, at
   schema validation, or at `appinfo.json` parse time. An installer-type app
