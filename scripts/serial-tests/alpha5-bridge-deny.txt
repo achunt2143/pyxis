@@ -1,0 +1,199 @@
+# Alpha 5: the app bridge is deny-by-default.
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-bridge-deny.txt
+#
+# PyxisBridgeParent.sys.mjs forwards a pyxis:// app's call to Echo only when
+# its BRIDGE_CAPABILITIES table lists that (service, method), and only if the
+# app holds the capability the table names. Until 2026-09-27 an unlisted pair
+# was forwarded, so any app, a third-party .ipk included, could open a root
+# shell (terminal), spawn processes as root, and drive evo, nova, appHost,
+# installer, audio, sound and settings.
+#
+# Both halves, on the real stack:
+#   * An ordinary app is refused what it did not declare. hello-pyxis (a
+#     third-party .ipk declaring filesystem.read/write and notifications)
+#     calls nine things it did not declare and records each result in its
+#     proof file. All nine must say "denied", and none may reach Echo, whose
+#     log lists every call it routes.
+#   * The shell and the built-ins are refused nothing they do. Bloom launches
+#     an app, shows the notification (a toast in its overlay, then the list
+#     in its centre), moves the volume and sets Do Not Disturb, all over the
+#     bridge, and the Terminal app opens its shell. The bridge logs each
+#     refusal (the shell's to vela.log, launched apps' to echo.log), so
+#     neither log may hold one from them.
+#
+# Needs an image built after 2026-09-27. An older one needs --push for the
+# bridge, echo-daemon (Nova's vocabulary), the manifests that use it and the
+# acceptance package; see the change's notes in CLAUDE.md. On an image whose
+# geckoOS-boot predates Bloom's overlay, the first step restarts the shell
+# with it, the way the current geckoOS-boot starts it.
+#
+# LOOK at target/serial-shots/bridge-{hello,centre,volume,dnd}.png: the first
+# shows hello-pyxis's nine refusals under Bloom's toast, the second the
+# notification in the centre, the third quick settings with the slider moved.
+
+routed() { grep -ac "Routing message to $1" /var/log/echo.log; }
+# Where Bloom's shell is, read from the guest instead of aimed at fixed
+# pixels: evo.GetOverlayState lists the rects the overlay takes input in, which
+# are the top bar and the dock while no panel is open (see
+# alpha5-shell-layering.txt, which these come from). Everything below is then
+# placed relative to those two boxes, so a rearranged bar or a dock that grows
+# with the apps running moves the clicks with it.
+orects() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done; }
+# "x y w h" of the bar (full width, at the top) and of the dock (low on the screen).
+barbox() { orects | awk '$1 == 0 && $2 == 0 && $3 >= 1200 && $4 <= 80 { print; exit }'; }
+dockbox() { orects | awk '$2 > 600 && $3 > 100 && $4 > 40 { print; exit }'; }
+
+echo "=== the shell runs with its overlay (restarted if geckoOS-boot predates it) ==="
+if pgrep -af -- '--pyxis-app bloom' | grep -q -- '--pyxis-overlay' || [ ! -f /usr/share/geckoOS/apps/bloom/webroot/overlay.html ]; then echo overlay-already-up; else pkill -f -- '--pyxis-app bloom'; sleep 3; printf 'user_pref("mozilla.widget.use-argb-visuals", true);\nuser_pref("browser.tabs.allow_transparent_browser", true);\n' >> /var/lib/pyxis/profiles/bloom/user.js; setsid /usr/bin/setpriv --reuid=1000 --regid=1000 --groups video,render /usr/bin/env MOZ_ENABLE_WAYLAND=1 PYXIS_APP_ID=bloom PYXIS_PROFILE_DIR=/var/lib/pyxis/profiles/bloom PYXIS_DISPLAY_MODE=fullscreen XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=wayland MOZ_GTK_TITLEBAR_DECORATION=none GTK_CSD=0 HOME=/home/geckouser /usr/lib/pyxis-gecko/vela --kiosk --profile /var/lib/pyxis/profiles/bloom --pyxis-app bloom --app-entry index.html --pyxis-overlay overlay.html >> /var/log/vela.log 2>&1 < /dev/null & sleep 25; echo restarted-with-overlay; fi
+#!must pyxis-overlay
+pgrep -a vela | grep -o -- '--pyxis-overlay [^ ]*' | head -1
+
+echo "=== the bridge is the deny-by-default one ==="
+#!must BRIDGE_CAPABILITIES
+grep -o -m1 BRIDGE_CAPABILITIES /usr/lib/pyxis-gecko/actors/PyxisBridgeParent.sys.mjs
+
+echo "=== Nova grants the built-ins what their manifests declare ==="
+#!must "windows:manage"
+echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"bloom"}' | grep -o '"windows:manage"'
+#!must "settings:write"
+echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"settings"}' | grep -o '"settings:write"'
+#!must "terminal"
+echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -o '"terminal"'
+# A privileged capability an in-image app declares but Nova withholds, or a
+# manifest Nova rejects outright, would each be logged here.
+#!must-not nova:
+grep -a "withheld\|unknown permission\|skipping invalid" /var/log/echo.log | head -5
+
+echo "=== an ordinary app is refused everything it did not declare ==="
+PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo removed-if-present
+#!must registeredApps
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}" | grep -E 'registeredApps|Error'
+# A profile left by an earlier boot (make run writes to the image) can hold
+# a startup cache with an older copy of the bridge in it.
+rm -rf /var/lib/pyxis/profiles/com.pyxis.hello/startupCache /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt; echo cleared
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
+sleep 15
+# The page writes its proof once every probe has answered, which a
+# freshly built image on a loaded host can take longer than 15 s to do:
+# wait up to 45 s more for it.
+for i in $(seq 1 45); do ls /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt > /dev/null 2>&1 && break; sleep 1; done; echo "proof waited ${i}s more"
+#!must getSystemInfo=ok
+#!must notify=ok
+#!must allow settings.get=ok
+cat /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>&1
+#!must NINE-DENIED
+n=$(cat /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>/dev/null | grep -c '^deny .*=denied: '); [ "$n" -eq 9 ] && echo NINE-DENIED || echo "denied: $n of 9"
+#!must-not FORWARDED
+cat /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>/dev/null | grep '^deny '
+#!must did not declare 'terminal' (required for terminal.Write)
+#!must called process.list, which no app may call
+cat /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>/dev/null | grep -E '^deny (terminal|process)\.'
+# The toast is Bloom's, drawn in its overlay: evo.SetOverlayRegion (windows:manage) got through.
+#!shot bridge-hello
+#!must REGION-SET
+[ "$(grep -ac 'Overlay input region: [0-9]* rect' /var/log/evo.log)" -ge 1 ] && echo REGION-SET || echo NO-REGION
+
+echo "=== none of those calls reached Echo, and the bridge logged each ==="
+#!must-not Routing message
+grep -a 'Routing message to org.geckoOS.terminal\|Routing message to org.geckoOS.process' /var/log/echo.log
+#!must [PyxisBridge] Pyxis capability denied: app 'com.pyxis.hello'
+grep -a -m1 "capability denied: app 'com.pyxis.hello'" /var/log/echo.log
+
+echo "=== Bloom's notification centre lists it (notification.list, notifications:manage) ==="
+# Bloom's desktop is stacked beneath every app, so close the app before
+# clicking the shell. The notification stays in the centre.
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'success|Error'
+sleep 3
+L0=$(routed 'org.geckoOS.notification (list)'); echo "list calls so far: $L0"
+# The Bell is the first button of the bar's right-hand cluster: Bell, Settings
+# gear, Wi-Fi, the battery pill, then the clock.
+read BX BY BW BH <<< "$(barbox)"; echo "bar: $BX,$BY ${BW}x$BH"
+BELLX=$((BX + BW - 240)); BARY=$((BY + BH / 2)); echo "bell $BELLX,$BARY"
+#!pointer click $BELLX $BARY
+sleep 3
+#!shot bridge-centre
+#!must LIST-CALLED
+[ "$(routed 'org.geckoOS.notification (list)')" -gt "$L0" ] && echo LIST-CALLED || echo NO-LIST-CALL
+#!pointer click 640 600
+sleep 2
+
+echo "=== Bloom moves the volume (audio.setVolume, audio) ==="
+#!must "volume": 40
+echo-cli call org.geckoOS.audio setVolume --interface org.geckoOS.audio --args '{"volume":40}' | grep '"volume"'
+V0=$(routed 'org.geckoOS.audio (setVolume)'); echo "setVolume calls so far: $V0"
+# The Settings gear opens quick settings, a panel anchored 14 px from the
+# right edge and 8 px under the bar. Inside it nothing can be read from the
+# guest (the panel is one rectangle to Evo), so its controls are placed from
+# those two anchors: LOOK at target/serial-shots/bridge-volume.png and
+# bridge-dnd.png if a layout change makes the checks below fail.
+read BX BY BW BH <<< "$(barbox)"
+GEARX=$((BX + BW - 204)); BARY=$((BY + BH / 2)); echo "gear $GEARX,$BARY"
+#!pointer click $GEARX $BARY
+sleep 3
+PANELT=$((BY + BH + 8)); PANELR=$((BX + BW - 14))
+# The volume row is the first slider, 156 px down; its track runs from 301 to
+# 73 px left of the panel's edge. The drag must start on the thumb, which is at
+# 40 % (set just above) of the track.
+SLY=$((PANELT + 156)); SLX0=$((PANELR - 210)); SLX1=$((PANELR - 73)); echo "volume slider thumb $SLX0 -> $SLX1 at $SLY"
+#!pointer drag $SLX0 $SLY $SLX1 $SLY
+sleep 3
+#!shot bridge-volume
+# (Not SET-BY-BLOOM / NOT-SET-BY-BLOOM: the first is a substring of the second,
+# so that pair passed whether or not the slider moved.)
+#!must BLOOM-SET-VOLUME
+[ "$(routed 'org.geckoOS.audio (setVolume)')" -gt "$V0" ] && echo BLOOM-SET-VOLUME || echo SLIDER-NOT-MOVED
+#!must VOLUME-MOVED
+v=$(setpriv --reuid=1000 --regid=1000 --clear-groups env XDG_RUNTIME_DIR=/run/user/1000 wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print $2}'); awk -v v="$v" 'BEGIN { exit !(v > 0.6) }' && echo VOLUME-MOVED || echo "volume=$v"
+
+echo "=== and a setting (settings.set, settings:write) ==="
+#!must "success": true
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.dnd","value":false}' | grep success
+# Do Not Disturb is the second toggle under Wi-Fi: the switch at the panel's
+# right, 447 px below its top.
+DNDX=$((PANELR - 61)); DNDY=$((PANELT + 447)); echo "DND switch $DNDX,$DNDY"
+#!pointer click $DNDX $DNDY
+sleep 3
+#!shot bridge-dnd
+#!must "value": true
+echo-cli call org.geckoOS.settings get --interface org.geckoOS.settings --args '{"key":"pyxis.dnd"}' | grep '"value"'
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.dnd","value":false}' | grep -c success
+#!pointer click 640 600
+sleep 2
+
+echo "=== Bloom launches an app (nova.Launch, appManager:manage) ==="
+N0=$(routed 'org.geckoOS.nova (Launch)'); echo "launches so far: $N0"
+# Files is the fifth button of the dock (drawer, overview, then the pinned
+# apps: Terminal, Browser, Files, Notes), 54 px apart after a separator.
+read DX DY DW DH <<< "$(dockbox)"; echo "dock: $DX,$DY ${DW}x$DH"
+FILESX=$((DX + 265)); FILESY=$((DY + DH / 2)); echo "files button $FILESX,$FILESY"
+#!pointer click $FILESX $FILESY
+sleep 18
+#!must LAUNCHED-BY-BLOOM
+[ "$(routed 'org.geckoOS.nova (Launch)')" -gt "$N0" ] && echo LAUNCHED-BY-BLOOM || echo NOT-LAUNCHED
+#!must "appId": "files"
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -o '"appId": "files"' | head -1
+
+echo "=== the Terminal app opens its shell (terminal, privileged) ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -E 'sessionId|Error'
+sleep 18
+#!must Routing message to org.geckoOS.terminal (Open)
+grep -a -m1 'Routing message to org.geckoOS.terminal (Open)' /var/log/echo.log
+
+echo "=== the shell and the built-ins were refused nothing ==="
+# Not counted: the five calls and signals a vela from before the latest bridge
+# patch refuses Bloom (SetWorkArea, SetOverlayFocus, GetOverlayState,
+# OverlayFocusChanged, SwitcherChanged, ShortcutTriggered). alpha5-shell-layering reports that
+# one cause, as BRIDGE-OK; repeating it here would fail every suite on it.
+#!must-not capability denied
+grep -a "capability denied" /var/log/vela.log | grep -v "SetWorkArea\|SetOverlayFocus\|GetOverlayState\|OverlayFocusChanged\|SwitcherChanged\|ShortcutTriggered" | head -5
+#!must-not capability denied
+grep -a "capability denied" /var/log/echo.log | grep -v "app 'com.pyxis.hello'" | head -5
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' | grep -m1 package

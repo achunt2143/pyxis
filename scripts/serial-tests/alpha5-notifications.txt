@@ -14,9 +14,9 @@
 # pre-existing entry cannot pass the assertions below. The alpha 4 image
 # fails this suite outright, because its daemon registered no `list`.
 #
-# LOOK at target/serial-shots/notify-toast.png: the toast is drawn inside
-# Bloom, and Evo stacks Bloom beneath app windows, so it shows only where no
-# window covers the top-right corner.
+# LOOK at target/serial-shots/notify-toast.png: the toast must show over the
+# hello-pyxis window. It is drawn in Bloom's overlay, which Evo keeps above
+# apps (alpha5-overlay.txt proves that with clicks).
 
 echo "=== control: the centre starts empty ==="
 #!must "notifications": []
@@ -33,14 +33,18 @@ echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --a
 # "Method call successful" banner.
 #!must registeredApps
 echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}" | grep -E 'registeredApps|Error'
-rm -f /tmp/pyxis-hello-proof*.txt
+rm -f /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt
 #!must sessionId
 echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
 sleep 15
+# The page writes its proof once every probe has answered, which a
+# freshly built image on a loaded host can take longer than 15 s to do:
+# wait up to 45 s more for it.
+for i in $(seq 1 45); do ls /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt > /dev/null 2>&1 && break; sleep 1; done; echo "proof waited ${i}s more"
 
 echo "=== the app says it raised one ==="
 #!must notify=ok
-cat /tmp/pyxis-hello-proof-*.txt 2>&1
+cat /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>&1
 
 echo "=== and it landed in the centre, stamped with the caller's id ==="
 #!must "appId": "com.pyxis.hello"

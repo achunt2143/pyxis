@@ -56,6 +56,15 @@ which is read from the guest shell, so a suite can aim at a window it has
 just measured. Pointer bugs like #7's
 press/release double-dispatch no longer need a human at `make run`.
 
+And type: the virtio keyboard takes key events the same way. `#!type TEXT`
+types the rest of the line one key at a time (letters, digits, space and a
+little punctuation), and `#!key QCODE...` presses one chord of QEMU qcodes,
+such as `#!key ret`, `#!key esc` or `#!key ctrl a`. `#!keydown QCODE...`
+and `#!keyup QCODE...` press and release keys separately, to hold a modifier
+across steps (`#!keydown alt`, `#!key tab`, `#!keyup alt` is Alt+Tab with
+Alt held in between, which opens the switcher). Keys go wherever Evo
+has put keyboard focus, so click into a field first.
+
 It can hear, too. The guest's sound card (an ICH9 HDA, as in emulate.sh)
 plays into a WAV file on the host. `#!listen <name>` measures whatever the
 guest played since the previous listen, saves it as
@@ -66,7 +75,10 @@ asserts that something did.
 Files move through two virtio disks rather than the console. They are
 faster, and nothing the tty or a stray kernel message does can corrupt them:
 
-  * `--push LOCAL:REMOTE` files are packed into a tar on a read-only disk
+  * `--push LOCAL:REMOTE` files (a directory is its files, under REMOTE, so a
+    built Bloom goes in with
+    `--push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot`)
+    are packed into a tar on a read-only disk
     (serial `pyxisin`). geckoOS-boot extracts it over the rootfs before it
     starts a single daemon, so a pushed binary (`target/release/evo:/usr/bin/evo`)
     is what the whole boot runs. There is no sudo rootfs rebuild per
@@ -87,6 +99,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import io
 import os
@@ -122,6 +135,13 @@ XFER_OUT_BYTES = 256 * 1024 * 1024  # sparse, so free until written
 SCREEN_W, SCREEN_H = 1280, 800
 # The virtio tablet's absolute axis range (QEMU's INPUT_EVENT_ABS_MAX).
 ABS_RANGE = 0x8000
+# The QEMU qcodes `#!type` uses for characters other than a-z and 0-9, as
+# (qcode, shifted) on a US layout.
+TYPE_QCODES = {
+    " ": ("spc", False), "-": ("minus", False), "_": ("minus", True),
+    ".": ("dot", False), ",": ("comma", False), "/": ("slash", False),
+    ":": ("semicolon", True), "'": ("apostrophe", False), '"': ("apostrophe", True),
+}
 
 # What QEMU's wav audiodev records: fixed here, so #!listen knows how to
 # read it without trusting a header QEMU only finalises when it exits.
@@ -273,9 +293,9 @@ class Guest:
                  "-b", str(image), str(self.disk)],
                 check=True, stdout=subprocess.DEVNULL,
             )
-            drive = f"file={self.disk},format=qcow2,media=disk,if=virtio"
+            drive = f"file={self.disk},format=qcow2,media=disk,if=none,id=root"
         else:
-            drive = f"file={image},format=raw,media=disk,if=virtio"
+            drive = f"file={image},format=raw,media=disk,if=none,id=root"
 
         self.pushes = pushes
         self.xfer_out = self.tmp / "xfer-out.img"
@@ -312,6 +332,10 @@ class Guest:
             "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
             "-drive", f"if=pflash,format=raw,file={nvram}",
             "-drive", drive,
+            # bootindex: the firmware boots the root disk, never a transfer
+            # disk or the NIC, whatever PCI slots the devices land in. See
+            # emulate.sh, where a moved slot left the VM at a PXE prompt.
+            "-device", "virtio-blk-pci,drive=root,bootindex=0",
             *xfer,
             # egl-headless + virtio-vga-gl: Evo will not start without a GL
             # backend, and a guest whose compositor died answers every Echo
@@ -579,6 +603,8 @@ class Guest:
     def pointer(self, spec: str) -> tuple[bool, str]:
         """Drive the virtio tablet: `move X Y`, `click X Y` or
         `drag X1 Y1 X2 Y2`, in output pixels. Returns (ok, report).
+        `down X Y` moves and presses, `up` releases: with `move` between
+        them, a suite can look at a window while it is held (a move grab).
 
         A drag moves first and pauses before pressing. A press on Evo's
         frame hit-tests against where the pointer was last *seen*, and a grab
@@ -595,9 +621,9 @@ class Guest:
             action, nums = words[0], [int(n) for n in words[1:]]
         except (IndexError, ValueError):
             return False, f"bad pointer step {spec!r} (resolved: {' '.join(words)})"
-        want = {"move": 2, "click": 2, "drag": 4}.get(action)
+        want = {"move": 2, "click": 2, "drag": 4, "down": 2, "up": 0}.get(action)
         if want != len(nums):
-            return False, f"bad pointer step {spec!r}: move/click X Y, drag X1 Y1 X2 Y2"
+            return False, f"bad pointer step {spec!r}: move/click/down X Y, drag X1 Y1 X2 Y2, up"
 
         def at(x: int, y: int) -> list[dict]:
             # libinput maps value v to v * size / ABS_RANGE; the ceiling puts
@@ -608,13 +634,13 @@ class Guest:
         def button(down: bool) -> list[dict]:
             return [{"type": "btn", "data": {"down": down, "button": "left"}}]
 
-        steps: list[list[dict]] = [at(nums[0], nums[1])]
-        if action in ("click", "drag"):
+        steps: list[list[dict]] = [] if action == "up" else [at(nums[0], nums[1])]
+        if action in ("click", "drag", "down"):
             steps.append(button(True))
         if action == "drag":
             (x1, y1, x2, y2), n = nums, 12
             steps += [at(x1 + (x2 - x1) * i // n, y1 + (y2 - y1) * i // n) for i in range(1, n + 1)]
-        if action in ("click", "drag"):
+        if action in ("click", "drag", "up"):
             steps.append(button(False))
 
         for events in steps:
@@ -623,6 +649,45 @@ class Guest:
                 return False, f"pointer {spec}: {res['error'].get('desc', res['error'])}"
             time.sleep(0.1)
         return True, f"pointer {spec}: ok"
+
+    def key(self, *qcodes: str) -> tuple[bool, str]:
+        """Press `qcodes` together as one chord, then release them."""
+        def event(code: str, down: bool) -> dict:
+            return {"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": code}}}
+
+        for events in ([event(c, True) for c in qcodes], [event(c, False) for c in reversed(qcodes)]):
+            res = self.qmp(execute="input-send-event", arguments={"events": events})
+            if "error" in res:
+                return False, f"key {' '.join(qcodes)}: {res['error'].get('desc', res['error'])}"
+            time.sleep(0.03)
+        return True, f"key {' '.join(qcodes)}: ok"
+
+    def key_hold(self, down: bool, *qcodes: str) -> tuple[bool, str]:
+        """Press (`down`) or release `qcodes` and leave them so: a held
+        modifier, as Alt+Tab's switcher needs. `#!key` taps a chord whole."""
+        events = [{"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": c}}}
+                  for c in (qcodes if down else reversed(qcodes))]
+        res = self.qmp(execute="input-send-event", arguments={"events": events})
+        verb = "keydown" if down else "keyup"
+        if "error" in res:
+            return False, f"{verb} {' '.join(qcodes)}: {res['error'].get('desc', res['error'])}"
+        time.sleep(0.03)
+        return True, f"{verb} {' '.join(qcodes)}: ok"
+
+    def type_text(self, text: str) -> tuple[bool, str]:
+        """Type `text` on the virtio keyboard, one key at a time."""
+        for ch in text:
+            if ch.isascii() and ch.isalnum():
+                chord = ("shift", ch.lower()) if ch.isupper() else (ch,)
+            elif ch in TYPE_QCODES:
+                code, shifted = TYPE_QCODES[ch]
+                chord = ("shift", code) if shifted else (code,)
+            else:
+                return False, f"type: no key for {ch!r}"
+            ok, out = self.key(*chord)
+            if not ok:
+                return False, out
+        return True, f"typed {text!r}"
 
     def listen(self, dest: Path) -> tuple[bool, str]:
         """Save and measure what the guest played since the last listen.
@@ -677,7 +742,8 @@ def main() -> int:
     ap.add_argument("--script", type=Path,
                     help="file of commands, one per line; # comments and blanks skipped")
     ap.add_argument("--push", action="append", default=[], metavar="LOCAL:REMOTE",
-                    help="lay a file over the rootfs before the guest boots its daemons")
+                    help="lay a file (or every file of a directory) over the rootfs "
+                         "before the guest boots its daemons")
     ap.add_argument("--boot-timeout", type=int, default=300)
     ap.add_argument("--timeout", type=int, default=60, help="per-command timeout")
     ap.add_argument("--settle", type=int, default=25,
@@ -720,7 +786,8 @@ def main() -> int:
                 # A misspelt directive must not quietly become a no-op or,
                 # worse, a vacuous must-not (anything not "must" was one).
                 kind = line[2:].split(" ", 1)[0]
-                if kind not in ("must", "must-not", "shot", "pointer", "listen"):
+                if kind not in ("must", "must-not", "shot", "pointer", "listen", "type", "key",
+                                "keydown", "keyup"):
                     sys.exit(f"{args.script}: unknown directive {line!r}")
                 commands.append(line)
             elif line and not line.startswith("#"):
@@ -739,12 +806,33 @@ def main() -> int:
     if not (commands or args.keep_running or args.screenshot or args.pull):
         sys.exit("nothing to do: pass -c/--script/--screenshot/--pull (or --keep-running)")
 
+    # One VM at a time on this host. Each takes 4 GB and a GPU context, and
+    # several sessions may run suites at once; polling for "no qemu running"
+    # races and starves whichever poller waits longer. The kernel drops the
+    # lock when this process exits, however it exits.
+    lock_path = PROJECT_ROOT / "target" / "serial-vm.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"waiting for another serial-test run to finish ({lock_path}) ...", flush=True)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
     pushes = []
     for spec in args.push:
         local, _, remote = spec.partition(":")
-        if not remote.startswith("/") or not Path(local).is_file():
-            sys.exit(f"--push wants LOCAL_FILE:/ABSOLUTE/REMOTE, got {spec!r}")
-        pushes.append((Path(local), remote))
+        source = Path(local)
+        if not remote.startswith("/") or not (source.is_file() or source.is_dir()):
+            sys.exit(f"--push wants LOCAL_FILE_OR_DIR:/ABSOLUTE/REMOTE, got {spec!r}")
+        if source.is_dir():
+            # A directory is its files, laid out under REMOTE (a built web
+            # app, say: ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot).
+            # Source maps are only for a debugger and are the bulk of a build.
+            for path in sorted(p for p in source.rglob("*") if p.is_file() and p.suffix != ".map"):
+                pushes.append((path, remote.rstrip("/") + "/" + path.relative_to(source).as_posix()))
+        else:
+            pushes.append((source, remote))
 
     log = args.transcript.open("w") if args.transcript else None
     guest = Guest(args.image, not args.no_overlay, args.memory, log, pushes,
@@ -797,6 +885,22 @@ def main() -> int:
                     failures += 1
             elif cmd.startswith("#!pointer"):
                 step_ok, out = guest.pointer(cmd[len("#!pointer"):].strip())
+                print(f"\n\033[1m[{out}]\033[0m")
+                if not step_ok:
+                    failures += 1
+            elif cmd.startswith("#!type "):
+                step_ok, out = guest.type_text(cmd[len("#!type "):])
+                print(f"\n\033[1m[{out}]\033[0m")
+                if not step_ok:
+                    failures += 1
+            elif cmd.startswith(("#!keydown ", "#!keyup ")):
+                verb, _, rest = cmd[2:].partition(" ")
+                step_ok, out = guest.key_hold(verb == "keydown", *rest.split())
+                print(f"\n\033[1m[{out}]\033[0m")
+                if not step_ok:
+                    failures += 1
+            elif cmd.startswith("#!key "):
+                step_ok, out = guest.key(*cmd[len("#!key "):].split())
                 print(f"\n\033[1m[{out}]\033[0m")
                 if not step_ok:
                     failures += 1

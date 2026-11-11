@@ -477,6 +477,8 @@ stage_rootfs_dirs() {
 
     sudo mkdir -p "${ROOTFS_DIR}/home/user"
     sudo mkdir -p "${ROOTFS_DIR}/home/geckouser"
+    # The home of pyxisapp, the user every Nova-launched app runs as.
+    sudo mkdir -p "${ROOTFS_DIR}/home/pyxisapp"
 
     sudo mkdir -p "${ROOTFS_DIR}/lib/modules"
     sudo mkdir -p "${ROOTFS_DIR}/lib/gecko"
@@ -539,6 +541,18 @@ GDK_BACKEND="wayland"
 QT_QPA_PLATFORM="wayland"
 EOF
 
+    # PipeWire's Pulse server also listens where apps (pyxisapp) can reach it.
+    # The key replaces the default list, so the default address stays in it.
+    sudo mkdir -p "${ROOTFS_DIR}/etc/pipewire/pipewire-pulse.conf.d"
+    write_rootfs_file "${ROOTFS_DIR}/etc/pipewire/pipewire-pulse.conf.d/10-pyxis-apps.conf" <<'EOF'
+pulse.properties = {
+    server.address = [
+        "unix:native"
+        "unix:/run/pyxis/pulse/native"
+    ]
+}
+EOF
+
     write_rootfs_file "${ROOTFS_DIR}/etc/profile" <<'EOF'
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOME="/root"
@@ -549,6 +563,7 @@ EOF
     write_rootfs_file "${ROOTFS_DIR}/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/bash
 geckouser:x:1000:1000:Gecko User:/home/geckouser:/bin/bash
+pyxisapp:x:1001:1001:Pyxis app user:/home/pyxisapp:/usr/sbin/nologin
 EOF
 
     write_rootfs_file "${ROOTFS_DIR}/etc/group" <<'EOF'
@@ -560,11 +575,13 @@ input:x:105:
 render:x:109:
 seat:x:110:
 geckouser:x:1000:
+pyxisapp:x:1001:
 EOF
 
     write_rootfs_file "${ROOTFS_DIR}/etc/shadow" <<'EOF'
 root:*:20000:0:99999:7:::
 geckouser:*:20000:0:99999:7:::
+pyxisapp:*:20000:0:99999:7:::
 EOF
     sudo chmod 640 "${ROOTFS_DIR}/etc/shadow"
 
@@ -734,7 +751,11 @@ mount -t cgroup2 cgroup2 /sys/fs/cgroup -n 2>/dev/null || true
 mkdir -p /run/lock /run/user/1000 /tmp/.X11-unix
 chmod 1777 /tmp /var/tmp /tmp/.X11-unix
 chown 1000:1000 /run/user/1000
-chmod 700 /run/user/1000
+# 711, not 700: geckouser (the shell) owns this dir, and apps run as pyxisapp,
+# which must be able to reach the paths inside it that it is meant to use
+# (Echo's socket, PipeWire's Pulse socket), by name. It cannot list the dir.
+# The one socket it must not reach, Evo's wayland-0, is geckouser:geckouser 0600.
+chmod 711 /run/user/1000
 
 echo "rcS: Startup complete."
 EOF
@@ -818,7 +839,13 @@ export GDK_BACKEND=wayland
 export QT_QPA_PLATFORM=wayland
 
 mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
+# 711, as rcS left it: pyxisapp reaches Echo's and Pulse's sockets in here by
+# name. 700 leaves every app with no bridge, falling back to the mock.
+chmod 711 "$XDG_RUNTIME_DIR"
+
+# The kernel's hostname. Nothing else sets it (no systemd here), so uname
+# said "(none)" and Settings' About showed that.
+[ -s /etc/hostname ] && head -n1 /etc/hostname > /proc/sys/kernel/hostname 2>/dev/null
 
 # Test overlay. Only scripts/serial-test.py uses this; it is absent on any
 # real boot. The harness attaches a read-only virtio disk whose serial is
@@ -866,6 +893,88 @@ start_daemon() {
     # which is what a daemon should have anyway; </dev/null stops any of them
     # blocking on console reads.
     setsid "$bin" "$@" > "/var/log/${name}.log" 2>&1 < /dev/null &
+}
+
+# Supervised launch for the two daemons whose death leaves no desktop: echo
+# (every app talks to it) and the shell's vela. The daemon runs in a setsid
+# loop of its own, so the boot script still exits and the SIGHUP described in
+# start_daemon can't reach it. An exit is logged with its status, and the
+# daemon is restarted after a backoff of 1, 2, 4 ... 30 s. The backoff resets
+# once a run has stayed up 60 s. After 5 exits within 2 minutes the loop gives
+# up, so a daemon that dies at start-up can't spin. The log is opened once and
+# shared by every run, so a crash's output is kept rather than truncated.
+#
+#   supervise_daemon <name> <guard> <chown> <bin> [args...]
+#     guard: a socket that must still exist before a restart, or "-". vela
+#            passes Evo's Wayland socket, because a shell with no compositor
+#            can't come back.
+#     chown: a socket to hand to geckouser after a restart, or "-". echo's
+#            socket is re-created root-owned on every bind, and Bloom's bridge
+#            needs it writable (see the echo socket chown above).
+#
+# Evo is deliberately NOT supervised. Restarting it means every client has to
+# reconnect, and nothing here restarts those clients. A dead Evo stays a reboot
+# until that is designed.
+supervise_daemon() {
+    local name="$1" guard="$2" chown_sock="$3" bin="$4"
+    shift 4
+    if [ ! -x "$bin" ]; then
+        echo "[boot] SKIP ${name}: ${bin} not found"
+        return
+    fi
+    echo "[boot] starting ${name}..."
+    setsid sh -c '
+        name="$1" guard="$2" chown_sock="$3"
+        shift 3
+        delay=1 exits=""
+        started=$(date +%s)
+        while :; do
+            "$@"
+            status=$?
+            now=$(date +%s)
+            echo "[supervise] ${name} exited with status ${status} at $(date "+%Y-%m-%d %H:%M:%S")"
+            if [ "$guard" != "-" ] && [ ! -S "$guard" ]; then
+                echo "[supervise] ${name}: ${guard} is gone, not restarting"
+                break
+            fi
+            keep="" n=0
+            for t in $exits $now; do
+                if [ $((now - t)) -le 120 ]; then
+                    keep="$keep $t"
+                    n=$((n + 1))
+                fi
+            done
+            exits="$keep"
+            if [ "$n" -ge 5 ]; then
+                echo "[supervise] ${name}: ${n} exits in 2 minutes, giving up"
+                break
+            fi
+            if [ $((now - started)) -ge 60 ]; then
+                delay=1
+            fi
+            echo "[supervise] restarting ${name} in ${delay}s"
+            sleep "$delay"
+            delay=$((delay * 2))
+            if [ "$delay" -gt 30 ]; then
+                delay=30
+            fi
+            started=$(date +%s)
+            if [ "$chown_sock" != "-" ]; then
+                # Background watcher, so the restarted daemon can bind first.
+                # The sleep comes before the poll: the socket file left by the
+                # old run would otherwise be chowned and then replaced.
+                (
+                    sleep 1
+                    i=0
+                    while [ ! -S "$chown_sock" ] && [ "$i" -lt 20 ]; do
+                        sleep 0.5
+                        i=$((i + 1))
+                    done
+                    chown 1000:1000 "$chown_sock" 2>/dev/null
+                ) &
+            fi
+        done
+    ' supervise "$name" "$guard" "$chown_sock" "$bin" "$@" > "/var/log/${name}.log" 2>&1 < /dev/null &
 }
 
 wait_for_socket() {
@@ -934,7 +1043,7 @@ fi
 start_daemon shift /usr/bin/shift-daemon
 sleep 1
 
-start_daemon echo /usr/bin/echo-daemon
+supervise_daemon echo - "${XDG_RUNTIME_DIR}/geckoOS/echo.sock" /usr/bin/env PYXIS_SHELL_APPS=@@BOOT_APP@@ /usr/bin/echo-daemon
 if wait_for_socket "${XDG_RUNTIME_DIR}/geckoOS/echo.sock" 20; then
     echo "[boot] echo socket ready"
 else
@@ -1002,7 +1111,15 @@ if wait_for_socket "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" 40; then
     # geckouser-owned from creation. That's a larger refactor (seatd video-
     # group membership, echo/shift root-need audit) deferred until the
     # smoke test passes.
+    # Mode 0600 too: the host socket is the shell's alone (and root's). A client
+    # on it is trusted by Evo (evo/src/trust.rs), and apps run as pyxisapp, so
+    # they can only arrive through the security-context socket pyxis-wlctx
+    # makes for them.
     chown 1000:1000 "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" 2>/dev/null || true
+    chmod 600 "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" 2>/dev/null || true
+    # Echo's dir must be traversable by apps (their bridge connects to
+    # echo.sock through a link in their own runtime dir).
+    chmod 755 "${XDG_RUNTIME_DIR}/geckoOS" 2>/dev/null || true
     chown 1000:1000 "${XDG_RUNTIME_DIR}/geckoOS" 2>/dev/null || true
     chown 1000:1000 "${XDG_RUNTIME_DIR}/geckoOS/echo.sock" 2>/dev/null || true
 else
@@ -1018,6 +1135,17 @@ fi
 # /etc/group membership needed. There is no D-Bus session bus here, so
 # WirePlumber logs a few warnings about device reservation and runs anyway.
 if [ -x /usr/bin/pipewire ]; then
+    # Apps run as pyxisapp and reach PipeWire's Pulse server on a second
+    # address, /run/pyxis/pulse/native (10-pyxis-apps.conf, written by
+    # create-rootfs.sh). Not on the default ${XDG_RUNTIME_DIR}/pulse/native:
+    # that directory is geckouser's and 0700, and every libpulse client of
+    # geckouser's (the shell's own vela) puts it back to 0700 whenever it
+    # connects, so loosening it can't hold. This one is geckouser's to create
+    # the socket in (pipewire-pulse chmods the socket itself to 0777) and
+    # world-traversable; /run/pyxis is root's.
+    mkdir -p /run/pyxis/pulse
+    chown 1000:1000 /run/pyxis/pulse
+    chmod 755 /run/pyxis/pulse
     for piece in pipewire wireplumber pipewire-pulse; do
         start_daemon "$piece" /usr/bin/setpriv --reuid=1000 --regid=1000 --groups audio \
             /usr/bin/env XDG_RUNTIME_DIR=/run/user/1000 HOME=/home/geckouser "/usr/bin/${piece}"
@@ -1124,6 +1252,9 @@ user_pref("media.autoplay.block-webaudio", false);
 // browser window (kept in lockstep with nova.rs's write_profile_prefs).
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.sessionstore.max_resumed_crashes", 0);
+// Never fall into automatic safe mode: an app closed during start-up counts as
+// a start-up crash, and past 3 a chromeless vela exits at once, for good.
+user_pref("toolkit.startup.max_resumed_crashes", -1);
 user_pref("browser.startup.page", 0);
 // No WebExtensions in a single-purpose profile. Its hidden background-page
 // host (chrome://extensions/content/dummy.xhtml) maps as a real Wayland
@@ -1141,6 +1272,27 @@ user_pref("xpinstall.enabled", false);
 PREFS
     chown 1000:1000 /var/lib/pyxis/profiles/@@BOOT_APP@@/user.js
 
+    # The shell's overlay: a second Bloom window (pyxis-experience's
+    # src/overlay/OverlayApp.tsx) that Evo keeps ABOVE app windows
+    # (evo/src/shell/overlay.rs), for what has to be seen over apps.
+    # Notification toasts live there now, and the lock screen goes there next.
+    # vela opens it in this same process when passed --pyxis-overlay. It is
+    # transparent only if the profile gives windows an alpha visual and a
+    # transparent <browser>; see the PYXIS block of browser-init.js. Only a
+    # boot app that ships an overlay page gets either.
+    OVERLAY_FLAG=""
+    if [ -f /usr/share/geckoOS/apps/@@BOOT_APP@@/webroot/overlay.html ]; then
+        OVERLAY_FLAG="--pyxis-overlay overlay.html"
+        cat >> /var/lib/pyxis/profiles/@@BOOT_APP@@/user.js <<'PREFS'
+// Bloom's overlay window is transparent wherever its page draws nothing.
+// Gecko decides both of these when it creates a window, so they are set for
+// the whole shell profile. The desktop window paints its own opaque
+// background either way.
+user_pref("mozilla.widget.use-argb-visuals", true);
+user_pref("browser.tabs.allow_transparent_browser", true);
+PREFS
+    fi
+
     # geckouser's cache/config dirs (found via a real boot: "Fontconfig
     # error: No writable cache directories" for /home/geckouser/.cache/
     # fontconfig, plus GTK/mesa want $HOME/.cache and $HOME/.config).
@@ -1152,6 +1304,11 @@ PREFS
     # cheap to silence and they slow font enumeration.
     mkdir -p /home/geckouser/.cache/fontconfig /home/geckouser/.config
     chown -R 1000:1000 /home/geckouser/.cache /home/geckouser/.config
+    # The same for the app user: vela runs as pyxisapp for every Nova-launched
+    # app, and its fontconfig/config dirs are under its own home.
+    mkdir -p /home/pyxisapp/.cache/fontconfig /home/pyxisapp/.config
+    chown -R 1001:1001 /home/pyxisapp
+    chmod 700 /home/pyxisapp
 
     # geckoOS-boot runs as root (started by BusyBox init, itself root), but
     # Gecko REFUSES to run as root ("Running Nightly as root in a regular
@@ -1281,7 +1438,7 @@ PREFS
     if [ "@@BOOT_DISPLAY_MODE@@" = "fullscreen" ]; then
         KIOSK_FLAG="--kiosk"
     fi
-    start_daemon vela /usr/bin/setpriv --reuid=1000 --regid=1000 --groups video,render \
+    supervise_daemon vela "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" - /usr/bin/setpriv --reuid=1000 --regid=1000 --groups video,render \
         /usr/bin/env MOZ_ENABLE_WAYLAND=1 PYXIS_APP_ID=@@BOOT_APP@@ \
         PYXIS_PROFILE_DIR=/var/lib/pyxis/profiles/@@BOOT_APP@@ \
         PYXIS_DISPLAY_MODE=@@BOOT_DISPLAY_MODE@@ XDG_RUNTIME_DIR=/run/user/1000 \
@@ -1289,7 +1446,7 @@ PREFS
         MOZ_GTK_TITLEBAR_DECORATION=none GTK_CSD=0 \
         HOME=/home/geckouser \
         "$VELA_BIN" $KIOSK_FLAG --profile /var/lib/pyxis/profiles/@@BOOT_APP@@ \
-        --pyxis-app @@BOOT_APP@@ --app-entry @@BOOT_APP_ENTRY@@
+        --pyxis-app @@BOOT_APP@@ --app-entry @@BOOT_APP_ENTRY@@ $OVERLAY_FLAG
 else
     echo "[boot] SKIP vela: binary (${VELA_BIN}) or @@BOOT_APP@@ app not staged"
 fi
@@ -1333,6 +1490,11 @@ stage_binaries() {
         rockhopper-compat
         pyxis
         pyxis-appctl
+        # Every app launch runs through pyxis-wlctx (it gives the app its own
+        # Wayland socket: Evo treats an app and the system differently);
+        # pyxis-wlprobe is the test client for scripts/serial-tests/alpha5-wayland-trust.txt.
+        pyxis-wlctx
+        pyxis-wlprobe
     )
 
     for bin in "${bins[@]}"; do
@@ -1481,6 +1643,18 @@ stage_bloom_app() {
     # nova-runtime-host-plan.md's KNOWN_CAPABILITIES vocabulary
     # (echo/src/services/nova.rs), which this manifest's permissions[]
     # must be a subset of or Nova's parse-time validation rejects it.
+    #
+    # The bridge refuses any call it doesn't list (PyxisBridgeParent's
+    # BRIDGE_CAPABILITIES), so this list has to cover every service the shell
+    # calls: volume, outputs and system sounds in quick settings (audio), the
+    # status bar's connection (network), the browser shortcut (browser),
+    # quick settings' theme/brightness/Do Not Disturb (settings:write), the
+    # overlay's input region (windows:manage), and desktop search, which
+    # reads the Notes, Contacts and Tasks apps' documents and adds notes and
+    # tasks (filesystem:apps: every app's files are its own, so reaching
+    # another app's takes that). notifications:manage, appManager:*,
+    # settings:write, windows:manage and filesystem:apps are privileged:
+    # Nova grants them only because `bloom` is on its PRIVILEGED_APP_IDS.
     local src="${PROJECT_ROOT}/../pyxis-experience/dist"
     local app_dir="${ROOTFS_DIR}/usr/share/geckoOS/apps/bloom"
 
@@ -1508,7 +1682,13 @@ stage_bloom_app() {
     "notifications",
     "notifications:manage",
     "appManager:install",
-    "appManager:manage"
+    "appManager:manage",
+    "audio",
+    "network",
+    "browser",
+    "settings:write",
+    "windows:manage",
+    "filesystem:apps"
   ]
 }
 EOF
@@ -1568,7 +1748,7 @@ stage_terminal_app() {
   "category": "utilities",
   "singleInstance": true,
   "display": "maximized",
-  "permissions": []
+  "permissions": ["terminal"]
 }
 EOF
     fi
@@ -1623,16 +1803,20 @@ EOF
 
 stage_browser_app() {
     log_section "Stage 8e: standalone Browser app"
-    # No filesystem/power/notification calls (BrowserApp.tsx only reads
-    # network status), so no declared permissions needed.
-    _stage_pyxis_app "browser" "Browser" "system" "" "windowed"
+    # Reads the connection state (network) and opens pages in a separate
+    # vela window through nova.OpenExternalBrowser (browser).
+    _stage_pyxis_app "browser" "Browser" "system" '"browser","network"' "windowed"
 }
 
 stage_files_app() {
     log_section "Stage 8f: standalone Files app"
-    # Real directory browsing via org.geckoOS.filesystem's readDirectory.
+    # Real directory browsing via org.geckoOS.filesystem's readDirectory,
+    # plus new folder, rename and delete, which need filesystem:write. Its
+    # calls reach the user's home (filesystem:user) and, read-only, the rest
+    # of the root filesystem (filesystem:system), not just its own data; both
+    # are privileged, and `files` is on Nova's PRIVILEGED_APP_IDS.
     _stage_pyxis_app "files" "File Manager" "system" \
-        '"filesystem:read","filesystem:write"' "windowed"
+        '"filesystem:read","filesystem:write","filesystem:user","filesystem:system"' "windowed"
 }
 
 stage_notes_app() {
@@ -1657,10 +1841,12 @@ stage_tasks_app() {
 
 stage_settings_app() {
     log_section "Stage 8j: standalone Settings app"
-    # Theme/wallpaper go through org.geckoOS.settings, which isn't in
-    # nova.rs's KNOWN_CAPABILITIES gated vocabulary -- no permissions to
-    # declare.
-    _stage_pyxis_app "settings" "Settings" "system" "" "windowed"
+    # Writes theme/wallpaper through org.geckoOS.settings (settings:write,
+    # privileged: `settings` is on Nova's PRIVILEGED_APP_IDS), and has the
+    # Sound page (audio), the network status (network) and sleep/reboot/
+    # shutdown (power).
+    _stage_pyxis_app "settings" "Settings" "system" \
+        '"power","audio","network","settings:write"' "windowed"
 }
 
 stage_installer_app() {
@@ -1784,12 +1970,16 @@ stage_permissions() {
     log_section "Stage 11: Final permissions"
 
     sudo chmod 1777 "${ROOTFS_DIR}/tmp" "${ROOTFS_DIR}/var/tmp"
-    sudo chmod 700 "${ROOTFS_DIR}/run/user/1000"
+    sudo chmod 711 "${ROOTFS_DIR}/run/user/1000"
     sudo chmod 755 "${ROOTFS_DIR}/etc/init.d"/* 2>/dev/null || true
     sudo chmod 755 "${ROOTFS_DIR}/usr/bin" 2>/dev/null || true
 
     if [[ -d "${ROOTFS_DIR}/home/geckouser" ]]; then
         sudo chown -R 1000:1000 "${ROOTFS_DIR}/home/geckouser"
+    fi
+    if [[ -d "${ROOTFS_DIR}/home/pyxisapp" ]]; then
+        sudo chown -R 1001:1001 "${ROOTFS_DIR}/home/pyxisapp"
+        sudo chmod 700 "${ROOTFS_DIR}/home/pyxisapp"
     fi
 
     log_success "Permissions finalized"

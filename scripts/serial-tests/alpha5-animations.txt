@@ -1,0 +1,1489 @@
+# Alpha 5: window animations (evo/src/anim): open, close, the mode switch.
+#
+#   scripts/serial-test.py --memory 4096 --push target/release/evo:/usr/bin/evo --push target/release/echo-cli:/usr/bin/echo-cli --script scripts/serial-tests/alpha5-animations.txt
+#
+# Animation is a render-time transform and the harness can't see motion, so the
+# assertions are Evo's own counters (evo.GetAnimationState): every animation
+# counts as `started` when it begins and `completed` when it ends however it
+# ended, so with nothing in flight `started == completed` and `active == 0`.
+# The echo-cli calls are root and need no vela rebuild.
+#
+# LOOK at target/serial-shots/anim-*.png:
+#   anim-open-mid    the Files window part-way through its open: smaller than
+#                    its final size, translucent (Bloom's desktop shows
+#                    through), its title bar intact and scaled with it.
+#   anim-close-mid   the same window mid-close, drawn from a snapshot after
+#                    the app's buffer is gone, with its title bar, above the
+#                    desktop: since Lumen, Evaporate (see evap-* at the end),
+#                    a hole burning out from the close button.
+#   anim-close-late  the same ghost six seconds on: the hole larger.
+#   geo-*            geometry transitions (maximize, unmaximize, the two
+#                    interrupting each other, a work-area change, fullscreen),
+#                    each caught part-way at scale 60. Look for: the old
+#                    frame's picture, header and all, scaled to the moving
+#                    rect with the new window fading in over it; header text
+#                    scaled, never re-laid-out; no black frame; and the
+#                    *-late shots must show the final frame with no trace of
+#                    the old size.
+#
+#   min-*            minimize and restore (lane B; drawn as Lumen's Droplet and
+#                    Rise since lane L1, see droplet-* further down). Look for:
+#                    min-mid, the Files window rounded off, soft and tinted on
+#                    its way to the dock icon at (600,740); min-late, an
+#                    icon-sized orb, fading; restore-mid, the window opening
+#                    back out of the orb; min-restore-mid, a minimize
+#                    turned round mid-flight with no jump in size or place;
+#                    min-nodock, a window with no reported icon heading for the
+#                    bottom centre of the screen; showdesk-*, three windows, the
+#                    front-most already well on its way, the next less, the
+#                    last barely started (45 ms x scale apart, 1.35 s at scale
+#                    30), drawn as Lumen's Recede (see recede-* there); closemid-*, a window closed while it was still
+#                    opening, evaporating from the size it had (never first
+#                    jumping to full size).
+#
+# The mid-animation shots run at scale 60 (a 260 ms open takes 15.6 s, a close
+# 10.8 s), slow enough for the guest's shell and the screenshot to land inside.
+
+# "started-open completed-open started-close completed-close active mode"
+st() { echo-cli call org.geckoOS.evo GetAnimationState --interface org.geckoOS.evo --args '{}' | awk '/"started"/ { sec = "s" } /"completed"/ { sec = "c" } /"(open|close)":/ { gsub(/[",:]/, ""); v[sec $1] = $2 } /"active"/ { gsub(/[",:]/, ""); a = $2 } /"mode"/ { gsub(/[",:]/, ""); m = $2 } END { print v["sopen"] + 0, v["copen"] + 0, v["sclose"] + 0, v["cclose"] + 0, a + 0, m }'; }
+# "window_id" of the first window whose app_id is $1.
+wid() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"window_id":/ { gsub(/[",:]/, ""); print $2; exit }'; }
+# "started completed" of the geometry kind, then the shared active count.
+gst() { echo-cli call org.geckoOS.evo GetAnimationState --interface org.geckoOS.evo --args '{}' | awk '/"started"/ { sec = "s" } /"completed"/ { sec = "c" } /"geometry":/ { gsub(/[",:]/, ""); v[sec] = $2 } /"active"/ { gsub(/[",:]/, ""); a = $2 } END { print v["s"] + 0, v["c"] + 0, a + 0 }'; }
+# "x y w h id" of the first window whose app_id is $1.
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+# The edges Bloom reserved, "top bottom".
+wa() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | awk '/"top"/ { gsub(/[",:]/, ""); t = $2 } /"bottom"/ { gsub(/[",:]/, ""); b = $2 } END { print t + 0, b + 0 }'; }
+winact() { echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "{\"window_id\":$2}" | grep -c '"success": true'; }
+setanim() { echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args "$1" | grep -c '"mode"'; }
+setwa() { echo-cli call org.geckoOS.evo SetWorkArea --interface org.geckoOS.evo --args "{\"top\":$1,\"bottom\":$2}" | grep -c success; }
+# Wait until the geometry kind is active (the transition has begun).
+wait_geo() { i=0; while [ $i -lt $1 ]; do read _ _ A <<< "$(gst)"; [ "$A" != 0 ] && return 0; sleep 0.5; i=$((i + 1)); done; return 1; }
+# Wait (up to $1 half-seconds) until animations are active.
+wait_active() { i=0; while [ $i -lt $1 ]; do read _ _ _ _ A _ <<< "$(st)"; [ "$A" != 0 ] && return 0; sleep 0.5; i=$((i + 1)); done; return 1; }
+# Wait until nothing is animating.
+wait_idle() { i=0; while [ $i -lt $1 ]; do read _ _ _ _ A _ <<< "$(st)"; [ "$A" = 0 ] && return 0; sleep 1; i=$((i + 1)); done; return 1; }
+
+echo "=== settings: the IPC contract ==="
+#!must SETTINGS-OK
+echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args '{"mode":"full","scale":1}' | grep -q '"mode": "full"' && echo SETTINGS-OK || echo SETTINGS-FAILED
+#!must BAD-MODE-REFUSED
+echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args '{"mode":"wobbly"}' 2>&1 | grep -qi 'mode must be' && echo BAD-MODE-REFUSED || echo BAD-MODE-ACCEPTED
+#!must STATE-SHAPE-OK
+echo-cli call org.geckoOS.evo GetAnimationState --interface org.geckoOS.evo --args '{}' | grep -E '"(mode|scale|active|started|completed|open|close|minimize|restore|geometry)"' | wc -l | awk '{ print ($1 >= 14) ? "STATE-SHAPE-OK" : "STATE-SHAPE-BAD " $1 }'
+read SO0 CO0 SC0 CC0 A0 MODE0 <<< "$(st)"; echo "baseline: open $SO0/$CO0 close $SC0/$CC0 active=$A0 mode=$MODE0"
+#!must BASELINE-MODE-FULL
+test "$MODE0" = full && echo BASELINE-MODE-FULL || echo "BASELINE-MODE-$MODE0"
+
+echo "=== open: one animation for a launched app, none for the pre-window ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+wait_idle 10
+read SO1 CO1 SC1 CC1 A1 _ <<< "$(st)"; echo "after launch: open $SO1/$CO1 close $SC1/$CC1 active=$A1"
+# Exactly one: the app's window. The about:blank pre-window each launch maps
+# first claims vela-default, which is not bindable, and must not animate.
+#!must OPEN-ONCE
+test $((SO1 - SO0)) = 1 && echo OPEN-ONCE || echo "OPEN-COUNT-$((SO1 - SO0))"
+#!must OPEN-COMPLETED
+test "$SO1" = "$CO1" && echo OPEN-COMPLETED || echo "OPEN-NOT-COMPLETED $SO1/$CO1"
+#!must IDLE-AFTER-OPEN
+test "$A1" = 0 && echo IDLE-AFTER-OPEN || echo "ACTIVE-$A1"
+# Bloom never animates, so a desktop-only boot has started nothing of its own:
+# the count above is the app's alone.
+
+echo "=== close: a ghost drawn from a snapshot, then gone ==="
+FID=$(wid files); echo "files window $FID"
+#!must CLOSE-REQUESTED
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$FID}" | grep -q '"success": true' && echo CLOSE-REQUESTED || echo CLOSE-REFUSED
+sleep 3
+wait_idle 10
+read SO2 CO2 SC2 CC2 A2 _ <<< "$(st)"; echo "after close: open $SO2/$CO2 close $SC2/$CC2 active=$A2"
+#!must CLOSE-STARTED
+test $((SC2 - SC1)) = 1 && echo CLOSE-STARTED || echo "CLOSE-COUNT-$((SC2 - SC1))"
+#!must CLOSE-COMPLETED
+test "$SC2" = "$CC2" && echo CLOSE-COMPLETED || echo "CLOSE-NOT-COMPLETED $SC2/$CC2"
+#!must IDLE-AFTER-CLOSE
+test "$A2" = 0 && echo IDLE-AFTER-CLOSE || echo "ACTIVE-$A2"
+# The window is gone from Evo's own list: the ghost took no part in it.
+#!must WINDOW-GONE
+test -z "$(wid files)" && echo WINDOW-GONE || echo WINDOW-STILL-LISTED
+# Make sure the app has really exited before the next launch.
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+echo "=== off: the counters do not move ==="
+#!must OFF-OK
+echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args '{"mode":"off"}' | grep -q '"mode": "off"' && echo OFF-OK || echo OFF-FAILED
+read SO3 CO3 SC3 CC3 A3 MODE3 <<< "$(st)"; echo "off: open $SO3/$CO3 close $SC3/$CC3 mode=$MODE3"
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+FID=$(wid files); echo "files window $FID"
+#!must FILES-MAPPED-OFF
+test -n "$FID" && echo FILES-MAPPED-OFF || echo FILES-NOT-MAPPED
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$FID}" | grep -q '"success": true'
+sleep 4
+read SO4 CO4 SC4 CC4 A4 _ <<< "$(st)"; echo "after an off launch and close: open $SO4/$CO4 close $SC4/$CC4 active=$A4"
+#!must OFF-COUNTERS-STILL
+test "$SO4 $CO4 $SC4 $CC4 $A4" = "$SO3 $CO3 $SC3 $CC3 $A3" && echo OFF-COUNTERS-STILL || echo "OFF-COUNTERS-MOVED"
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+echo "=== reduced: opacity only, still counted ==="
+#!must REDUCED-OK
+echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args '{"mode":"reduced","scale":1}' | grep -q '"mode": "reduced"' && echo REDUCED-OK || echo REDUCED-FAILED
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+wait_idle 10
+read SO5 CO5 _ _ A5 _ <<< "$(st)"; echo "reduced launch: open $SO5/$CO5 active=$A5"
+#!must REDUCED-OPEN-COUNTED
+test $((SO5 - SO4)) = 1 -a "$SO5" = "$CO5" -a "$A5" = 0 && echo REDUCED-OPEN-COUNTED || echo "REDUCED-OPEN-WRONG"
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+echo "=== slow motion: look at a window part-way through opening and closing ==="
+echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args '{"mode":"full","scale":60}' | grep -c '"scale": 60'
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+# The window maps about 15 s after the launch; the open then runs 15.6 s. The
+# shot goes right after the first sight of it: expo-out is most of the way
+# there within the first few percent of its time.
+#!must OPEN-IN-FLIGHT
+wait_active 80 && echo OPEN-IN-FLIGHT || echo OPEN-NEVER-STARTED
+#!shot anim-open-mid
+read _ _ _ _ AM _ <<< "$(st)"; echo "mid-open active=$AM"
+# The yardstick for the geometry fps below: the same VM drawing an open.
+sleep 2
+echo "fps during an open:"; echo-cli call org.geckoOS.evo GetRenderingStatus --interface org.geckoOS.evo --args '{}' | grep -E '"fps"'
+wait_idle 40
+FID=$(wid files); echo "files window $FID"
+sleep 1
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$FID}" | grep -q '"success": true'
+#!must CLOSE-IN-FLIGHT
+wait_active 20 && echo CLOSE-IN-FLIGHT || echo CLOSE-NEVER-STARTED
+#!shot anim-close-mid
+sleep 6
+#!shot anim-close-late
+wait_idle 40
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+
+echo "=== geometry: maximize, unmaximize, a work-area change ==="
+# Bloom reports the work area through the bridge; on an older vela say it for
+# Bloom (does nothing once it has).
+read WT0 WB0 <<< "$(wa)"; [ "$WT0" != 0 ] || setwa 44 76
+read WT WB <<< "$(wa)"; MAXH=$((800 - WT - WB)); echo "work area: top=$WT bottom=$WB maximized height=$MAXH"
+setanim '{"mode":"full","scale":1}'
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+wait_idle 10
+FID=$(wid files); echo "files window $FID"
+# A first-run window may be born maximized: leave it floating to start from.
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+read FX FY FW FH FID2 <<< "$(geom files)"; echo "floating: $FX,$FY ${FW}x$FH"
+
+# --- maximize: exactly one transition, and it lands on the work area.
+read GS0 GC0 GA0 <<< "$(gst)"
+#!must MAX-REQUESTED
+winact MaximizeWindow $FID | grep -q 1 && echo MAX-REQUESTED || echo MAX-REFUSED
+sleep 3
+wait_idle 10
+read GS1 GC1 GA1 <<< "$(gst)"; echo "maximize: geometry $GS0/$GC0 -> $GS1/$GC1 active=$GA1"
+#!must GEO-MAX-ONE
+test $((GS1 - GS0)) = 1 && echo GEO-MAX-ONE || echo "GEO-MAX-COUNT-$((GS1 - GS0))"
+#!must GEO-MAX-BALANCED
+test "$GS1" = "$GC1" -a "$GA1" = 0 && echo GEO-MAX-BALANCED || echo "GEO-MAX-UNBALANCED $GS1/$GC1 active=$GA1"
+read AX AY AW AH _ <<< "$(geom files)"; echo "maximized: $AX,$AY ${AW}x$AH"
+#!must GEO-MAX-FRAME
+test "$AX,$AY ${AW}x$AH" = "0,$WT 1280x$MAXH" && echo GEO-MAX-FRAME || echo "GEO-WRONG-FRAME $AX,$AY ${AW}x$AH (want 0,$WT 1280x$MAXH)"
+#!shot geo-maximized
+
+# --- unmaximize: one more, and back to the floating frame it left.
+#!must UNMAX-REQUESTED
+winact UnmaximizeWindow $FID | grep -q 1 && echo UNMAX-REQUESTED || echo UNMAX-REFUSED
+sleep 3
+wait_idle 10
+read GS2 GC2 GA2 <<< "$(gst)"; echo "unmaximize: geometry $GS1/$GC1 -> $GS2/$GC2 active=$GA2"
+#!must GEO-UNMAX-ONE
+test $((GS2 - GS1)) = 1 -a "$GS2" = "$GC2" -a "$GA2" = 0 && echo GEO-UNMAX-ONE || echo "GEO-UNMAX-WRONG $GS2/$GC2 active=$GA2"
+read UX UY UW UH _ <<< "$(geom files)"; echo "unmaximized: $UX,$UY ${UW}x$UH"
+#!must GEO-UNMAX-FRAME
+test "$UX,$UY ${UW}x$UH" = "$FX,$FY ${FW}x$FH" && echo GEO-UNMAX-FRAME || echo "GEO-NOT-RESTORED $UX,$UY ${UW}x$UH (was $FX,$FY ${FW}x$FH)"
+
+# --- interactive move stays 1:1: it starts no transition.
+SX=$((UX + UW / 2)); SY=$((UY + 12)); EX=$((SX - 30)); EY=$SY
+#!pointer drag $SX $SY $EX $EY
+sleep 2
+read DX DY _ _ _ <<< "$(geom files)"
+read GS3 GC3 GA3 <<< "$(gst)"
+#!must DRAG-NO-TRANSITION
+test "$DX" = $((UX - 30)) -a "$GS3" = "$GS2" && echo DRAG-NO-TRANSITION || echo "DRAG-ANIMATED-OR-FAILED x=$DX started=$GS3 (was $GS2)"
+winact MaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+read FX FY FW FH _ <<< "$(geom files)"; echo "floating again: $FX,$FY ${FW}x$FH"
+
+# --- a work-area change refits the maximized window with a transition.
+winact MaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+read GS4 GC4 _ <<< "$(gst)"
+NT=$((WT + 20))
+setwa $NT $WB | grep -q 1
+sleep 3
+wait_idle 10
+read GS5 GC5 GA5 <<< "$(gst)"
+read RX RY RW RH _ <<< "$(geom files)"; echo "after the bar grew: $RX,$RY ${RW}x$RH geometry $GS4 -> $GS5"
+#!must GEO-REFIT
+test $((GS5 - GS4)) -ge 1 -a "$GS5" = "$GC5" -a "$GA5" = 0 && echo GEO-REFIT || echo "GEO-REFIT-WRONG $GS4 -> $GS5 completed=$GC5 active=$GA5"
+#!must GEO-REFIT-FRAME
+test "$RX,$RY ${RW}x$RH" = "0,$NT 1280x$((800 - NT - WB))" && echo GEO-REFIT-FRAME || echo "GEO-REFIT-WRONG-FRAME $RX,$RY ${RW}x$RH"
+setwa $WT $WB | grep -q 1
+sleep 3
+wait_idle 10
+read RX RY RW RH _ <<< "$(geom files)"
+#!must GEO-REFIT-BACK
+test "$RX,$RY ${RW}x$RH" = "0,$WT 1280x$MAXH" && echo GEO-REFIT-BACK || echo "GEO-REFIT-NOT-BACK $RX,$RY ${RW}x$RH"
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+
+echo "=== geometry: reduced is counted, off is instant ==="
+setanim '{"mode":"reduced","scale":1}' | grep -q 1
+read GR0 GRC0 _ <<< "$(gst)"
+winact MaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+read GR1 GRC1 GRA1 <<< "$(gst)"; echo "reduced: geometry $GR0/$GRC0 -> $GR1/$GRC1 active=$GRA1"
+#!must GEO-REDUCED-COUNTED
+test $((GR1 - GR0)) = 2 -a "$GR1" = "$GRC1" -a "$GRA1" = 0 && echo GEO-REDUCED-COUNTED || echo "GEO-REDUCED-WRONG $GR0 -> $GR1 completed=$GRC1 active=$GRA1"
+setanim '{"mode":"off"}' | grep -q 1
+read GO0 GOC0 _ <<< "$(gst)"
+winact MaximizeWindow $FID | grep -q 1
+sleep 3
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+read GO1 GOC1 GOA1 <<< "$(gst)"
+#!must GEO-OFF-INSTANT
+test "$GO1 $GOC1 $GOA1" = "$GO0 $GOC0 0" && echo GEO-OFF-INSTANT || echo "GEO-OFF-ANIMATED $GO0/$GOC0 -> $GO1/$GOC1 active=$GOA1"
+read OX OY OW OH _ <<< "$(geom files)"
+#!must GEO-OFF-FRAME
+test "$OX,$OY ${OW}x$OH" = "$FX,$FY ${FW}x$FH" && echo GEO-OFF-FRAME || echo "GEO-OFF-WRONG-FRAME $OX,$OY ${OW}x$OH"
+
+echo "=== geometry: slow motion, and the two interrupting each other ==="
+setanim '{"mode":"full","scale":60}' | grep -q 1
+read GM0 GMC0 _ <<< "$(gst)"
+winact MaximizeWindow $FID | grep -q 1
+#!must GEO-MAX-IN-FLIGHT
+wait_geo 20 && echo GEO-MAX-IN-FLIGHT || echo GEO-MAX-NEVER-STARTED
+# The client takes a moment to paint its new size; then the spring runs for
+# 16.8 s. About 3 s in it is a third of the way there.
+sleep 3
+#!shot geo-max-mid
+read _ _ AM <<< "$(gst)"; echo "mid-maximize active=$AM"
+# Unmaximize while it is still moving: turns round from where it is.
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+#!shot geo-interrupt-mid
+read GMS GMC GMA <<< "$(gst)"; echo "interrupted: geometry $GM0 -> $GMS completed=$GMC active=$GMA"
+#!must GEO-INTERRUPT-ONE
+test $((GMS - GM0)) = 1 -a "$GMA" = 1 && echo GEO-INTERRUPT-ONE || echo "GEO-INTERRUPT-WRONG started=$((GMS - GM0)) active=$GMA"
+sleep 6
+#!shot geo-interrupt-late
+wait_idle 60
+read GMS GMC GMA <<< "$(gst)"
+#!must GEO-INTERRUPT-BALANCED
+test "$GMS" = "$GMC" -a "$GMA" = 0 && echo GEO-INTERRUPT-BALANCED || echo "GEO-INTERRUPT-UNBALANCED $GMS/$GMC active=$GMA"
+read IX IY IW IH _ <<< "$(geom files)"; echo "after the interrupt: $IX,$IY ${IW}x$IH"
+#!must GEO-INTERRUPT-FRAME
+test "$IX,$IY ${IW}x$IH" = "$FX,$FY ${FW}x$FH" && echo GEO-INTERRUPT-FRAME || echo "GEO-INTERRUPT-WRONG-FRAME $IX,$IY ${IW}x$IH (want $FX,$FY ${FW}x$FH)"
+# One uninterrupted look at the end: maximize, caught late.
+winact MaximizeWindow $FID | grep -q 1
+wait_geo 20
+sleep 14
+#!shot geo-max-late
+wait_idle 60
+read LX LY LW LH _ <<< "$(geom files)"
+#!must GEO-MAX-LATE-FRAME
+test "$LX,$LY ${LW}x$LH" = "0,$WT 1280x$MAXH" && echo GEO-MAX-LATE-FRAME || echo "GEO-MAX-LATE-WRONG $LX,$LY ${LW}x$LH"
+# Frame rate while a transition is on screen.
+winact UnmaximizeWindow $FID | grep -q 1
+wait_geo 20
+sleep 4
+echo "fps during a geometry transition (two full-size layers):"
+echo-cli call org.geckoOS.evo GetRenderingStatus --interface org.geckoOS.evo --args '{}' | grep -E '"fps"'
+sleep 2
+echo-cli call org.geckoOS.evo GetRenderingStatus --interface org.geckoOS.evo --args '{}' | grep -E '"fps"'
+#!shot geo-unmax-mid
+wait_idle 60
+
+echo "=== geometry: fullscreen in and out ==="
+setanim '{"mode":"full","scale":60}' | grep -q 1
+read GF0 GFC0 _ <<< "$(gst)"
+#!key f11
+sleep 3
+read GF1 GFC1 GFA1 <<< "$(gst)"; echo "after F11: geometry $GF0 -> $GF1 active=$GFA1"
+#!shot geo-fullscreen-mid
+wait_idle 60
+read FSX FSY FSW FSH _ <<< "$(geom files)"; echo "fullscreen frame: $FSX,$FSY ${FSW}x$FSH"
+#!must GEO-FULLSCREEN-FRAME
+test "$FSX,$FSY ${FSW}x$FSH" = "0,0 1280x800" && echo GEO-FULLSCREEN-FRAME || echo "GEO-FULLSCREEN-UNAVAILABLE-OR-WRONG $FSX,$FSY ${FSW}x$FSH"
+#!shot geo-fullscreen-late
+#!key f11
+sleep 3
+#!shot geo-unfullscreen-mid
+wait_idle 60
+read GF2 GFC2 GFA2 <<< "$(gst)"
+#!must GEO-FULLSCREEN-BALANCED
+test $((GF2 - GF0)) = 2 -a "$GF2" = "$GFC2" -a "$GFA2" = 0 && echo GEO-FULLSCREEN-BALANCED || echo "GEO-FULLSCREEN-WRONG $GF0 -> $GF2 completed=$GFC2 active=$GFA2"
+read EXX EXY EXW EXH _ <<< "$(geom files)"
+#!must GEO-FULLSCREEN-RESTORED
+test "$EXX,$EXY ${EXW}x$EXH" = "$FX,$FY ${FW}x$FH" && echo GEO-FULLSCREEN-RESTORED || echo "GEO-FULLSCREEN-NOT-RESTORED $EXX,$EXY ${EXW}x$EXH (want $FX,$FY ${FW}x$FH)"
+
+echo "=== Lumen Settle glint: a band of light crosses the frame as a geometry change ends ==="
+# Lane L4 (evo/src/anim/glint.rs). From 42% of the transition to its end a
+# soft diagonal white band (peak alpha 0.32 x sin(pi g)) crosses the window,
+# clipped to its frame. Full motion only, and only with Lumen on. Asserted
+# from GetLumenState (`frames.glint`, `last_progress.glint`, `glint_program`).
+#
+# LOOK at target/serial-shots/glint-*.png (maximize at scale 60, the band
+# caught at 25/50/75% of its crossing):
+#   glint-25   a faint pale band entering from the top-left corner of the
+#              nearly-maximized window, nothing outside the frame.
+#   glint-50   the band across the middle, at its brightest: the window still
+#              readable through it, no hard edge.
+#   glint-75   the band leaving by the bottom-right, fading.
+lflat() { echo-cli call org.geckoOS.evo GetLumenState --interface org.geckoOS.evo --args '{}' | tr -d ' \n'; }
+# `frames.$1` and `last_progress.$1` of GetLumenState.
+lfr() { lflat | grep -o '"frames":{[^}]*}' | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
+lpr() { lflat | grep -o '"last_progress":{[^}]*}' | grep -o "\"$1\":[0-9.e-]*" | cut -d: -f2; }
+# Wait (up to $3 tenths) until effect $1 has drawn a frame beyond count $2 at
+# progress >= $4.
+wait_lp() { i=0; while [ $i -lt $3 ]; do if [ "$(lfr $1)" -gt "$2" ] && awk -v p="$(lpr $1)" -v w="$4" 'BEGIN { exit !(p + 0 >= w) }'; then return 0; fi; sleep 0.1; i=$((i + 1)); done; return 1; }
+setlumen_g() { echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args "{\"enabled\":$1}" | grep -c '"enabled"'; }
+setanim '{"mode":"full","scale":1}' | grep -q 1
+setlumen_g true | grep -q 1
+read GX GY GW GH _ <<< "$(geom files)"; echo "files at $GX,$GY ${GW}x$GH"
+G0=$(lfr glint)
+winact MaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+G1=$(lfr glint); echo "glint frames: $G0 -> $G1, program $(lflat | grep -o '"glint_program":"[a-z]*"')"
+#!must GLINT-COMPILED
+lflat | grep -q '"glint_program":"compiled"' && echo GLINT-COMPILED || echo "GLINT-PROGRAM-$(lflat | grep -o '"glint_program":"[a-z]*"')"
+#!must GLINT-DRAWN
+test "$G1" -gt "$G0" && echo GLINT-DRAWN || echo GLINT-NOT-DRAWN
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+G2=$(lfr glint)
+#!must GLINT-UNMAX-DRAWN
+test "$G2" -gt "$G1" && echo GLINT-UNMAX-DRAWN || echo GLINT-UNMAX-NOT-DRAWN
+# Part-way, at scale 60: the glint runs from about 7 s to 16.8 s.
+setanim '{"mode":"full","scale":60}' | grep -q 1
+G3=$(lfr glint)
+winact MaximizeWindow $FID | grep -q 1
+wait_lp glint $G3 300 0.25 && echo "glint at $(lpr glint)"
+#!shot glint-25
+wait_lp glint $G3 200 0.5 && echo "glint at $(lpr glint)"
+#!shot glint-50
+wait_lp glint $G3 200 0.75 && echo "glint at $(lpr glint)"
+#!shot glint-75
+wait_idle 60
+setanim '{"mode":"full","scale":1}' | grep -q 1
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+wait_idle 10
+# None in reduced, none with Lumen off (the transition itself still runs).
+G4=$(lfr glint)
+setanim '{"mode":"reduced","scale":1}' | grep -q 1
+winact MaximizeWindow $FID | grep -q 1; sleep 3; wait_idle 10
+winact UnmaximizeWindow $FID | grep -q 1; sleep 3; wait_idle 10
+setanim '{"mode":"full","scale":1}' | grep -q 1
+setlumen_g false | grep -q 1
+read GL0 _ _ <<< "$(gst)"
+winact MaximizeWindow $FID | grep -q 1; sleep 3; wait_idle 10
+winact UnmaximizeWindow $FID | grep -q 1; sleep 3; wait_idle 10
+read GL1 GLC1 GLA1 <<< "$(gst)"
+setlumen_g true | grep -q 1
+#!must GLINT-NONE-REDUCED-OR-OFF
+test "$(lfr glint)" = "$G4" && echo GLINT-NONE-REDUCED-OR-OFF || echo "GLINT-DRAWN-WHEN-IT-SHOULD-NOT $G4 -> $(lfr glint)"
+#!must GLINT-OFF-STILL-TRANSITIONS
+test $((GL1 - GL0)) = 2 -a "$GL1" = "$GLC1" -a "$GLA1" = 0 && echo GLINT-OFF-STILL-TRANSITIONS || echo "GLINT-OFF-GEOMETRY-WRONG $GL0 -> $GL1/$GLC1 active=$GLA1"
+read GX2 GY2 GW2 GH2 _ <<< "$(geom files)"
+#!must GLINT-FRAME-UNCHANGED
+test "$GX2,$GY2 ${GW2}x$GH2" = "$GX,$GY ${GW}x$GH" && echo GLINT-FRAME-UNCHANGED || echo "GLINT-FRAME-MOVED $GX2,$GY2 ${GW2}x$GH2"
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+# How long Gecko took to paint each size Evo asked for: the time the old
+# picture is held before the spring starts.
+echo "client latency per transition:"; grep -a 'geometry transition: new size landed' /var/log/evo.log | sed 's/.*landed after/landed after/'
+
+# "started-minimize completed-minimize started-restore completed-restore active"
+mst() { echo-cli call org.geckoOS.evo GetAnimationState --interface org.geckoOS.evo --args '{}' | awk '/"started"/ { sec = "s" } /"completed"/ { sec = "c" } /"(minimize|restore)":/ { gsub(/[",:]/, ""); v[sec $1] = $2 } /"active"/ { gsub(/[",:]/, ""); a = $2 } END { print v["sminimize"] + 0, v["cminimize"] + 0, v["srestore"] + 0, v["crestore"] + 0, a + 0 }'; }
+# "true"/"false": whether the first window whose app_id is $1 is on screen.
+vis() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"visible":/ { gsub(/[",:]/, ""); print $2; exit }'; }
+settargets() { echo-cli call org.geckoOS.evo SetMinimizeTargets --interface org.geckoOS.evo --args "$1" | grep -c '"ok": true'; }
+wait_mactive() { i=0; while [ $i -lt $1 ]; do read _ _ _ _ A <<< "$(mst)"; [ "$A" != 0 ] && return 0; sleep 0.5; i=$((i + 1)); done; return 1; }
+wait_midle() { i=0; while [ $i -lt $1 ]; do read _ _ _ _ A <<< "$(mst)"; [ "$A" = 0 ] && return 0; sleep 1; i=$((i + 1)); done; return 1; }
+
+echo "=== minimize and restore: a window springs into its dock icon and back ==="
+setanim '{"mode":"full","scale":1}' | grep -q 1
+#!must TARGETS-SET
+settargets '{"targets":[{"app_id":"files","x":600,"y":740,"w":48,"h":48},{"app_id":"notes","x":660,"y":740,"w":48,"h":48},{"app_id":"tasks","x":720,"y":740,"w":48,"h":48}]}' | grep -q 1 && echo TARGETS-SET || echo TARGETS-REFUSED
+#!must BAD-TARGETS-REFUSED
+echo-cli call org.geckoOS.evo SetMinimizeTargets --interface org.geckoOS.evo --args '{"targets":"no"}' 2>&1 | grep -qi 'targets must be' && echo BAD-TARGETS-REFUSED || echo BAD-TARGETS-ACCEPTED
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+wait_idle 10
+FID=$(wid files); echo "files window $FID"
+#!must MIN-FILES-MAPPED
+test -n "$FID" -a "$(vis files)" = true && echo MIN-FILES-MAPPED || echo MIN-FILES-NOT-MAPPED
+read MS0 MC0 RS0 RC0 MA0 <<< "$(mst)"; echo "baseline: minimize $MS0/$MC0 restore $RS0/$RC0 active=$MA0"
+#!must MIN-REQUESTED
+winact MinimizeWindow $FID | grep -q 1 && echo MIN-REQUESTED || echo MIN-REFUSED
+# Placement is instant: the window leaves the Space at once (ListWindows is
+# rebuilt at most every 250 ms, so give it a moment), while its ghost is
+# still drawn.
+sleep 1
+#!must MIN-HIDDEN
+test "$(vis files)" = false && echo MIN-HIDDEN || echo MIN-STILL-VISIBLE
+sleep 1
+wait_midle 10
+read MS1 MC1 RS1 RC1 MA1 <<< "$(mst)"; echo "minimized: minimize $MS1/$MC1 restore $RS1/$RC1 active=$MA1"
+#!must MIN-ONE-BALANCED
+test $((MS1 - MS0)) = 1 -a "$MS1" = "$MC1" -a "$MA1" = 0 && echo MIN-ONE-BALANCED || echo "MIN-WRONG $MS0 -> $MS1 completed=$MC1 active=$MA1"
+#!must RESTORE-REQUESTED
+winact RestoreWindow $FID | grep -q 1 && echo RESTORE-REQUESTED || echo RESTORE-REFUSED
+sleep 2
+wait_midle 10
+read MS2 MC2 RS2 RC2 MA2 <<< "$(mst)"; echo "restored: minimize $MS2/$MC2 restore $RS2/$RC2 active=$MA2"
+#!must RESTORE-ONE-BALANCED
+test $((RS2 - RS1)) = 1 -a "$RS2" = "$RC2" -a "$MA2" = 0 && echo RESTORE-ONE-BALANCED || echo "RESTORE-WRONG $RS1 -> $RS2 completed=$RC2 active=$MA2"
+#!must RESTORED-VISIBLE
+test "$(vis files)" = true && echo RESTORED-VISIBLE || echo RESTORED-HIDDEN
+
+echo "=== minimize and restore: slow motion, look at the poses ==="
+# Scale 30: a spring's run is capped at 10 s, so a minimize at scale 60 would
+# snap to the end instead of settling.
+setanim '{"mode":"full","scale":30}' | grep -q 1
+read MS2 MC2 RS2 RC2 _ <<< "$(mst)"
+winact MinimizeWindow $FID | grep -q 1
+#!must MIN-IN-FLIGHT
+wait_mactive 10 && echo MIN-IN-FLIGHT || echo MIN-NEVER-STARTED
+sleep 1
+#!shot min-mid
+sleep 3
+#!shot min-late
+wait_midle 60
+winact RestoreWindow $FID | grep -q 1
+wait_mactive 10
+sleep 1
+#!shot restore-mid
+wait_midle 60
+# Turn it round: restore while it is still sinking into the icon.
+read MS2 MC2 RS2 RC2 _ <<< "$(mst)"
+winact MinimizeWindow $FID | grep -q 1
+sleep 1
+winact RestoreWindow $FID | grep -q 1
+sleep 1
+#!shot min-restore-mid
+read MS3 MC3 RS3 RC3 MA3 <<< "$(mst)"; echo "interrupted: minimize $MS3/$MC3 restore $RS3/$RC3 active=$MA3"
+#!must MIN-RESTORE-INTERRUPT
+test $((MS3 - MS2)) = 1 -a $((RS3 - RS2)) = 1 -a "$MC3" = "$MS3" -a "$MA3" = 1 && echo MIN-RESTORE-INTERRUPT || echo "INTERRUPT-WRONG min=$((MS3 - MS2)) restore=$((RS3 - RS2)) minimize-completed=$MC3/$MS3 active=$MA3"
+wait_midle 60
+read MS4 MC4 RS4 RC4 MA4 <<< "$(mst)"
+#!must INTERRUPT-BALANCED
+test "$MS4" = "$MC4" -a "$RS4" = "$RC4" -a "$MA4" = 0 && echo INTERRUPT-BALANCED || echo "INTERRUPT-UNBALANCED $MS4/$MC4 $RS4/$RC4 active=$MA4"
+#!must INTERRUPT-VISIBLE
+test "$(vis files)" = true && echo INTERRUPT-VISIBLE || echo INTERRUPT-HIDDEN
+# The reverse: restore started, then minimize again part-way.
+winact MinimizeWindow $FID | grep -q 1
+wait_midle 60
+winact RestoreWindow $FID | grep -q 1
+sleep 1
+winact MinimizeWindow $FID | grep -q 1
+sleep 1
+#!shot restore-minimize-mid
+wait_midle 90
+#!must REVERSE-INTERRUPT-HIDDEN
+test "$(vis files)" = false && echo REVERSE-INTERRUPT-HIDDEN || echo REVERSE-INTERRUPT-VISIBLE
+read MS5 MC5 RS5 RC5 MA5 <<< "$(mst)"
+#!must REVERSE-INTERRUPT-BALANCED
+test "$MS5" = "$MC5" -a "$RS5" = "$RC5" -a "$MA5" = 0 && echo REVERSE-INTERRUPT-BALANCED || echo "REVERSE-UNBALANCED $MS5/$MC5 $RS5/$RC5 active=$MA5"
+winact RestoreWindow $FID | grep -q 1
+wait_midle 90
+
+echo "=== minimize and restore: the immediate round trip, reduced and off ==="
+setanim '{"mode":"full","scale":1}' | grep -q 1
+read MS6 MC6 RS6 RC6 _ <<< "$(mst)"
+# Back to back: the restore lands while the minimize is barely under way.
+winact MinimizeWindow $FID | grep -q 1; winact RestoreWindow $FID | grep -q 1
+sleep 2
+wait_midle 10
+read MS7 MC7 RS7 RC7 MA7 <<< "$(mst)"; echo "round trip: minimize $MS6 -> $MS7/$MC7 restore $RS6 -> $RS7/$RC7 active=$MA7"
+#!must ROUND-TRIP-COUNTED
+test $((MS7 - MS6)) -ge 1 -a "$MS7" = "$MC7" -a "$RS7" = "$RC7" -a "$MA7" = 0 && echo ROUND-TRIP-COUNTED || echo "ROUND-TRIP-WRONG min $MS6 -> $MS7/$MC7 restore $RS6 -> $RS7/$RC7 active=$MA7"
+#!must ROUND-TRIP-VISIBLE
+test "$(vis files)" = true && echo ROUND-TRIP-VISIBLE || echo ROUND-TRIP-HIDDEN
+setanim '{"mode":"reduced","scale":1}' | grep -q 1
+winact MinimizeWindow $FID | grep -q 1
+sleep 2
+wait_midle 10
+winact RestoreWindow $FID | grep -q 1
+sleep 2
+wait_midle 10
+read MS8 MC8 RS8 RC8 MA8 <<< "$(mst)"
+#!must REDUCED-MIN-COUNTED
+test $((MS8 - MS7)) = 1 -a $((RS8 - RS7)) = 1 -a "$MS8" = "$MC8" -a "$RS8" = "$RC8" -a "$MA8" = 0 && echo REDUCED-MIN-COUNTED || echo "REDUCED-MIN-WRONG min $MS7 -> $MS8/$MC8 restore $RS7 -> $RS8/$RC8 active=$MA8"
+setanim '{"mode":"off"}' | grep -q 1
+winact MinimizeWindow $FID | grep -q 1
+sleep 1
+#!must OFF-MIN-HIDDEN
+test "$(vis files)" = false && echo OFF-MIN-HIDDEN || echo OFF-MIN-VISIBLE
+winact RestoreWindow $FID | grep -q 1
+sleep 1
+#!must OFF-MIN-RESTORED
+test "$(vis files)" = true && echo OFF-MIN-RESTORED || echo OFF-MIN-NOT-RESTORED
+read MS9 MC9 RS9 RC9 MA9 <<< "$(mst)"
+#!must OFF-MIN-COUNTERS-STILL
+test "$MS9 $MC9 $RS9 $RC9 $MA9" = "$MS8 $MC8 $RS8 $RC8 0" && echo OFF-MIN-COUNTERS-STILL || echo "OFF-MIN-COUNTERS-MOVED"
+
+echo "=== minimize: an app the dock never reported heads for the bottom centre ==="
+# Forget the table: the window has no icon to go to.
+settargets '{"targets":[]}' | grep -q 1
+setanim '{"mode":"full","scale":30}' | grep -q 1
+winact MinimizeWindow $FID | grep -q 1
+wait_mactive 10
+sleep 2
+#!shot min-nodock
+winact RestoreWindow $FID | grep -q 1
+sleep 1
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_midle 90
+settargets '{"targets":[{"app_id":"files","x":600,"y":740,"w":48,"h":48},{"app_id":"notes","x":660,"y":740,"w":48,"h":48},{"app_id":"tasks","x":720,"y":740,"w":48,"h":48}]}' | grep -q 1
+
+echo "=== close mid-open: the snapshot starts from the pose the window had ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 4
+setanim '{"mode":"full","scale":60}' | grep -q 1
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+#!must CLOSEMID-OPENING
+wait_active 80 && echo CLOSEMID-OPENING || echo CLOSEMID-NEVER-OPENED
+sleep 2
+#!shot closemid-before
+FID=$(wid files)
+read _ _ SC8 CC8 _ _ <<< "$(st)"
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$FID}" | grep -q '"success": true'
+sleep 3
+#!shot closemid-after
+read SO9 CO9 SC9 CC9 A9 _ <<< "$(st)"; echo "closed mid-open: open $SO9/$CO9 close $SC9/$CC9 active=$A9"
+#!must CLOSEMID-ONE-CLOSE
+test $((SC9 - SC8)) = 1 && echo CLOSEMID-ONE-CLOSE || echo "CLOSEMID-COUNT-$((SC9 - SC8))"
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_idle 90
+read SO9 CO9 SC9 CC9 A9 _ <<< "$(st)"
+#!must CLOSEMID-BALANCED
+test "$SO9" = "$CO9" -a "$SC9" = "$CC9" -a "$A9" = 0 && echo CLOSEMID-BALANCED || echo "CLOSEMID-UNBALANCED open $SO9/$CO9 close $SC9/$CC9 active=$A9"
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+echo "=== show desktop: Super+D, three apps, front-most first ==="
+# Since Lumen (lane L4, evo/src/shell/recede.rs) drawn as Recede: each window
+# shrinks to 0.88, sinks 14 px, blurs and fades, front-most first, 45 ms x
+# scale apart. A second Super+D brings back exactly that set (Emerge),
+# back-most first. A Recede counts as a minimize, an Emerge as a restore;
+# GetLumenState.recede has the set's order and `frames.recede` the frames.
+#
+# LOOK at target/serial-shots/recede-*.png (three windows, scale 30):
+#   recede-25/50/75   the three windows soft and shrinking where they stand
+#                     (no travel to the dock, no orb), the front-most furthest
+#                     gone; at 75% little more than a blur over the wallpaper.
+#   emerge-25/50/75   the same three coming back into focus, the back-most
+#                     furthest along, the stack in its old order.
+lflat() { echo-cli call org.geckoOS.evo GetLumenState --interface org.geckoOS.evo --args '{}' | tr -d ' \n'; }
+lfr() { lflat | grep -o '"frames":{[^}]*}' | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
+lpr() { lflat | grep -o '"last_progress":{[^}]*}' | grep -o "\"$1\":[0-9.e-]*" | cut -d: -f2; }
+# The window_id of the focused window.
+focused_id() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk '/\{/ { id = ""; f = 0 } /"window_id":/ { gsub(/[",:]/, ""); id = $2 } /"focused": true/ { f = 1 } /\}/ { if (f && id != "") w = id; f = 0 } END { print w }'; }
+fps_sd() { echo-cli call org.geckoOS.evo GetRenderingStatus --interface org.geckoOS.evo --args '{}' | awk '/"fps"/ { gsub(/[",:]/, ""); print $2 }'; }
+# GetLumenState.recede's field $1 (a number, or an array as "a,b,c").
+lrc() { lflat | grep -o '"recede":{[^}]*}' | grep -o "\"$1\":\(\[[0-9,]*\]\|[a-z0-9]*\)" | cut -d: -f2 | tr -d '[]'; }
+wait_lp() { i=0; while [ $i -lt $3 ]; do if [ "$(lfr $1)" -gt "$2" ] && awk -v p="$(lpr $1)" -v w="$4" 'BEGIN { exit !(p + 0 >= w) }'; then return 0; fi; sleep 0.1; i=$((i + 1)); done; return 1; }
+# Wait until effect $1's progress has fallen to <= $2 (an Emerge runs 1 -> 0).
+wait_lp_down() { i=0; while [ $i -lt $3 ]; do if awk -v p="$(lpr $1)" -v w="$2" 'BEGIN { exit !(p + 0 <= w) }'; then return 0; fi; sleep 0.1; i=$((i + 1)); done; return 1; }
+setanim '{"mode":"full","scale":1}' | grep -q 1
+for A in files notes tasks; do echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'sessionId|Error'; sleep 15; done
+sleep 3
+wait_idle 20
+#!must SD-THREE-VISIBLE
+test "$(vis files)" = true -a "$(vis notes)" = true -a "$(vis tasks)" = true && echo SD-THREE-VISIBLE || echo "SD-NOT-ALL-VISIBLE files=$(vis files) notes=$(vis notes) tasks=$(vis tasks)"
+read MSA MCA RSA RCA _ <<< "$(mst)"
+FRONT=$(wid tasks); MIDDLE=$(wid notes); BACK=$(wid files)
+RF0=$(lfr recede); RC0=$(lrc recedes); DL0=$(lflat | grep -o '"landed":{[^}]*}')
+setanim '{"mode":"full","scale":30}' | grep -q 1
+#!key meta_l d
+sleep 1
+#!must SD-HIDDEN-AT-ONCE
+test "$(vis files)" = false -a "$(vis notes)" = false -a "$(vis tasks)" = false && echo SD-HIDDEN-AT-ONCE || echo "SD-STILL-VISIBLE files=$(vis files) notes=$(vis notes) tasks=$(vis tasks)"
+#!must SD-IN-FLIGHT
+wait_mactive 10 && echo SD-IN-FLIGHT || echo SD-NEVER-STARTED
+#!shot showdesk-early
+wait_lp recede $RF0 200 0.25 && echo "recede at $(lpr recede)"
+#!shot recede-25
+wait_lp recede $RF0 200 0.5 && echo "recede at $(lpr recede)"
+#!shot recede-50
+wait_lp recede $RF0 200 0.75 && echo "recede at $(lpr recede)"
+#!shot recede-75
+read MSB MCB _ _ MAB <<< "$(mst)"; echo "show desktop: minimize $MSA -> $MSB/$MCB active=$MAB"
+#!must SD-THREE-STARTED
+test $((MSB - MSA)) = 3 && echo SD-THREE-STARTED || echo "SD-STARTED-$((MSB - MSA))"
+echo "recede state: $(lflat | grep -o '"recede":{[^}]*}')"
+#!must RECEDE-FRONT-FIRST
+test "$(lrc recede_order)" = "$FRONT,$MIDDLE,$BACK" && echo RECEDE-FRONT-FIRST || echo "RECEDE-ORDER-$(lrc recede_order) (want $FRONT,$MIDDLE,$BACK)"
+#!must RECEDE-SHOWN
+test "$(lrc shown)" = true -a $(($(lrc recedes) - RC0)) = 3 && echo RECEDE-SHOWN || echo "RECEDE-STATE-WRONG shown=$(lrc shown) recedes=$RC0->$(lrc recedes)"
+#!must RECEDE-THROUGH-LUMEN
+test "$(lfr recede)" -gt "$RF0" && echo RECEDE-THROUGH-LUMEN || echo RECEDE-NOT-THROUGH-LUMEN
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_midle 120
+read MSC MCC _ _ MAC <<< "$(mst)"
+#!must SD-BALANCED
+test "$MSC" = "$MCC" -a "$MAC" = 0 && echo SD-BALANCED || echo "SD-UNBALANCED $MSC/$MCC active=$MAC"
+# Nothing lands in an icon: a Recede sends no MinimizeLanded.
+#!must RECEDE-NO-LANDING
+test "$(lflat | grep -o '"landed":{[^}]*}')" = "$DL0" && echo RECEDE-NO-LANDING || echo "RECEDE-LANDED $DL0 -> $(lflat | grep -o '"landed":{[^}]*}')"
+
+# --- Super+D again: Emerge brings back exactly those three, back-most first.
+read MSE MCE RSE RCE _ <<< "$(mst)"
+RF1=$(lfr recede); EC0=$(lrc emerges)
+setanim '{"mode":"full","scale":30}' | grep -q 1
+#!key meta_l d
+sleep 1
+#!must EMERGE-ALL-BACK-AT-ONCE
+test "$(vis files)" = true -a "$(vis notes)" = true -a "$(vis tasks)" = true && echo EMERGE-ALL-BACK-AT-ONCE || echo "EMERGE-NOT-ALL files=$(vis files) notes=$(vis notes) tasks=$(vis tasks)"
+wait_lp_down recede 0.75 200 && echo "emerge at $(lpr recede)"
+#!shot emerge-25
+wait_lp_down recede 0.5 200 && echo "emerge at $(lpr recede)"
+#!shot emerge-50
+wait_lp_down recede 0.25 200 && echo "emerge at $(lpr recede)"
+#!shot emerge-75
+#!must EMERGE-BACK-FIRST
+test "$(lrc emerge_order)" = "$BACK,$MIDDLE,$FRONT" && echo EMERGE-BACK-FIRST || echo "EMERGE-ORDER-$(lrc emerge_order) (want $BACK,$MIDDLE,$FRONT)"
+#!must EMERGE-STATE
+test "$(lrc shown)" = false -a $(($(lrc emerges) - EC0)) = 3 && echo EMERGE-STATE || echo "EMERGE-STATE-WRONG shown=$(lrc shown) emerges=$EC0->$(lrc emerges)"
+#!must EMERGE-THROUGH-LUMEN
+test "$(lfr recede)" -gt "$RF1" && echo EMERGE-THROUGH-LUMEN || echo EMERGE-NOT-THROUGH-LUMEN
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_midle 120
+read MSG MCG RSG RCG MAG <<< "$(mst)"; echo "emerge: restore $RSE -> $RSG/$RCG active=$MAG"
+#!must EMERGE-COUNTED-BALANCED
+test $((RSG - RSE)) = 3 -a "$MSG" = "$MCG" -a "$RSG" = "$RCG" -a "$MAG" = 0 && echo EMERGE-COUNTED-BALANCED || echo "EMERGE-WRONG restore $RSE -> $RSG/$RCG active=$MAG"
+# The stack is as it was, and the front-most has the keyboard again.
+# (Keys come sorted, so `focused` precedes `window_id`: judge each object whole.)
+echo "focused after emerge: $(focused_id) (front-most was $FRONT)"
+#!must EMERGE-STACK-RESTORED
+test "$(focused_id)" = "$FRONT" && echo EMERGE-STACK-RESTORED || echo EMERGE-FOCUS-WRONG
+
+# --- fps with three windows receding, Lumen against its plain fallback (scale 10).
+setanim '{"mode":"full","scale":10}' | grep -q 1
+#!key meta_l d
+sleep 1
+echo "fps while three windows recede, LUMEN: $(fps_sd) $(sleep 1; fps_sd) $(sleep 1; fps_sd)"
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_midle 60
+#!key meta_l d
+sleep 2
+wait_midle 60
+echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args '{"enabled":false}' | grep -q enabled
+RF2=$(lfr recede)
+setanim '{"mode":"full","scale":10}' | grep -q 1
+#!key meta_l d
+sleep 1
+echo "fps while three windows recede, PLAIN: $(fps_sd) $(sleep 1; fps_sd) $(sleep 1; fps_sd)"
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_midle 60
+#!must RECEDE-LUMEN-OFF-PLAIN
+test "$(lfr recede)" = "$RF2" && echo RECEDE-LUMEN-OFF-PLAIN || echo "RECEDE-DREW-WITH-LUMEN-OFF $RF2 -> $(lfr recede)"
+#!key meta_l d
+sleep 2
+wait_midle 60
+echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args '{"enabled":true}' | grep -q enabled
+echo "recede snapshot costs:"; grep -a "lumen recede: snapshot" /var/log/evo.log | tail -6
+
+# --- reduced: a fade, no stagger, no picture; off: instant. Both still toggle.
+setanim '{"mode":"reduced","scale":1}' | grep -q 1
+RF3=$(lfr recede)
+#!key meta_l d
+sleep 2
+wait_midle 10
+#!must RECEDE-REDUCED-HIDDEN
+test "$(vis files)" = false -a "$(vis notes)" = false -a "$(vis tasks)" = false && echo RECEDE-REDUCED-HIDDEN || echo RECEDE-REDUCED-VISIBLE
+#!key meta_l d
+sleep 2
+wait_midle 10
+#!must EMERGE-REDUCED-BACK
+test "$(vis files)" = true -a "$(vis notes)" = true -a "$(vis tasks)" = true && echo EMERGE-REDUCED-BACK || echo EMERGE-REDUCED-MISSING
+#!must RECEDE-REDUCED-NO-LUMEN
+test "$(lfr recede)" = "$RF3" && echo RECEDE-REDUCED-NO-LUMEN || echo RECEDE-REDUCED-DREW-LUMEN
+setanim '{"mode":"off"}' | grep -q 1
+read MSO MCO RSO RCO _ <<< "$(mst)"
+#!key meta_l d
+sleep 1
+#!key meta_l d
+sleep 1
+read MSO2 MCO2 RSO2 RCO2 MAO2 <<< "$(mst)"
+#!must RECEDE-OFF-INSTANT
+test "$(vis files)" = true -a "$MSO2 $RSO2 $MAO2" = "$MSO $RSO 0" && echo RECEDE-OFF-INSTANT || echo "RECEDE-OFF-WRONG files=$(vis files) min $MSO->$MSO2 restore $RSO->$RSO2 active=$MAO2"
+setanim '{"mode":"full","scale":1}' | grep -q 1
+#!key meta_l d
+sleep 2
+wait_midle 60
+# Restore is per window, as before: one restores, the other two stay down.
+NID=$(wid notes)
+winact RestoreWindow $NID | grep -q 1
+sleep 2
+wait_midle 10
+#!must SD-RESTORE-ONE
+test "$(vis notes)" = true -a "$(vis files)" = false -a "$(vis tasks)" = false && echo SD-RESTORE-ONE || echo "SD-RESTORE-WRONG files=$(vis files) notes=$(vis notes) tasks=$(vis tasks)"
+read MSD MCD RSD RCD MAD <<< "$(mst)"
+#!must SD-RESTORE-BALANCED
+test "$MSD" = "$MCD" -a "$RSD" = "$RCD" -a "$MAD" = 0 && echo SD-RESTORE-BALANCED || echo "SD-RESTORE-UNBALANCED $MSD/$MCD $RSD/$RCD active=$MAD"
+# A dock restore ended the shown desktop: Super+D now sends Notes away (a
+# fresh Recede of what is on screen), it does not bring the other two back.
+#!key meta_l d
+sleep 2
+wait_midle 20
+#!must RECEDE-AFTER-RESTORE
+test "$(vis notes)" = false -a "$(vis files)" = false -a "$(vis tasks)" = false -a "$(lrc recede_order)" = "$NID" && echo RECEDE-AFTER-RESTORE || echo "RECEDE-AFTER-RESTORE-WRONG files=$(vis files) notes=$(vis notes) tasks=$(vis tasks) order=$(lrc recede_order)"
+for A in files notes tasks; do echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'success|Error'; done
+sleep 4
+
+echo "=== back to normal ==="
+echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args '{"mode":"full","scale":1}' | grep -c '"mode": "full"'
+sleep 3
+read SOF COF SCF CCF AF _ <<< "$(st)"; echo "final: open $SOF/$COF close $SCF/$CCF active=$AF"
+#!must FINAL-BALANCED
+test "$SOF" = "$COF" -a "$SCF" = "$CCF" -a "$AF" = 0 && echo FINAL-BALANCED || echo "FINAL-UNBALANCED"
+read MSF MCF RSF RCF MAF <<< "$(mst)"; echo "final minimize/restore: $MSF/$MCF $RSF/$RCF active=$MAF"
+#!must FINAL-MINIMIZE-BALANCED
+test "$MSF" = "$MCF" -a "$RSF" = "$RCF" -a "$MAF" = 0 && echo FINAL-MINIMIZE-BALANCED || echo FINAL-MINIMIZE-UNBALANCED
+read GFS GFC GFA <<< "$(gst)"; echo "final geometry: $GFS/$GFC active=$GFA"
+#!must FINAL-GEOMETRY-BALANCED
+test "$GFS" = "$GFC" && echo FINAL-GEOMETRY-BALANCED || echo "FINAL-GEOMETRY-UNBALANCED"
+
+echo "=== depth: drop shadows, rounded corners, focus, lift (evo/src/anim/depth.rs) ==="
+# Lane D. Four windows open, so there is something to cast a shadow on.
+#
+# LOOK at target/serial-shots/depth-*.png (the harness cannot see shadows):
+#   depth-two-windows     a smaller Notes window over a larger Files window: a
+#                         soft shadow all round it, deeper below than above,
+#                         falling on the window beneath; the bottom corners
+#                         rounded like the top, with no square client pixels
+#                         poking out of them.
+#   depth-corner-bl       the same window's bottom-left corner at 4x: the frame
+#                         line follows the content's rounding, nothing square
+#                         behind it.
+#   depth-inactive        Files raised and focused, Notes behind it: Notes'
+#                         shadow smaller and lighter, its title bar dimmer.
+#   depth-maximized       a maximized window: square corners, no shadow.
+#   depth-max-corner      its top-left corner at 4x: square.
+#   depth-rest / -lift    the same window held still, then held and moved: the
+#                         shadow larger and softer while it is in the hand, the
+#                         window itself exactly where the pointer put it.
+#   depth-geo-mid / -unmax-mid  maximizing and unmaximizing caught part-way: the
+#                         shadow tracks the window's drawn rect, fading out
+#                         toward the maximized end and in from it.
+#   depth-off             depth switched off: the old flat look, for comparison.
+fps() { echo-cli call org.geckoOS.evo GetRenderingStatus --interface org.geckoOS.evo --args '{}' | awk '/"fps"/ { gsub(/[",:]/, ""); print $2 }'; }
+cpu() { awk '{ print $14 + $15 }' /proc/$(pidof evo | awk '{ print $1 }')/stat; }
+dstate() { echo-cli call org.geckoOS.evo GetDepthState --interface org.geckoOS.evo --args '{}' | awk '/"shaders"/ { gsub(/[",:]/, ""); print $2 }'; }
+setdepth() { echo-cli call org.geckoOS.evo SetDepth --interface org.geckoOS.evo --args "{\"enabled\":$1}" | grep -c "\"enabled\": $1"; }
+setanim '{"mode":"full","scale":1}' | grep -q 1
+#!must DEPTH-ON
+setdepth true | grep -q 1 && echo DEPTH-ON || echo DEPTH-REFUSED
+read WT WB <<< "$(wa)"; [ "$WT" != 0 ] || setwa 44 76
+for A in files notes tasks settings; do rm -f /var/lib/pyxis/profiles/$A/xulstore.json /var/lib/pyxis/profiles/$A/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'sessionId|Error'; sleep 15; done
+sleep 3
+wait_idle 20
+for A in files notes tasks settings; do winact UnmaximizeWindow $(wid $A) | grep -q 1; done
+sleep 3
+wait_idle 20
+#!must SHADERS-COMPILED
+test "$(dstate)" = compiled && echo SHADERS-COMPILED || echo "SHADERS-$(dstate)"
+# Notes over Files, smaller: shrink Notes by its bottom-right resize band,
+# then drag it by its title bar to the middle of Files.
+# Raise it first: the press has to land on Notes, not on a window above it.
+NID=$(wid notes)
+winact FocusWindow $NID | grep -q 1
+sleep 3
+wait_idle 20
+read NX NY NW NH NID <<< "$(geom notes)"; echo "notes: $NX,$NY ${NW}x$NH"
+SX=$((NX + NW + 3)); SY=$((NY + NH + 3)); EX=$((SX - 420)); EY=$((SY - 280))
+#!pointer drag $SX $SY $EX $EY
+sleep 2
+read NX NY NW NH NID <<< "$(geom notes)"; echo "notes shrunk: $NX,$NY ${NW}x$NH"
+FOX=$((NX + 200)); FOY=$((NY + 120))
+TX=$((NX + NW / 2)); TY=$((NY + 12)); TX2=$((TX + 200)); TY2=$((TY + 120))
+#!pointer drag $TX $TY $TX2 $TY2
+sleep 2
+read NX NY NW NH NID <<< "$(geom notes)"; echo "notes moved: $NX,$NY ${NW}x$NH"
+FID=$(wid files)
+winact FocusWindow $NID | grep -q 1
+sleep 2
+#!shot depth-two-windows
+CX=$((NX - 30)); CY=$((NY + NH - 70))
+#!shot depth-corner-bl -g "$CX,$CY 130x130" -s 4
+# Focus moves to Files: Notes dims and its shadow shrinks.
+winact FocusWindow $FID | grep -q 1
+sleep 2
+#!shot depth-inactive
+#!shot depth-inactive-corner -g "$CX,$CY 130x130" -s 4
+winact FocusWindow $NID | grep -q 1
+sleep 2
+
+# --- the lift: the same window at rest, then held and moved.
+#!shot depth-rest
+LX=$((NX + NW / 2)); LY=$((NY + 12))
+#!pointer down $LX $LY
+LX2=$((LX + 40)); LY2=$((LY + 30))
+#!pointer move $LX2 $LY2
+sleep 1
+read MX MY MW MH _ <<< "$(geom notes)"; echo "held: $MX,$MY ${MW}x$MH (was $NX,$NY)"
+#!shot depth-lift
+#!pointer up
+sleep 2
+#!must LIFT-FOLLOWS-POINTER
+test "$MX" = $((NX + 40)) -a "$MY" = $((NY + 30)) && echo LIFT-FOLLOWS-POINTER || echo "LIFT-MOVED-WRONG $MX,$MY (want $((NX + 40)),$((NY + 30)))"
+#!shot depth-settled
+
+# --- maximized: square, no shadow.
+setanim '{"mode":"full","scale":60}' | grep -q 1
+#!must DEPTH-MAX-OK
+winact MaximizeWindow $NID | grep -q 1 && echo DEPTH-MAX-OK || echo DEPTH-MAX-REFUSED
+wait_geo 20
+sleep 5
+# Mid-transition: the shadow follows the window as it grows (and fades out).
+#!shot depth-geo-mid
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_idle 90
+sleep 2
+read BX BY BW BH _ <<< "$(geom notes)"; echo "maximized: $BX,$BY ${BW}x$BH"
+#!shot depth-maximized
+#!shot depth-max-corner -g "$BX,$BY 130x130" -s 4
+setanim '{"mode":"full","scale":60}' | grep -q 1
+winact UnmaximizeWindow $NID | grep -q 1
+wait_geo 20
+sleep 5
+# Back out: the shadow fades in with the window leaving its maximized frame.
+#!shot depth-geo-unmax-mid
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_idle 90
+sleep 2
+
+# --- the cost: frame rate and compositor CPU through an open animation with
+# four windows already up, depth on and off.
+cost() { setanim '{"mode":"full","scale":10}' | grep -q 1; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"contacts"}' | grep -E 'sessionId|Error'; wait_active 120 || echo "COST-NEVER-OPENED"; C0=$(cpu); sleep 2.2; C1=$(cpu); F=$(fps); echo "COST $1: fps=$F evo cpu ticks over ~2.2 s of open animation: $((C1 - C0))"; wait_idle 40; echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"contacts"}' | grep -E 'success|Error'; sleep 4; setanim '{"mode":"full","scale":1}' | grep -q 1; }
+cost depth-on
+setdepth false | grep -q 1
+sleep 1
+#!shot depth-off
+cost depth-off
+setdepth true | grep -q 1
+# A static scene costs nothing: evo's CPU ticks over three idle seconds.
+sleep 3
+C0=$(cpu); sleep 3; C1=$(cpu); echo "IDLE depth-on: evo cpu ticks over 3 idle seconds with four windows: $((C1 - C0))"
+setdepth false | grep -q 1
+sleep 3
+C0=$(cpu); sleep 3; C1=$(cpu); echo "IDLE depth-off: evo cpu ticks over 3 idle seconds with four windows: $((C1 - C0))"
+setdepth true | grep -q 1
+
+# --- the modes: shadows are static styling, only the transitions change.
+setanim '{"mode":"off"}' | grep -q 1
+winact FocusWindow $FID | grep -q 1
+sleep 1
+#!shot depth-mode-off
+setanim '{"mode":"reduced"}' | grep -q 1
+winact FocusWindow $NID | grep -q 1
+sleep 1
+#!shot depth-mode-reduced
+setanim '{"mode":"full","scale":1}' | grep -q 1
+for A in files notes tasks settings; do echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'success|Error'; done
+sleep 4
+read SOD COD SCD CCD AD _ <<< "$(st)"
+#!must DEPTH-COUNTERS-BALANCED
+test "$SOD" = "$COD" -a "$SCD" = "$CCD" -a "$AD" = 0 && echo DEPTH-COUNTERS-BALANCED || echo "DEPTH-COUNTERS-UNBALANCED open $SOD/$COD close $SCD/$CCD active=$AD"
+
+echo "=== Lumen Droplet and Rise: minimize into an orb, restore out of it (evo/src/anim/droplet.rs, warp.rs, lumen.rs) ==="
+# Lane L1. A minimize draws the window's snapshot through the Lumen program:
+# it rounds off into a circle the size of its dock icon over the first 60%,
+# goes soft (blur up to 6 px), takes on the app's accent (tint and an outer
+# glow by ~50%), travels an arc that lifts ~70 px above the higher end,
+# squashing and stretching along its velocity once it is orb-like, and lands:
+# the last 18% shrinks it by 55%, the last 14% fades it. At 90% Evo sends
+# `MinimizeLanded {phase: "land"}`; a restore (Rise, the same backwards) sends
+# `rise` as it starts. The same minimize spring drives it, so a restore that
+# interrupts a minimize cannot jump. The assertions are GetLumenState
+# (`frames.droplet`, `program`, `last_progress.droplet`, `landed`), the
+# animation counters, and the signal itself, read with `echo-cli watch`
+# (a new echo-cli: push target/release/echo-cli:/usr/bin/echo-cli with this
+# suite). Shots are taken when the Droplet's own progress reaches 25/50/75%, at
+# scale 13 (the 720 ms spring takes 9.4 s; a spring's run is capped at 10 s).
+# The Files window's accent is sent as #2e9e6b (green) so the orb's colour is
+# Bloom's, not the window's average. LOOK at target/serial-shots/droplet-*.png:
+#   droplet-below-25    the window already smaller and clearly rounded at every
+#                       corner, a little soft, faintly green, a few px of glow
+#                       round it; heading down along a slight arc.
+#   droplet-below-50    nearly a circle, green, blurred, glowing, a little
+#                       stretched along the way it moves (down toward the icon).
+#   droplet-below-75    a green orb about icon-sized over or just above the
+#                       icon at (600,740), glowing; no window left anywhere.
+#   droplet-left-* / droplet-right-*  the same toward icons left and right:
+#                       the path lifts and arcs over toward the icon, the orb
+#                       stretched along the arc, never a funnel or a fold.
+#   rise-75/50/25       a restore: the orb leaves the icon and opens back into
+#                       the window, sharp and untinted by 25%.
+#   droplet-interrupt-* a restore that turned a minimize round at 50% and a
+#                       minimize that turned a restore round: shape, place and
+#                       colour carry on from where they were, no jump.
+#   droplet-zorder      two windows in flight: the one in front stays in front.
+#   droplet-lite-50     Lumen off: genie-lite's plain scaled window, no orb.
+lstate_d() { echo-cli call org.geckoOS.evo GetLumenState --interface org.geckoOS.evo --args '{}'; }
+# A Droplet field: $1 = frames|last_progress|landed, $2 = key.
+lfield_d() { lstate_d | awk -v want="$1" -v key="$2" '/"frames"/ { s = "frames" } /"last_progress"/ { s = "last_progress" } /"landed"/ { s = "landed" } $0 ~ "\"" key "\":" { gsub(/[",:]/, ""); if (s == want) { print $2 + 0; exit } }'; }
+dframes() { lfield_d frames droplet; }
+dprog() { lfield_d last_progress droplet; }
+dland() { lfield_d landed land; }
+drise() { lfield_d landed rise; }
+dprogram() { lstate_d | awk '/"program":/ { gsub(/[",:]/, ""); print $2; exit }'; }
+dl_setlumen() { echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args "{\"enabled\":$1}" | grep -c '"enabled"'; }
+# Wait (up to $3 polls) for the Droplet's progress to reach $1 going $2 (up|down).
+wait_dp() { i=0; while [ $i -lt $3 ]; do P=$(dprog); if [ "$2" = up ]; then awk -v p="$P" -v w="$1" 'BEGIN { exit !(p >= w) }' && return 0; else awk -v p="$P" -v w="$1" 'BEGIN { exit !(p <= w) }' && return 0; fi; i=$((i + 1)); done; return 1; }
+# Wait (up to $2 polls) until more frames than $1 went through the Droplet.
+wait_dframes() { i=0; while [ $i -lt $2 ]; do [ "$(dframes)" -gt "$1" ] && return 0; i=$((i + 1)); done; return 1; }
+wait_midle_d() { i=0; while [ $i -lt $1 ]; do read _ _ _ _ A <<< "$(mst)"; [ "$A" = 0 ] && return 0; sleep 1; i=$((i + 1)); done; return 1; }
+settargets_d() { echo-cli call org.geckoOS.evo SetMinimizeTargets --interface org.geckoOS.evo --args "$1" | grep -c '"ok": true'; }
+
+#!must ECHO-CLI-WATCH
+echo-cli watch --help >/dev/null 2>&1 && echo ECHO-CLI-WATCH || echo "ECHO-CLI-OLD (push target/release/echo-cli:/usr/bin/echo-cli)"
+setanim '{"mode":"full","scale":1}' | grep -q 1
+dl_setlumen true | grep -q 1
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+wait_midle_d 20
+DFID=$(wid files); echo "files window $DFID"
+winact UnmaximizeWindow $DFID | grep -q 1
+sleep 3
+read DX DY DW DH _ <<< "$(geom files)"; echo "window: $DX,$DY ${DW}x$DH"
+DBX=$((DX + DW / 2 - 24))
+settargets_d "{\"targets\":[{\"app_id\":\"files\",\"x\":$DBX,\"y\":740,\"w\":48,\"h\":48,\"accent\":\"#2e9e6b\"}]}" | grep -q 1
+
+# --- MinimizeLanded at full speed: land at 90%, rise when a restore starts.
+L0=$(dland); R0=$(drise)
+echo-cli watch --signal MinimizeLanded --interface org.geckoOS.evo --seconds 12 --count 2 > /tmp/landed.txt 2>&1 &
+sleep 1
+winact MinimizeWindow $DFID | grep -q 1
+sleep 3
+winact RestoreWindow $DFID | grep -q 1
+sleep 3
+wait_midle_d 20
+cat /tmp/landed.txt
+#!must LANDED-LAND-SEEN
+grep -q "\"phase\":\"land\"" /tmp/landed.txt && grep -q "\"window_id\":$DFID" /tmp/landed.txt && grep -q '"app_id":"files"' /tmp/landed.txt && echo LANDED-LAND-SEEN || echo LANDED-LAND-MISSING
+#!must LANDED-RISE-SEEN
+grep -q "\"phase\":\"rise\"" /tmp/landed.txt && echo LANDED-RISE-SEEN || echo LANDED-RISE-MISSING
+#!must LANDED-COUNTED
+test $(($(dland) - L0)) = 1 -a $(($(drise) - R0)) = 1 && echo LANDED-COUNTED || echo "LANDED-COUNTS land +$(($(dland) - L0)) rise +$(($(drise) - R0))"
+
+# --- an icon below the window, slowed down.
+setanim '{"mode":"full","scale":13}' | grep -q 1
+F0=$(dframes); L0=$(dland)
+winact MinimizeWindow $DFID | grep -q 1
+#!must DROPLET-DRAWN
+wait_dframes $F0 40 && echo DROPLET-DRAWN || echo DROPLET-NEVER-DRAWN
+#!must LUMEN-COMPILED
+test "$(dprogram)" = compiled && echo LUMEN-COMPILED || echo "LUMEN-PROGRAM-$(dprogram)"
+wait_dp 0.25 up 200
+#!shot droplet-below-25
+wait_dp 0.5 up 200
+#!shot droplet-below-50
+wait_dp 0.75 up 200
+#!shot droplet-below-75
+#!must NOT-LANDED-AT-75
+test "$(dland)" = "$L0" && echo NOT-LANDED-AT-75 || echo "LANDED-EARLY at $(dprog)"
+wait_dp 0.95 up 300
+#!must LANDED-BY-95
+test $(($(dland) - L0)) = 1 && echo LANDED-BY-95 || echo "NOT-LANDED-BY-95 at $(dprog)"
+wait_midle_d 60
+
+# --- Rise: the same backwards.
+F0=$(dframes)
+winact RestoreWindow $DFID | grep -q 1
+#!must RISE-DRAWN
+wait_dframes $F0 40 && echo RISE-DRAWN || echo RISE-NOT-DRAWN
+wait_dp 0.75 down 200
+#!shot rise-75
+wait_dp 0.5 down 200
+#!shot rise-50
+wait_dp 0.25 down 200
+#!shot rise-25
+wait_midle_d 60
+
+# --- an icon left of the window.
+settargets_d '{"targets":[{"app_id":"files","x":8,"y":740,"w":48,"h":48,"accent":"#2e9e6b"}]}' | grep -q 1
+F0=$(dframes)
+winact MinimizeWindow $DFID | grep -q 1
+wait_dframes $F0 40
+wait_dp 0.25 up 200
+#!shot droplet-left-25
+wait_dp 0.5 up 200
+#!shot droplet-left-50
+wait_dp 0.75 up 200
+#!shot droplet-left-75
+wait_midle_d 60
+winact RestoreWindow $DFID | grep -q 1
+wait_midle_d 60
+
+# --- an icon right of the window, level with its middle: the arc lifts.
+settargets_d "{\"targets\":[{\"app_id\":\"files\",\"x\":1224,\"y\":$((DY + DH / 2 - 24)),\"w\":48,\"h\":48,\"accent\":\"#2e9e6b\"}]}" | grep -q 1
+F0=$(dframes)
+winact MinimizeWindow $DFID | grep -q 1
+wait_dframes $F0 40
+wait_dp 0.25 up 200
+#!shot droplet-right-25
+wait_dp 0.5 up 200
+#!shot droplet-right-50
+wait_dp 0.75 up 200
+#!shot droplet-right-75
+wait_midle_d 60
+winact RestoreWindow $DFID | grep -q 1
+wait_midle_d 60
+
+# --- interrupted: a restore turns a minimize round at 50% (no land is sent,
+# one rise is), and a minimize turns a restore round.
+settargets_d "{\"targets\":[{\"app_id\":\"files\",\"x\":$DBX,\"y\":740,\"w\":48,\"h\":48,\"accent\":\"#2e9e6b\"}]}" | grep -q 1
+read DMS0 DMC0 DRS0 DRC0 _ <<< "$(mst)"
+L0=$(dland); R0=$(drise)
+F0=$(dframes)
+winact MinimizeWindow $DFID | grep -q 1
+wait_dframes $F0 40
+wait_dp 0.5 up 200
+winact RestoreWindow $DFID | grep -q 1
+#!shot droplet-interrupt-restore
+wait_dp 0.25 down 200
+#!shot droplet-interrupt-restore-late
+read DMS1 DMC1 DRS1 DRC1 DMA1 <<< "$(mst)"
+#!must DROPLET-INTERRUPT-ONE-EACH
+test $((DMS1 - DMS0)) = 1 -a $((DRS1 - DRS0)) = 1 -a "$DMA1" = 1 && echo DROPLET-INTERRUPT-ONE-EACH || echo "DROPLET-INTERRUPT-COUNTS min=$((DMS1 - DMS0)) restore=$((DRS1 - DRS0)) active=$DMA1"
+wait_midle_d 60
+#!must INTERRUPT-RISE-NO-LAND
+test "$(dland)" = "$L0" -a $(($(drise) - R0)) = 1 && echo INTERRUPT-RISE-NO-LAND || echo "INTERRUPT-LANDED land +$(($(dland) - L0)) rise +$(($(drise) - R0))"
+winact MinimizeWindow $DFID | grep -q 1
+wait_midle_d 60
+winact RestoreWindow $DFID | grep -q 1
+wait_dp 0.5 down 200
+winact MinimizeWindow $DFID | grep -q 1
+#!shot droplet-reverse-interrupt
+wait_midle_d 90
+read DMS2 DMC2 DRS2 DRC2 DMA2 <<< "$(mst)"
+#!must DROPLET-INTERRUPT-BALANCED
+test "$DMS2" = "$DMC2" -a "$DRS2" = "$DRC2" -a "$DMA2" = 0 && echo DROPLET-INTERRUPT-BALANCED || echo "DROPLET-INTERRUPT-UNBALANCED $DMS2/$DMC2 $DRS2/$DRC2 active=$DMA2"
+winact RestoreWindow $DFID | grep -q 1
+wait_midle_d 60
+
+# --- z-order: two windows minimizing at once keep their stack order. Notes
+# (in front) leaves first, Files (behind it) a moment later: Notes' orb must
+# stay above Files'.
+rm -f /var/lib/pyxis/profiles/notes/xulstore.json /var/lib/pyxis/profiles/notes/sessionstore.jsonlz4
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+sleep 18
+wait_midle_d 20
+DNID=$(wid notes)
+winact UnmaximizeWindow $DNID | grep -q 1
+sleep 3
+settargets_d '{"targets":[{"app_id":"files","x":8,"y":740,"w":48,"h":48,"accent":"#2e9e6b"},{"app_id":"notes","x":1224,"y":740,"w":48,"h":48,"accent":"#e0a020"}]}' | grep -q 1
+winact FocusWindow $DNID | grep -q 1
+sleep 2
+winact MinimizeWindow $DNID | grep -q 1
+sleep 1
+winact MinimizeWindow $DFID | grep -q 1
+sleep 1
+#!shot droplet-zorder
+wait_midle_d 90
+winact RestoreWindow $DFID | grep -q 1
+winact RestoreWindow $DNID | grep -q 1
+wait_midle_d 90
+
+# --- Lumen off: genie-lite, no frame through the program.
+dl_setlumen false | grep -q 1
+F0=$(dframes)
+winact MinimizeWindow $DNID | grep -q 1
+sleep 2
+#!shot droplet-lite-50
+wait_midle_d 90
+#!must LITE-NOT-THROUGH-LUMEN
+test "$(dframes)" = "$F0" && echo LITE-NOT-THROUGH-LUMEN || echo "LITE-DREW-DROPLET $F0 -> $(dframes)"
+winact RestoreWindow $DNID | grep -q 1
+wait_midle_d 90
+dl_setlumen true | grep -q 1
+
+# --- reduced and off draw no Droplet: they fade in place / do not animate.
+# Both still send MinimizeLanded (reduced at 90% faded, off at once).
+L0=$(dland); R0=$(drise)
+setanim '{"mode":"reduced","scale":1}' | grep -q 1
+F0=$(dframes)
+winact MinimizeWindow $DFID | grep -q 1
+sleep 2
+winact RestoreWindow $DFID | grep -q 1
+sleep 2
+setanim '{"mode":"off"}' | grep -q 1
+winact MinimizeWindow $DFID | grep -q 1
+sleep 1
+winact RestoreWindow $DFID | grep -q 1
+sleep 1
+#!must REDUCED-OFF-NO-DROPLET
+test "$(dframes)" = "$F0" && echo REDUCED-OFF-NO-DROPLET || echo "REDUCED-OR-OFF-DREW-DROPLET $F0 -> $(dframes)"
+#!must REDUCED-OFF-STILL-LAND
+test $(($(dland) - L0)) = 2 -a $(($(drise) - R0)) = 2 && echo REDUCED-OFF-STILL-LAND || echo "REDUCED-OFF-LANDED land +$(($(dland) - L0)) rise +$(($(drise) - R0))"
+setanim '{"mode":"full","scale":1}' | grep -q 1
+read DMS3 DMC3 DRS3 DRC3 DMA3 <<< "$(mst)"
+#!must DROPLET-FINAL-BALANCED
+test "$DMS3" = "$DMC3" -a "$DRS3" = "$DRC3" -a "$DMA3" = 0 && echo DROPLET-FINAL-BALANCED || echo "DROPLET-FINAL-UNBALANCED $DMS3/$DMC3 $DRS3/$DRC3 active=$DMA3"
+
+# --- the cost: frame rate while four windows minimize at once (each its own
+# MinimizeWindow, so show desktop's own effect is not what is measured), at
+# scale 10 for a long enough run to sample, Lumen against genie-lite.
+for A in tasks settings; do rm -f /var/lib/pyxis/profiles/$A/xulstore.json /var/lib/pyxis/profiles/$A/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'sessionId|Error'; sleep 15; done
+sleep 3
+wait_midle_d 20
+settargets_d '{"targets":[{"app_id":"files","x":560,"y":740,"w":48,"h":48},{"app_id":"notes","x":620,"y":740,"w":48,"h":48},{"app_id":"tasks","x":680,"y":740,"w":48,"h":48},{"app_id":"settings","x":740,"y":740,"w":48,"h":48}]}' | grep -q 1
+setanim '{"mode":"full","scale":10}' | grep -q 1
+min_all_d() { for A in files notes tasks settings; do winact MinimizeWindow $(wid $A) | grep -q 1; done; }
+restore_all_d() { for A in files notes tasks settings; do winact RestoreWindow $(wid $A) | grep -q 1; done; }
+echo "idle fps with four windows:"; sleep 3; fps
+F0=$(dframes)
+min_all_d
+sleep 1
+echo "fps while four windows minimize, LUMEN: $(fps) $(sleep 1; fps) $(sleep 1; fps)"
+wait_midle_d 60
+#!must MIN4-THROUGH-LUMEN
+test "$(dframes)" -gt "$F0" && echo MIN4-THROUGH-LUMEN || echo MIN4-NOT-THROUGH-LUMEN
+restore_all_d
+wait_midle_d 60
+dl_setlumen false | grep -q 1
+min_all_d
+sleep 1
+echo "fps while four windows minimize, LITE: $(fps) $(sleep 1; fps) $(sleep 1; fps)"
+wait_midle_d 60
+restore_all_d
+wait_midle_d 60
+dl_setlumen true | grep -q 1
+echo "snapshot costs:"; grep -a "lumen droplet: snapshot" /var/log/evo.log | tail -8
+setanim '{"mode":"full","scale":1}' | grep -q 1
+for A in files notes tasks settings; do echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'success|Error'; done
+sleep 4
+
+echo "=== Lumen Evaporate: the close dissolves from its close button ==="
+# Lane L2. A close draws the window's snapshot through Evaporate's own program:
+# a noisy front (value noise plus distance from the close button) burns the
+# picture away from the top-right corner, its edge glowing in the window's
+# accent, while it swells to 1.04, goes soft (mip LOD bias) and fades over the
+# last 20%. The harness can't see a field; the assertions are GetLumenState
+# (`frames.evaporate` grows, `evaporate_program` compiled), none in reduced,
+# off or with Lumen off, and the close counters balancing. Shots are taken when
+# `last_progress.evaporate` reaches 25/50/75%, at scale 60 (380 ms -> 22.8 s).
+# LOOK at target/serial-shots/evap-*.png:
+#   evap-25   the Files window whole but for a ragged hole round its close
+#             button (top right) and the first few blobs near it, their rims
+#             glowing pale and tinted; the window already a little soft.
+#   evap-50   the hole has eaten the top-right half in noisy blobs (not a
+#             straight wipe), islands left behind near the front; the window
+#             a little soft; no shadow.
+#   evap-75   only the bottom-left corner left, in blobs, still glowing at
+#             the rim, starting to fade.
+#   evap-midopen  a window closed while it was opening: the dissolve on the
+#             smaller, fainter picture it had, not jumping to full size.
+#   evap-off-50   Lumen switched off: the plain shrink and fade, no holes.
+lstate() { echo-cli call org.geckoOS.evo GetLumenState --interface org.geckoOS.evo --args '{}'; }
+eframes() { lstate | awk '/"frames"/ { s = "f" } /"last_progress"/ { s = "p" } /"evaporate":/ { gsub(/[",:]/, ""); if (s == "f") print $2 + 0 }'; }
+eprog() { lstate | awk '/"frames"/ { s = "f" } /"last_progress"/ { s = "p" } /"evaporate":/ { gsub(/[",:]/, ""); if (s == "p") print $2 + 0 }'; }
+eprogram() { lstate | awk '/"evaporate_program"/ { gsub(/[",:]/, ""); print $2 }'; }
+setlumen() { echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args "{\"enabled\":$1}" | grep -c '"enabled"'; }
+# Wait (up to $2 tenths of a second) until more frames than $1 went through
+# Evaporate. Each poll sleeps: an echo-cli call takes a few ms, so a bare loop
+# runs out its count in a second or two and the shots land early.
+wait_eframes() { i=0; while [ $i -lt $2 ]; do [ "$(eframes)" -gt "$1" ] && return 0; sleep 0.1; i=$((i + 1)); done; return 1; }
+# Wait (up to $2 tenths of a second) until Evaporate's progress reaches $1;
+# says EP-REACHED or EP-MISSED so a suite can assert the shot is where it says.
+wait_ep() { i=0; while [ $i -lt $2 ]; do awk -v p="$(eprog)" -v w="$1" 'BEGIN { exit !(p >= w) }' && { echo "EP-REACHED $1 at $(eprog)"; return 0; }; sleep 0.1; i=$((i + 1)); done; echo "EP-MISSED $1 at $(eprog)"; return 1; }
+# Launch $1 at scale 1 and wait for it to settle; prints its window id.
+evap_open() { setanim '{"mode":"full","scale":1}' | grep -q 1; rm -f /var/lib/pyxis/profiles/$1/xulstore.json /var/lib/pyxis/profiles/$1/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$1\"}" | grep -qE 'sessionId'; sleep 16; wait_idle 30 >/dev/null; }
+evap_close() { echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$(wid $1)}" | grep -q '"success": true'; }
+
+setlumen true | grep -q 1
+evap_open files
+winact UnmaximizeWindow $(wid files) | grep -q 1
+sleep 3
+read SO0 CO0 SC0 CC0 _ _ <<< "$(st)"
+setanim '{"mode":"full","scale":60}' | grep -q 1
+E0=$(eframes); echo "evaporate frames before: $E0"
+evap_close files
+#!must EVAP-DRAWN
+wait_eframes $E0 60 && echo EVAP-DRAWN || echo EVAP-NEVER-DRAWN
+#!must EVAP-COMPILED
+test "$(eprogram)" = compiled && echo EVAP-COMPILED || echo "EVAP-PROGRAM-$(eprogram)"
+#!must EP-REACHED
+wait_ep 0.25 400
+#!shot evap-25
+#!must EP-REACHED
+wait_ep 0.5 400
+#!shot evap-50
+#!must EP-REACHED
+wait_ep 0.75 400
+#!shot evap-75
+wait_idle 60
+read SO1 CO1 SC1 CC1 A1 _ <<< "$(st)"; echo "after: close $SC1/$CC1 active=$A1"
+#!must EVAP-ONE-CLOSE-BALANCED
+test $((SC1 - SC0)) = 1 -a "$SC1" = "$CC1" -a "$A1" = 0 && echo EVAP-ONE-CLOSE-BALANCED || echo "EVAP-COUNTS close +$((SC1 - SC0)) $SC1/$CC1 active=$A1"
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+# --- a close mid-open evaporates from the pose the open had.
+setanim '{"mode":"full","scale":60}' | grep -q 1
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+#!must EVAP-MIDOPEN-OPENING
+wait_active 80 && echo EVAP-MIDOPEN-OPENING || echo EVAP-MIDOPEN-NEVER-OPENED
+sleep 2
+E0=$(eframes)
+evap_close files
+#!must EVAP-MIDOPEN-DRAWN
+wait_eframes $E0 60 && echo EVAP-MIDOPEN-DRAWN || echo EVAP-MIDOPEN-NOT-DRAWN
+#!must EP-REACHED
+wait_ep 0.3 400
+#!shot evap-midopen
+setanim '{"mode":"full","scale":1}' | grep -q 1
+wait_idle 90
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+# --- Lumen off: the plain close, no frame through Evaporate.
+evap_open files
+winact UnmaximizeWindow $(wid files) | grep -q 1
+sleep 3
+setlumen false | grep -q 1
+setanim '{"mode":"full","scale":60}' | grep -q 1
+E0=$(eframes)
+evap_close files
+wait_active 20
+sleep 5
+#!shot evap-off-50
+wait_idle 60
+#!must LUMEN-OFF-NOT-EVAPORATED
+test "$(eframes)" = "$E0" && echo LUMEN-OFF-NOT-EVAPORATED || echo "LUMEN-OFF-EVAPORATED $E0 -> $(eframes)"
+setlumen true | grep -q 1
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+# --- reduced (a plain fade) and off (nothing) never evaporate.
+evap_open files
+E0=$(eframes)
+setanim '{"mode":"reduced","scale":1}' | grep -q 1
+evap_close files
+sleep 2
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+evap_open files
+setanim '{"mode":"off"}' | grep -q 1
+evap_close files
+sleep 2
+#!must REDUCED-OFF-NOT-EVAPORATED
+test "$(eframes)" = "$E0" && echo REDUCED-OFF-NOT-EVAPORATED || echo "REDUCED-OR-OFF-EVAPORATED $E0 -> $(eframes)"
+setanim '{"mode":"full","scale":1}' | grep -q 1
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+sleep 3
+
+# --- the cost: frame rate while three windows evaporate at once (scale 10:
+# 3.8 s each), against the plain close with Lumen off.
+evap3() { for A in files notes tasks; do evap_open $A; winact UnmaximizeWindow $(wid $A) | grep -q 1; done; sleep 3; setanim '{"mode":"full","scale":10}' | grep -q 1; for A in files notes tasks; do evap_close $A; done; sleep 1; echo "fps during three closes, $1: $(fps) $(sleep 1; fps) $(sleep 1; fps)"; wait_idle 60; for A in files notes tasks; do echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -qE 'success|Error'; done; sleep 3; }
+echo "idle fps:"; fps
+E0=$(eframes)
+evap3 EVAPORATE
+#!must EVAP3-DRAWN
+test "$(eframes)" -gt "$E0" && echo EVAP3-DRAWN || echo EVAP3-NOT-DRAWN
+setlumen false | grep -q 1
+evap3 PLAIN
+setlumen true | grep -q 1
+setanim '{"mode":"full","scale":1}' | grep -q 1
+read SO9 CO9 SC9 CC9 A9 _ <<< "$(st)"
+#!must EVAP-FINAL-BALANCED
+test "$SO9" = "$CO9" -a "$SC9" = "$CC9" -a "$A9" = 0 && echo EVAP-FINAL-BALANCED || echo "EVAP-FINAL-UNBALANCED open $SO9/$CO9 close $SC9/$CC9 active=$A9"
+
+echo "=== bloom: Lumen's open (evo/src/anim/bloom.rs) ==="
+# Lane L3. An open is drawn as Bloom: the live window, blurred 10 px -> 0 (the
+# focus pull), tinted toward its accent, its corners 42 -> 16, over a radial
+# glow of the accent that peaks half-way, while it grows from 0.90 on a spring
+# and rises 16 px. The asserts are GetLumenState's `frames.bloom` (and
+# `bloom_blurred_frames`, `bloom_program`) and the open counters; shots are
+# taken when `last_progress.bloom` reaches 8/25/50/75% at scale 60 (a 25 s
+# open). LOOK at target/serial-shots/bloom-*.png:
+#   bloom-08   just mapped: very soft, washed toward cool white, the corners
+#              much rounder than 16 px, the silhouette itself soft, a faint
+#              glow round it. Whatever vela's first buffer is (often blank),
+#              it should read as light coming into focus, not as a white card.
+#   bloom-25   still visibly soft (~4 px), the tint fading, the glow stronger.
+#   bloom-50   nearly sharp, no tint, the glow at its brightest round the
+#              frame, corners still a little rounder than at rest.
+#   bloom-75   sharp, the glow fading, the frame's own corners and border.
+#   bloom-noblur-25  the blur switched off: the same tint, corners and glow,
+#              with crisp content.
+blstate() { echo-cli call org.geckoOS.evo GetLumenState --interface org.geckoOS.evo --args '{}' | tr -d ' \n'; }
+# The "bloom" entry of the object named $1 (frames, last_progress).
+lfield() { blstate | grep -o "\"$1\":{[^}]*}" | grep -o '"bloom":[0-9.eE+-]*' | cut -d: -f2; }
+bframes() { F=$(lfield frames); echo "${F:-0}"; }
+bprog() { P=$(lfield last_progress); echo "${P:-0}"; }
+bblurred() { B=$(blstate | grep -o '"bloom_blurred_frames":[0-9]*' | cut -d: -f2); echo "${B:-0}"; }
+bprogram() { blstate | grep -o '"bloom_program":"[a-z]*"' | cut -d'"' -f4; }
+setbloom() { echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args "$1" > /dev/null; }
+# Wait (up to $2 polls) until more Bloom frames than $1 have been drawn.
+wait_bf() { i=0; while [ $i -lt $2 ]; do [ "$(bframes)" -gt "$1" ] && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
+# Wait (up to $2 polls, 20 a second) until Bloom's progress reaches $1.
+wait_bp() { i=0; while [ $i -lt $2 ]; do awk -v p="$(bprog)" -v w="$1" 'BEGIN { exit !(p >= w) }' && return 0; sleep 0.05; i=$((i + 1)); done; return 1; }
+# Wait (up to 30 s) until no process of app $1 is left (vela and its pyxis-wlctx),
+# so each launch starts from nothing rather than racing the last one's exit.
+bgone() { i=0; while [ $i -lt 60 ]; do pgrep -f "profiles/$1( |$)" > /dev/null || return 0; sleep 0.5; i=$((i + 1)); done; echo "STILL-RUNNING $1"; return 1; }
+bclose() { echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args "{\"appId\":\"$1\"}" | grep -E 'success|Error'; bgone $1; }
+# Wait (up to 40 s) until app $1 has its real window: one appHost has bound.
+# ListWindows lists vela's about:blank pre-window under the app's id too, and
+# a wait that ended on it let the checks read the counters before the open.
+bbound() { echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | tr -d ' \n' | grep -o "\"appId\":\"$1\"[^}]*" | grep -q '"surfaces":\[[0-9]'; }
+bmapped() { i=0; while [ $i -lt 80 ]; do [ -n "$(wid $1)" ] && bbound $1 && return 0; sleep 0.5; i=$((i + 1)); done; echo "NOT-MAPPED $1"; return 1; }
+# Launch app $1 and wait for its window, saying so with the guest's log and
+# trying once more if none comes. The vela that "never mapped" in about half the
+# full-length runs, at the launch after the off-mode one, was Gecko's automatic
+# safe mode: this suite closes several vela before their start-up finishes, each
+# counts as a start-up crash, and past three a chromeless vela exited at once.
+# Nova's user.js turns that off (toolkit.startup.max_resumed_crashes = -1;
+# alpha5-startup-lockout).
+bstart() { blaunch $1; bmapped $1 && return 0; echo "APP-NOT-STARTED $1"; grep -a -v "DEBUG\|RSLoader" /var/log/echo.log | tail -15 | cut -c1-200; bclose $1 > /dev/null; blaunch $1; bmapped $1 && echo "RELAUNCHED $1"; }
+blaunch() { echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$1\"}" | grep -E 'sessionId|Error'; }
+for A in files notes tasks settings; do bclose $A; done
+sleep 3
+setanim '{"mode":"full","scale":1}' | grep -q 1
+setbloom '{"enabled":true,"bloom_blur":true}'
+
+# --- one open at full speed: drawn through Bloom, blurred, and balanced.
+F0=$(bframes); B0=$(bblurred); read SO0 CO0 _ _ _ _ <<< "$(st)"
+blaunch files
+#!must BLOOM-DRAWN
+wait_bf $F0 150 && echo BLOOM-DRAWN || echo "BLOOM-NOT-DRAWN $F0 -> $(bframes)"
+wait_idle 10
+#!must BLOOM-PROGRAM-COMPILED
+test "$(bprogram)" = compiled && echo BLOOM-PROGRAM-COMPILED || echo "BLOOM-PROGRAM-$(bprogram)"
+#!must BLOOM-BLURRED
+test "$(bblurred)" -gt "$B0" && echo BLOOM-BLURRED || echo "BLOOM-NOT-BLURRED $B0 -> $(bblurred)"
+read SO1 CO1 _ _ A1 _ <<< "$(st)"; echo "bloom open: $((SO1 - SO0)) started, frames $F0 -> $(bframes), blurred $B0 -> $(bblurred)"
+#!must BLOOM-BALANCED
+test $((SO1 - SO0)) = 1 -a "$SO1" = "$CO1" -a "$A1" = 0 && echo BLOOM-BALANCED || echo "BLOOM-UNBALANCED $SO0->$SO1/$CO1 active=$A1"
+# Floating for the shots, so the glow has room to show. vela remembers it
+# only when its window is closed (a killed vela saves nothing).
+winact UnmaximizeWindow $(wid files) | grep -q 1
+sleep 3
+wait_idle 10
+winact CloseWindow $(wid files) | grep -q 1
+bgone files
+sleep 3
+
+# --- slow motion: shots part-way, by Bloom's own progress.
+setanim '{"mode":"full","scale":60}' | grep -q 1
+F0=$(bframes)
+blaunch files
+#!must BLOOM-SLOW-DRAWN
+wait_bf $F0 150 && echo BLOOM-SLOW-DRAWN || echo BLOOM-SLOW-NOT-DRAWN
+echo "window: $(geom files)"
+wait_bp 0.08 1200
+#!shot bloom-08
+echo "progress $(bprog)"
+wait_bp 0.25 1200
+#!shot bloom-25
+echo "progress $(bprog)"
+wait_bp 0.5 1200
+#!shot bloom-50
+echo "progress $(bprog)"
+wait_bp 0.75 1200
+#!shot bloom-75
+echo "progress $(bprog)"
+wait_idle 40
+# Close at full speed, so no slow evaporating ghost sits behind the next shot.
+setanim '{"mode":"full","scale":1}' | grep -q 1
+bclose files
+wait_idle 10
+setanim '{"mode":"full","scale":60}' | grep -q 1
+# The blur off: the cheaper look.
+setbloom '{"enabled":true,"bloom_blur":false}'
+F0=$(bframes); B0=$(bblurred)
+blaunch files
+wait_bf $F0 150
+wait_bp 0.25 1200
+#!shot bloom-noblur-25
+wait_idle 40
+#!must BLOOM-NOBLUR-SHARP
+test "$(bblurred)" = "$B0" -a "$(bframes)" -gt "$F0" && echo BLOOM-NOBLUR-SHARP || echo "BLOOM-NOBLUR-WRONG blurred $B0 -> $(bblurred) frames $F0 -> $(bframes)"
+setbloom '{"enabled":true,"bloom_blur":true}'
+setanim '{"mode":"full","scale":1}' | grep -q 1
+bclose files
+wait_idle 10
+
+# --- reduced, off and Lumen off draw no Bloom; the open is still counted
+# where it animates.
+setanim '{"mode":"reduced","scale":1}' | grep -q 1
+F0=$(bframes); read SO0 _ _ _ _ _ <<< "$(st)"
+bstart files
+wait_idle 10
+read SO1 CO1 _ _ A1 _ <<< "$(st)"
+#!must BLOOM-NONE-REDUCED
+test "$(bframes)" = "$F0" -a $((SO1 - SO0)) = 1 -a "$SO1" = "$CO1" && echo BLOOM-NONE-REDUCED || echo "BLOOM-REDUCED-WRONG frames $F0 -> $(bframes) open $SO0->$SO1/$CO1"
+bclose files
+sleep 3
+setanim '{"mode":"off"}' | grep -q 1
+F0=$(bframes)
+bstart files
+#!must BLOOM-NONE-OFF
+test "$(bframes)" = "$F0" && echo BLOOM-NONE-OFF || echo "BLOOM-OFF-DRAWN $F0 -> $(bframes)"
+bclose files
+sleep 3
+setanim '{"mode":"full","scale":1}' | grep -q 1
+setbloom '{"enabled":false}'
+F0=$(bframes); read SO0 _ _ _ _ _ <<< "$(st)"
+bstart files
+wait_idle 10
+read SO1 CO1 _ _ A1 _ <<< "$(st)"
+#!must BLOOM-NONE-LUMEN-OFF
+test "$(bframes)" = "$F0" -a $((SO1 - SO0)) = 1 -a "$SO1" = "$CO1" -a "$A1" = 0 && echo BLOOM-NONE-LUMEN-OFF || echo "BLOOM-LUMEN-OFF-WRONG frames $F0 -> $(bframes) open $SO0->$SO1/$CO1 active=$A1 window=$(wid files) lumen=$(blstate | grep -o '"enabled":[a-z]*')"
+setbloom '{"enabled":true,"bloom_blur":true}'
+bclose files
+sleep 3
+
+# --- the cost: three apps opening back to back at scale 5 (2.1 s each), fps
+# sampled while Bloom draws: with the blur, without it, and with Lumen off.
+bloom_fps() { for A in files notes tasks; do rm -f /var/lib/pyxis/profiles/$A/xulstore.json /var/lib/pyxis/profiles/$A/sessionstore.jsonlz4; done; F0=$(bframes); blaunch files; sleep 2; blaunch notes; sleep 2; blaunch tasks; S=""; i=0; while [ $i -lt 60 ]; do read _ _ _ _ A _ <<< "$(st)"; [ "$A" != 0 ] && S="$S $(fps)"; sleep 0.5; i=$((i + 1)); done; echo "fps during opens, $1:$S (bloom frames $F0 -> $(bframes))"; wait_idle 20; for A in files notes tasks; do bclose $A; done; }
+setanim '{"mode":"full","scale":5}' | grep -q 1
+bloom_fps BLUR
+setbloom '{"enabled":true,"bloom_blur":false}'
+bloom_fps NOBLUR
+setbloom '{"bloom_blur":true,"enabled":false}'
+bloom_fps LUMEN-OFF
+setbloom '{"enabled":true,"bloom_blur":true}'
+setanim '{"mode":"full","scale":1}' | grep -q 1
+read SO CO SC CC A _ <<< "$(st)"
+#!must BLOOM-FINAL-BALANCED
+test "$SO" = "$CO" -a "$SC" = "$CC" -a "$A" = 0 && echo BLOOM-FINAL-BALANCED || echo "BLOOM-FINAL-UNBALANCED open $SO/$CO close $SC/$CC active=$A"

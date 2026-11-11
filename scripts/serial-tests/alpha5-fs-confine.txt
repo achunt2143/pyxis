@@ -1,0 +1,266 @@
+# Alpha 5: an app's filesystem calls reach its own data, and nothing else.
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-fs-confine.txt
+#
+# echo-daemon runs as root, and until 2026-10-06 its filesystem service did
+# whatever path a call named, as root: any app holding filesystem:write, a
+# third-party .ipk included, could rewrite /etc/shadow, set a setuid bit or
+# delete /usr/bin. Now the bridge stamps every app's filesystem call with a
+# scope, and echo resolves the call's paths beneath that scope's root with
+# openat2(RESOLVE_BENEATH | RESOLVE_NO_XDEV) on a thread that has dropped to
+# geckouser (echo/src/services/filesystem/scope.rs). An app's scope is its
+# own directory, /var/lib/pyxis/data/<id>, which it sees as `~`. Files holds
+# the privileged filesystem:user (the home) and filesystem:system (the root
+# filesystem, read-only); Bloom holds filesystem:apps (other apps' data, for
+# desktop search).
+#
+# This checks, on the real stack:
+#   * echo's half, called directly: each scope's root, the user's
+#     permissions, /proc out of reach, the system scope read-only, a link
+#     out of the home refused, and the unscoped service unchanged for
+#     trusted clients. Sixty scoped calls at once leave no thread behind,
+#     and every thread echo-daemon has left is still root's;
+#   * the bridge and echo together: hello-pyxis (a third-party .ipk with
+#     filesystem.read/write) aims eighteen calls outside its storage, through
+#     absolute paths, `..`, links planted here, copies and moves, a scope it
+#     names itself, another app's id and a path that is not a string. All
+#     must be refused, and nothing may change outside its directory. What it
+#     may do inside works, as the user;
+#   * the Files app lists the home and, read-only, /, and Nova grants the
+#     three privileged capabilities to the apps that declare them;
+#   * removing an app deletes its data and its Gecko profile, through both
+#     paths (installer.Remove for an .ipk, nova.Uninstall for a tarball),
+#     even while the app runs: each waits for it to exit first.
+#
+# Needs an image built after 2026-10-06, or --push for echo-daemon, the
+# bridge (to /usr/lib/pyxis-gecko/actors/), the acceptance package (to
+# /var/lib/pyxis/incoming/), Files' manifest, and the Bloom manifest that
+# create-rootfs.sh writes (for filesystem:apps).
+#
+# LOOK at target/serial-shots/fs-files-{home,system}.png: the Files app open
+# on the user's home, then on File System, whose listing says read-only.
+
+# Not `D`: the harness's #!shot sets D in this same shell.
+HELLO_DATA=/var/lib/pyxis/data/com.pyxis.hello
+fsproof() { cat $HELLO_DATA/proof-*.txt 2>/dev/null; }
+fscall() { echo-cli call org.geckoOS.filesystem "$1" --interface org.geckoOS.filesystem --args "$2" 2>&1; }
+# x y width height window_id of an app's window (alpha5-resize.txt's helper).
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+
+echo "=== echo: each scope's root, and the user's permissions ==="
+#!must "~/.config"
+fscall readDirectory '{"path":"~","scope":"user"}' | grep -o '"~/.config"'
+#!must PRETTY_NAME
+fscall readFile '{"path":"/etc/os-release","scope":"system"}' | grep -o PRETTY_NAME
+# The thread is geckouser's, so root's own files stay closed to it.
+#!must Permission denied
+fscall readFile '{"path":"/etc/shadow","scope":"system"}' | grep -o 'Permission denied'
+# /proc is another mount. Inside echo's own process, /proc/self would
+# otherwise hand the thread echo-daemon's memory and environment.
+#!must leads outside the root filesystem
+fscall readFile '{"path":"/proc/self/environ","scope":"system"}' | grep -o 'leads outside the root filesystem'
+#!must read-only
+fscall writeFile '{"path":"/home/geckouser/x","content":"x","scope":"system"}' | grep -o 'read-only'
+#!must not an app id
+fscall exists '{"path":"~","scope":"app:../../etc"}' | grep -o 'not an app id'
+# A call without a scope is the old service, for clients that hold the
+# Echo socket: they can run anything as root through process.spawn anyway.
+#!must "exists": true
+fscall exists '{"path":"/etc/shadow"}' | grep -o '"exists": true'
+# /root is root's, mode 0700, so the system scope can't list it.
+#!must Permission denied
+fscall readDirectory '{"path":"/root","scope":"system"}' | grep -o 'Permission denied'
+# A link the user (or anything else) leaves in the home can't lead out of it.
+#!must leads outside the home folder
+ln -sfn /etc /home/geckouser/etc-link && fscall readDirectory '{"path":"~/etc-link","scope":"user"}' | grep -o 'leads outside the home folder'
+rm -f /home/geckouser/etc-link; echo unlinked
+
+echo "=== each scoped call's thread ends with it, and echo stays root ==="
+P=$(pgrep -x echo-daemon); T0=$(ls /proc/$P/task | wc -l); echo "echo-daemon threads: $T0"
+for i in $(seq 1 60); do fscall exists '{"path":"~","scope":"user"}' > /dev/null & done; wait; echo sixty-done
+sleep 2
+#!must NO-THREAD-LEFT
+T1=$(ls /proc/$P/task | wc -l); [ "$T1" -le "$T0" ] && echo NO-THREAD-LEFT || echo "threads: $T0 then $T1"
+# Every thread left has uid 0 in all four slots: no dropped thread
+# lingered, and none of the daemon's own threads was dropped.
+#!must ALL-ROOT
+n=$(for t in /proc/$P/task/*; do awk '/^Uid:/ { print $2 $3 $4 $5 }' "$t/status"; done | grep -vc '^0000$'); [ "$n" -eq 0 ] && echo ALL-ROOT || echo "$n threads are not root"
+
+echo "=== hello-pyxis, and the links its probes aim through ==="
+PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo removed-if-present
+#!must registeredApps
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}" | grep -E 'registeredApps|Error'
+rm -rf /var/lib/pyxis/profiles/com.pyxis.hello/startupCache /tmp/pyxis-fs-escape-*; echo cleared
+# The app's directory as echo makes it, with the links planted inside: two
+# absolute (a world-readable file, a world-writable directory) and one
+# relative that climbs out.
+#!must planted
+mkdir -p $HELLO_DATA && chown 1001:1001 $HELLO_DATA && chmod 700 $HELLO_DATA && ln -sfn /etc/os-release $HELLO_DATA/escape-link && ln -sfn /tmp $HELLO_DATA/escape-dir && ln -sfn ../../../.. $HELLO_DATA/up-link && echo planted
+#!must canary-set
+echo canary > /tmp/pyxis-fs-canary && chmod 644 /tmp/pyxis-fs-canary && echo canary-set
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
+# The page writes its proof once every probe has answered, which takes
+# longer than a fixed sleep on a loaded host: wait for it (a minute at most),
+# and a second more so the write has finished.
+#!must PROOF-WRITTEN
+for i in $(seq 1 60); do ls $HELLO_DATA/proof-*.txt > /dev/null 2>&1 && break; sleep 1; done; sleep 1; ls $HELLO_DATA/proof-*.txt > /dev/null 2>&1 && echo "PROOF-WRITTEN after ${i}s" || echo NO-PROOF
+
+echo "=== every call aimed outside was refused ==="
+fsproof | grep '^fs '
+#!must ALL-REFUSED
+n=$(fsproof | grep -c '^fs [a-z-]*=refused: '); t=$(fsproof | grep -c '^fs [a-z-]*='); [ "$t" -ge 18 ] && [ "$n" -eq "$t" ] && echo ALL-REFUSED || echo "refused: $n of $t"
+#!must-not ESCAPED
+fsproof | grep '^fs '
+# Absolute paths never reach echo: the bridge refuses them.
+#!must did not declare 'filesystem:system' (required for an absolute path in filesystem.readFile)
+fsproof | grep '^fs read-abs='
+#!must did not declare 'filesystem:system'
+fsproof | grep '^fs spoof-scope='
+#!must did not declare 'filesystem:apps'
+fsproof | grep '^fs other-app='
+# The rest reach echo, which refuses them beneath the app's directory.
+#!must climbs with '..'
+fsproof | grep '^fs read-dotdot='
+#!must ~/escape-link leads outside the app's own storage
+fsproof | grep '^fs read-link='
+#!must ~/escape-dir leads outside the app's own storage
+fsproof | grep '^fs write-link='
+#!must ~/up-link leads outside the app's own storage
+fsproof | grep '^fs list-uplink='
+#!must NOTHING-OUTSIDE-CHANGED
+[ ! -e /tmp/pyxis-fs-escape-abs ] && [ ! -e /tmp/pyxis-fs-escape-dots ] && [ ! -e /tmp/pyxis-fs-escape-link ] && [ "$(cat /tmp/pyxis-fs-canary)" = canary ] && [ "$(stat -c %a /tmp/pyxis-fs-canary)" = 644 ] && echo NOTHING-OUTSIDE-CHANGED || ls -la /tmp
+
+echo "=== what it may do in its own storage works, as the user ==="
+#!must fs-ok own=ok paths=~/
+fsproof | grep '^fs-ok own='
+#!must fs-ok scope-named=own storage
+fsproof | grep '^fs-ok scope-named='
+#!must fs storage mount=/
+fsproof | grep '^fs storage'
+#!must 1001 1001 700
+stat -c '%u %g %a' $HELLO_DATA
+#!must 1001 1001
+stat -c '%u %g' $HELLO_DATA/nested/deep/a.txt
+#!must PROOF-HERE
+ls $HELLO_DATA/proof-*.txt > /dev/null 2>&1 && echo PROOF-HERE || echo NO-PROOF
+#!must-not pyxis-hello-proof
+ls /tmp
+
+echo "=== the privileged filesystem capabilities go to the apps that declare them ==="
+#!must "filesystem:user"
+echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"filesystem:user"'
+#!must "filesystem:system"
+echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"filesystem:system"'
+#!must "filesystem:apps"
+echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"appId":"bloom"}' | grep -o '"filesystem:apps"'
+#!must-not nova:
+grep -a "withheld\|unknown permission\|skipping invalid" /var/log/echo.log | head -5
+
+echo "=== the Files app lists the home ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'success|Error'
+R0=$(grep -ac 'Routing message to org.geckoOS.filesystem (readDirectory)' /var/log/echo.log); echo "readDirectory calls so far: $R0"
+rm -rf /var/lib/pyxis/profiles/files/startupCache; echo cleared
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+#!must FILES-LISTED
+[ "$(grep -ac 'Routing message to org.geckoOS.filesystem (readDirectory)' /var/log/echo.log)" -gt "$R0" ] && echo FILES-LISTED || echo NOT-LISTED
+#!shot fs-files-home
+# The File System place lists /, read-only: Files' system scope. The window
+# opens maximized on some images and not on others, so aim from its frame.
+R1=$(grep -ac 'Routing message to org.geckoOS.filesystem (readDirectory)' /var/log/echo.log); echo "readDirectory calls so far: $R1"
+read FX FY FW FH FID <<< "$(geom files)"; FSX=$((FX + 112)); FSY=$((FY + 618)); echo "files at $FX,$FY ${FW}x$FH; File System at $FSX,$FSY"
+#!pointer click $FSX $FSY
+sleep 4
+#!shot fs-files-system
+#!must SYSTEM-LISTED
+[ "$(grep -ac 'Routing message to org.geckoOS.filesystem (readDirectory)' /var/log/echo.log)" -gt "$R1" ] && echo SYSTEM-LISTED || echo NOT-LISTED
+#!must-not capability denied: app 'files'
+grep -a "capability denied: app 'files'" /var/log/echo.log | head -3
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+
+echo "=== the Notes app saves into its own storage, as the user ==="
+rm -f /var/lib/pyxis/profiles/notes/xulstore.json /var/lib/pyxis/profiles/notes/sessionstore.jsonlz4 /var/lib/pyxis/data/notes/notes.json; echo fresh
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+sleep 18
+# "+ Note" sits 75 px in from the window's right edge, below the header.
+read NX NY NW NH NID <<< "$(geom notes)"; NBX=$((NX + NW - 75)); NBY=$((NY + 71)); echo "notes at $NX,$NY ${NW}x$NH; + Note at $NBX,$NBY"
+#!pointer click $NBX $NBY
+sleep 3
+#!shot fs-notes-new
+# A new note autosaves within half a second: appStorage's writeFile, in
+# the app's own storage.
+#!must NOTE-SAVED
+grep -q '"notes": \[' /var/lib/pyxis/data/notes/notes.json 2>/dev/null && grep -q '"id"' /var/lib/pyxis/data/notes/notes.json && echo NOTE-SAVED || ls -la /var/lib/pyxis/data/notes
+#!must 1001 1001
+stat -c '%u %g' /var/lib/pyxis/data/notes/notes.json
+#!must-not capability denied: app 'notes'
+grep -a "capability denied: app 'notes'" /var/log/echo.log | head -3
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'success|Error'
+sleep 3
+
+echo "=== Bloom's desktop search reads the Notes app's documents (filesystem:apps) ==="
+# A note in the Notes app's own storage, as Notes would have saved it.
+#!must seeded
+mkdir -p /var/lib/pyxis/data/notes && printf '{"notes":[{"id":"zebra1","title":"Zebra crossing plan","body":"seeded by alpha5-fs-confine","category":"General","updatedAt":1}]}' > /var/lib/pyxis/data/notes/notes.json && chown -R 1001:1001 /var/lib/pyxis/data/notes && chmod 700 /var/lib/pyxis/data/notes && echo seeded
+F0=$(grep -ac 'Routing message to org.geckoOS.filesystem (readFile)' /var/log/echo.log); echo "readFile calls so far: $F0"
+# The search field at the left of the top bar; opening it loads the
+# documents, and typing filters them.
+#!pointer click 180 21
+sleep 2
+#!type zebra
+sleep 3
+#!shot fs-search
+# Each app's documents were read in that app's own storage: reading
+# Contacts' (there are none) made its directory.
+#!must SEARCH-READ
+[ "$(grep -ac 'Routing message to org.geckoOS.filesystem (readFile)' /var/log/echo.log)" -ge $((F0 + 3)) ] && [ -d /var/lib/pyxis/data/contacts ] && echo SEARCH-READ || echo NO-SEARCH-READ
+# Not counted: the five calls and signals a vela from before the latest bridge
+# patch refuses Bloom (SetWorkArea, SetOverlayFocus, GetOverlayState,
+# OverlayFocusChanged, SwitcherChanged, ShortcutTriggered). alpha5-shell-layering reports that
+# one cause, as BRIDGE-OK; repeating it here would fail every suite on it.
+#!must-not capability denied: app 'bloom'
+grep -a "capability denied: app 'bloom'" /var/log/vela.log | grep -v "SetWorkArea\|SetOverlayFocus\|GetOverlayState\|OverlayFocusChanged\|SwitcherChanged\|ShortcutTriggered" | head -3
+#!key esc
+sleep 1
+
+echo "=== removing an .ipk, while it runs, deletes its data and profile ==="
+# Running, so Remove has to stop it first: a vela still shutting down
+# writes its profile on the way out, which Remove must wait for.
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
+sleep 12
+#!must PROFILE-THERE
+[ -d /var/lib/pyxis/profiles/com.pyxis.hello ] && echo PROFILE-THERE || echo NO-PROFILE
+#!must "dataRemoved":["com.pyxis.hello"]
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' | tr -d ' \n' | grep -o '"dataRemoved":\[[^]]*\]'
+#!must-not --pyxis-app com.pyxis.hello
+pgrep -af -- '--pyxis-app com.pyxis.hello'
+# Look again later, in case something wrote them back.
+sleep 5
+#!must ALL-GONE
+[ ! -e $HELLO_DATA ] && [ ! -e /var/lib/pyxis/profiles/com.pyxis.hello ] && echo ALL-GONE || ls -la $HELLO_DATA /var/lib/pyxis/profiles/com.pyxis.hello
+rm -f /tmp/pyxis-fs-canary; echo cleaned
+
+echo "=== uninstalling a tarball app, while it runs, deletes its data and profile ==="
+UT=/tmp/pyxis-usertest; rm -rf $UT $UT.tar; mkdir -p $UT/webroot && echo '<!doctype html><title>usertest</title><p>usertest</p>' > $UT/webroot/index.html && printf '{"id":"com.pyxis.usertest","name":"User Test","version":"0.1.0","entry":"index.html","permissions":["filesystem:read","filesystem:write"]}' > $UT/manifest.webapp && tar -cf $UT.tar -C $UT . && echo built
+#!must "appId": "com.pyxis.usertest"
+echo-cli call org.geckoOS.nova Install --interface org.geckoOS.nova --args "{\"packagePath\":\"$UT.tar\"}" | grep -E '"appId"|Error'
+#!must "success": true
+fscall writeFile '{"path":"~/kept.txt","content":"kept","scope":"app:com.pyxis.usertest"}' | grep -o '"success": true'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.usertest"}' | grep -E 'sessionId|Error'
+sleep 12
+#!must BOTH-THERE
+[ -f /var/lib/pyxis/data/com.pyxis.usertest/kept.txt ] && [ -d /var/lib/pyxis/profiles/com.pyxis.usertest ] && echo BOTH-THERE || ls -la /var/lib/pyxis/data /var/lib/pyxis/profiles
+#!must "removed":["data","profile"]
+echo-cli call org.geckoOS.nova Uninstall --interface org.geckoOS.nova --args '{"appId":"com.pyxis.usertest"}' | tr -d ' \n' | grep -o '"removed":\[[^]]*\]'
+#!must-not --pyxis-app com.pyxis.usertest
+pgrep -af -- '--pyxis-app com.pyxis.usertest'
+sleep 5
+#!must USERTEST-GONE
+[ ! -e /var/lib/pyxis/data/com.pyxis.usertest ] && [ ! -e /var/lib/pyxis/profiles/com.pyxis.usertest ] && echo USERTEST-GONE || ls -la /var/lib/pyxis/data/com.pyxis.usertest /var/lib/pyxis/profiles/com.pyxis.usertest
+rm -rf $UT $UT.tar; echo cleaned

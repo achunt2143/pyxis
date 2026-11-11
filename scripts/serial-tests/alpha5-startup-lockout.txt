@@ -1,0 +1,19 @@
+# An app closed during start-up must still launch afterwards. Gecko counts each
+# start that didn't finish as a crash (toolkit.startup.recent_crashes) and past
+# toolkit.startup.max_resumed_crashes (3 by default) starts in safe mode, which a
+# chromeless vela can't show: it exited at once on every later launch, and the
+# count never reset. Nova's user.js sets the limit to -1 (off). Found by
+# alpha5-animations, whose quick launch-and-close in `off` mode tripped it.
+wid() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"window_id":/ { gsub(/[",:]/, ""); print $2; exit }'; }
+gone() { i=0; while [ $i -lt 60 ]; do pgrep -f "profiles/files( |$)" > /dev/null || return 0; sleep 0.5; i=$((i + 1)); done; echo STILL; }
+launch() { echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'; }
+close() { echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'; gone; }
+sleep 30
+for n in 1 2 3 4; do launch; i=0; while [ $i -lt 80 ] && [ -z "$(wid files)" ]; do sleep 0.25; i=$((i+1)); done; close; grep -ao 'toolkit.startup.recent_crashes", [0-9]*' /var/lib/pyxis/profiles/files/prefs.js; echo "round $n done"; done
+launch
+sleep 20
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -E 'app_id|window_id'
+#!must APP-STARTS
+test -n "$(wid files)" && echo APP-STARTS || echo APP-LOCKED-OUT
+pgrep -af "profiles/files( |$)" | cut -c1-160
+grep -ao 'toolkit.startup[a-z_.]*", [0-9a-z]*' /var/lib/pyxis/profiles/files/prefs.js

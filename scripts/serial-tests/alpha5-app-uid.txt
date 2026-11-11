@@ -1,0 +1,204 @@
+# Alpha 5: apps run as a user of their own, and can't dial Evo's host socket.
+#
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/pyxis-wlctx:/usr/bin/pyxis-wlctx \
+#     --push target/release/pyxis-wlprobe:/usr/bin/pyxis-wlprobe \
+#     --script scripts/serial-tests/alpha5-app-uid.txt
+#
+# Evo decides what a Wayland client may do from how it connected
+# (evo/src/trust.rs): on its own socket, it is the system; through a
+# wp_security_context_v1 socket pyxis-wlctx made, it is an app. That was a
+# convention the app followed until apps got their own uid: they ran as
+# geckouser, the shell's user, and `wayland-0` was geckouser's, so any app
+# could connect() to the host socket and be trusted (screencopy, data-control,
+# virtual-keyboard, the shell's own roles), and ptrace the shell besides.
+#
+# Now Nova starts every app as `pyxis-wlctx` running as root, which makes the
+# app's socket, drops to pyxisapp (uid 1001) itself, and only then arms
+# PR_SET_PDEATHSIG (a credential change clears it, which is why `setpriv`
+# can't do the drop). `wayland-0` is geckouser:geckouser 0600 and is bind-
+# mounted over with /dev/null in the app's own mount namespace.
+#
+# What this checks, on the real stack:
+#   * the users and the host socket's owner and mode;
+#   * an app uid can't dial the host socket (and so can't be trusted), where
+#     geckouser can; and through pyxis-wlctx the app sees no host socket at
+#     all, holds no capabilities, and keeps only the groups it was given;
+#   * an app can't read the shell's process or profile;
+#   * a Nova-launched app (Files) runs as pyxisapp, as a child of the root
+#     helper, and renders (LOOK at target/serial-shots/appuid-files.png);
+#   * killing the helper (the session's pid) takes the app with it, SIGTERM to
+#     the helper reaches the app, and the helper's socket directory goes;
+#   * hello-pyxis, an .ipk app, plays sound (heard, not inferred), and reads and
+#     writes its own data as pyxisapp through the bridge and the filesystem
+#     service.
+#
+# NEEDS A ROOTFS REBUILD for the real thing: the user and group (stage 5),
+# /home/pyxisapp, and geckoOS-boot's `chmod 711 /run/user/1000` / host-socket
+# chown+chmod 0600 / the second Pulse address (/run/pyxis/pulse) / PYXIS_SHELL_APPS. `--push` can't carry the boot script (it
+# is applied by the old one), so on an old image the first step does by hand what
+# the boot script does, and says so: ROOTFS=stand-in. After a rebuild it must
+# say ROOTFS=rebuilt. Everything after that step is the real code either way.
+# Needs --push of the four binaries above on an image from before them.
+#
+# Run it with nothing else using the VM's memory: --memory 4096.
+
+as_app() { setpriv --reuid=1001 --regid=1001 --clear-groups env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 "$@"; }
+as_shell() { setpriv --reuid=1000 --regid=1000 --clear-groups env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 "$@"; }
+uid_of() { awk '/^Uid:/ { print $2; exit }' /proc/$1/status 2>/dev/null; }
+ppid_of() { awk '/^PPid:/ { print $2; exit }' /proc/$1/status 2>/dev/null; }
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+# The app's own vela (not the root helper, whose command line carries the same words) and the helper.
+vela_of() { for p in $(pgrep -f "[-]-pyxis-app $1"); do [ "$(awk '/^Uid:/ { print $2; exit }' /proc/$p/status 2>/dev/null)" != 0 ] && { echo $p; return; }; done; }
+helper_of() { pgrep -f "[p]yxis-wlctx --app-id $1 " | head -1; }
+# How many processes the app user has.
+app_procs() { n=0; for p in /proc/[0-9]*; do [ "$(awk '/^Uid:/ { print $2; exit }' $p/status 2>/dev/null)" = 1001 ] && n=$((n + 1)); done; echo $n; }
+
+echo "=== the rootfs: the app user, and the shell's runtime dir ==="
+REBUILT=no; grep -q '^pyxisapp:x:1001:1001:' /etc/passwd && [ "$(stat -c %a /run/user/1000)" = 711 ] && [ "$(stat -c %U:%G:%a /run/user/1000/wayland-0)" = geckouser:geckouser:600 ] && [ -S /run/pyxis/pulse/native ] && [ -d /home/pyxisapp ] && REBUILT=yes
+# What create-rootfs.sh and geckoOS-boot do, by hand, on an image from before them (see the header).
+[ $REBUILT = yes ] || { grep -q '^pyxisapp:' /etc/passwd || echo 'pyxisapp:x:1001:1001:Pyxis app user:/home/pyxisapp:/usr/sbin/nologin' >> /etc/passwd; grep -q '^pyxisapp:' /etc/group || echo 'pyxisapp:x:1001:' >> /etc/group; grep -q '^pyxisapp:' /etc/shadow || echo 'pyxisapp:*:20000:0:99999:7:::' >> /etc/shadow; chmod 711 /run/user/1000; chown 1000:1000 /run/user/1000/wayland-0; chmod 600 /run/user/1000/wayland-0; chmod 755 /run/user/1000/geckoOS; mkdir -p /home/pyxisapp/.cache/fontconfig /home/pyxisapp/.config; chown -R 1001:1001 /home/pyxisapp; chmod 700 /home/pyxisapp; [ -S /run/pyxis/pulse/native ] || { mkdir -p /run/pyxis/pulse /etc/pipewire/pipewire-pulse.conf.d; chown 1000:1000 /run/pyxis/pulse; chmod 755 /run/pyxis/pulse; printf 'pulse.properties = {\n    server.address = [\n        "unix:native"\n        "unix:/run/pyxis/pulse/native"\n    ]\n}\n' > /etc/pipewire/pipewire-pulse.conf.d/10-pyxis-apps.conf; pkill -x pipewire-pulse; sleep 1; setsid setpriv --reuid=1000 --regid=1000 --groups audio env XDG_RUNTIME_DIR=/run/user/1000 HOME=/home/geckouser /usr/bin/pipewire-pulse > /var/log/pipewire-pulse.log 2>&1 < /dev/null & sleep 3; }; }
+#!must ROOTFS=
+[ $REBUILT = yes ] && echo ROOTFS=rebuilt || echo ROOTFS=stand-in
+#!must APP-USER-OK
+[ "$(id -u pyxisapp)" = 1001 ] && [ "$(id -g pyxisapp)" = 1001 ] && [ "$(id -u geckouser)" = 1000 ] && echo APP-USER-OK || echo APP-USER-MISSING
+#!must geckouser:geckouser:600
+stat -c %U:%G:%a /run/user/1000/wayland-0
+#!must 711
+stat -c %a /run/user/1000
+# The apps are Nova's: bloom's profile stays geckouser's, an app's is the app user's.
+#!must 1000
+stat -c %u /var/lib/pyxis/profiles/bloom
+
+echo "=== an app's uid can't dial the host socket; the shell's can ==="
+#!must SHELL-CAN-DIAL
+as_shell pyxis-wlprobe globals 2>&1 | grep -q zwlr_screencopy_manager_v1 && echo SHELL-CAN-DIAL || echo SHELL-CANT-DIAL
+#!must APP-CANT-DIAL
+as_app pyxis-wlprobe globals > /tmp/app-dial.out 2>&1; grep -q xdg_wm_base /tmp/app-dial.out && echo APP-DIALED-HOST || echo APP-CANT-DIAL
+#!must-not APP-DIALED-HOST
+head -c 200 /tmp/app-dial.out
+# It can't get at the shell's runtime dir beyond what it is meant to use, or at the shell's own state.
+BV=$(vela_of bloom); echo "bloom vela=$BV uid=$(uid_of $BV)"
+#!must SHELL-STATE-CLOSED
+as_app cat /proc/$BV/environ > /dev/null 2>&1; E=$?; as_app ls /var/lib/pyxis/profiles/bloom > /dev/null 2>&1; P=$?; as_app ls /run/user/1000 > /dev/null 2>&1; L=$?; [ $E != 0 ] && [ $P != 0 ] && [ $L != 0 ] && echo SHELL-STATE-CLOSED || echo "SHELL-STATE-OPEN environ=$E profile=$P list=$L"
+#!must APP-CAN-PULSE
+setpriv --reuid=1001 --regid=1001 --clear-groups env HOME=/home/pyxisapp XDG_RUNTIME_DIR=/run/user/1001 PULSE_SERVER=unix:/run/pyxis/pulse/native pactl info 2>&1 | grep -q "Server Name" && echo APP-CAN-PULSE || echo APP-NO-PULSE
+#!must ECHO-REACHABLE
+as_app test -S /run/user/1000/geckoOS/echo.sock && echo ECHO-REACHABLE || echo ECHO-UNREACHABLE
+
+echo "=== through pyxis-wlctx: no host socket, no capabilities, only the given groups ==="
+# The command a real launch composes (nova.rs contained_launch), around a probe.
+#!must UID=1001
+#!must CAPS=0000000000000000
+#!must GROUPS=1001 44 109
+#!must HOST-SOCKET-HIDDEN
+#!must LINKED-ECHO
+#!must xdg_wm_base
+#!must-not zwlr_screencopy_manager_v1
+pyxis-wlctx --app-id probe.app --uid 1001 --gid 1001 --groups video,render --runtime-dir /run/user/1001 --host-socket /run/user/1000/wayland-0 --hide /run/user/1000/wayland-0 --link geckoOS=/run/user/1000/geckoOS -- sh -c 'echo UID=$(id -u); echo CAPS=$(awk "/^CapEff/ { print \$2 }" /proc/self/status); echo GROUPS=$(id -G); [ -c /run/user/1000/wayland-0 ] && echo HOST-SOCKET-HIDDEN; [ -S /run/user/1001/geckoOS/echo.sock ] && echo LINKED-ECHO; pyxis-wlprobe globals'
+# The hidden path is hidden from the app only: Evo's socket is still there for the shell.
+#!must HOST-SOCKET-INTACT
+[ -S /run/user/1000/wayland-0 ] && echo HOST-SOCKET-INTACT
+# And it refuses to start an app as root, or to run unprivileged work as another user.
+#!must REFUSED-AS-ROOT
+pyxis-wlctx --app-id probe.root --host-socket /run/user/1000/wayland-0 -- id -u > /tmp/wlctx-root.out 2>&1; grep -q "will not start an app as root" /tmp/wlctx-root.out && echo REFUSED-AS-ROOT || cat /tmp/wlctx-root.out
+# Fail closed: no host socket to make the context on, no command.
+#!must connect to Evo
+#!must-not RAN-ANYWAY
+pyxis-wlctx --app-id probe.closed --uid 1001 --gid 1001 --host-socket /run/user/1000/nonexistent -- sh -c 'echo RAN-ANYWAY' 2>&1
+
+echo "=== a Nova-launched app runs as pyxisapp, under the root helper, and renders ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 20
+FV=$(vela_of files); WL=$(helper_of files)
+echo "files vela=$FV (uid $(uid_of $FV)) helper=$WL (uid $(uid_of $WL)) vela's parent=$(ppid_of $FV)"
+#!must FILES-AS-APP-USER
+[ "$(uid_of $FV)" = 1001 ] && echo FILES-AS-APP-USER || echo "FILES-WRONG-USER $(uid_of $FV)"
+#!must HELPER-IS-ROOT-PARENT
+[ -n "$WL" ] && [ "$(uid_of $WL)" = 0 ] && [ "$(ppid_of $FV)" = "$WL" ] && echo HELPER-IS-ROOT-PARENT || echo HELPER-WRONG
+# Every process of the app, content ones included, is the app user's.
+#!must ALL-APP-USER
+bad=0; n=0; for p in /proc/[0-9]*; do p=${p#/proc/}; [ "$(ppid_of $p)" = "$FV" ] || continue; n=$((n + 1)); [ "$(uid_of $p)" = 1001 ] || bad=$((bad + 1)); done; [ "$(uid_of $FV)" = 1001 ] && [ $bad = 0 ] && echo "ALL-APP-USER ($n child processes)" || echo "NOT-ALL-APP-USER $bad"
+# The app's profile and the Gecko sandbox: the profile is the app user's, and a sandboxed content process started.
+#!must 1001
+stat -c %u /var/lib/pyxis/profiles/files
+# Evo sees a window, bound to the app (its identity is the context's app id).
+read FX FY FW FH FID <<< "$(geom files)"; echo "files window: $FX,$FY ${FW}x$FH id=$FID"
+#!must WINDOW-UP
+[ -n "$FID" ] && [ "${FW:-0}" -gt 100 ] && echo WINDOW-UP || echo NO-WINDOW
+#!must-not uniform
+#!shot appuid-files
+
+echo "=== killing the session's pid (the helper) takes the app with it ==="
+kill -9 $WL; sleep 3
+#!must APP-DIED-WITH-HELPER
+kill -0 $FV 2>/dev/null && echo APP-OUTLIVED-HELPER || echo APP-DIED-WITH-HELPER
+# Its content processes go with it (their parent's channel closes).
+for i in $(seq 1 15); do [ "$(app_procs)" = 0 ] && break; sleep 1; done; echo "app-user processes left: $(app_procs)"
+#!must NO-APP-PROCESSES
+[ "$(app_procs)" = 0 ] && echo NO-APP-PROCESSES || ps | grep -v grep | grep -E "vela|wlctx" | head
+
+echo "=== SIGTERM to the helper reaches the app, and the helper's directory is removed ==="
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -c sessionId
+sleep 15
+FV=$(vela_of files); WL=$(helper_of files)
+#!must CONTEXT-DIR-OWNED
+D=$(ls -d /run/pyxis/wl/files-* 2>/dev/null | head -1); [ -n "$D" ] && [ "$(stat -c %u $D)" = 1001 ] && [ "$(stat -c %u $D/wayland)" = 1001 ] && [ "$(stat -c %a $D/wayland)" = 600 ] && echo CONTEXT-DIR-OWNED || echo "CONTEXT-DIR-WRONG $D"
+kill -TERM $WL
+for i in $(seq 1 20); do kill -0 $FV 2>/dev/null || break; sleep 1; done
+#!must APP-STOPPED-BY-TERM
+kill -0 $FV 2>/dev/null && echo APP-STILL-UP || echo APP-STOPPED-BY-TERM
+#!must CONTEXT-DIR-GONE
+ls -d /run/pyxis/wl/files-* > /dev/null 2>&1 && echo CONTEXT-DIR-LEFT || echo CONTEXT-DIR-GONE
+
+echo "=== hello-pyxis: sound, and its own data, as the app user ==="
+# Do Not Disturb keeps the app's launch notification's chime out of the recording.
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.dnd","value":true}' | grep -c success
+PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo removed-if-present
+#!must registeredApps
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}" | grep -E 'registeredApps|Error'
+rm -f /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt
+#!listen appuid-before-hello
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
+sleep 15
+for i in $(seq 1 45); do ls /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt > /dev/null 2>&1 && break; sleep 1; done; echo "proof waited ${i}s more"
+HV=$(vela_of com.pyxis.hello)
+#!must HELLO-AS-APP-USER
+[ "$(uid_of $HV)" = 1001 ] && echo HELLO-AS-APP-USER || echo "HELLO-WRONG-USER $(uid_of $HV)"
+# The sound came out of vela, as pyxisapp, through the shell's PipeWire.
+#!must audio=running
+cat /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>&1
+#!must-not silent
+#!listen appuid-hello
+# Its data: written through the bridge and the filesystem service, as the app user.
+#!must 1001 1001 700
+stat -c '%u %g %a' /var/lib/pyxis/data/com.pyxis.hello
+#!must 1001 1001
+stat -c '%u %g' /var/lib/pyxis/data/com.pyxis.hello/nested/deep/a.txt
+#!must kept
+cat /var/lib/pyxis/data/com.pyxis.hello/nested/deep/a.txt; echo
+#!must 1001
+stat -c %u /var/lib/pyxis/profiles/com.pyxis.hello
+
+echo "=== a data directory left by geckouser is taken over, contents and all, without following links ==="
+# What an image from before apps had a user of their own leaves behind.
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -c success
+sleep 3
+D=/var/lib/pyxis/data/com.pyxis.hello; chown -R 1000:1000 $D; ln -sfn /etc/os-release $D/escape-link; echo canary > /tmp/pyxis-uid-canary; chmod 644 /tmp/pyxis-uid-canary; chown 0:0 /tmp/pyxis-uid-canary; ln -sfn /tmp/pyxis-uid-canary $D/canary-link
+#!must nested
+echo-cli call org.geckoOS.filesystem readDirectory --interface org.geckoOS.filesystem --args '{"path":"~","scope":"app:com.pyxis.hello"}' 2>&1 | grep -o nested | head -1
+#!must 1001 1001
+stat -c '%u %g' $D/nested/deep/a.txt
+#!must LINK-TARGETS-UNTOUCHED
+[ "$(stat -c %U /etc/os-release)" = root ] && [ "$(stat -c %U /tmp/pyxis-uid-canary)" = root ] && echo LINK-TARGETS-UNTOUCHED || echo LINK-TARGET-CHOWNED
+
+echo "=== clean up ==="
+rm -f /tmp/pyxis-uid-canary
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.dnd","value":false}' | grep success
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' | grep '"package"'

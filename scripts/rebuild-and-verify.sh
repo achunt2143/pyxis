@@ -68,7 +68,14 @@ fail=0
 # kiosk-relaunch is the regression guard for "apps come back as Firefox
 # windows" -- a guard nobody runs is not a guard, and that bug survived four
 # diagnoses. It is the slowest suite (~8 min of launch/close cycles).
-for suite in alpha4-ipk-e2e system-service alpha4-exit-criteria kiosk-relaunch; do
+# The alpha5-* suites see, click and hear the device (screenshots, pointer,
+# the sound card); look at target/serial-shots/ after a run. alpha5-fs-confine
+# is the guard for "an app's filesystem calls reach only its own data", and
+# alpha5-wayland-trust for "an app can't bind screencopy/virtual-keyboard or
+# claim a shell app id".
+for suite in alpha4-ipk-e2e system-service alpha4-exit-criteria kiosk-relaunch \
+             alpha5-eyes alpha5-resize alpha5-notifications alpha5-audio alpha5-overlay \
+             alpha5-fs-confine alpha5-wayland-trust; do
     printf '\n--- %s ---\n' "$suite"
     if python3 scripts/serial-test.py --script "scripts/serial-tests/$suite.txt" \
          --settle 35 --timeout 200 > "/tmp/pyxis-$suite.out" 2>&1; then

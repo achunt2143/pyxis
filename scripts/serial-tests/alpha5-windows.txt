@@ -1,0 +1,156 @@
+# Alpha 5: window state. Focus, place, layout and teardown, through minimize.
+#
+#   scripts/serial-test.py --memory 4096 --push target/release/evo:/usr/bin/evo --script scripts/serial-tests/alpha5-windows.txt
+#
+# Evo kept a window's location in two places and wrote only one of them: a
+# move, a maximize or a settle went to the Space, while the workspace record,
+# which minimize restores from, held the birth location. So a moved window
+# came back from minimize where it was born, and a maximized one at a random
+# spot still output-sized. New windows were mapped activated but never given
+# the keyboard, so typing went to Bloom. And a window closed while minimized
+# was out of the Space, which is where the destroy handler looked, so it
+# leaked: a ghost in ListWindows, no WindowClosed, a surface appHost kept.
+#
+# Every check reads Evo's own ListWindows (frame x/y/width/height, and
+# `focused`, which is "the seat's keyboard focus is this window").
+#
+# LOOK at target/serial-shots/windows-*.png: windows-typed-desktop is Bloom
+# with Files minimized, and its search box must be empty (the typing went to
+# Files, not here).
+#
+# Needs an Evo built after 2026-11-07. The last section kills the app (-9)
+# instead of calling nova.Close: until appHost stops SIGSTOPping a minimized
+# app, nova.Close can't make a stopped process exit, and this suite is about
+# what Evo does when its window goes, not about how it went.
+
+# "x y w h id focused" of the first window whose app_id is $1.
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id|focused)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"], v["focused"]; exit } on = 0 }'; }
+# The edges Bloom has reserved for its top bar and dock, as "top bottom"
+# ("0 0" while Bloom has reported none): a maximized frame starts below the
+# first and ends above the second (see alpha5-shell-layering.txt).
+wa() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | awk '/"top"/ { gsub(/[",:]/, ""); t = $2 } /"bottom"/ { gsub(/[",:]/, ""); b = $2 } END { print t + 0, b + 0 }'; }
+winact() { echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "{\"window_id\":$2}" | grep -c '"success": true'; }
+
+# Bloom reports the work area through the vela bridge. On a vela built before
+# SetWorkArea was allowed there, it cannot, so say it for Bloom: this suite
+# drags windows by their title bars and resize bands, and a window under the
+# bar's input region can't be reached. (Does nothing once Bloom has reported.)
+read WT0 WB0 <<< "$(wa)"; [ "$WT0" != 0 ] || echo-cli call org.geckoOS.evo SetWorkArea --interface org.geckoOS.evo --args '{"top":44,"bottom":76}' | grep -c success
+
+echo "=== a new app window takes the keyboard without a click ==="
+# A first-run window opens maximized on this 1280x800 VM (see alpha5-resize).
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+read X Y W H ID FOC <<< "$(geom files)"; echo "files: $X,$Y ${W}x$H id=$ID focused=$FOC"
+#!must FILES-FOCUSED
+test "$FOC" = true && echo FILES-FOCUSED || echo "FILES-NOT-FOCUSED focused=$FOC"
+# And Bloom is not: exactly one window holds the keyboard.
+read BX BY BW BH BID BFOC <<< "$(geom bloom)"
+#!must BLOOM-UNFOCUSED
+test "$BFOC" = false && echo BLOOM-UNFOCUSED || echo "BLOOM-FOCUSED"
+# What typing did is for the eyes: Files has no text field to take the keys,
+# so the proof is the focus flag above plus where they did NOT go. With
+# Files minimized, Bloom's search box must still read "Just type...".
+#!type pyxis
+sleep 1
+#!shot windows-typed
+winact MinimizeWindow $ID | grep -q 1
+sleep 2
+#!must-not uniform
+#!shot windows-typed-desktop
+winact RestoreWindow $ID | grep -q 1
+sleep 2
+
+echo "=== move, minimize, restore: back at the same place ==="
+#!must MAX-OFF
+winact UnmaximizeWindow $ID | grep -q 1 && echo MAX-OFF || echo MAX-STILL-ON
+sleep 3
+read X Y W H ID FOC <<< "$(geom files)"; echo "floating: $X,$Y ${W}x$H"
+# Drag by the title bar, 30 px to the left. (Not down: the frame fills the
+# work area between the bar and the dock, so there is no room to go down; it
+# is clamped, which alpha5-shell-layering.txt covers.)
+SX=$((X + W / 2)); SY=$((Y + 12)); EX=$((SX - 30)); EY=$SY; echo "title bar $SX,$SY -> $EX,$EY"
+#!pointer drag $SX $SY $EX $EY
+sleep 2
+read MX MY MW MH ID FOC <<< "$(geom files)"; echo "moved: $MX,$MY ${MW}x$MH"
+#!must DRAGGED-OK
+test "$MX" = $((X - 30)) -a "$MY" = "$Y" && echo DRAGGED-OK || echo "DRAG-FAILED ($MX,$MY)"
+# Announced once, when the grab ended (Evo logs each signal the broker confirms).
+#!must MOVED-SIGNALLED
+grep -aq 'Signal emitted: WindowMoved' /var/log/evo.log && echo MOVED-SIGNALLED || echo NO-MOVED-SIGNAL
+#!must MIN-OK
+winact MinimizeWindow $ID | grep -q 1 && echo MIN-OK || echo MIN-FAILED
+sleep 2
+# Minimized, it is hidden and does not hold the keyboard.
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -A8 '"files"' | grep -E 'focused|visible'
+read NX NY NW NH ID NFOC <<< "$(geom files)"
+#!must NOT-FOCUSED
+test "$NFOC" = false && echo NOT-FOCUSED || echo STILL-FOCUSED
+# The shell takes the keyboard back: there is no other app.
+read BX BY BW BH BID BFOC <<< "$(geom bloom)"
+#!must SHELL-HAS-KEYBOARD
+test "$BFOC" = true && echo SHELL-HAS-KEYBOARD || echo "SHELL-NOT-FOCUSED"
+#!must RESTORE-OK
+winact RestoreWindow $ID | grep -q 1 && echo RESTORE-OK || echo RESTORE-FAILED
+sleep 2
+read RX RY RW RH ID RFOC <<< "$(geom files)"; echo "restored: $RX,$RY ${RW}x$RH focused=$RFOC"
+#!must SAME-PLACE
+test "$RX" = "$MX" -a "$RY" = "$MY" -a "$RW" = "$MW" -a "$RH" = "$MH" && echo SAME-PLACE || echo "MOVED-ON-RESTORE (born at $X,$Y)"
+#!must RESTORED-FOCUSED
+test "$RFOC" = true && echo RESTORED-FOCUSED || echo RESTORED-UNFOCUSED
+#!shot windows-restored
+
+echo "=== maximize, minimize, restore: still maximized ==="
+#!must MAXED
+winact MaximizeWindow $ID | grep -q 1 && echo MAXED || echo MAX-FAILED
+sleep 3
+read AX AY AW AH ID AFOC <<< "$(geom files)"; echo "maximized: $AX,$AY ${AW}x$AH"
+read WT WB <<< "$(wa)"; MAXH=$((800 - WT - WB))
+#!must FILLS-WORK-AREA
+test "$AX,$AY ${AW}x$AH" = "0,$WT 1280x$MAXH" && echo FILLS-WORK-AREA || echo "WRONG-AREA $AX,$AY ${AW}x$AH (work area top=$WT bottom=$WB)"
+#!must MAXIMIZED-SIGNALLED
+grep -aq 'Signal emitted: WindowMaximized' /var/log/evo.log && echo MAXIMIZED-SIGNALLED || echo NO-MAXIMIZED-SIGNAL
+winact MinimizeWindow $ID | grep -q 1
+sleep 2
+winact RestoreWindow $ID | grep -q 1
+sleep 3
+read CX CY CW CH ID CFOC <<< "$(geom files)"; echo "back: $CX,$CY ${CW}x$CH"
+#!must STILL-MAXIMIZED
+test "$CX,$CY ${CW}x$CH" = "0,$WT 1280x$MAXH" && echo STILL-MAXIMIZED || echo "NOT-MAXIMIZED"
+#!shot windows-maximized-restored
+# Leaving maximized goes to where the window was moved to, not where it was born.
+winact UnmaximizeWindow $ID | grep -q 1
+sleep 3
+read UX UY UW UH ID UFOC <<< "$(geom files)"; echo "unmaximized: $UX,$UY ${UW}x$UH"
+#!must BACK-WHERE-MOVED
+test "$UX" = "$MX" -a "$UY" = "$MY" && echo BACK-WHERE-MOVED || echo "ELSEWHERE ($UX,$UY, moved to $MX,$MY)"
+
+echo "=== a window closed while minimized leaves no ghost ==="
+winact MinimizeWindow $ID | grep -q 1
+sleep 2
+echo "before: $(echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -c '"files"') window(s) for files"
+#!must "files" in the list
+test "$(echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -c '"files"')" -ge 1 && echo '"files" in the list' || echo "files-not-listed"
+# The session's pid is the app's main process; its content processes die with it.
+FPID=$(echo-cli call org.geckoOS.appHost ListSurfaceSessions --interface org.geckoOS.appHost --args '{}' | awk '/"appId": "files"/ { f = 1 } f && /"pid"/ { gsub(/[^0-9]/, "", $2); print $2; exit }')
+echo "files pid=$FPID"
+#!must HAVE-PID
+test -n "$FPID" && echo HAVE-PID || echo NO-PID
+kill -9 $FPID
+sleep 4
+#!must-not "files"
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep '"files"'
+# appHost was told to let go of the surface (UnbindSurface), so no session
+# still holds a window for files.
+#!must-not "appId": "files"
+echo-cli call org.geckoOS.appHost ListSurfaceSessions --interface org.geckoOS.appHost --args '{}'
+# And the keyboard has gone back to the desktop rather than nowhere.
+read BX BY BW BH BID BFOC <<< "$(geom bloom)"
+#!must SHELL-HAS-KEYBOARD
+test "$BFOC" = true && echo SHELL-HAS-KEYBOARD || echo "SHELL-NOT-FOCUSED"
+#!shot windows-closed
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'

@@ -1,0 +1,131 @@
+# Alpha 5: settings reach the shell live, from the Settings app
+# (docs/internal/pyxis-wallpaper-settings-plan.md, lanes S, T and P).
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-settings-live.txt
+#
+# The Settings app is pyxis://settings and the shell is pyxis://bloom: two
+# origins, so the BroadcastChannel the SDK used to rely on never carried a
+# change from one to the other on a device, and a wallpaper picked in
+# Settings showed only after the shell restarted. Now echo's settings service
+# sends SettingChanged after every change, the bridge passes it to any page
+# (BRIDGE_SIGNALS settings.SettingChanged), and the desktop logs what it
+# shows (`PYXIS-WALLPAPER-SETTING ...` in /var/log/vela.log, via dump()).
+# This suite clicks in Settings and reads that line. It also sets the time
+# zone from Settings' Date & Time page (org.geckoOS.time, new; the bridge
+# needs settings:write, which Settings holds) and checks /etc/localtime,
+# Echo's clock and the TimezoneChanged signal.
+#
+# Clicks are placed inside the Settings window from its frame (ListWindows)
+# plus the 32 px title bar, at offsets measured in the dev server at the
+# device's client size (1280x648, a first-run window opens maximized). If a
+# layout change moves them, LOOK at settings-live-*.png and re-measure (the
+# selectors are in the lane P hand-over: data-wallpaper, data-theme-choice,
+# data-settings-section, data-timezone-search, data-timezone).
+#
+# Needs the vela with the new bridge entries (settings.SettingChanged, time.*):
+# on an older one the shell never hears Settings (SHELL-DID-NOT-HEAR) and the
+# zone change is refused (Settings shows the refusal).
+#
+# LOOK at settings-live-appearance.png (Sunset selected, Dark chosen),
+# settings-live-datetime.png (Tokyo, confirmed), settings-live-topbar.png (the
+# bar's clock in Tokyo time, 24-hour) and settings-live-about.png (real OS,
+# kernel, memory, CPU and hostname, no "alpha2").
+
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+sget() { echo-cli call org.geckoOS.settings get --interface org.geckoOS.settings --args "{\"key\":\"$1\"}" | tr -d ' \n' | grep -o '"value":[^,}]*' | head -1 | cut -d: -f2- | tr -d '"'; }
+sset() { echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args "{\"key\":\"$1\",\"value\":$2}" | grep -c '"success": true'; }
+tcall() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.time "$1" --interface org.geckoOS.time --args "$a" | tr -d ' \n'; }
+waitlog() { i=0; while [ $i -lt $(($2 * 2)) ]; do grep -aq -- "$1" /var/log/vela.log && { echo "$3"; return 0; }; sleep 0.5; i=$((i + 1)); done; echo "$4"; return 1; }
+waitset() { i=0; while [ $i -lt $(($3 * 2)) ]; do test "$(sget $1)" = "$2" && { echo "$4"; return 0; }; sleep 0.5; i=$((i + 1)); done; echo "NOT-SET: $1 is $(sget $1)"; return 1; }
+
+echo "=== Settings opens (first run: maximized) ==="
+sleep 15
+rm -f /var/lib/pyxis/profiles/settings/xulstore.json /var/lib/pyxis/profiles/settings/sessionstore.jsonlz4; echo first-run
+sset pyxis.wallpaper '"daylight"'; sset pyxis.theme '"light"'
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"settings"}' | grep -E 'sessionId|Error'
+sleep 20
+read SX SY SW SH SID <<< "$(geom settings)"; CX=$SX; CY=$((SY + 32)); echo "settings: $SX,$SY ${SW}x$SH id=$SID content at $CX,$CY"
+#!must SETTINGS-UP
+test -n "$SID" -a "$SW" = 1280 && echo SETTINGS-UP || echo "SETTINGS-NOT-MAXIMIZED $SX,$SY ${SW}x$SH"
+AX=$((CX + 131)); AY=$((CY + 147)); echo "appearance $AX,$AY"
+#!pointer click $AX $AY
+sleep 2
+
+echo "=== a wallpaper picked in Settings reaches the shell, live ==="
+WX=$((CX + 628)); WY=$((CY + 300)); echo "sunset thumbnail $WX,$WY"
+#!pointer click $WX $WY
+#!must SETTINGS-WROTE
+waitset pyxis.wallpaper sunset 10 SETTINGS-WROTE
+#!must SHELL-HEARD-SETTINGS
+waitlog "PYXIS-WALLPAPER-SETTING wallpaper=sunset" 10 SHELL-HEARD-SETTINGS "SHELL-DID-NOT-HEAR (vela without settings.SettingChanged?)"
+grep -a "PYXIS-WALLPAPER-SETTING" /var/log/vela.log | tail -2
+
+echo "=== the theme, both ways ==="
+DX=$((CX + 761)); DY=$((CY + 142)); echo "dark $DX,$DY"
+#!pointer click $DX $DY
+#!must THEME-DARK
+waitset pyxis.theme dark 10 THEME-DARK
+sleep 2
+#!must-not uniform
+#!shot settings-live-appearance
+# Set elsewhere (as quick settings would), Settings follows: look at the shot.
+#!must 1
+sset pyxis.theme '"light"'
+sleep 3
+#!must-not uniform
+#!shot settings-live-theme-from-elsewhere
+
+echo "=== the time zone, from Settings' Date & Time page ==="
+#!must timezone
+tcall getClock
+TX=$((CX + 131)); TY=$((CY + 347)); echo "date and time $TX,$TY"
+#!pointer click $TX $TY
+sleep 2
+( echo-cli watch --signal TimezoneChanged --seconds 25 > /root/tz-signal.log 2>&1 & ) ; sleep 1
+# Aim at the middle of the search box and of the first result, not their edges:
+# remochi 0.4's Prelude font sets text a few px taller on the device than in a
+# desktop browser (the box is 273-307 below the content's top in Chrome,
+# 281-314 on the device), and 280 was one pixel above it on the device.
+QX=$((CX + 762)); QY=$((CY + 297)); echo "search $QX,$QY"
+#!pointer click $QX $QY
+sleep 1
+#!type Tokyo
+sleep 2
+OX=$((CX + 767)); OY=$((CY + 346)); echo "first result $OX,$OY"
+#!pointer click $OX $OY
+sleep 4
+#!must Asia/Tokyo
+tcall getClock | grep -o '"timezone":"[^"]*"'
+#!must "utc_offset_minutes":540
+tcall getClock | grep -o '"utc_offset_minutes":-\?[0-9]*'
+#!must Asia/Tokyo
+readlink /etc/localtime; cat /etc/timezone
+sleep 2
+#!must TimezoneChanged-OK
+grep -q 'Asia/Tokyo' /root/tz-signal.log && echo TimezoneChanged-OK || { echo "NO-SIGNAL"; cat /root/tz-signal.log; }
+# The location follows the zone: Tokyo's coordinates, for the sun.
+#!must "source":"zone"
+tcall getLocation
+#!must-not uniform
+#!shot settings-live-datetime
+
+echo "=== the shell's clock follows (Tokyo time, then 24-hour) ==="
+echo "Tokyo now: $(TZ=Asia/Tokyo date +%H:%M) (host clock in the zone)"
+#!must 1
+sset pyxis.clock24h true
+sleep 3
+#!must-not uniform
+#!shot settings-live-topbar
+
+echo "=== About reads the real system ==="
+BX=$((CX + 131)); BY=$((CY + 447)); echo "about $BX,$BY"
+#!pointer click $BX $BY
+sleep 3
+#!must-not uniform
+#!shot settings-live-about
+
+echo "=== nothing refused on the way ==="
+#!must-not capability denied
+grep -a "capability denied" /var/log/vela.log /var/log/echo.log | grep -i "settings\|time" | head -5
+grep -a "PYXIS-WALLPAPER-SETTING" /var/log/vela.log | tail -3

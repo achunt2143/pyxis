@@ -65,16 +65,21 @@ echo-cli ping 2>&1 | tail -4
 # hello-pyxis probes the bridge on load and writes the result to a file.
 # Before this service existed the probe recorded
 #   getSystemInfo=FAILED Error: Method failed: Service not registered: org.geckoOS.system
-rm -f /tmp/pyxis-hello-proof*.txt
+rm -f /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt
 echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args '{"packagePath":"/var/lib/pyxis/incoming/com.pyxis.hello_0.2.0_all.ipk"}' | grep -E 'registeredApps|launchable'
 #!must sessionId
 echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep sessionId
 sleep 15
+# The page writes its proof once every probe has answered, which a
+# freshly built image on a loaded host can take longer than 15 s to do:
+# wait up to 45 s more for it.
+for i in $(seq 1 45); do ls /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt > /dev/null 2>&1 && break; sleep 1; done; echo "proof waited ${i}s more"
 # The acceptance check: a THIRD-PARTY app calling the new service through
 # the bridge. This line read "getSystemInfo=FAILED ... Service not
 # registered: org.geckoOS.system" before the service existed.
-# The page writes ONE FILE PER LAUNCH -- /tmp/pyxis-hello-proof-<ms>.txt, not
-# a fixed name (see hello-pyxis/public/index.html: appendFile wrote nothing at
+# The page writes ONE FILE PER LAUNCH, in its own storage since filesystem
+# calls were confined (2026-10-06): /var/lib/pyxis/data/com.pyxis.hello/proof-<ms>.txt,
+# not a fixed name (see hello-pyxis/public/index.html: appendFile wrote nothing at
 # all on device, so each launch records itself instead). This read globbed the
 # old fixed name until 2026-09-25 and so asserted on a file that is never
 # created: `cat` printed "No such file or directory" and all three assertions
@@ -82,9 +87,9 @@ sleep 15
 # file count too so a missing probe cannot pass quietly.
 #!must getSystemInfo=ok
 #!must bridge=present
-cat /tmp/pyxis-hello-proof-*.txt 2>&1
+cat /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>&1
 #!must 1
-ls /tmp/pyxis-hello-proof-*.txt 2>/dev/null | wc -l
+ls /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>/dev/null | wc -l
 
 # ---------- clean up so the image is left as it was ----------
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep appId

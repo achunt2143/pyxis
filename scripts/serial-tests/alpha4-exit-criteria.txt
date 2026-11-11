@@ -75,9 +75,11 @@ echo "WID=$WID"
 #!must "success": true
 echo-cli call org.geckoOS.evo MinimizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$WID}"
 sleep 4
-# Nova drives appHost.suspend off Evo's WindowMinimized signal, so a
-# minimized app should read as suspended rather than vanishing from the dock.
-#!must suspended
+# Nova no longer suspends on minimize (SIGSTOP silenced minimized music and
+# left the app unable to handle SIGTERM): Evo's xdg `suspended` hint is the
+# background signal. A minimized app stays listed, and stays running.
+#!must-not suspended
+#!must running
 echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -E '"state"' | sort | uniq -c
 
 # Restore is what the dock click does: nova.Focus -> evo.FocusWindow.
@@ -127,7 +129,8 @@ echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHos
 
 # ---------- a crash in an app must not take the shell or compositor ----------
 #!must 1
-pgrep -cf '[-]-pyxis-app bloom'
+# Count the vela process itself (comm "vela"): the boot supervisor's `sh -c` wrapper carries the same words.
+pgrep -ax vela | grep -c -- '--pyxis-app bloom'
 #!must 1
 pgrep -c '[e]vo'
 #!must-not panicked

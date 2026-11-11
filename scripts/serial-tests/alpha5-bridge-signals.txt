@@ -1,0 +1,156 @@
+# Alpha 5: the app bridge's signals are deny-by-default too.
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-bridge-signals.txt
+#
+# Echo sends every signal to every connection, so what an app hears is
+# decided in PyxisBridgeParent.sys.mjs alone. Until 2026-09-28 the bridge
+# passed on any service:event an app subscribed to: a third-party .ipk heard
+# every app's notifications, title and body included, the Terminal app's
+# root shell, which apps run and what gets installed. Now BRIDGE_SIGNALS
+# lists each signal with the capability it needs, as BRIDGE_CAPABILITIES
+# does for calls, and a signal it does not list reaches no app.
+#
+# Both halves, on the real stack:
+#   * An ordinary app hears nothing it may not. hello-pyxis subscribes to
+#     notification:NotificationShown and then raises a notification itself,
+#     so the signal certainly fires while it listens. Its proof file must say
+#     `listen notification.NotificationShown=silent`, and the bridge must
+#     log the refusal.
+#   * The shell and the built-ins still hear theirs. Bloom's overlay shows
+#     that same notification as a toast, and the centre gets it without
+#     listing again. The app list re-fetches when the install changes Nova's
+#     registry, and quick settings follows a volume change made elsewhere.
+#     The Terminal app shows what its shell's terminal prints, and closes
+#     itself when the shell exits. The bridge logs every refusal, and none
+#     may be theirs.
+#
+# Needs an image built after 2026-09-28. An older one needs --push for the
+# bridge and the acceptance package, on top of what alpha5-bridge-deny.txt
+# lists. The proof is read from both places hello-pyxis has written it: /tmp,
+# and the app's own data directory.
+#
+# LOOK at target/serial-shots/signals-*.png: the toast over hello-pyxis,
+# whose window says `silent`; the notification in the centre; quick settings
+# at 25%; SIGNALS-SUITE-MARKER in the Terminal app; and the desktop once the
+# Terminal app has closed itself.
+
+routed() { grep -ac "Routing message to $1" /var/log/echo.log; }
+proofs() { cat /tmp/pyxis-hello-proof-*.txt /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt 2>/dev/null; }
+
+echo "=== the shell runs with its overlay (restarted if geckoOS-boot predates it) ==="
+if pgrep -af -- '--pyxis-app bloom' | grep -q -- '--pyxis-overlay' || [ ! -f /usr/share/geckoOS/apps/bloom/webroot/overlay.html ]; then echo overlay-already-up; else pkill -f -- '--pyxis-app bloom'; sleep 3; printf 'user_pref("mozilla.widget.use-argb-visuals", true);\nuser_pref("browser.tabs.allow_transparent_browser", true);\n' >> /var/lib/pyxis/profiles/bloom/user.js; setsid /usr/bin/setpriv --reuid=1000 --regid=1000 --groups video,render /usr/bin/env MOZ_ENABLE_WAYLAND=1 PYXIS_APP_ID=bloom PYXIS_PROFILE_DIR=/var/lib/pyxis/profiles/bloom PYXIS_DISPLAY_MODE=fullscreen XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=wayland MOZ_GTK_TITLEBAR_DECORATION=none GTK_CSD=0 HOME=/home/geckouser /usr/lib/pyxis-gecko/vela --kiosk --profile /var/lib/pyxis/profiles/bloom --pyxis-app bloom --app-entry index.html --pyxis-overlay overlay.html >> /var/log/vela.log 2>&1 < /dev/null & sleep 25; echo restarted-with-overlay; fi
+#!must pyxis-overlay
+pgrep -a vela | grep -o -- '--pyxis-overlay [^ ]*' | head -1
+
+echo "=== the bridge gates signals ==="
+#!must BRIDGE_SIGNALS
+grep -o -m1 BRIDGE_SIGNALS /usr/lib/pyxis-gecko/actors/PyxisBridgeParent.sys.mjs
+
+echo "=== an install changes Nova's registry, and the shell hears it (nova RegistryChanged) ==="
+PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo removed-if-present
+sleep 5
+N0=$(routed 'org.geckoOS.nova (List)'); echo "nova.List calls so far: $N0"
+#!must registeredApps
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}" | grep -E 'registeredApps|Error'
+sleep 5
+# The installer refreshes Nova in-process, so a routed nova.List after it
+# is the shell's app list re-fetching on RegistryChanged.
+#!must RELISTED
+[ "$(routed 'org.geckoOS.nova (List)')" -gt "$N0" ] && echo RELISTED || echo NOT-RELISTED
+
+echo "=== an ordinary app hears nothing it may not (notification NotificationShown) ==="
+# A profile left by an earlier boot can hold a startup cache with an older
+# copy of the bridge in it.
+rm -rf /var/lib/pyxis/profiles/com.pyxis.hello/startupCache /tmp/pyxis-hello-proof*.txt /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt; echo cleared
+R0=$(grep -ac 'Overlay input region: [0-9]* rect' /var/log/evo.log); echo "overlay regions so far: $R0"
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'sessionId|Error'
+sleep 15
+# The page writes its proof once every probe has answered, which a
+# freshly built image on a loaded host can take longer than 15 s to do:
+# wait up to 45 s more for it.
+for i in $(seq 1 45); do ls /var/lib/pyxis/data/com.pyxis.hello/proof-*.txt > /dev/null 2>&1 && break; sleep 1; done; echo "proof waited ${i}s more"
+#!must notify=ok
+#!must listen notification.NotificationShown=silent
+proofs
+#!must-not HEARD
+proofs | grep '^listen '
+# The same notification reached the shell: its overlay draws the toast and
+# reports the toast's box to Evo.
+#!must SHELL-HEARD
+[ "$(grep -ac 'Overlay input region: [0-9]* rect' /var/log/evo.log)" -gt "$R0" ] && echo SHELL-HEARD || echo SHELL-DEAF
+#!shot signals-toast
+#!must did not declare 'notifications:manage' (required to receive notification.NotificationShown)
+grep -a -m1 "app 'com.pyxis.hello' did not declare 'notifications:manage' (required to receive notification.NotificationShown)" /var/log/echo.log
+
+echo "=== the centre has it without listing again (NotificationShown, to the desktop) ==="
+# The centre lists once, when the shell starts, and then follows the
+# signals, so the notification is in it only if the desktop heard it.
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'success|Error'
+sleep 3
+#!pointer click 1021 22
+sleep 3
+#!shot signals-centre
+#!pointer click 640 600
+sleep 2
+
+echo "=== quick settings follows a volume change made elsewhere (audio VolumeChanged) ==="
+V0=$(echo-cli call org.geckoOS.audio getVolume --interface org.geckoOS.audio --args '{}' | grep -o '"volume": [0-9]*' | grep -o '[0-9]*$'); echo "volume was $V0"
+#!pointer click 1061 22
+sleep 3
+#!must "volume": 25
+echo-cli call org.geckoOS.audio setVolume --interface org.geckoOS.audio --args '{"volume":25}' | grep '"volume"'
+sleep 2
+#!shot signals-volume
+#!pointer click 640 600
+sleep 2
+echo-cli call org.geckoOS.audio setVolume --interface org.geckoOS.audio --args "{\"volume\":${V0:-40}}" | grep -c volume
+
+echo "=== the Terminal app hears its shell (terminal TerminalOutput, TerminalClosed) ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"terminal"}' | grep -E 'sessionId|Error'
+sleep 18
+#!must Routing message to org.geckoOS.terminal (Open)
+grep -a -m1 'Routing message to org.geckoOS.terminal (Open)' /var/log/echo.log
+#!must "appId": "terminal"
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -o '"appId": "[^"]*"'
+# The shell is `$SHELL -i`, forked by echo-daemon. A Terminal app closed
+# earlier leaves its shell running, so take the newest. Its first prompt
+# shows only sometimes, on the bridge before the gate too, so write into its
+# terminal instead, as though it had printed.
+ED=$(pidof echo-daemon); ALL=$(for p in /proc/[0-9]*; do [ "$(awk '/^PPid:/{print $2}' $p/status 2>/dev/null)" = "$ED" ] && tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q -- ' -i ' && basename $p; done | sort -n); SH=$(echo "$ALL" | tail -1); echo "shells:" $ALL "- the Terminal app's: $SH"
+#!must SHELL-FOUND
+[ -n "$SH" ] && echo SHELL-FOUND || echo NO-SHELL
+echo "SIGNALS-SUITE-MARKER" > "$(readlink /proc/$SH/fd/0)"; sleep 3; echo wrote-marker
+#!shot signals-terminal
+# The app closes its window when its last shell's TerminalClosed arrives.
+kill -KILL $SH; sleep 4; echo killed
+#!shot signals-terminal-closed
+#!must-not "appId": "terminal"
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -o '"appId": "[^"]*"'
+
+echo "=== the Installer app subscribes to its progress (installer InstallProgress, InstallFailed) ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"installer"}' | grep -E 'sessionId|Error'
+sleep 18
+#!shot signals-installer
+
+echo "=== the shell and the built-ins were refused nothing ==="
+# Not counted: the five calls and signals a vela from before the latest bridge
+# patch refuses Bloom (SetWorkArea, SetOverlayFocus, GetOverlayState,
+# OverlayFocusChanged, SwitcherChanged, ShortcutTriggered). alpha5-shell-layering reports that
+# one cause, as BRIDGE-OK; repeating it here would fail every suite on it.
+#!must-not capability denied
+grep -a "capability denied" /var/log/vela.log | grep -v "SetWorkArea\|SetOverlayFocus\|GetOverlayState\|OverlayFocusChanged\|SwitcherChanged\|ShortcutTriggered" | head -5
+#!must-not capability denied
+grep -a "capability denied" /var/log/echo.log | grep -v "app 'com.pyxis.hello'" | head -5
+# Nor did delivery fail, or a permission lookup (which would hold a
+# subscription back until Nova answered).
+#!must-not PyxisBridge
+grep -a "could not deliver\|failed to resolve permissions" /var/log/vela.log /var/log/echo.log | head -5
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"installer"}' > /dev/null 2>&1; echo closed-installer
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"terminal"}' > /dev/null 2>&1; echo closed-terminal
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo removed-hello

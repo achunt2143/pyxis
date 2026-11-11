@@ -21,7 +21,9 @@
     // pyxis:// origin served the document, the script ran, window.geckoOS
     // attached for a *third-party* origin, and Nova's appinfo->capability
     // mapping actually granted filesystem:write to an ordinary opkg app.
-    const PROOF = '/tmp/pyxis-hello-proof.txt';
+    // `~` is this app's own storage, the only place its filesystem calls
+    // reach: /var/lib/pyxis/data/com.pyxis.hello on the device.
+    const PROOF = '~/proof.txt';
     // Chrome visibility, measured rather than looked at. These barprops are
     // standard DOM and readable from content, and they reflect the window
     // features openPyxisAppWindow passed (toolbar=no, location=no,
@@ -43,6 +45,88 @@
     // so raise at most one notification per page load.
     let notified = false;
     let beeped = false;
+    let fenced = false;
+    let listening = false;
+    // The NotificationShown signals this page heard. It must hear none: see
+    // the listen probe in probe().
+    const heard = [];
+
+    // Calls this package did NOT declare, each of which the bridge must
+    // refuse before it reaches Echo. The package declares filesystem.read,
+    // filesystem.write and notifications, nothing else. Every probe is
+    // harmless if it does get through, so a bridge that lets it pass shows
+    // up as FORWARDED in the proof file rather than as damage.
+    const FENCE = [
+      ['settings', 'set', { key: 'hello.probe', value: true }], // settings:write
+      ['audio', 'getVolume', {}], // audio
+      ['network', 'getStatus', {}], // network
+      ['terminal', 'Write', { terminalId: 'hello-probe', data: '' }], // terminal
+      ['evo', 'ListWindows', {}], // windows:manage
+      ['nova', 'List', {}], // appManager:manage
+      ['process', 'list', {}], // not in the bridge's table at all
+      ['Echo', 'ListServices', {}], // the bus itself: not in the table
+      ['deviceInfo', 'getUUID', {}], // a device identifier: not in the table
+    ];
+
+    // Filesystem calls this package may make, aimed outside its own storage.
+    // Each must be refused: the absolute ones by the bridge (they need the
+    // privileged filesystem:system), the rest by echo, which resolves every
+    // path beneath the app's own directory. The suite plants the links
+    // first (alpha5-fs-confine.txt): escape-link -> /etc/os-release and
+    // escape-dir -> /tmp, absolute; up-link -> ../../../.., relative. Every
+    // target is world-readable or world-writable, so only the confinement
+    // can stop the call, and every probe is harmless if it gets through:
+    // the result says ESCAPED instead.
+    const FS_FENCE = [
+      ['read-abs', 'readFile', { path: '/etc/os-release' }],
+      ['write-abs', 'writeFile', { path: '/tmp/pyxis-fs-escape-abs', content: 'x' }],
+      ['chmod-abs', 'chmod', { path: '/tmp/pyxis-fs-canary', mode: 0o4777 }],
+      ['delete-abs', 'deleteFile', { path: '/tmp/pyxis-fs-canary' }],
+      ['read-dotdot', 'readFile', { path: '~/../../../../etc/os-release' }],
+      ['write-dotdot', 'writeFile', { path: '../../../../tmp/pyxis-fs-escape-dots', content: 'x' }],
+      ['read-link', 'readFile', { path: '~/escape-link' }],
+      ['write-link', 'writeFile', { path: '~/escape-dir/pyxis-fs-escape-link', content: 'x' }],
+      ['list-uplink', 'readDirectory', { path: '~/up-link' }],
+      ['copy-link', 'copy', { source: '~/escape-link', destination: '~/stolen' }],
+      ['chmod-link', 'chmod', { path: '~/escape-link', mode: 0o777 }],
+      // Out of its storage by copying or moving, rather than by reading.
+      ['copy-out', 'copy', { source: '~/nested/deep/a.txt', destination: '/tmp/pyxis-fs-escape-copy' }],
+      ['move-out', 'move', { source: '~/nested', destination: '../../../../tmp/pyxis-fs-escape-move' }],
+      // A scope the page names counts for nothing: the bridge writes its
+      // own over it, and an absolute path still needs filesystem:system.
+      ['spoof-scope', 'readFile', { path: '/etc/os-release', scope: 'system' }],
+      // Another app's data needs the privileged filesystem:apps. Naming its
+      // own id gets an app nothing more.
+      ['other-app', 'readFile', { path: '~/notes.json', app: 'notes' }],
+      ['own-id', 'readFile', { path: '/etc/os-release', app: 'com.pyxis.hello' }],
+      // A path that is not a string, which the bridge could not check.
+      ['not-a-string', 'readFile', { path: ['/etc/os-release'] }],
+      // Its own storage stays: the top of it can't be deleted.
+      ['delete-top', 'deleteDirectory', { path: '~', recursive: true }],
+    ];
+
+    // `refused` when the call failed, ESCAPED when it worked.
+    async function fsProbe(method, params) {
+      try {
+        const res = await window.geckoOS.callService('filesystem', method, params);
+        return 'ESCAPED ' + JSON.stringify(res).slice(0, 120);
+      } catch (e) {
+        return 'refused: ' + String((e && e.message) || e);
+      }
+    }
+
+    // `denied` when the bridge refused the call, FORWARDED when it reached
+    // Echo (whether Echo then answered or failed).
+    async function fenceProbe(service, method, params) {
+      try {
+        await window.geckoOS.callService(service, method, params);
+        return 'FORWARDED ok';
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        const denied = 'Pyxis capability denied: ';
+        return msg.startsWith(denied) ? 'denied: ' + msg.slice(denied.length) : 'FORWARDED error: ' + msg;
+      }
+    }
 
     async function probe() {
       const lines = [
@@ -53,6 +137,21 @@
         'chrome: ' + CHROME,
       ];
       if (window.geckoOS) {
+        // Signals are deny-by-default too (2026-09-28). NotificationShown
+        // carries every app's notification, title and body included, so
+        // only an app holding notifications:manage (the shell) may hear it,
+        // and this package does not declare it. Listen first, and give the
+        // bridge a second to decide the subscription, so the notification
+        // raised below certainly fires while the page listens. The shell's
+        // toast shows that it fired.
+        if (!listening) {
+          listening = true;
+          window.geckoOS.addEventListener('notification', 'NotificationShown', (data) => {
+            const n = (data && data.notification) || {};
+            heard.push(n.title + ': ' + n.body);
+          });
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
         lines.push('initialized=' + window.geckoOS.initialized);
         lines.push('apis=' + Object.keys(window.geckoOS).sort().join(','));
         try {
@@ -78,6 +177,54 @@
             lines.push('notify=FAILED ' + e);
           }
         }
+        // Deny by default: what an app did not declare, it cannot call. The
+        // control is settings.get, which every app's theme needs and which
+        // the bridge lists as needing no capability.
+        if (!fenced) {
+          fenced = true;
+          try {
+            await window.geckoOS.callService('settings', 'get', { key: 'pyxis.theme' });
+            lines.push('allow settings.get=ok');
+          } catch (e) {
+            lines.push('allow settings.get=FAILED ' + e);
+          }
+          for (const [service, method, params] of FENCE) {
+            lines.push('deny ' + service + '.' + method + '=' + (await fenceProbe(service, method, params)));
+          }
+          for (const [label, method, params] of FS_FENCE) {
+            lines.push('fs ' + label + '=' + (await fsProbe(method, params)));
+          }
+          // What this app may do with its own storage: a folder made with
+          // its parents, a file in it read back, and paths that come back
+          // rooted at ~.
+          try {
+            const fs = window.geckoOS.filesystem;
+            await fs.writeFile('~/nested/deep/a.txt', 'kept');
+            const back = await fs.readFile('~/nested/deep/a.txt');
+            const list = await fs.readDirectory('~');
+            const paths = list.entries.map((e) => e.path).sort().join(',');
+            lines.push('fs-ok own=' + (back.content === 'kept' ? 'ok' : 'WRONG ' + back.content) + ' paths=' + paths);
+          } catch (e) {
+            lines.push('fs-ok own=FAILED ' + e);
+          }
+          // Naming the user's scope gets this app its own storage, not the
+          // home: the bridge writes the scope itself.
+          try {
+            const res = await window.geckoOS.callService('filesystem', 'readDirectory', { path: '~', scope: 'user' });
+            const names = res.entries.map((e) => e.name);
+            lines.push('fs-ok scope-named=' + (names.includes('.mozilla') ? 'LEAKED the home: ' + names.join(',') : 'own storage'));
+          } catch (e) {
+            lines.push('fs-ok scope-named=FAILED ' + e);
+          }
+          // getStorageInfo answers for the root filesystem, whatever path
+          // the page names.
+          try {
+            const res = await window.geckoOS.callService('deviceInfo', 'getStorageInfo', { mount: '/root' });
+            lines.push('fs storage mount=' + res.mount);
+          } catch (e) {
+            lines.push('fs storage=FAILED ' + e);
+          }
+        }
       }
       // Alpha 5 exit criterion: "audio plays from a web page in vela". A
       // one-second 440 Hz tone through Web Audio, which the serial harness's
@@ -95,10 +242,29 @@
           osc.connect(gain).connect(ctx.destination);
           osc.start();
           osc.stop(ctx.currentTime + 1);
+          // A new context always starts "suspended" and turns "running"
+          // once the audio device is open, if autoplay lets it start at all.
+          // So read the state once it has settled: read at creation it says
+          // "suspended" either way, which failed a run whose tone played.
+          if (ctx.state !== 'running') {
+            await Promise.race([
+              new Promise((resolve) => ctx.addEventListener('statechange', resolve, { once: true })),
+              new Promise((resolve) => setTimeout(resolve, 3000)),
+            ]);
+          }
           lines.push('audio=' + ctx.state);
         } catch (e) {
           lines.push('audio=FAILED ' + e);
         }
+      }
+      // The listen probe's result. `silent` is the pass. HEARD, with the
+      // text, means the bridge handed this app the signal that carries every
+      // app's notifications (the one it heard is its own, raised above).
+      // Wait a second more, so that a signal still on its way lands first.
+      if (listening) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        lines.push('listen notification.NotificationShown=' +
+          (heard.length ? 'HEARD ' + heard.join(' | ') : 'silent'));
       }
       out.textContent = lines.join('\n');
 

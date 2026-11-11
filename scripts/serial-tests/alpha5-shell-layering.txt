@@ -1,0 +1,227 @@
+# Alpha 5: the shell above apps, and a work area so apps keep out of it.
+#
+#   cargo build --release -p geckoOS-evo -p geckoOS-echo
+#   (cd ../pyxis-experience && npm run build)
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/pyxis-wlctx:/usr/bin/pyxis-wlctx \
+#     --push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot \
+#     --script scripts/serial-tests/alpha5-shell-layering.txt
+#
+# (Without pyxis-wlctx no app launches on an image from before it existed.)
+#
+# Evo used to stack all of Bloom beneath every app, so a maximized app covered
+# the top bar, the dock and every panel, and Bloom worked around it by
+# minimizing the apps before it opened a panel. Now the whole shell (top bar,
+# dock, panels, toasts) is drawn by the overlay, which Evo keeps above apps,
+# and Bloom tells Evo three things (evo.SetOverlayRegion / SetWorkArea /
+# SetOverlayFocus): where it takes clicks, which edges apps must leave alone,
+# and when it needs the keyboard. This suite proves them with input, not
+# pixels:
+#
+#   * the top bar and the dock take clicks over a MAXIMIZED app;
+#   * that app's frame starts below the bar and ends above the dock;
+#   * opening the drawer or the search over it does not minimize it;
+#   * typing reaches the overlay's search box (the proof is that Enter
+#     launches the app the typed word names), and Escape gives the keyboard
+#     back to the app;
+#   * a restored window is shrunk to fit between bar and dock, and one dragged
+#     to the top or bottom edge stops at the bar or the dock, whole.
+#
+# The bridge half needs a vela rebuilt with the patched PyxisBridgeParent
+# (SetWorkArea, SetOverlayFocus and GetOverlayState are new there). On a vela
+# without it the shell's own calls are refused, so those steps print
+# BRIDGE-OLD-VELA, make the same call themselves as Bloom would so the rest
+# still runs, and the `#!must BRIDGE-OK` lines FAIL: that is the report that
+# the image is missing the patch, not a bug in Evo or Bloom. Everything past
+# the call (what Evo does with it, what Bloom draws) is checked either way.
+# PANEL-CLOSED-BY-LOSS is the same case: Bloom only hears the signal that
+# closes a panel through the patched bridge.
+#
+# LOOK at target/serial-shots/layering-{maximized,search,drawer}.png: the bar
+# and the dock sit over Files with the app visible around them, and the
+# drawer's dimmed backdrop covers the app without Files having been minimized.
+
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id|focused|visible)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"], v["focused"], v["visible"]; exit } on = 0 }'; }
+winact() { echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "{\"window_id\":$2}" | grep -c '"success": true'; }
+evo() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "$a"; }
+# GetOverlayState, flattened to one line.
+ostate() { evo GetOverlayState | tr -d ' \n'; }
+# Does the overlay hold the keyboard?
+okbd() { ostate | grep -o '"keyboard":[a-z]*' | cut -d: -f2; }
+# One "x y w h" line per rect of the overlay's input region.
+orects() { ostate | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done; }
+# "top bottom" of the work area, "0 0" while none is reported.
+wa() { local w t b; w=$(ostate | grep -o '"workArea":{[^}]*}'); t=$(echo "$w" | grep -o '"top":[0-9]*' | cut -d: -f2); b=$(echo "$w" | grep -o '"bottom":[0-9]*' | cut -d: -f2); echo "${t:-0} ${b:-0}"; }
+# How many rects cover the whole 1280x800 screen (a panel is open).
+fullscreen_rects() { orects | grep -c '^0 0 1280 800$'; }
+
+echo "=== the shell is the overlay's: the bar and the dock are in its input region ==="
+#!must pyxis-overlay
+pgrep -a vela | grep -o -- '--pyxis-overlay [^ ]*' | head -1
+sleep 5
+echo "region: $(orects | tr '\n' ';')"
+# The bar spans the screen at the top; the dock floats at the bottom.
+#!must BAR-IN-REGION
+orects | awk '$1 == 0 && $2 == 0 && $3 == 1280 && $4 >= 40 && $4 <= 60 { found = 1 } END { print found ? "BAR-IN-REGION" : "NO-BAR-RECT" }'
+#!must DOCK-IN-REGION
+orects | awk '$2 > 600 && $3 > 100 && $4 > 40 { found = 1 } END { print found ? "DOCK-IN-REGION" : "NO-DOCK-RECT" }'
+#!must NO-PANEL-YET
+test "$(fullscreen_rects)" = 0 && echo NO-PANEL-YET || echo PANEL-ALREADY-OPEN
+read DX DY DW DH <<< "$(orects | awk '$2 > 600 && $3 > 100 { print; exit }')"; echo "dock: $DX,$DY ${DW}x$DH"
+
+echo "=== Bloom reports the work area ==="
+read WT WB <<< "$(wa)"; echo "work area: top=$WT bottom=$WB"
+#!must BRIDGE-OK
+test "$WT" -gt 0 && echo BRIDGE-OK || echo "BRIDGE-OLD-VELA: SetWorkArea was refused (see /var/log/vela.log); standing in"
+# On a vela without the patch, say what Bloom would have said: the bar's
+# height, and the dock's height plus its margin and gap.
+if [ "$WT" = 0 ]; then evo SetWorkArea "{\"top\":44,\"bottom\":$((800 - DY + 6))}" | grep -c success; fi
+sleep 1
+read WT WB <<< "$(wa)"; echo "work area now: top=$WT bottom=$WB"
+#!must WORK-AREA-SET
+test "$WT" -ge 40 -a "$WB" -ge 60 && echo WORK-AREA-SET || echo "WORK-AREA-MISSING top=$WT bottom=$WB"
+
+echo "=== a maximized app starts below the bar and ends above the dock ==="
+# Only a first-run window opens maximized (see alpha5-resize.txt).
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4 /var/lib/pyxis/profiles/notes/xulstore.json /var/lib/pyxis/profiles/notes/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+read FX FY FW FH FID FFOC FVIS <<< "$(geom files)"; echo "files: $FX,$FY ${FW}x$FH id=$FID focused=$FFOC"
+#!must BELOW-BAR
+test "$FY" = "$WT" && echo BELOW-BAR || echo "UNDER-BAR y=$FY (bar reserves $WT)"
+#!must ABOVE-DOCK
+test $((FY + FH)) -eq $((800 - WB)) && echo ABOVE-DOCK || echo "UNDER-DOCK bottom=$((FY + FH)) (dock reserves $WB)"
+#!must FULL-WIDTH
+test "$FX" = 0 -a "$FW" = 1280 && echo FULL-WIDTH || echo "WRONG-WIDTH $FX ${FW}"
+# Maximizing again (the SSD button) lands in the same place.
+winact MaximizeWindow $FID | grep -q 1
+sleep 3
+read FX FY FW FH FID FFOC FVIS <<< "$(geom files)"
+#!must STILL-FITS
+test "$FY" = "$WT" -a $((FY + FH)) -eq $((800 - WB)) && echo STILL-FITS || echo "MOVED ${FX},${FY} ${FW}x${FH}"
+#!must-not uniform
+#!shot layering-maximized
+
+echo "=== the search box, in the bar, takes a click over the maximized app ==="
+#!pointer click 100 22
+sleep 2
+echo "region: $(orects | tr '\n' ';')"
+#!must SEARCH-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo SEARCH-OPEN || echo "SEARCH-NOT-OPEN (the click went to the app?)"
+# Opening it must not have minimized the app, or moved it.
+read AX AY AW AH AID AFOC AVIS <<< "$(geom files)"; echo "files: $AX,$AY ${AW}x$AH visible=$AVIS"
+#!must APP-STILL-UP
+test "$AVIS" = true -a "$AY" = "$WT" -a "$AH" = "$FH" && echo APP-STILL-UP || echo "APP-DISTURBED"
+# Bloom asks Evo for the keyboard while the box is open.
+sleep 1
+#!must BRIDGE-OK
+test "$(okbd)" = true && echo BRIDGE-OK || echo "BRIDGE-OLD-VELA: SetOverlayFocus was refused (see /var/log/vela.log); standing in"
+if [ "$(okbd)" != true ]; then evo SetOverlayFocus '{"focused":true}' | grep -c success; sleep 1; fi
+#!must OVERLAY-HAS-KEYBOARD
+test "$(okbd)" = true && echo OVERLAY-HAS-KEYBOARD || echo OVERLAY-WITHOUT-KEYBOARD
+# The app lost the keyboard to the overlay.
+read AX AY AW AH AID AFOC AVIS <<< "$(geom files)"
+#!must APP-UNFOCUSED
+test "$AFOC" = false && echo APP-UNFOCUSED || echo APP-STILL-FOCUSED
+
+echo "=== typing reaches the overlay: the word names the app Enter launches ==="
+#!type notes
+sleep 1
+#!shot layering-search
+#!key ret
+sleep 16
+read NX NY NW NH NID NFOC NVIS <<< "$(geom notes)"; echo "notes: $NX,$NY ${NW}x$NH id=$NID focused=$NFOC"
+#!must TYPED-INTO-OVERLAY
+test -n "$NID" && echo TYPED-INTO-OVERLAY || echo "NOTHING-LAUNCHED (the keys went elsewhere)"
+# Launching closed the box: the region is the bar and dock again, and the
+# keyboard went to the app that just opened, not back to Files.
+#!must PANEL-CLOSED
+test "$(fullscreen_rects)" = 0 && echo PANEL-CLOSED || echo PANEL-STILL-OPEN
+#!must NEW-APP-HAS-KEYBOARD
+test "$NFOC" = true && echo NEW-APP-HAS-KEYBOARD || echo "NEW-APP-UNFOCUSED"
+
+echo "=== the dock takes a click, and the drawer opens over the apps ==="
+# The first dock button is the app drawer: 12 px of padding and a border,
+# then a 46 px button.
+CX=$((DX + 36)); CY=$((DY + DH / 2)); echo "drawer button $CX,$CY"
+#!pointer click $CX $CY
+sleep 2
+echo "region: $(orects | tr '\n' ';')"
+#!must DRAWER-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo DRAWER-OPEN || echo "DRAWER-NOT-OPEN (the click went to an app?)"
+#!must APPS-UP
+for a in files notes; do read X Y W H I F V <<< "$(geom $a)"; test "$V" = true || echo "$a-HIDDEN"; done; echo APPS-UP
+sleep 1
+if [ "$(okbd)" != true ]; then evo SetOverlayFocus '{"focused":true}' | grep -c success; sleep 1; fi
+#!shot layering-drawer
+echo "=== Escape closes it, and the keyboard goes back to the app ==="
+#!key esc
+sleep 2
+#!must DRAWER-CLOSED
+test "$(fullscreen_rects)" = 0 && echo DRAWER-CLOSED || echo DRAWER-STILL-OPEN
+# Bloom gives the keyboard back when its panel closes; with the old bridge
+# it cannot, so do it for it.
+if [ "$(okbd)" = true ]; then echo "BRIDGE-OLD-VELA: SetOverlayFocus(false) was refused; standing in"; evo SetOverlayFocus '{"focused":false}' | grep -c success; sleep 1; fi
+read X Y W H I NFOC V <<< "$(geom notes)"; read X Y W H I FFOC V <<< "$(geom files)"
+#!must KEYBOARD-RETURNED
+test "$(okbd)" = false -a "$NFOC" = true && echo KEYBOARD-RETURNED || echo "KEYBOARD-LOST overlay=$(okbd) notes=$NFOC files=$FFOC"
+
+echo "=== something else taking the keyboard is reported, and closes the panel ==="
+# Alt+Tab while the drawer is open: Evo moves the keyboard to another app.
+CX=$((DX + 36)); CY=$((DY + DH / 2))
+#!pointer click $CX $CY
+sleep 2
+if [ "$(okbd)" != true ]; then evo SetOverlayFocus '{"focused":true}' | grep -c success; sleep 1; fi
+#!key alt tab
+sleep 2
+#!must OVERLAY-LOST-KEYBOARD
+test "$(okbd)" = false && echo OVERLAY-LOST-KEYBOARD || echo OVERLAY-STILL-HAS-IT
+#!must FOCUS-SIGNALLED
+grep -aq 'Signal emitted: OverlayFocusChanged' /var/log/evo.log && echo FOCUS-SIGNALLED || echo NO-FOCUS-SIGNAL
+sleep 1
+#!must PANEL-CLOSED-BY-LOSS
+test "$(fullscreen_rects)" = 0 && echo PANEL-CLOSED-BY-LOSS || echo "PANEL-STAYED-OPEN (needs the patched bridge to hear the signal)"
+
+echo "=== a window dragged up stops under the bar ==="
+read X Y W H FID F V <<< "$(geom files)"
+winact FocusWindow $FID | grep -q 1
+winact UnmaximizeWindow $FID | grep -q 1
+sleep 3
+read X Y W H FID F V <<< "$(geom files)"; echo "floating: $X,$Y ${W}x$H"
+# Firefox restores at the size it chose for the whole screen (1152x752); Evo
+# fits the frame to the work area: shrunk, and all of it (resize band
+# included) between the bar and the dock, not just shifted down.
+#!must RESTORED-FITS
+test "$X" -ge 0 -a "$Y" -ge "$WT" -a $((X + W)) -le 1280 -a $((Y + H)) -le $((800 - WB)) && echo RESTORED-FITS || echo "RESTORED-OUTSIDE $X,$Y ${W}x$H (work area top=$WT bottom=$WB)"
+# Drag the title bar to the very top of the screen.
+SX=$((X + W / 2)); SY=$((Y + 12)); echo "title bar $SX,$SY -> $SX,2"
+#!pointer drag $SX $SY $SX 2
+sleep 2
+read MX MY MW MH FID F V <<< "$(geom files)"; echo "dragged: $MX,$MY ${MW}x$MH"
+#!must CLAMPED-AT-BAR
+test "$MY" = "$WT" && echo CLAMPED-AT-BAR || echo "NOT-CLAMPED y=$MY (bar reserves $WT)"
+# And dragged to the bottom: it stops above the dock, whole.
+SX=$((MX + MW / 2)); SY=$((MY + 12)); echo "title bar $SX,$SY -> $SX,799"
+#!pointer drag $SX $SY $SX 799
+sleep 2
+read MX MY MW MH FID F V <<< "$(geom files)"; echo "dragged down: $MX,$MY ${MW}x$MH"
+#!must CLAMPED-AT-DOCK
+test $((MY + MH)) -le $((800 - WB)) -a "$MY" -ge "$WT" && echo CLAMPED-AT-DOCK || echo "NOT-CLAMPED bottom=$((MY + MH)) (dock reserves $WB)"
+
+echo "=== a click below the bar still reaches the app ==="
+read BX BY BW BH BID BF BV <<< "$(geom bloom)"
+winact FocusWindow $BID | grep -q 1
+sleep 1
+PX=$((MX + MW / 2)); PY=$((MY + MH / 2)); echo "click $PX,$PY"
+#!pointer click $PX $PY
+sleep 2
+read X Y W H I FFOC V <<< "$(geom files)"
+#!must APP-CLICKED
+test "$FFOC" = true && echo APP-CLICKED || echo "APP-NOT-FOCUSED (the overlay swallowed the click)"
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'success|Error'

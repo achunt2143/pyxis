@@ -1,0 +1,93 @@
+# Alpha 5 A: Bloom's overlay, the shell's layer above app windows.
+#
+#   scripts/serial-test.py --script scripts/serial-tests/alpha5-overlay.txt
+#
+# Evo stacks Bloom (the desktop) beneath every app, so anything Bloom draws
+# is hidden by an app over it. The overlay is a second Bloom window: vela
+# opens it in the shell's process (`--pyxis-overlay overlay.html`, passed by
+# geckoOS-boot), it covers the screen and is transparent, and Evo keeps it
+# ABOVE apps (evo/src/shell/overlay.rs). Only the areas Bloom reports take
+# clicks. Everywhere else, clicks go to what is beneath.
+#
+# This suite proves each half with input rather than pixels:
+#   * a click on a toast's X, over a maximized app, dismisses the
+#     notification. It could only reach the toast if the overlay is on top.
+#   * a click beside the toast lands on the app and focuses it, so the
+#     transparent overlay isn't swallowing the screen.
+#   * once the toast is gone, its old spot passes clicks through too.
+#
+# LOOK at target/serial-shots/overlay-{desktop,over-app,dismissed}.png:
+# the toast must sit over Files in the second, with the app visible around
+# it, and the third must show no toast.
+
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id|focused)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"], v["focused"]; exit } on = 0 }'; }
+# The edges Bloom has reserved for its top bar and dock, as "top bottom"
+# ("0 0" while Bloom has reported none): a maximized frame starts below the
+# first and ends above the second (see alpha5-shell-layering.txt).
+wa() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | awk '/"top"/ { gsub(/[",:]/, ""); t = $2 } /"bottom"/ { gsub(/[",:]/, ""); b = $2 } END { print t + 0, b + 0 }'; }
+# One "x y w h" line per rect of the overlay's input region: the bar, the dock
+# and, while there is one, the toast stack (340 wide).
+orects() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done; }
+toast_rects() { orects | awk '$3 == 340 { n++ } END { print "toast-rects=" n + 0 }'; }
+notes() { echo "notifications=$(echo-cli call org.geckoOS.notification list --interface org.geckoOS.notification --args '{}' | grep -c '"title"')"; }
+
+echo "=== the overlay is up, and it is not a window anyone manages ==="
+#!must pyxis-overlay
+pgrep -a vela | grep -o -- '--pyxis-overlay [^ ]*' | head -1
+#!must bloom-overlay
+grep -a -o 'app_id=Some("bloom-overlay")' /var/log/evo.log | head -1
+#!must-not bloom-overlay
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep app_id
+#!must-not uniform
+#!shot overlay-desktop
+
+echo "=== an app, maximized, under a toast ==="
+# Only a first-run window opens maximized; an image used by hand remembers
+# the window Files was left at (see alpha5-resize.txt).
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+read FX FY FW FH FID FFOC <<< "$(geom files)"; echo "files: $FX $FY ${FW}x$FH id=$FID"
+read WT WB <<< "$(wa)"
+#!must FITS
+test "$FW" = 1280 -a "$FH" = $((800 - WT - WB)) && echo FITS || echo "WRONG-SIZE ${FW}x${FH}"
+# timeout 0: the toast stays until dismissed, so the shots and clicks
+# below don't race it.
+#!must "success": true
+echo-cli call org.geckoOS.notification show --interface org.geckoOS.notification --args '{"title":"Overlay toast","body":"Drawn above every app","timeout":0}' | grep success
+sleep 3
+#!must toast-rects=1
+toast_rects
+#!shot overlay-over-app
+
+echo "=== beside the toast, the click is the app's ==="
+read BX BY BW BH BID BFOC <<< "$(geom bloom)"; echo-cli call org.geckoOS.evo FocusWindow --interface org.geckoOS.evo --args "{\"window_id\":$BID}" | grep -c success
+sleep 1
+#!must files-unfocused
+read FX FY FW FH FID FFOC <<< "$(geom files)"; [ "$FFOC" = false ] && echo files-unfocused || echo "files focused=$FFOC"
+#!pointer click 600 400
+sleep 2
+#!must files-focused
+read FX FY FW FH FID FFOC <<< "$(geom files)"; [ "$FFOC" = true ] && echo files-focused || echo "files focused=$FFOC"
+
+echo "=== the toast's X, over the app, dismisses it ==="
+#!must notifications=1
+notes
+# The X sits at the stack's top-right: the stack is 340 wide at right 16,
+# top 62, and the button is inside 12 px of padding.
+#!pointer click 1245 82
+sleep 2
+#!must notifications=0
+notes
+#!must toast-rects=0
+toast_rects
+#!shot overlay-dismissed
+
+echo "=== where the toast was, clicks reach the app again ==="
+echo-cli call org.geckoOS.evo FocusWindow --interface org.geckoOS.evo --args "{\"window_id\":$BID}" | grep -c success
+sleep 1
+#!pointer click 1100 100
+sleep 2
+#!must files-focused
+read FX FY FW FH FID FFOC <<< "$(geom files)"; [ "$FFOC" = true ] && echo files-focused || echo "files focused=$FFOC"

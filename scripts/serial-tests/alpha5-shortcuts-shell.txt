@@ -1,0 +1,137 @@
+# Alpha 5: Evo's shell shortcuts reach Bloom and open its panels over a running app.
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-shortcuts-shell.txt
+#
+# Evo owns Super (tapped alone), Super+Space and Super+Tab and sends them as the
+# org.geckoOS.evo signal ShortcutTriggered {launcher, search, overview}, which
+# the bridge hands Bloom (windows:manage). Bloom opens the app drawer, the
+# search box and the card overview, drawn by the overlay above whatever runs.
+# None of them may minimize the app (only Super+D does). A panel on screen is
+# the whole screen in the overlay's input region, so that is what is counted.
+# Alt+Tab is the same overview in switcher mode: Evo keeps the keys and the
+# order and sends SwitcherChanged {open, step, commit, cancel}; Bloom opens
+# the cards in Evo's order with the selection highlighted, never asks for the
+# keyboard (Alt is held in the app), and on release zooms the chosen card
+# toward its window. The Evo half of that is asserted in alpha5-shortcuts.
+# Needs a vela with the patched PyxisBridgeParent: on an older one nothing
+# opens. SwitcherChanged is new there too: on a vela without it the switcher
+# steps print BRIDGE-OLD-VELA and the `#!must BRIDGE-OK` line FAILS, which is
+# the report that the image needs the rebuild (Evo still switches windows on
+# release, and that is checked either way).
+#
+# LOOK at target/serial-shots/shellkeys-{launcher,search,overview,switcher-open,switcher-step}.png.
+
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(window_id|visible)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["window_id"], v["visible"]; exit } on = 0 }'; }
+orects() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done; }
+okbd() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o '"keyboard":[a-z]*' | cut -d: -f2; }
+fid() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk '/"(focused|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (v["focused"] == "true") { print v["window_id"]; exit } v["focused"] = "" }'; }
+swc() { echo-cli call org.geckoOS.evo GetSwitcherState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o "\"$1\":[0-9]*" | head -1 | cut -d: -f2; }
+fullscreen_rects() { orects | grep -c '^0 0 1280 800$'; }
+
+echo "=== a running app ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+#!must NO-PANEL
+test "$(fullscreen_rects)" = 0 && echo NO-PANEL || echo PANEL-OPEN-ALREADY
+
+echo "=== Super tapped alone opens the launcher ==="
+#!key meta_l
+sleep 3
+#!shot shellkeys-launcher
+#!must LAUNCHER-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo LAUNCHER-OPEN || echo LAUNCHER-NOT-OPEN
+#!key esc
+sleep 2
+#!must CLOSED-1
+test "$(fullscreen_rects)" = 0 && echo CLOSED-1 || echo STILL-OPEN-1
+
+echo "=== Super+Space opens search ==="
+#!key meta_l spc
+sleep 3
+#!shot shellkeys-search
+#!must SEARCH-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo SEARCH-OPEN || echo SEARCH-NOT-OPEN
+#!key esc
+sleep 2
+#!must CLOSED-2
+test "$(fullscreen_rects)" = 0 && echo CLOSED-2 || echo STILL-OPEN-2
+
+echo "=== Super+Tab opens the overview ==="
+#!key meta_l tab
+sleep 3
+#!shot shellkeys-overview
+#!must OVERVIEW-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo OVERVIEW-OPEN || echo OVERVIEW-NOT-OPEN
+#!key esc
+sleep 2
+
+echo "=== and the app was never minimized ==="
+read FID FVIS <<< "$(geom files)"
+#!must APP-VISIBLE
+test "$FVIS" = true && echo APP-VISIBLE || echo "APP-HIDDEN visible=$FVIS"
+
+echo "=== Alt+Tab: two more apps (three, so two steps land on a third), then a quick tap never shows the switcher ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+sleep 15
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"tasks"}' | grep -E 'sessionId|Error'
+sleep 15
+O0=$(swc open)
+#!key alt tab
+sleep 1
+#!must QUICK-TAP-NEVER-DRAWN
+test "$(fullscreen_rects)" = 0 -a "$(swc open)" = "$O0" && echo QUICK-TAP-NEVER-DRAWN || echo "QUICK-TAP-DREW-IT rects=$(fullscreen_rects)"
+
+echo "=== Alt held: Bloom draws the overview over the app, and does not take the keyboard ==="
+START=$(fid)
+#!keydown alt
+#!key tab
+sleep 3
+#!shot shellkeys-switcher-open
+#!must BRIDGE-OK
+test "$(fullscreen_rects)" -ge 1 && echo BRIDGE-OK || echo "BRIDGE-OLD-VELA: Bloom never heard SwitcherChanged (see /var/log/vela.log); the switcher was not drawn"
+#!must SWITCHER-LEAVES-KEYBOARD-TO-EVO
+test "$(okbd)" = false -a "$(fid)" = "$START" && echo SWITCHER-LEAVES-KEYBOARD-TO-EVO || echo "SWITCHER-TOOK-KEYBOARD overlay=$(okbd) focus=$(fid) start=$START"
+#!key tab
+sleep 2
+#!shot shellkeys-switcher-step
+
+echo "=== releasing Alt takes the overview down and focuses the chosen window ==="
+#!keyup alt
+sleep 3
+#!shot shellkeys-switcher-commit
+#!must SWITCHER-CLOSED
+test "$(fullscreen_rects)" = 0 && echo SWITCHER-CLOSED || echo "SWITCHER-STILL-OPEN"
+#!must COMMITTED-WINDOW-FOCUSED
+test "$(fid)" != "$START" -a -n "$(fid)" && echo COMMITTED-WINDOW-FOCUSED || echo "FOCUS-DID-NOT-MOVE"
+
+echo "=== Escape cancels: the overview closes, focus stays ==="
+START=$(fid)
+#!keydown alt
+#!key tab
+sleep 3
+#!key esc
+sleep 2
+#!must CANCEL-CLOSED
+test "$(fullscreen_rects)" = 0 && echo CANCEL-CLOSED || echo "CANCEL-LEFT-IT-OPEN"
+#!keyup alt
+sleep 1
+#!must CANCEL-KEPT-FOCUS
+test "$(fid)" = "$START" && echo CANCEL-KEPT-FOCUS || echo "CANCEL-MOVED-FOCUS"
+
+echo "=== Super+Tab's overview still works, and the switcher left nothing behind ==="
+#!key meta_l tab
+sleep 3
+#!must OVERVIEW-STILL-OPENS
+test "$(fullscreen_rects)" -ge 1 && echo OVERVIEW-STILL-OPENS || echo OVERVIEW-BROKEN
+#!key esc
+sleep 2
+#!must OVERVIEW-CLOSED-AGAIN
+test "$(fullscreen_rects)" = 0 && echo OVERVIEW-CLOSED-AGAIN || echo OVERVIEW-STUCK
+
+echo "=== clean up ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"tasks"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'

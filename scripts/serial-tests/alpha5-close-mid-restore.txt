@@ -1,0 +1,35 @@
+# Windows closed while they restore must not leave their restore animation
+# running. An animation completes (and its count with it) only when it is drawn,
+# and a window killed mid-restore has no buffer left, so begin_close_animation
+# made no close and never cancelled the restore: GetAnimationState kept
+# `active` above 0 for good. remove_window_from_workspace now ends the window's
+# own animations. Found by alpha5-animations (lite restores, scale 10, then the
+# apps closed).
+wid() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"window_id":/ { gsub(/[",:]/, ""); print $2; exit }'; }
+winact() { echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "{\"window_id\":$2}" | grep -c '"success": true'; }
+setanim() { echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args "$1" | grep -c '"mode"'; }
+mst() { echo-cli call org.geckoOS.evo GetAnimationState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' ; echo; }
+act() { mst | grep -o '"active":[0-9]*'; }
+sleep 25
+for A in files notes tasks settings; do echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'sessionId|Error'; sleep 15; done
+echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args '{"enabled":false}' | grep -c enabled
+setanim '{"mode":"full","scale":10}'
+for A in files notes tasks settings; do winact MinimizeWindow $(wid $A); done
+sleep 12; act
+for A in files notes tasks settings; do winact RestoreWindow $(wid $A); done
+sleep 1
+for A in files notes tasks settings; do echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'success|Error'; done
+sleep 20; act
+sleep 20
+mst
+#!must NO-LEAK
+act | grep -q '"active":0' && echo NO-LEAK || echo LEAKED
+# Evo's Echo connection must hold through the four restores. It dropped in one
+# run in three ("Connection task dropped the request", then "Service not
+# registered: org.geckoOS.evo" until the broker re-registered): echo-daemon and
+# Evo's broker both read frames inside a select!, which is not cancel-safe, so a
+# signal arriving mid-frame (a thumbnail reply is large) put the stream out of
+# step. Both read in a task of their own now.
+#!must NO-RECONNECT
+grep -aq 'Re-registering' /var/log/evo.log && echo EVO-RECONNECTED || echo NO-RECONNECT
+grep -a 'Error receiving message\|Command processing error\|Re-registering' /var/log/evo.log | tail -5 | cut -c1-220

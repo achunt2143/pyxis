@@ -1,0 +1,147 @@
+# Alpha 5: Evo decides what a Wayland client may do from who it is, not from
+# what it claims.
+#
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/pyxis-wlctx:/usr/bin/pyxis-wlctx \
+#     --push target/release/pyxis-wlprobe:/usr/bin/pyxis-wlprobe \
+#     --script scripts/serial-tests/alpha5-wayland-trust.txt
+#
+# The bridge's permissions (alpha5-bridge-deny) cover web apps. A native app
+# talks Wayland directly, and until 2026-11-07 Evo took its word for what it
+# was: the xdg app_id `bloom-overlay` got the overlay's place above every
+# window (undecorated, unlisted), `bloom` the desktop's, and any client could
+# bind wlr-screencopy (the whole screen), data-control (the clipboard, no
+# focus needed) and virtual-keyboard (typing into the focused window, the
+# root Terminal included).
+#
+# Now a client is trusted only if it connected on Evo's own socket (the
+# shell, root-run tools such as this harness's grim, geckoOS-boot's
+# children). Nova starts each app through pyxis-wlctx, which puts it on a
+# wp_security_context_v1 socket carrying its app id; those clients are apps,
+# whose identity is that app id and who are never offered the privileged
+# globals. `asapp` below stands in for Nova's launch: the same helper, the
+# same setpriv drop.
+#
+# pyxis-wlprobe `bind` replays what a hostile client would do: take the
+# registry name a trusted client sees for a privileged global, and bind it
+# unseen. Evo must answer with a protocol error, not a manager.
+#
+# LOOK at target/serial-shots/trust-*.png: trust-grim is root's grim working
+# (a screenshot of the desktop), and trust-claims is the desktop with the
+# fake overlay claim open. Nothing from it may sit over the windows.
+
+export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0
+# Mirrors Nova's launch: root, dropping to the app user inside pyxis-wlctx.
+asapp() { id=$1; shift; pyxis-wlctx --app-id "$id" --uid 1001 --gid 1001 --groups video,render --runtime-dir /run/user/1001 --host-socket /run/user/1000/wayland-0 -- "$@"; }
+gname() { pyxis-wlprobe globals | awk -v i="$1" '$3 == i { print $2 }' | head -1; }
+winlist() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}'; }
+
+echo "=== the system (Evo's own socket) sees the privileged globals ==="
+#!must zwlr_screencopy_manager_v1
+pyxis-wlprobe globals
+SC=$(gname zwlr_screencopy_manager_v1); VK=$(gname zwp_virtual_keyboard_manager_v1); DC=$(gname zwlr_data_control_manager_v1); SX=$(gname wp_security_context_manager_v1); LS=$(gname zwlr_layer_shell_v1); echo "names: sc=$SC vk=$VK dc=$DC sx=$SX ls=$LS"
+#!must TRUSTED-BINDS
+pyxis-wlprobe bind "$SC" zwlr_screencopy_manager_v1 | grep -q BIND-OK && echo TRUSTED-BINDS
+
+echo "=== an app sees none of them ==="
+#!must xdg_wm_base
+#!must-not zwlr_screencopy_manager_v1
+#!must-not zwp_virtual_keyboard_manager_v1
+#!must-not zwlr_data_control_manager_v1
+#!must-not wp_security_context_manager_v1
+#!must-not zwlr_layer_shell_v1
+#!must-not zwp_input_method_manager_v2
+asapp probe.app pyxis-wlprobe globals
+
+echo "=== and can't bind them by guessing the name either ==="
+#!must BIND-REFUSED zwlr_screencopy_manager_v1
+asapp probe.app pyxis-wlprobe bind "$SC" zwlr_screencopy_manager_v1
+#!must BIND-REFUSED zwp_virtual_keyboard_manager_v1
+asapp probe.app pyxis-wlprobe bind "$VK" zwp_virtual_keyboard_manager_v1
+#!must BIND-REFUSED zwlr_data_control_manager_v1
+asapp probe.app pyxis-wlprobe bind "$DC" zwlr_data_control_manager_v1
+#!must BIND-REFUSED wp_security_context_manager_v1
+asapp probe.app pyxis-wlprobe bind "$SX" wp_security_context_manager_v1
+#!must BIND-REFUSED zwlr_layer_shell_v1
+asapp probe.app pyxis-wlprobe bind "$LS" zwlr_layer_shell_v1
+
+echo "=== grim: root's works, an app's does not ==="
+#!shot trust-grim
+echo shot-taken
+#!must APP-GRIM-REFUSED
+asapp probe.app grim /var/lib/pyxis/data/app-grim.png > /dev/null 2>&1; test -s /var/lib/pyxis/data/app-grim.png && echo APP-GRIM-GOT-A-SCREENSHOT || echo APP-GRIM-REFUSED
+rm -f /var/lib/pyxis/data/app-grim.png
+
+echo "=== an app claiming the shell's app ids is an ordinary app window ==="
+# The app claims `bloom-overlay`. As the real overlay it would be above every
+# window, undecorated and out of ListWindows. As what it is, it is listed under
+# the id its launcher gave it, with no trace of the claim.
+asapp probe.claim pyxis-wlprobe toplevel bloom-overlay 14 > /dev/null 2>&1 &
+sleep 5
+winlist | grep -c '"app_id": "probe.claim"'
+#!must CLAIM-LISTED-AS-ITSELF
+winlist | grep -q '"app_id": "probe.claim"' && echo CLAIM-LISTED-AS-ITSELF || echo CLAIM-NOT-LISTED
+#!must-not "app_id": "bloom-overlay"
+winlist
+#!shot trust-claims
+sleep 10
+# appHost bound the window to the app's session, under its own id.
+asapp probe.claim2 pyxis-wlprobe toplevel bloom 10 > /dev/null 2>&1 &
+sleep 5
+#!must "appId": "probe.claim2"
+echo-cli call org.geckoOS.appHost ListSurfaceSessions --interface org.geckoOS.appHost --args '{}'
+#!must-not "appId": "bloom"
+echo-cli call org.geckoOS.appHost ListSurfaceSessions --interface org.geckoOS.appHost --args '{}'
+# Claiming `bloom` did not make it the desktop: the real one still holds that id.
+#!must BLOOM-STILL-THE-DESKTOP
+test "$(winlist | grep -c '"app_id": "bloom"')" = 1 && echo BLOOM-STILL-THE-DESKTOP || echo BLOOM-COUNT-WRONG
+sleep 8
+
+echo "=== the control: the system claiming a shell role keeps it ==="
+# Same claim, from a client on Evo's own socket. It is the shell's overlay as
+# far as Evo can tell, so it stays out of ListWindows.
+pyxis-wlprobe toplevel bloom-overlay 8 > /dev/null 2>&1 &
+sleep 5
+#!must TRUSTED-CLAIM-HIDDEN
+winlist | grep -c '"app_id": "bloom-overlay"' | grep -q '^0$' && echo TRUSTED-CLAIM-HIDDEN || echo TRUSTED-CLAIM-LISTED
+sleep 5
+
+echo "=== a launched app is on its own socket, and it is tidied away ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+# Nova starts apps as root through pyxis-wlctx, whose sockets live under /run/pyxis/wl
+# (as do the asapp helper's).
+VPID=$(pgrep -f -- '--pyxis-app files' | tail -1); echo "vela pid=$VPID"
+#!must WAYLAND_DISPLAY=/run/pyxis/wl/files-
+tr '\0' '\n' < /proc/$VPID/environ | grep WAYLAND_DISPLAY
+#!must SOCKET-MADE
+ls /run/pyxis/wl/ | grep -q '^files-' && echo SOCKET-MADE
+#!must "app_id": "files"
+winlist
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' > /dev/null
+sleep 8
+#!must SOCKET-TIDIED
+ls /run/pyxis/wl/ | grep -q '^files-' && echo SOCKET-LEFT || echo SOCKET-TIDIED
+
+echo "=== the app lives and dies with its helper ==="
+# appHost records the helper's pid as the session's; a kill aimed at it must
+# not leave the app running on a socket nobody owns or tidies.
+asapp probe.pd sleep 300 > /dev/null 2>&1 &
+sleep 3
+HPID=$(pgrep -f -- '--app-id probe.pd' | head -1); echo "helper pid=$HPID"
+#!must APP-RUNNING
+pgrep -x sleep > /dev/null && echo APP-RUNNING
+kill -9 $HPID; sleep 2
+#!must APP-DIED-WITH-HELPER
+pgrep -x sleep > /dev/null && echo APP-OUTLIVED-HELPER || echo APP-DIED-WITH-HELPER
+# The directory a SIGKILLed helper left is swept by the next launch.
+#!must SWEPT
+asapp probe.sweep true; ls /run/pyxis/wl/ | grep -q probe.pd && echo STALE-LEFT || echo SWEPT
+
+echo "=== Evo is still up, and the desktop still has the keyboard ==="
+#!must EVO-ALIVE
+pidof evo > /dev/null && echo EVO-ALIVE
+#!shot trust-end

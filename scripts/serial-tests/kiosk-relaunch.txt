@@ -98,13 +98,24 @@ echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"app
 #!must Removed window from workspace
 grep -a 'Removed window from workspace' /var/log/evo.log | tail -3
 
-# The count is the regression guard. Bloom + one app is 2; with the leak it
-# reached 6 over three launches. Anything above 3 means windows are piling up.
+# The regression guard counts APP windows: what evo.ListWindows reports, minus
+# the shell. ListWindows leaves the overlay out and Bloom (app id `bloom`) is
+# the desktop, so what remains is the apps. This used to read the workspace's
+# "total windows" log line and cap it at 3, a number that predates the overlay
+# and also counted the short-lived about:blank vela window each launch maps
+# just before the app's own. With the leak the app count climbed 1,2,3,... over
+# three launches of one app; here it must match what is actually running.
+#
+# files (launch 2, never closed) and terminal (cycle C) are the two apps left
+# running, so exactly two app windows may exist. A stray one (a dead
+# browser-chrome window, an unstamped vela-default) makes it three.
 # Sentinels under 8 characters: the stripper ate WINDOW-COUNT-SANE (17) and
 # this assertion failed on every passing run until 2026-09-25.
+appwins() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep '"app_id"' | grep -vc '"bloom'; }
 #!must SANE
-test $(grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).*/\1/' | sort -n | tail -1) -le 3 && echo SANE || echo LEAK
-grep -a 'total windows:' /var/log/evo.log | sed -E 's/.*total windows: ([0-9]+).*/count=\1/' | tr '\n' ' '
+n=$(appwins); [ "$n" -le 2 ] && echo SANE || echo "LEAK: $n app windows"
+echo "app windows: $(appwins)"
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep '"app_id"'
 
 # And no unstamped leftovers should still be mapped at the end.
 # Assert the count itself rather than a sentinel -- ONLY-EXPECTED-WINDOWS (21

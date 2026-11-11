@@ -1,0 +1,168 @@
+# Alpha 5: the Daylight wallpaper (docs/internal/pyxis-wallpaper-settings-plan.md).
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-wallpaper.txt
+#
+# Bloom's desktop draws Daylight, a flowing gradient that follows the sun
+# (packages/app-sdk/src/wallpaper/), and logs to /var/log/vela.log through
+# dump(): `PYXIS-WALLPAPER state=flowing|paused|still backend=webgl|css ...`
+# on every change of state, and `PYXIS-WALLPAPER-SETTING wallpaper=<id>
+# motion=<m> pinned=<min|none>` on every change of what it shows. Settings
+# reach it as Echo's SettingChanged signal, so every step here that sets a
+# key with echo-cli and waits for the desktop to say so also proves that
+# signal crosses the bridge (BRIDGE_SIGNALS settings.SettingChanged, new in
+# this vela). On an older vela those waits time out: SIGNAL-MISSED.
+#
+# Movement is checked in the guest: grim grabs the same patch of desktop
+# twice, seconds apart. Flowing, the two differ; still, or pinned and still,
+# they match byte for byte (the grain layer is static).
+#
+# The image's zone is UTC, which has no place, so the sun is the fixed day
+# (sunrise 06:30, sunset 18:30, peak 50 degrees): the pinned times below are
+# chosen against that.
+#
+# LOOK at target/serial-shots/wallpaper-*.png: night is deep navy with a teal
+# glow, dawn coral and lilac, midday bright azure, golden evening amber into
+# magenta, dusk rose and violet; wallpaper-sunset is the Sunset palette.
+
+st() { grep -a "PYXIS-WALLPAPER state=" /var/log/vela.log | tail -1; }
+# Wait up to $2 s for vela.log to have a line matching $1, then say $3 or SIGNAL-MISSED.
+waitlog() { i=0; while [ $i -lt $(($2 * 2)) ]; do grep -aq -- "$1" /var/log/vela.log && { echo "$3"; return 0; }; sleep 0.5; i=$((i + 1)); done; echo "SIGNAL-MISSED: no '$1' in vela.log after $2 s"; return 1; }
+# Wait for the desktop's newest state line to read $1.
+waitst() { i=0; while [ $i -lt $(($2 * 2)) ]; do st | grep -q "state=$1" && { echo "STATE-$1"; return 0; }; sleep 0.5; i=$((i + 1)); done; echo "STATE-NOT-$1: $(st)"; return 1; }
+sset() { echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args "{\"key\":\"$1\",\"value\":$2}" | grep -c '"success": true'; }
+# One grab of a patch of desktop, clear of the bar, the dock and app windows.
+grab() { grim -g "60,120 360x260" -t ppm - 2>/dev/null | md5sum | cut -c1-12; }
+# Two grabs $1 s apart: MOVED or STEADY.
+moved() { a=$(grab); sleep $1; b=$(grab); test "$a" != "$b" && echo "MOVED $a $b" || echo "STEADY $a"; }
+geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+# CPU of Evo and every geckouser process (the shell's vela), in % of one core over $1 s.
+ticks() { t=0; for d in /proc/[0-9]*; do u=$(awk '/^Uid:/ { print $2 }' $d/status 2>/dev/null); c=$(cat $d/comm 2>/dev/null); if [ "$u" = 1000 ] || [ "$c" = evo ]; then s=$(awk '{ sub(/.*\) /, ""); print $12 + $13 }' $d/stat 2>/dev/null); t=$((t + ${s:-0})); fi; done; echo $t; }
+cpu() { a=$(ticks); sleep $1; b=$(ticks); awk -v a=$a -v b=$b -v s=$1 'BEGIN { printf "%.1f\n", (b - a) / s }'; }
+
+echo "=== the desktop draws Daylight, flowing, through WebGL ==="
+sleep 20
+#!must STATE-flowing
+waitst flowing 40
+#!must backend=webgl
+st
+#!must WALLPAPER-DAYLIGHT
+waitlog "PYXIS-WALLPAPER-SETTING wallpaper=daylight" 5 WALLPAPER-DAYLIGHT
+#!must MOVED
+moved 8
+#!must-not uniform
+#!shot wallpaper-now
+
+echo "=== Daylight follows the time: five pinned times (and the signal reaches the shell) ==="
+#!must 1
+sset pyxis.wallpaper.motion '"still"'
+#!must SIGNAL-OK
+waitlog "motion=still pinned=none" 10 SIGNAL-OK
+#!must STATE-still
+waitst still 10
+#!must PINNED-1380
+sset pyxis.wallpaper.pinnedTime 1380 > /dev/null; waitlog "pinned=1380" 10 PINNED-1380; sleep 2
+#!must-not uniform
+#!shot wallpaper-night
+#!must PINNED-390
+sset pyxis.wallpaper.pinnedTime 390 > /dev/null; waitlog "pinned=390" 10 PINNED-390; sleep 2
+#!must-not uniform
+#!shot wallpaper-dawn
+#!must PINNED-720
+sset pyxis.wallpaper.pinnedTime 720 > /dev/null; waitlog "pinned=720" 10 PINNED-720; sleep 2
+#!must-not uniform
+#!shot wallpaper-midday
+#!must PINNED-1050
+sset pyxis.wallpaper.pinnedTime 1050 > /dev/null; waitlog "pinned=1050" 10 PINNED-1050; sleep 2
+#!must-not uniform
+#!shot wallpaper-golden-evening
+#!must PINNED-1110
+sset pyxis.wallpaper.pinnedTime 1110 > /dev/null; waitlog "pinned=1110" 10 PINNED-1110; sleep 2
+#!must-not uniform
+#!shot wallpaper-dusk
+# Pinned and still: nothing moves at all.
+#!must STEADY
+moved 8
+# Night and midday are different pictures (the palette really follows the time).
+sset pyxis.wallpaper.pinnedTime 1380 > /dev/null; sleep 3; N=$(grab); sset pyxis.wallpaper.pinnedTime 720 > /dev/null; sleep 3; M=$(grab); echo "night=$N midday=$M"
+#!must DAY-DIFFERS
+test "$N" != "$M" && echo DAY-DIFFERS || echo "SAME-PICTURE night and midday"
+
+echo "=== flowing again; a refused value changes nothing ==="
+#!must 1
+sset pyxis.wallpaper.motion '"flow"'
+#!must STATE-flowing
+waitst flowing 10
+#!must MOVED
+moved 8
+# Echo validates: a bad value is refused and the desktop keeps its wallpaper.
+#!must must be one of
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.wallpaper","value":"plaid"}' 2>&1 | grep -o 'must be one of[^"]*' | head -1
+#!must-not wallpaper=plaid
+grep -a "PYXIS-WALLPAPER-SETTING" /var/log/vela.log | tail -2
+
+echo "=== another wallpaper: Sunset flows too ==="
+#!must WALLPAPER-SUNSET
+sset pyxis.wallpaper '"sunset"' > /dev/null; waitlog "wallpaper=sunset" 10 WALLPAPER-SUNSET
+sleep 2
+#!must MOVED
+moved 8
+#!must-not uniform
+#!shot wallpaper-sunset
+sset pyxis.wallpaper '"daylight"' > /dev/null; sset pyxis.wallpaper.pinnedTime null > /dev/null; sleep 2; grep -a "PYXIS-WALLPAPER-SETTING" /var/log/vela.log | tail -1
+
+echo "=== reduced animations: the wallpaper stands still ==="
+#!must 1
+sset pyxis.animations '"reduced"'
+#!must STATE-still
+waitst still 10
+#!must STEADY
+moved 8
+#!must 1
+sset pyxis.animations '"full"'
+#!must STATE-flowing
+waitst flowing 10
+
+echo "=== the cost, idle: flowing against still (budget: 8 points of one core) ==="
+F1=$(cpu 20); F2=$(cpu 20); echo "flowing: $F1 $F2"
+sset pyxis.wallpaper.motion '"still"' > /dev/null; waitst still 10 > /dev/null; sleep 3
+S1=$(cpu 20); S2=$(cpu 20); echo "still: $S1 $S2"
+sset pyxis.wallpaper.motion '"flow"' > /dev/null; waitst flowing 10 > /dev/null
+#!must COST-OK
+awk -v f1=$F1 -v f2=$F2 -v s1=$S1 -v s2=$S2 'BEGIN { f = (f1 < f2 ? f1 : f2); s = (s1 < s2 ? s1 : s2); d = f - s; printf "COST delta=%.1f%% (flowing %.1f, still %.1f) %s\n", d, f, s, (d <= 8 ? "COST-OK" : "COST-OVER") }'
+
+echo "=== under a maximized app the wallpaper stops drawing, and resumes after ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 18
+read FX FY FW FH FID <<< "$(geom files)"; echo "files: $FX,$FY ${FW}x$FH id=$FID"
+#!must STATE-paused
+waitst paused 15
+st
+#!must-not uniform
+#!shot wallpaper-under-maximized
+P1=$(cpu 20); echo "maximized, paused: $P1"
+# Restored, Files fits the work area at about 1152x680, leaving about a
+# quarter of the desktop: it flows again, and once the frames are re-read the
+# desktop logs PYXIS-WALLPAPER-EXPOSURE with the window's real frame (the
+# state line is written when the state changes, before sizes are re-read).
+EX0=$(grep -ac "PYXIS-WALLPAPER-EXPOSURE" /var/log/vela.log); echo "exposure lines so far: $EX0"
+#!must 1
+echo-cli call org.geckoOS.evo UnmaximizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$FID}" | grep -c '"success": true'
+sleep 4
+read FX FY FW FH FID <<< "$(geom files)"; echo "files restored: $FX,$FY ${FW}x$FH"
+#!must STATE-flowing
+waitst flowing 15
+sleep 3
+grep -a "PYXIS-WALLPAPER-EXPOSURE" /var/log/vela.log | tail -3
+#!must EXPOSURE-COUNTS-WINDOW
+grep -a "PYXIS-WALLPAPER-EXPOSURE" /var/log/vela.log | tail -n +$((EX0 + 1)) | tail -1 | awk '{ split($2, e, "="); split($3, w, "="); print (e[2] >= 0.18 && e[2] <= 0.45 && w[2] == 1 ? "EXPOSURE-COUNTS-WINDOW " : "EXPOSURE-WRONG ") $0 }'
+#!must 1
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -c success
+#!must STATE-flowing
+waitst flowing 20
+
+echo "=== nothing refused on the way ==="
+#!must-not capability denied
+grep -a "capability denied" /var/log/vela.log | grep -i "settings\|time\|evo" | head -5
+grep -a "PYXIS-WALLPAPER" /var/log/vela.log | tail -12

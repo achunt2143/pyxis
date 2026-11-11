@@ -1,0 +1,76 @@
+# Alpha 5: appHost's surface bindings come back after echo-daemon restarts.
+#
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/pyxis-wlctx:/usr/bin/pyxis-wlctx \
+#     --script scripts/serial-tests/alpha5-echo-restart.txt
+#
+# Evo binds each window to its appHost session once, when its app id first
+# appears. A restarted daemon's appHost starts empty, and Evo used to bind
+# nothing again, so every open window lost its session mapping and
+# nova.Launch of a running app started a second instance instead of raising.
+# Evo now replays its binds once its broker has reconnected and re-registered.
+#
+# Needs the boot supervisor (`supervise_daemon echo` in create-rootfs.sh) to
+# bring echo-daemon back: an image built before 2026-11-07 does not have it,
+# and the suite says SUPERVISOR-MISSING and stops asserting.
+#
+# After the restart the window's session is a synthesized foreign one (the
+# daemon that launched the app is gone), so it is matched by the client's pid.
+
+# Surfaces appHost holds, as one line of window ids ("" if none).
+surfaces() { echo-cli call org.geckoOS.appHost ListSurfaceSessions --interface org.geckoOS.appHost --args '{}' | tr -d ' \n' | grep -o '"surfaces":\[[0-9,]*\]' | tr '\n' ' '; }
+# How many windows Evo reports for app $1.
+count() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -c "\"app_id\": *\"$1\""; }
+
+# Stand-in for the app-uid split on an image built before it (copied from alpha5-app-uid.txt).
+[ $REBUILT = yes ] || { grep -q '^pyxisapp:' /etc/passwd || echo 'pyxisapp:x:1001:1001:Pyxis app user:/home/pyxisapp:/usr/sbin/nologin' >> /etc/passwd; grep -q '^pyxisapp:' /etc/group || echo 'pyxisapp:x:1001:' >> /etc/group; grep -q '^pyxisapp:' /etc/shadow || echo 'pyxisapp:*:20000:0:99999:7:::' >> /etc/shadow; chmod 711 /run/user/1000; chown 1000:1000 /run/user/1000/wayland-0; chmod 600 /run/user/1000/wayland-0; chmod 755 /run/user/1000/geckoOS; mkdir -p /home/pyxisapp/.cache/fontconfig /home/pyxisapp/.config; chown -R 1001:1001 /home/pyxisapp; chmod 700 /home/pyxisapp; [ -S /run/pyxis/pulse/native ] || { mkdir -p /run/pyxis/pulse /etc/pipewire/pipewire-pulse.conf.d; chown 1000:1000 /run/pyxis/pulse; chmod 755 /run/pyxis/pulse; printf 'pulse.properties = {\n    server.address = [\n        "unix:native"\n        "unix:/run/pyxis/pulse/native"\n    ]\n}\n' > /etc/pipewire/pipewire-pulse.conf.d/10-pyxis-apps.conf; pkill -x pipewire-pulse; sleep 1; setsid setpriv --reuid=1000 --regid=1000 --groups audio env XDG_RUNTIME_DIR=/run/user/1000 HOME=/home/geckouser /usr/bin/pipewire-pulse > /var/log/pipewire-pulse.log 2>&1 < /dev/null & sleep 3; }; }
+
+echo "=== launch an app and wait for its window to bind ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 20
+BEFORE="$(surfaces)"; echo "bound before: $BEFORE"
+#!must BOUND-BEFORE-OK
+case "$BEFORE" in *'"surfaces":[1'*|*'"surfaces":[2'*|*'"surfaces":[3'*|*'"surfaces":[4'*|*'"surfaces":[5'*|*'"surfaces":[6'*|*'"surfaces":[7'*|*'"surfaces":[8'*|*'"surfaces":[9'*) echo BOUND-BEFORE-OK;; *) echo NOT-BOUND-BEFORE;; esac
+WINS="$(count files)"; echo "files windows: $WINS"
+
+echo "=== kill echo-daemon; the supervisor brings it back ==="
+OLD="$(pidof echo-daemon)"; echo "old pid: $OLD"
+# Keep the daemon's own environment, for a restart by hand (see below).
+tr '\0' '\n' < /proc/$OLD/environ > /tmp/echo.env
+kill -9 $OLD
+sleep 5
+NEW="$(pidof echo-daemon)"
+# One line each: the harness feeds the guest shell a line at a time.
+restart_by_hand() { setsid env -i $(cat /tmp/echo.env) /usr/bin/echo-daemon >> /var/log/echo.log 2>&1 < /dev/null & i=0; while [ ! -S /run/user/1000/geckoOS/echo.sock ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done; sleep 1; chown 1000:1000 /run/user/1000/geckoOS/echo.sock; }
+# An image from before supervise_daemon has nothing to respawn it: start it the way geckoOS-boot does (own session, no tty, the old environment, socket handed to geckouser).
+if [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then echo SUPERVISOR-OK; else restart_by_hand; echo "SUPERVISOR-MISSING (restarted by hand)"; fi
+sleep 8
+NEW="$(pidof echo-daemon)"; echo "new pid: $NEW"
+#!must RESTARTED
+test -n "$NEW" -a "$NEW" != "$OLD" && echo RESTARTED || echo NOT-RESTARTED
+
+echo "=== Evo's broker reconnected and re-registered ==="
+#!must evo
+echo-cli call org.geckoOS.system listServices --interface org.geckoOS.system --args '{}' | grep -o 'org.geckoOS.evo'
+# Replay is queued on the first compositor loop after the reconnect.
+sleep 5
+
+echo "=== appHost shows the window bound again ==="
+AFTER="$(surfaces)"; echo "bound after: $AFTER"
+#!must BOUND-AFTER-OK
+test -n "$AFTER" && echo BOUND-AFTER-OK || echo NOT-BOUND-AFTER
+#!must SAME-SURFACE
+test "$AFTER" = "$BEFORE" && echo SAME-SURFACE || echo SURFACE-CHANGED
+
+echo "=== launching the app raises it instead of starting a second instance ==="
+#!must raised running instance
+pyxis-appctl launch files
+sleep 5
+NOW="$(count files)"; echo "files windows now: $NOW (was $WINS)"
+#!must NO-SECOND-WINDOW
+test "$NOW" = "$WINS" && echo NO-SECOND-WINDOW || echo SECOND-WINDOW
+#!shot echo-restart-after

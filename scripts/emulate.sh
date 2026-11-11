@@ -117,6 +117,15 @@ main() {
         log_info "Initialized UEFI NVRAM from $OVMF_VARS_TEMPLATE"
     fi
 
+    # The disk below carries bootindex=0, and that is load-bearing because the
+    # NVRAM persists. OVMF remembers the disk by its PCI slot, and slots are
+    # handed out in device order. When alpha 5 added the sound card, the disk
+    # moved from slot 4 to slot 5. OVMF then re-added it at the END of the
+    # saved boot order, behind PXE, HTTP boot and the EFI shell: the VM showed
+    # "Start PXE over IPv4" and never reached GRUB. bootindex passes QEMU's
+    # boot order to the firmware on every boot, so a saved NVRAM can't bury
+    # the disk again, whatever devices are added later.
+
     log_success "OVMF CODE: $OVMF_CODE"
     log_success "OVMF VARS: $OVMF_VARS (persistent; QEMU_RESET_NVRAM=1 to reset)"
 
@@ -179,7 +188,8 @@ main() {
         ${KVM_OPTS} \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$OVMF_VARS" \
-        -drive file="${IMAGE_FILE}",format=raw,media=disk,if=virtio \
+        -drive file="${IMAGE_FILE}",format=raw,media=disk,if=none,id=disk0 \
+        -device virtio-blk-pci,drive=disk0,bootindex=0 \
         -vga none \
         -device "${VGA_DEVICE}",xres="${QEMU_XRES}",yres="${QEMU_YRES}",edid=on,max_outputs=1 \
         -display "${DISPLAY_OPTS}" \

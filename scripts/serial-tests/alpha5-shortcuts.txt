@@ -1,0 +1,255 @@
+# Alpha 5: Evo's global shortcuts. Alt+Tab and Super+Q work whichever app has
+# the keyboard; the quit keys are gone.
+#
+#   cargo build --release -p geckoOS-evo
+#   scripts/serial-test.py --memory 4096 --push target/release/evo:/usr/bin/evo --script scripts/serial-tests/alpha5-shortcuts.txt
+#
+# Anvil's keybindings quit the compositor on Super+Q and Ctrl+Alt+Backspace,
+# which ends the session (nothing restarts Evo), and ran weston-terminal as
+# root on Super+Enter. Super+Q now asks the focused app window to close, as
+# the titlebar X does. Alt+Tab cycles app windows by recency in Evo itself,
+# restoring minimized ones.
+#
+# Each #!key is a whole chord, so Alt is released between presses: every
+# Alt+Tab here is a fresh walk, and the one step it takes is "the most
+# recently used other window". Released inside 150 ms that is a quick tap: Evo
+# switches at once and the shell never shows its switcher. The switcher
+# sections below hold Alt (#!keydown alt ... #!keyup alt) and read Evo's own
+# record of what it told the shell (GetSwitcherState), so they pass whether or
+# not the vela on the image has the bridge entry that lets Bloom hear
+# SwitcherChanged: that half is alpha5-shortcuts-shell.
+#
+# The Super-tap/Super+Tab/Super+Space/Super+D signals (ShortcutTriggered)
+# reach Bloom only through the vela bridge, which needs a vela rebuilt with
+# the patched PyxisBridgeParent; this suite does not cover them.
+
+focused() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(focused|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["focused"], v["window_id"]; exit } on = 0 }'; }
+
+# Alt+Tab's state, as Evo reports it. swc: how many of a phase went out;
+# sws: one scalar field; swo: the order, as "id,id,id" (first = where the walk started).
+sw() { echo-cli call org.geckoOS.evo GetSwitcherState --interface org.geckoOS.evo --args '{}' | tr -d ' \n'; }
+swc() { sw | grep -o "\"$1\":[0-9]*" | head -1 | cut -d: -f2; }
+sws() { sw | grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2 | tr -d '"'; }
+swo() { sw | grep -o '"order":\[[^]]*\]' | tr -dc '0-9,'; }
+nth() { echo "$1" | cut -d, -f"$2"; }
+fid() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk '/"(focused|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (v["focused"] == "true") { print v["window_id"]; exit } v["focused"] = "" }'; }
+wvis() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v id="$1" '/"(visible|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (v["window_id"] == id) { print v["visible"]; exit } }'; }
+orects() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}'; }
+
+echo "=== two apps; the newer one (Notes) has the keyboard ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4 /var/lib/pyxis/profiles/notes/xulstore.json /var/lib/pyxis/profiles/notes/sessionstore.jsonlz4
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 15
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+sleep 15
+read FF FID <<< "$(focused files)"; read NF NID <<< "$(focused notes)"; echo "files focused=$FF id=$FID; notes focused=$NF id=$NID"
+#!must NOTES-FOCUSED
+test "$NF" = true && echo NOTES-FOCUSED || echo NOTES-NOT-FOCUSED
+
+echo "=== Alt+Tab goes to Files, and back ==="
+#!key alt tab
+sleep 2
+read FF FID <<< "$(focused files)"; read NF NID <<< "$(focused notes)"; echo "files focused=$FF; notes focused=$NF"
+#!must TAB-TO-FILES
+test "$FF" = true -a "$NF" = false && echo TAB-TO-FILES || echo TAB-FAILED
+#!shot shortcuts-alt-tab
+#!key alt tab
+sleep 2
+read FF FID <<< "$(focused files)"; read NF NID <<< "$(focused notes)"; echo "files focused=$FF; notes focused=$NF"
+#!must TAB-BACK-TO-NOTES
+test "$NF" = true -a "$FF" = false && echo TAB-BACK-TO-NOTES || echo TAB-BACK-FAILED
+
+echo "=== Alt+Tab restores a minimized window ==="
+echo-cli call org.geckoOS.evo MinimizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$FID}" | grep -c '"success": true'
+sleep 2
+#!key alt tab
+sleep 3
+read FF FID <<< "$(focused files)"; echo "files focused=$FF"
+#!must TAB-RESTORED
+test "$FF" = true && echo TAB-RESTORED || echo TAB-NOT-RESTORED
+
+echo "=== Shift+Alt+Tab walks the other way ==="
+#!key alt shift tab
+sleep 2
+read NF NID <<< "$(focused notes)"; echo "notes focused=$NF"
+#!must SHIFT-TAB
+test "$NF" = true && echo SHIFT-TAB || echo SHIFT-TAB-FAILED
+
+echo "=== a third app, and Alt+Tab's switcher ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"tasks"}' | grep -E 'sessionId|Error'
+sleep 15
+#!must SWITCHER-IDLE
+test "$(sws active)" = false -a "$(sws shown)" = false && echo SWITCHER-IDLE || echo "SWITCHER-NOT-IDLE $(sw)"
+
+echo "=== a quick tap switches at once and the switcher never opens ==="
+START=$(fid); O0=$(swc open); C0=$(swc commit)
+#!key alt tab
+sleep 2
+#!must QUICK-TAP-NO-OPEN
+test "$(swc open)" = "$O0" -a "$(swc commit)" -gt "$C0" -a "$(sws lastPhase)" = commit && echo QUICK-TAP-NO-OPEN || echo "QUICK-TAP-OPENED open=$(swc open)/$O0 commit=$(swc commit)/$C0"
+#!must QUICK-TAP-SWITCHED
+test -n "$START" -a "$(fid)" != "$START" && echo QUICK-TAP-SWITCHED || echo "QUICK-TAP-DID-NOT-SWITCH start=$START now=$(fid)"
+
+echo "=== Alt held: the switcher opens over the app and does not move focus ==="
+START=$(fid); O0=$(swc open); S0=$(swc step); C0=$(swc commit)
+#!keydown alt
+#!key tab
+sleep 1
+ORDER=$(swo); echo "order=$ORDER selected=$(sws selected) shown=$(sws shown)"
+#!must SWITCHER-OPENED
+test "$(sws active)" = true -a "$(sws shown)" = true -a "$(swc open)" -gt "$O0" -a "$(sws lastPhase)" = open && echo SWITCHER-OPENED || echo "SWITCHER-NOT-OPENED $(sw)"
+#!must ORDER-STARTS-AT-FOCUSED
+test "$(nth "$ORDER" 1)" = "$START" -a "$(echo "$ORDER" | tr ',' '\n' | wc -l)" -ge 3 && echo ORDER-STARTS-AT-FOCUSED || echo "BAD-ORDER order=$ORDER start=$START"
+#!must FIRST-TAB-SELECTS-PREVIOUS
+test "$(sws selected)" = "$(nth "$ORDER" 2)" && echo FIRST-TAB-SELECTS-PREVIOUS || echo "WRONG-SELECTION $(sws selected)"
+#!must FOCUS-UNMOVED
+test "$(fid)" = "$START" && echo FOCUS-UNMOVED || echo "FOCUS-MOVED now=$(fid) start=$START"
+#!shot shortcuts-switcher-open
+
+echo "=== a step moves the selection, Shift steps back ==="
+#!key tab
+sleep 1
+#!must STEP-FORWARD
+test "$(sws selected)" = "$(nth "$ORDER" 3)" -a "$(swc step)" -gt "$S0" && echo STEP-FORWARD || echo "STEP-FAILED selected=$(sws selected) steps=$(swc step)"
+#!shot shortcuts-switcher-step
+#!key shift tab
+sleep 1
+#!must STEP-BACK
+test "$(sws selected)" = "$(nth "$ORDER" 2)" && echo STEP-BACK || echo "STEP-BACK-FAILED selected=$(sws selected)"
+#!must STILL-NO-FOCUS-MOVE
+test "$(fid)" = "$START" && echo STILL-NO-FOCUS-MOVE || echo "FOCUS-MOVED now=$(fid)"
+
+echo "=== releasing Alt focuses the chosen window ==="
+CHOSEN=$(nth "$ORDER" 2); LAST=$(nth "$ORDER" 3)
+#!keyup alt
+sleep 2
+#!must RELEASE-COMMITTED
+test "$(fid)" = "$CHOSEN" -a "$(sws active)" = false -a "$(sws shown)" = false -a "$(sws lastPhase)" = commit -a "$(sws lastCommit)" = "$CHOSEN" -a "$(swc commit)" -gt "$C0" && echo RELEASE-COMMITTED || echo "RELEASE-FAILED focus=$(fid) chosen=$CHOSEN $(sw)"
+
+echo "=== the walk includes a minimized window, and release restores it ==="
+echo-cli call org.geckoOS.evo MinimizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$LAST}" | grep -c '"success": true'
+sleep 2
+#!must LAST-MINIMIZED
+test "$(wvis "$LAST")" = false && echo LAST-MINIMIZED || echo "LAST-NOT-MINIMIZED visible=$(wvis "$LAST")"
+START=$(fid)
+#!keydown alt
+#!key tab
+sleep 1
+#!key tab
+sleep 1
+ORDER=$(swo); echo "order=$ORDER selected=$(sws selected) (minimized window is $LAST)"
+#!must SELECTED-IS-THE-MINIMIZED-ONE
+test "$(sws selected)" = "$LAST" && echo SELECTED-IS-THE-MINIMIZED-ONE || echo "WRONG-SELECTION selected=$(sws selected)"
+#!must MINIMIZED-STAYS-DOWN-WHILE-WALKING
+test "$(wvis "$LAST")" = false && echo MINIMIZED-STAYS-DOWN-WHILE-WALKING || echo "RESTORED-TOO-EARLY"
+#!keyup alt
+sleep 3
+#!must RESTORED-ON-RELEASE
+test "$(fid)" = "$LAST" -a "$(wvis "$LAST")" = true && echo RESTORED-ON-RELEASE || echo "NOT-RESTORED focus=$(fid) visible=$(wvis "$LAST")"
+
+echo "=== Escape cancels and leaves focus where it was ==="
+START=$(fid); X0=$(swc cancel); C0=$(swc commit)
+#!keydown alt
+#!key tab
+sleep 1
+#!must OPEN-BEFORE-ESCAPE
+test "$(sws shown)" = true && echo OPEN-BEFORE-ESCAPE || echo "NOT-OPEN $(sw)"
+#!key esc
+sleep 1
+#!must CANCELLED
+test "$(sws active)" = false -a "$(sws shown)" = false -a "$(sws lastPhase)" = cancel -a "$(swc cancel)" -gt "$X0" && echo CANCELLED || echo "CANCEL-FAILED $(sw)"
+#!keyup alt
+sleep 1
+#!must FOCUS-UNCHANGED-BY-CANCEL
+test "$(fid)" = "$START" -a "$(swc commit)" = "$C0" && echo FOCUS-UNCHANGED-BY-CANCEL || echo "CANCEL-MOVED-FOCUS focus=$(fid) start=$START commits=$(swc commit)/$C0"
+
+echo "=== a card clicked in the switcher is its commit (the focus call is the click) ==="
+START=$(fid); C0=$(swc commit)
+#!keydown alt
+#!key tab
+sleep 1
+ORDER=$(swo); PICK=$(nth "$ORDER" 3)
+echo-cli call org.geckoOS.evo FocusWindow --interface org.geckoOS.evo --args "{\"window_id\":$PICK}" | grep -c '"success": true'
+sleep 1
+#!must CLICK-COMMITS
+test "$(fid)" = "$PICK" -a "$(sws active)" = false -a "$(sws lastCommit)" = "$PICK" -a "$(swc commit)" -gt "$C0" && echo CLICK-COMMITS || echo "CLICK-FAILED focus=$(fid) pick=$PICK $(sw)"
+#!keyup alt
+sleep 1
+#!must RELEASE-AFTER-CLICK-KEEPS-IT
+test "$(fid)" = "$PICK" -a "$(swc commit)" -eq "$((C0 + 1))" && echo RELEASE-AFTER-CLICK-KEEPS-IT || echo "RELEASE-OVERRODE focus=$(fid) pick=$PICK commits=$(swc commit)"
+
+echo "=== with no overlay alive Evo cycles directly, as before ==="
+# Kill the shell's vela (the overlay lives in its process). It is supervised
+# and comes back; until then there is nothing to draw a switcher, so each
+# step must focus a window, and say nothing. The pattern is anchored: the
+# supervisor's own command line carries the same arguments, and killing it
+# would end the respawn.
+# The supervisor is stopped first and continued after the direct checks. It
+# used to be left running, and it had the shell back within a couple of
+# seconds, sometimes before the first Tab: Evo then walked in shell mode and
+# DIRECT-STEP-FOCUSED-AN-APP failed now and then. Stopped, it can't reap the
+# dead vela or start another until SIGCONT.
+SUP=$(pgrep -f 'supervise vela ' | head -1); echo "supervisor=${SUP:-none}"
+test -n "$SUP" && kill -STOP "$SUP"
+pkill -9 -f '^/usr/lib/pyxis-gecko/vela .*--pyxis-overlay'
+for i in $(seq 1 20); do test -z "$(orects)" && break; sleep 0.5; done
+#!must OVERLAY-GONE
+test -z "$(orects)" && echo OVERLAY-GONE || echo "OVERLAY-STILL-THERE $(orects)"
+O0=$(swc open); C0=$(swc commit); S0=$(swc step)
+appfocus() { for a in files notes tasks; do set -- $(focused $a); test "$1" = true && echo $a && return; done; }
+#!keydown alt
+#!key tab
+sleep 1
+#!must DIRECT-STEP-FOCUSED-AN-APP
+test -n "$(appfocus)" && echo DIRECT-STEP-FOCUSED-AN-APP || echo "DIRECT-STEP-DID-NOT-FOCUS an app (fid=$(fid))"
+#!must DIRECT-SAYS-NOTHING
+test "$(swc open)" = "$O0" -a "$(swc commit)" = "$C0" -a "$(swc step)" = "$S0" && echo DIRECT-SAYS-NOTHING || echo "DIRECT-SIGNALLED (overlay was alive, or direct mode is broken) $(sw)"
+SECOND=$(fid)
+#!key tab
+sleep 1
+#!must DIRECT-SECOND-STEP
+test "$(fid)" != "$SECOND" && echo DIRECT-SECOND-STEP || echo "DIRECT-SECOND-STEP-STUCK"
+#!keyup alt
+sleep 1
+#!must DIRECT-RELEASE-QUIET
+test "$(swc commit)" = "$C0" -a "$(sws active)" = false && echo DIRECT-RELEASE-QUIET || echo "DIRECT-RELEASE-SIGNALLED $(sw)"
+test -n "$SUP" && kill -CONT "$SUP"
+echo "=== wait for the shell to come back ==="
+for i in $(seq 1 40); do test -n "$(orects)" && break; sleep 2; done
+#!must OVERLAY-BACK
+test -n "$(orects)" && echo OVERLAY-BACK || echo OVERLAY-NEVER-CAME-BACK
+
+echo "=== the old quit keys do nothing ==="
+#!key ctrl alt backspace
+sleep 2
+#!must EVO-ALIVE
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -q '"windows"' && echo EVO-ALIVE || echo EVO-GONE
+
+echo "=== Super+Q closes the focused app window, not the compositor ==="
+read NF NID <<< "$(focused notes)"; echo "notes focused=$NF id=$NID"
+# The switcher sections moved focus about: put it on Notes, which is what dies.
+echo-cli call org.geckoOS.evo FocusWindow --interface org.geckoOS.evo --args "{\"window_id\":$NID}" | grep -c '"success": true'
+sleep 2
+#!key meta_l q
+sleep 5
+read NF2 NID2 <<< "$(focused notes)"
+#!must NOTES-CLOSED
+test -z "$NID2" && echo NOTES-CLOSED || echo "NOTES-STILL-OPEN id=$NID2"
+read FF FID <<< "$(focused files)"
+#!must FILES-SURVIVES
+test -n "$FID" && echo FILES-SURVIVES || echo FILES-GONE
+#!must EVO-STILL-ALIVE
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -q '"windows"' && echo EVO-STILL-ALIVE || echo EVO-GONE
+#!shot shortcuts-after-close
+
+echo "=== Super+Q with the desktop focused closes nothing ==="
+# Close Files via its window, leaving only Bloom, then Super+Q.
+echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$FID}" | grep -c '"success": true'
+sleep 5
+#!key meta_l q
+sleep 2
+#!must BLOOM-STILL-THERE
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -q '"bloom"' && echo BLOOM-STILL-THERE || echo BLOOM-GONE

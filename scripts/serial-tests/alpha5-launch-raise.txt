@@ -1,0 +1,57 @@
+# Alpha 5: launching a running app raises it, and a closing app is not "running".
+#
+#   scripts/serial-test.py --memory 4096 --push target/release/echo-daemon:/usr/bin/echo-daemon --script scripts/serial-tests/alpha5-launch-raise.txt
+#
+# Nova's single-instance path used to answer `raised: true` after only noting
+# which session was active, so launching a running app from Bloom's drawer or
+# search did nothing visible. It now has Evo focus the app's window, and says
+# which one. And `close` leaves a session in AppHost as Stopped for up to 5 s
+# until it is reaped: relaunching in that window was swallowed as a raise of
+# the dying instance.
+#
+# Run only on a build that has both fixes (needs --push of echo-daemon, or an
+# image built after 2026-11-07). Look at target/serial-shots/raise-*.png: the
+# Files window is in front after the second launch of it.
+
+# Focused flag of the first window whose app_id is $1, and its window_id.
+focused() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(focused|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["focused"], v["window_id"]; exit } on = 0 }'; }
+
+echo "=== two apps; Files is not focused ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 15
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+sleep 15
+read FF FID <<< "$(focused files)"; read NF NID <<< "$(focused notes)"; echo "files focused=$FF id=$FID; notes focused=$NF id=$NID"
+# A new window is not necessarily focused, so only require that Files is not
+# the focused one: otherwise the raise below proves nothing.
+#!must FILES-NOT-FOCUSED
+test "$FF" = false && echo FILES-NOT-FOCUSED || echo FILES-FOCUSED
+#!shot raise-before
+
+echo "=== launching Files again raises its window ==="
+#!must "raised": true
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep raised
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -o '"windowId": *[0-9]*'
+sleep 2
+read FF FID2 <<< "$(focused files)"; read NF NID <<< "$(focused notes)"; echo "files focused=$FF id=$FID2; notes focused=$NF"
+#!must FILES-RAISED
+test "$FF" = true -a "$NF" = false -a "$FID2" = "$FID" && echo FILES-RAISED || echo NOT-RAISED
+#!shot raise-after
+
+echo "=== relaunch right after close spawns, instead of raising the dying instance ==="
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+#!must "raised": false
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep raised
+sleep 15
+#!must NOTES-BACK
+read NF NID <<< "$(focused notes)"; test -n "$NID" && echo NOTES-BACK || echo NOTES-GONE
+
+echo "=== a minimized app is not frozen ==="
+# Minimizing used to SIGSTOP the app, so a closing minimized app never shut down.
+echo-cli call org.geckoOS.evo MinimizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$NID}" | grep -E 'success|Error'
+sleep 2
+#!must-not suspended
+echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | grep -o '"state": *"suspended"'

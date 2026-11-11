@@ -30,7 +30,22 @@
 # Frame geometry of the first window whose app_id is $1, as "x y w h id".
 geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
 
+# The edges Bloom has reserved for its top bar and dock, as "top bottom"
+# ("0 0" while Bloom has reported none): a maximized frame starts below the
+# first and ends above the second (see alpha5-shell-layering.txt).
+wa() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | awk '/"top"/ { gsub(/[",:]/, ""); t = $2 } /"bottom"/ { gsub(/[",:]/, ""); b = $2 } END { print t + 0, b + 0 }'; }
+
+# Bloom reports the work area through the vela bridge. On a vela built before
+# SetWorkArea was allowed there, it cannot, so say it for Bloom: this suite
+# drags windows by their title bars and resize bands, and a window under the
+# bar's input region can't be reached. (Does nothing once Bloom has reported.)
+read WT0 WB0 <<< "$(wa)"; [ "$WT0" != 0 ] || echo-cli call org.geckoOS.evo SetWorkArea --interface org.geckoOS.evo --args '{"top":44,"bottom":76}' | grep -c success
+
 echo "=== launch an app to resize ==="
+# Only a first-run window opens maximized. An image someone used by hand
+# (make run writes to it) remembers the window Files was left at, in its
+# profile, and the suite would start from that instead.
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
 #!must sessionId
 echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
 sleep 18
@@ -38,8 +53,9 @@ sleep 18
 echo "=== maximized: the frame fits the screen, header included ==="
 #!shot resize-maximized
 read MX MY MW MH ID <<< "$(geom files)"; echo "maximized: x=$MX y=$MY w=$MW h=$MH id=$ID"
-#!must 1280x800
-echo "${MW}x${MH}"
+read WT WB <<< "$(wa)"; echo "work area: top=$WT bottom=$WB"
+#!must FITS
+test "$MW" = 1280 -a "$MH" = $((800 - WT - WB)) && echo FITS || echo "WRONG-SIZE ${MW}x${MH}"
 
 echo "=== restore it, so it has edges to drag ==="
 #!must "success": true
@@ -51,12 +67,19 @@ sleep 3
 read X Y W H ID <<< "$(geom files)"; echo "before: x=$X y=$Y w=$W h=$H"
 #!must GEOM-OK
 test -n "$H" && echo GEOM-OK || echo NO-GEOM
-# The band must be on screen for a pointer to reach it.
+# A restored window is fitted to the work area: all of it, resize band
+# included, is inside it (the top inset, the dock's inset and the screen edge
+# respected), even though Firefox restores it at the size it chose for the
+# whole screen (1152x752). The bottom band must be on screen for a pointer to
+# reach it.
+read WT WB <<< "$(wa)"; echo "work area: top=$WT bottom=$WB"
+#!must FITS-WORK-AREA
+test "$X" -ge 0 -a "$Y" -ge "$WT" -a $((X + W)) -le 1280 -a $((Y + H)) -le $((800 - WB)) && echo FITS-WORK-AREA || echo "OUTSIDE x=$X y=$Y ${W}x$H (work area top=$WT bottom=$WB)"
 #!must ON-SCR
 test $((X + W + 8)) -le 1280 -a $((Y + H + 8)) -le 800 && echo ON-SCR || echo OFF-SCR
 
 echo "=== control: the same drag, started inside the frame, is the client's ==="
-IX=$((X + W - 30)); IY=$((Y + H - 30)); IEX=$((IX + 100)); IEY=$((IY + 80)); echo "inside=$IX,$IY -> $IEX,$IEY"
+IX=$((X + W - 30)); IY=$((Y + H - 30)); IEX=$((IX - 100)); IEY=$((IY - 80)); echo "inside=$IX,$IY -> $IEX,$IEY"
 #!pointer drag $IX $IY $IEX $IEY
 sleep 2
 read X0 Y0 W0 H0 ID <<< "$(geom files)"; echo "after inside drag: w=$W0 h=$H0"
@@ -82,9 +105,12 @@ test "$H1" -eq $((H - 80)) && echo SHORTER || echo "wrong height"
 test "$X1" = "$X" -a "$Y1" = "$Y" && echo PINNED || echo MOVED
 
 echo "=== grow: drag the top-left band out by 40 x 20 ==="
-# This edge moves the window as well as resizing it: the commit-time
-# fix-up keeps the bottom-right corner where it was. Frame and client sizes
-# have to agree for that to hold, which is what grabs.rs's client_size is for.
+# The frame is at the top of the work area, and a frame may not be dragged
+# under the bar, so move it down off it by its title bar first.
+NSX=$((X1 + W1 / 2)); NSY=$((Y1 + 12)); NEY=$((NSY + 60)); echo "title bar $NSX,$NSY -> $NSX,$NEY"
+#!pointer drag $NSX $NSY $NSX $NEY
+sleep 2
+read X1 Y1 W1 H1 ID <<< "$(geom files)"; echo "moved down: x=$X1 y=$Y1 w=$W1 h=$H1"
 TX=$((X1 - 4)); TY=$((Y1 - 4)); TEX=$((TX - 40)); TEY=$((TY - 20)); echo "band=$TX,$TY -> $TEX,$TEY"
 #!pointer drag $TX $TY $TEX $TEY
 sleep 3
