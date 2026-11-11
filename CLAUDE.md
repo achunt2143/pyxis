@@ -14,7 +14,7 @@ A full desktop Linux OS built from scratch, architecturally descended from two r
 
 | Name | Role | Crate/repo path | Status |
 |---|---|---|---|
-| **Evo** | Wayland compositor & window manager (formerly "Ouranos") | `evo/` (workspace member) | Real, mature (~16.5k lines). Real two-step window-create/claim contract bound to Echo sessions. Owns server-side decoration for app windows — see [Window decoration model](#window-decoration-model). |
+| **Evo** | Wayland compositor & window manager (formerly "Ouranos") | `evo/` (workspace member) | Real, mature (~16.5k lines). Windows bind to Echo sessions by app id (`BindSurface`, sent when a window's id first appears); there is no create/claim contract (the legacy `CreateWindow`, which spawned programs as root, was deleted 2026-11-07). Owns global shortcuts too — see [Global shortcuts](#global-shortcuts-evo). Owns server-side decoration for app windows — see [Window decoration model](#window-decoration-model). Separates apps from the system by how a client connected — see [Wayland trust classes](#wayland-trust-classes-evo). |
 | **Echo** | IPC message bus (D-Bus/LS2-style: `destination`+`interface`+`method` routing, service registration) | `echo/` (workspace member) | Real. Routing, registration, forwarding all functional. |
 | **Bloom** | Desktop shell UI (wallpaper/status-bar/dock/launcher/overlay layers) | `pyxis-experience/` (sibling repo; `package.json` name is literally `"bloom"`) | Visually complete, richly interactive, **100% simulated** — see [Bloom status](#bloom-pyxis-experience-status) below. |
 | **Flow** | React component/design-system library for Bloom's 2000s-adjacent aesthetic | — | Aspirational naming only — Bloom currently uses plain MUI + framer-motion, no separate `Flow` library exists yet. |
@@ -23,7 +23,7 @@ A full desktop Linux OS built from scratch, architecturally descended from two r
 | **Shift** | System orchestrator: process supervision, boot ordering, power states (formerly "Cronus") | `shift/` (workspace member) | **Real bookkeeping over a simulated process layer** (~1,800 lines). The process table, tree, lifecycle log and limits are real; beneath them `fork_and_exec` spawns nothing, resource sampling returns constants, and the Echo methods (`LaunchProcess`, `TerminateProcess`, …) answer success without acting. `shift-daemon` runs at boot and launches nothing. It used to `kill(2)` its bookkeeping ids as though they were kernel pids; since 2026-09-25 it refuses to signal anything it didn't spawn, which is everything. Wire the Echo stubs to the library **only** after `fork_and_exec` is real. |
 | **Vroom** | **Pyxis SDK/PDK packaging toolchain** — builds/packages/installs web (SDK) and native (PDK) apps as `.ipk` via `pyxis`/`pyxis-sdk`/`pyxis-pdk` CLIs (repurposed 2026-07-25; its previous life as a "GPU acceleration / perf monitoring" layer, formerly "Kratos", was audited and confirmed **100% simulated** — hardcoded dashboard numbers, fake GPU structs, zero consumers — and deleted) | `vroom/` (workspace member; spec `vroom/docs/pyxis-sdk-pdk-spec.md`, schemas `vroom/schemas/`, reference script `vroom/tools/`) | Real: `pyxis.json` project config + validation, `appinfo.json`/`CONTROL/control` generation, staging tree, `.ipk` emission (`opkg-build` when present, built-in root-owned tar.gz writer otherwise), web builders (static/vite/webpack via npm), native builders (cmake/meson/cargo/make/qmake), device profiles + scp/ssh `opkg install`, `new` templates, `doctor`/`lint`/`inspect`. **Phase 3 done 2026-07-25** (`vroom/docs/pyxis-phase3-implementation.md`): service packaging (`pyxis.json` `services[]`, policy-gated activation via `/etc/pyxis/allow-packaged-services`), upgrade-aware maintainer scripts (postinst/prerm/postrm + `packaging/` overrides), and the registry/launcher side — which is **Nova + `pyxis-appctl`** (a thin Echo client in `echo/src/bin/appctl.rs`), deliberately *not* the spec's standalone registry daemon. |
 | **Installer** | `.ipk`/opkg package installation service (`org.geckoOS.installer`): discovery, metadata-without-install, `opkg install`/`remove`, each followed by a Nova registry refresh. Frontend is the Remochi **App Installer** app (`pyxis-experience/packages/apps/installer`, Wizard-based). | `echo/src/services/installer.rs` (in-process in echo-daemon) | Real (added 2026-07-25). Owns the *package* layer only — opkg owns files + status db, Nova owns identity/launch (hence `Nova::uninstall` refusing ipk apps and pointing at `opkg remove`). Install paths are canonicalized and confined to `/var/lib/pyxis/incoming`, `/media`, `/tmp`, `/home`, `/root`. See `vroom/docs/pyxis-phase3-implementation.md` §7. |
-| **Nova** | App runtime host: manifest/origin/install/launch-composition layer above `appHost` (formerly conceptual "pyxis-hostd") | `echo/src/services/nova.rs` (in-process in echo-daemon, **not** a standalone `nova/` crate) | **Real** (~1,900 lines), registered in `echo/src/bin/daemon.rs` (`register_nova_handlers`). Does `manifest.webapp` discovery/validation, `pyxis://` origin mapping (`origins.map`), native-manifest generation, launch composition (delegates to `appHost`), install/uninstall (sha256 integrity + atomic swap), and Evo-visibility-driven suspend/resume. Built in-process rather than as the standalone daemon `nova-runtime-host-plan.md` §8 specifies (deliberate: reuses the one proven request-dispatch path; standalone-crate extraction is a tracked follow-up per the user's "wire in now, extract later" call). At **reload** it pre-generates each app's native `manifest.json` (a `setpriv`-wrapped `vela` launch that drops to geckouser + grants video/render groups) so `appHost.ListApps`/`LaunchApp` see the full app set. **Since 2026-07-25 it is also the ipk-app registry** (SDK/PDK spec §10): scans `/usr/pyxis/applications/*/appinfo.json` (both `web` and `native` runtimes — native apps get a setpriv-wrapped direct-exec manifest, no vela/profile), writes derived manifests to the Nova-owned `/var/lib/pyxis/nova/native/` (AppHost's third scan root; never into the opkg-owned app dir), maps appinfo's §19 permission vocabulary onto the bridge capabilities (deny-by-default for unmapped ones), and refuses `Uninstall` for opkg-owned apps. Driven from devices by `pyxis-appctl` (rescan/list/info/launch/close/focus). |
+| **Nova** | App runtime host: manifest/origin/install/launch-composition layer above `appHost` (formerly conceptual "pyxis-hostd") | `echo/src/services/nova.rs` (in-process in echo-daemon, **not** a standalone `nova/` crate) | **Real** (~1,900 lines), registered in `echo/src/bin/daemon.rs` (`register_nova_handlers`). Does `manifest.webapp` discovery/validation, `pyxis://` origin mapping (`origins.map`), native-manifest generation, launch composition (delegates to `appHost`), install/uninstall (sha256 integrity + atomic swap), and Evo-visibility-driven suspend/resume. Built in-process rather than as the standalone daemon `nova-runtime-host-plan.md` §8 specifies (deliberate: reuses the one proven request-dispatch path; standalone-crate extraction is a tracked follow-up per the user's "wire in now, extract later" call). At **reload** it pre-generates each app's native `manifest.json` (a `setpriv`-wrapped `vela` launch that drops to geckouser + grants video/render groups) so `appHost.ListApps`/`LaunchApp` see the full app set. **Since 2026-07-25 it is also the ipk-app registry** (SDK/PDK spec §10): scans `/usr/pyxis/applications/*/appinfo.json` (both `web` and `native` runtimes — native apps get a setpriv-wrapped direct-exec manifest, no vela/profile), writes derived manifests to the Nova-owned `/var/lib/pyxis/nova/native/` (AppHost's third scan root; never into the opkg-owned app dir), maps appinfo's §19 permission vocabulary onto the bridge capabilities (deny-by-default for unmapped ones), and refuses `Uninstall` for opkg-owned apps. Driven from devices by `pyxis-appctl` (rescan/list/info/launch/close/focus). **Every app launch is `pyxis-wlctx`, run as root, which makes the app's own Wayland socket (carrying the app id) and drops to the app user `pyxisapp` (uid 1001) itself** — see [Wayland trust classes](#wayland-trust-classes-evo). |
 | **gecko** | Gecko/Firefox integration + native bridge host process | `gecko/` (workspace member) | Native-messaging host (`native-host.rs`) is real and working. `gecko/src/gecko.rs`'s libxul-FFI-embedding scaffolding is **obsolete direction** — no maintained desktop libxul embedding API exists (GeckoView is Android-only, EmbedLite is Sailfish-only/stale). Superseded by the from-source custom-Gecko-build plan (see below); `gecko.rs` should be repurposed as launcher/supervisor, not an embedder. |
 | **Puppis** | Gecko native-app lifecycle management (launch/suspend/resume/terminate, resource tracking) | `puppis/` (workspace member) | Real (~730 lines), used by Rockhopper's daemon (`GeckoAppLauncher`). Extracted 2026-07-07 from the old `gaia` crate — `gaia` was a full legacy shell (its own actix-web HTTP/WebSocket server serving a static JS UI, long superseded by Bloom, plus several source files that turned out to be entirely orphaned — never even wired into its own module tree). Only `gecko_app_launcher.rs`, the one piece of `gaia` genuinely still in use, was kept; the rest (`ui_server.rs`, static assets, its own now-unused `node_modules/` JS build pipeline) was deleted rather than carried forward under a new name. `suspend_app`/`resume_app` (real webOS-style freeze/thaw logic) already live in this crate — still worth wiring into Nova/appHost per the roadmap below, just not discarded. |
 | `pyxis-evo` | — | sibling repo `pyxis-evo/` | **Dead end, not part of the build.** Confirmed 100% unmodified fork of upstream `cosmic-comp` (System76) — zero Pyxis commits, zero Echo/embedding code, never referenced in the Makefile. Not to be confused with the real compositor, `evo/`. Candidate for archival. |
@@ -36,7 +36,7 @@ Apps — web or native — are **independent Wayland clients that Evo composites
 **App serving is the biggest newly-scoped workstream.** There is no maintained way to embed Gecko in a native host anymore, so the plan is to **build a customized Gecko from source** (`vela`, pinned to an ESR branch) with three compiled-in additions:
 1. A native `pyxis://<app-id>/<path>` protocol handler (`nsIProtocolHandler`, backed by `nsIStandardURL` so each app gets a real, isolated, secure-context origin — `pyxis://<app-id>` — mapped to `<apps-root>/<app-id>/webroot/`).
 2. A compiled-in `window.geckoOS` bridge via `JSWindowActor` (since WebExtension content scripts can't run on `pyxis://`), matching Synergy's existing API shape exactly.
-3. A `vela --app=<id>` chromeless kiosk run mode — one Wayland toplevel per app, `WM_CLASS`/title stamped with `PYXIS_APP_ID` so Evo's existing two-step window-create/claim contract binds it deterministically.
+3. A `vela --app=<id>` chromeless kiosk run mode — one Wayland toplevel per app, `WM_CLASS`/title stamped with `PYXIS_APP_ID` so Evo binds it to its AppHost session by app id deterministically.
 
 Full implementation plan: `pyxis-gecko-embedding-plan.md` (why/approach) and `pyxis-scheme-and-kiosk-plan.md` (protocol handler + kiosk mode, file-by-file).
 
@@ -57,10 +57,125 @@ Visually complete desktop shell (draggable/resizable windows, taskbar, launcher,
   `org.geckoOS.audio` (PipeWire via `wpctl`). Named system sounds go through
   `org.geckoOS.sound`, with the files in `system-sounds/` at the repo root.
   The SDK side of each lives in `packages/app-sdk/src/{notifications,audio,useAudio}.ts`,
-  and each has a Vitest contract suite that reads its Rust source. **Known
-  limit:** toasts draw inside Bloom, and Evo stacks Bloom beneath every app,
-  so an app covering the top-right corner hides them (roadmap alpha 5, A).
+  and each has a Vitest contract suite that reads its Rust source. Toasts
+  draw in Bloom's overlay, above app windows (see [Shell overlay](#shell-overlay-bloom-above-apps)).
+- **The wallpaper is Daylight, and settings are live across apps, as of
+  alpha 5** (2026-11-09): see [Daylight wallpaper and live
+  settings](#daylight-wallpaper-and-live-settings).
 - Git branches: all five remote feature branches are fully merged into `main` or stale pre-merge snapshots — no unmerged work is at risk, though `feature/app-host-client` and `feature/app-surface-embed`'s remote-ref tips are confusingly swapped and worth pruning.
+
+## Wayland trust classes (Evo)
+
+**Built 2026-11-07.** Evo decides what a Wayland client may do from *how it
+connected*, never from what it claims (`evo/src/trust.rs`). The bridge's
+deny-by-default permissions cover web apps; a native app talks Wayland
+directly, and this is the half that covers it.
+
+- **Trusted** = a client on Evo's own socket (`wayland-0`): the shell's vela,
+  root-run tools (the serial harness's `grim`), anything geckoOS-boot starts.
+  **App** = a client that arrived through a `wp_security_context_v1` socket,
+  and XWayland (one client for every X11 window, so never trusted).
+- **Two users** (since 2026-11-07): the shell is **geckouser** (1000), every
+  Nova-launched app is **pyxisapp** (1001, home `/home/pyxisapp`, groups
+  `video,render` granted per launch, no `/etc/group` membership). `wayland-0`
+  is `geckouser:geckouser 0600`, so an app can't `connect()` to it: the host
+  socket is reachable only by the shell and root. `/run/user/1000` is **0711**
+  (apps reach paths they know inside it, Echo's socket and PipeWire's Pulse
+  socket, and can't list it). Constants: `nova.rs` (`APP_UID`, `APP_GID`,
+  `APP_HOME`, `APP_GROUPS`, `app_owner`), which `create-rootfs.sh` must match
+  (a test reads the script).
+- Nova starts every app as **`pyxis-wlctx` itself, as root** (`echo/src/bin/wlctx.rs`):
+  `pyxis-wlctx --app-id ID --uid 1001 --gid 1001 --groups video,render
+  --runtime-dir /run/user/1001 --host-socket …/wayland-0 --hide …/wayland-0
+  --link geckoOS=/run/user/1000/geckoOS -- vela …`. As root it (1) connects to
+  the host socket, (2) makes the app's socket in `/run/pyxis/wl/<app>-<pid>/`
+  (parent root-owned 0755, so nothing the app runs can swap a component for a
+  symlink under root; the instance dir and socket are chowned to the app only
+  once root is done) and hands it to Evo with sandbox engine `pyxis`, the app
+  id and an instance id, (3) makes the app's runtime dir `/run/user/1001`
+  (app-owned 0700; root only ever *adds* a missing `geckoOS` link, so Echo's
+  socket is at the path the bridge reads, and never touches a planted entry),
+  (4) `unshare(CLONE_NEWNS)`s and bind-mounts `/dev/null` over the host socket
+  for the app only (best effort and said so: the mode already refuses the app,
+  this makes the socket absent too, and is meaningful now that the uid differs:
+  `/proc/<shell>/root` isn't reachable from the app), (5) forks, and **in the
+  child drops groups, gid, uid, checks the drop took and `setuid(0)` fails,
+  and only then arms `PR_SET_PDEATHSIG`**, then execs with `WAYLAND_DISPLAY`
+  set to the absolute socket path. It stays as the app's parent (so the
+  session's process group is unchanged), forwards TERM/INT/HUP, and removes the
+  directory on exit (a SIGKILLed helper's is swept by the next launch).
+  appHost's recorded session pid is the *helper's*, so the app gets
+  `PR_SET_PDEATHSIG` SIGKILL: a kill aimed at the session pid takes the app too.
+  **That is why the drop is the helper's and not `setpriv`'s**: a credential
+  change clears the parent-death signal (`commit_creds`). The earlier design ran
+  the helper *after* a `setpriv` drop for that reason; with the helper as root
+  the drop has to be its own, with the signal armed after it.
+  **It fails closed**: no context, no drop, a missing group, or `--uid 0` and
+  the app doesn't start, and run as root without `--uid` it refuses (running
+  the app on the host socket, or as root, would make it the system). Run as an
+  ordinary user with no `--uid` it keeps its old behaviour (socket under
+  `$XDG_RUNTIME_DIR/pyxis-wl/`, no drop), which is how `alpha5-wayland-trust`
+  starts its probes.
+- **Everything that assumed one uid** (done): each app's profile
+  `/var/lib/pyxis/profiles/<id>` and data dir `/var/lib/pyxis/data/<id>` are
+  pyxisapp's, **except the shell's** (`bloom`, plus the ids in
+  `PYXIS_SHELL_APPS`, which geckoOS-boot sets from the boot app): those stay
+  geckouser's because the boot script's vela, not Nova, runs them. A dir left
+  by an earlier image (geckouser's, with files inside) is taken over, contents
+  included, by `chown_tree` (`filesystem/scope.rs`), which never follows a link
+  (every level opened `O_NOFOLLOW`, entries changed with `AT_SYMLINK_NOFOLLOW`,
+  hard-linked files left alone). Nova writes `user.js` into the app-owned
+  profile by unlinking and `create_new`, so a symlink planted there isn't
+  followed by root. The filesystem service's `app:<id>` calls run as the app's
+  owner (`Owner::of_app`); `user` and `system` stay geckouser's (the Files
+  app reads *geckouser's* home). Apps' `HOME` is `/home/pyxisapp`, their
+  `XDG_RUNTIME_DIR` `/run/user/1001`, audio is `PULSE_SERVER=unix:/run/pyxis/pulse/native`, a second address PipeWire's
+  Pulse server listens on (`10-pyxis-apps.conf`; the socket is 0777, the dir
+  geckouser's 755, made by geckoOS-boot). Not the default
+  `/run/user/1000/pulse/native`: its dir is 0700 and every libpulse client of
+  geckouser's puts it back to 0700 on connect, so it can't be loosened for good.
+  PipeWire itself stays geckouser's, `wpctl` is echo's. The GPU needs only the `video`/`render` gids,
+  set per launch. The Gecko content sandbox is unchanged in kind: it runs as
+  pyxisapp with user namespaces.
+- **Apps still share one uid**, so the kernel doesn't separate app A from app B
+  (their data dirs are all pyxisapp's; the bridge's scopes and the filesystem
+  service's confinement are what do). A uid per app is the next step: it
+  touches `APP_UID`/`app_owner`, the `--uid` Nova passes, and the runtime dir,
+  and nothing else.
+- Why a security context, not the alternatives: *pid lookup in appHost*
+  is asynchronous (a global's `can_view` filter is synchronous), racy against
+  pid reuse, and makes the compositor call back into Echo from its hot path.
+  *A separate shell socket* gives only a class, not an identity (the app id
+  would still be the client's claim). The security context hands Evo the class
+  and the app id in the connection itself, in a standard protocol Evo already
+  carried; the uid split is what makes the class unforgeable (the app can't
+  reach `wayland-0` at all).
+- **Globals hidden from apps** (`trust::trusted_only`, used as the global
+  filter): wlr-screencopy, data-control, virtual-keyboard, input-method,
+  security-context (so an app can't mint contexts or choose its app id), and
+  wlr-layer-shell (a layer surface can cover the screen above every window
+  and take the keyboard exclusively). A hidden global is also refused when
+  its registry name is guessed.
+- **Roles and identity.** `bloom` / `bloom-overlay` treatment
+  (`WindowElement::is_shell`/`is_overlay`/`is_shell_window`) needs a trusted
+  client; an app claiming those ids is an ordinary window. For an app, the
+  window's identity (`WindowElement::app_id`) is the context's app id, used
+  for BindSurface, `ListWindows` and the title bar's fallback;
+  `claimed_app_id` is the raw xdg app_id / X11 class. The origin is recorded
+  in the window's `user_data` in `new_toplevel`; a window with none (X11) is
+  an app. appHost's bind still waits on the *claimed* id being a real one
+  (`is_bindable_app_id`), because a vela window that hasn't run its PYXIS
+  block claims `vela-default` and must not bind, but binds under the context's id.
+- Not filtered, on purpose: `ext-idle-notify` (a timing side channel only;
+  smithay has no filter for it), `keyboard-shortcuts-inhibit` (honoured for the
+  focused app, as a game would expect), xdg-activation/foreign (focus- and
+  token-bound). A window's *title* is still the client's text, so an app can
+  caption itself "Files": the SSD bar cannot yet tell the user whose title
+  it is.
+- On-device suite: `scripts/serial-tests/alpha5-wayland-trust.txt`, with
+  `pyxis-wlprobe` (`echo/src/bin/wlprobe.rs`) as the test client. Both new
+  binaries are staged by `create-rootfs.sh`; for `--push` runs they must be
+  pushed, or **no app will launch** (Nova's manifests name the helper).
 
 ## Window decoration model
 
@@ -92,13 +207,859 @@ Consequence for the open bugs: #7 (maximize→unmaximize crash), #8, #9 and #11
 (resize) are all **Evo SSD work**, not GTK's. They are not blocked on a
 decision — the decision is above.
 
+**Depth (built 2026-11-07, lane D; `evo/src/anim/{depth,shader}.rs`).** The
+frame reads as one rounded card above whatever is beneath it:
+
+- **Drop shadow** under every app window: a GLES pixel shader (Evan Wallace's
+  closed-form blurred rounded rectangle, masked to the *outside* of the frame so
+  the translucent title bar isn't darkened from behind). Never under the shell,
+  the overlay, popups or a window with no bindable app id yet (the
+  `vela-default` pre-window); never under a maximized/fullscreen window, where
+  it fades out as the window goes square and back in as it leaves. Focused
+  windows get a larger, softer, darker shadow, inactive ones a small one, and a
+  move grab lifts it further (`lift`: set on the grab's first motion and cleared
+  in `unset`, in `grabs.rs`).
+- **Rounded bottom corners** on client content (a texture-shader clip,
+  `ClippedSurface`), matching the title bar's 16 px top corners; the border
+  gained matching bottom arcs. Maximized/fullscreen: square all round
+  (`HeaderBar::square`). The clip assumes a buffer that is not y-inverted or
+  rotated; the on-device shots would show the *top* corners rounded if not.
+- **Focus crossfade**: header glass/title/buttons dim to 55% when inactive, and
+  the shadow shrinks, over the `focus` token (150 ms). State per window in
+  `DepthSlot` (user data), driven by `anim::depth::focus_changed` from
+  `SeatHandler::focus_changed`. Not counted in `GetAnimationState` (these are
+  not `WindowAnim`s).
+- **Static styling vs animation**: shadows and corners are drawn in `reduced`
+  and `off`; only the focus/lift/appear transitions follow the mode (instant
+  when off).
+- **Plumbing, and why a trait.** Smithay's stock shader elements are
+  `RenderElement<GlesRenderer>` only, and udev draws through a `MultiRenderer`.
+  `MultiRenderer`/`MultiFrame` hand out the `GlesRenderer`/`GlesFrame` through
+  `AsMut`; `GlesAccess` (anim/shader.rs; impl'd for `GlesRenderer` and the udev
+  renderer) names that route, and `ShadowElement`/`ClippedSurface` are
+  `RenderElement<R>` for any `R: GlesAccess`. **Generic render code that
+  touches `WindowRenderElement<R>` therefore needs `R: GlesAccess`.** Shaders
+  compile once per `GlesRenderer` (kept in its EGL context's user data). If
+  compiling fails (logged once), or with `EVO_DEPTH=off` /
+  `evo.SetDepth {enabled:false}`, Evo draws what it drew before depth: no
+  shadow, a square bottom, the old border. `evo.GetDepthState` says whether the
+  shaders compiled (echo-cli only; no bridge entry).
+- **Damage**: a shadow has a stable id per window and a commit counter that
+  moves only when its parameters do, so a window at rest costs no damage; a
+  window drawn through a pose (open, close, minimize, a geometry transition)
+  takes its shadow with it (`depth::pose_frame`). The shadow's draw skips the
+  part of each damage rect inside the frame. A shadow is a render element and
+  takes no input, so the resize band is untouched.
+
+## Shell overlay (Bloom above apps)
+
+**Decided and built 2026-09-27; the whole shell moved into it 2026-11-07.** Evo
+stacks Bloom, the desktop, beneath every app. Shell UI that must be seen over
+apps lives in a second Bloom window, the overlay. The alternative was drawing
+that UI in the compositor, and it was rejected so shell UI stays web tech.
+Layer-shell was rejected too: Gecko can't create layer surfaces, and Evo hides
+that global from apps.
+
+**What is where.** The overlay holds *all* shell UI: top bar, dock, quick
+settings, notification centre, app drawer, overview, desktop search and
+toasts (`src/components/ShellLayer.tsx`, rendered by `src/overlay/OverlayApp.tsx`
+inside the same `AppHostProvider`/`CompositorWindowsProvider` the desktop used
+to have). The desktop window (`Desktop.tsx`) is now only the wallpaper. Why the
+bar and dock moved too, rather than staying in the desktop with a reserved
+strip: panels and their state (`quickSettingsOpen`, the drawer, search) are
+driven by the bar and dock, so splitting them across two windows would mean
+mirroring every open/close over a BroadcastChannel; in one window it is plain
+React state. The cost is that the bar's `backdrop-filter` blurs nothing (the
+overlay is transparent), so it is a flat translucent bar now.
+
+- **vela** opens it in the shell's own process when passed `--pyxis-overlay
+  overlay.html` (geckoOS-boot does, when the shell ships `overlay.html`). It
+  gets the app id `bloom-overlay` and chrome that paints nothing
+  (BrowserContentHandler and browser-init.js patches). It is transparent only
+  because the shell profile sets `mozilla.widget.use-argb-visuals`, an alpha
+  visual that Gecko decides at widget creation, and
+  `browser.tabs.allow_transparent_browser`.
+- **Evo** (`evo/src/shell/overlay.rs`) treats a *trusted* client's `bloom-overlay` like the shell (an app claiming that id gets nothing, see [Wayland trust classes](#wayland-trust-classes-evo)),
+  so it is undecorated, unbound, and fullscreened without being exclusive.
+  It sorts it *above* apps (`RenderZindex::Top`, drawn over a fullscreen app
+  too) and leaves it out of `ListWindows`. Three things come from Bloom, all
+  `windows:manage` at the bridge (`PyxisBridgeParent`'s `BRIDGE_CAPABILITIES`,
+  so only the shell's trust-listed ids hold them), all applied on the
+  compositor thread:
+  - **Input region** (`evo.SetOverlayRegion`): Gecko can't set one on a
+    toplevel, so Bloom reports where it draws and only those rectangles take
+    input; everywhere else a click falls through. Until Bloom reports, the
+    overlay passes every click through. Bloom's pieces (bar, dock, a toast
+    stack, a panel's full-screen backdrop) each register what they cover in
+    `overlay/useOverlayRegion.ts`, which sends Evo the *union* (Evo holds one
+    region). Elements marked `data-shell-region` (and their `data-shell-popup`
+    children) are measured; measurements repeat a few times after any layout
+    change because the dock springs in and nothing observable says when it
+    stops.
+  - **Keyboard** (`evo.SetOverlayFocus {focused}`): the overlay **never takes
+    the keyboard implicitly** (a click on it, `focus_window`, xdg-activation all
+    refuse it, so a toast can't steal what an app is typing). While a panel
+    that takes typing is open (any panel, or the search box), Bloom asks
+    (`overlay/useOverlayKeyboard.ts`); on close it gives it back and Evo hands
+    it to the next app down the stack, else the shell (`refocus_after_loss`).
+    Evo tracks the real focus in `focus_changed` and emits
+    `OverlayFocusChanged {focused}` on every change, including a loss to
+    something else (Alt+Tab, a dock click): Bloom closes its panels on that.
+    `evo.GetOverlayState` returns `{keyboard, rects, workArea}` for tests.
+  - **Work area** (`evo.SetWorkArea {top, bottom, left, right}`,
+    `evo/src/shell/work_area.rs`): the edges apps must leave to the shell.
+    Maximize, first placement, restore-from-fullscreen, the unmaximize centre
+    fallback, new-window `bounds`, the move clamp (a dragged frame stays
+    wholly inside the area, so title bar and resize band are never under the
+    bar or dock) and the resize clamp (no edge can be dragged out of the area)
+    all use the output minus the insets. **A floating window is shrunk to fit,
+    not just shifted** (`EvoState::fit_to_work_area`, run on every commit and
+    on a work-area change): Firefox restores at the size it chose for the whole
+    screen (1152x752), which would put the bottom edge and resize band off a
+    800 px screen under a 44 px bar. It asks the client once per size and
+    respects its minimum; X11 windows are only moved. Fitting waits while a
+    configure is in flight or a size change hasn't landed yet
+    (`WindowElement::begin_settling`): Gecko acks a configure at once but its
+    toplevel geometry follows only on the next paint, so a commit in between
+    shows the old size, and fitting *that* threw an unmaximize's restored
+    place away. **Fullscreen still covers everything.**
+    Insets are ignored on an axis where they would leave under half of it. A
+    change re-fits open windows (`EvoState::refit_to_work_area`: maximized ones
+    resize, floating ones under the bar move out). Insets are zero until Bloom
+    reports, and are reset, with the region and keyboard, when the overlay
+    window is destroyed, so a dead Bloom can't leave apps squeezed.
+- **Bloom** (`src/overlay/`, `src/components/ShellLayer.tsx`):
+  - `useWorkArea` reports the bar's height and the dock's height plus its
+    margin and a gap, measured by layout (`offsetHeight`, computed `bottom`)
+    because a transformed box would report the dock 80 px low while it
+    animates in. The dock no longer shrinks when an app is maximized (it
+    doesn't float over it any more). A fullscreen app hides the bar and dock
+    (not drawn, not clickable, last work area kept).
+  - A panel on screen registers the whole screen as its region (its backdrop
+    takes every click) and asks for the keyboard. The search box, which is in
+    the bar and so has no backdrop of its own, portals one (z 1150) while open.
+  - **The minimize-before-panel workaround is gone** (`useGlobalShortcuts`
+    callers in `ShellLayer`): launcher, overview and search just open their
+    panel over whatever is running. Only Super+D still minimizes windows.
+  - **"Just type"**: with no app focused, the *desktop* window has the keyboard
+    but the search box is in the overlay. `useForwardJustType` (desktop) sends a
+    printable key or Ctrl+Space/Meta+K over the BroadcastChannel; the overlay
+    opens the box, asks for the keyboard and starts the query with the key.
+  - The desktop draws `ShellLayer` itself (`reporting={false}`, telling Evo
+    nothing) only while no overlay is alive: the dev server, or an overlay that
+    failed to open within 8 s or went quiet for 5 s (`useOverlayPresence`).
+    During the overlay's startup the desktop draws no shell, so it doesn't
+    flash up and vanish.
+- **Verified** by `scripts/serial-tests/alpha5-shell-layering.txt` with clicks,
+  not pixels: bar and dock take clicks over a maximized app, its frame starts
+  below the bar and ends above the dock, the drawer and search open without
+  minimizing it, typing reaches the overlay (Enter launches the app the word
+  names), Escape/Alt+Tab return the keyboard, a window dragged to the top stops
+  at the bar. `alpha5-overlay`, `alpha5-windows` and `alpha5-resize` read the
+  work area (`GetOverlayState`) instead of assuming a maximized frame is
+  `0,0 1280x800`.
+- **Needs a vela rebuild.** The bridge table gained `SetWorkArea`,
+  `SetOverlayFocus`, `GetOverlayState` and the `OverlayFocusChanged` signal in
+  `PyxisBridgeParent.sys.mjs`, which is compiled into vela. On a vela without
+  it Bloom's calls are refused (logged once in `/var/log/vela.log`): the bar
+  and dock still take clicks (`SetOverlayRegion` was already allowed), but apps
+  are not kept out from under them and panels get no keyboard. The suite says
+  `BRIDGE-OLD-VELA` and stands in for Bloom on that image. Bloom's built shell
+  can be laid over a rootfs without a rebuild: `serial-test.py --push
+  ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot` (a directory
+  pushes its files).
+- Not done: the lock screen (the overlay is where it goes), and no IPC to put
+  an app fullscreen, so the fullscreen-hides-the-shell path is unit-reasoned
+  and not covered on device.
+
+## Daylight wallpaper and live settings
+
+**Built 2026-11-09** in four lanes (plan and lane split:
+`docs/internal/pyxis-wallpaper-settings-plan.md`). Verified on device by
+`alpha5-wallpaper.txt` and `alpha5-settings-live.txt`.
+
+- **Settings reach every page live, through Echo.** The SDK used to carry a
+  change on a BroadcastChannel, which is same-origin: `pyxis://settings` and
+  `pyxis://bloom` are different origins, so on a device a wallpaper or theme
+  picked in Settings showed only after the shell restarted (it worked in the
+  dev server, one origin, which hid it). Now `org.geckoOS.settings` emits
+  `SettingChanged {key, value, previous, exists}` once per key whose stored
+  value actually changed (`value` is what `get` would now answer, so a deleted
+  system key reads its default), `BRIDGE_SIGNALS` passes it to any page
+  (`null`: every key is readable with `settings.get` anyway), and the SDK's
+  `onSettingChange` hears it plus the BroadcastChannel and reports each change
+  once (2 s de-dupe). `useSetting(key, fallback, parse?)` (`asBoolean`,
+  `asNumber`, `oneOf`) is the one way to read a setting in a component.
+- **Echo validates and writes safely** (`echo/src/services/settings/schema.rs`).
+  Every `pyxis.*` key has a type, an allowed set or range and a default; a bad
+  value is refused with an error naming the key, an unknown `pyxis.*` key is
+  refused, other keys are stored as given (apps' own). `get` of an absent key
+  answers its default with `exists: false`, so a fresh install reads Daylight
+  with no special case. One process-wide lock per read-modify-write, atomic
+  write (temp, fsync, rename): before, two concurrent sets lost one and a crash
+  mid-write emptied the file. The SDK keeps a TS copy (`settingsSchema.ts`)
+  for the dev mock; `settingsContract.test.ts` reads the Rust schema and fails
+  when they drift. New keys: `pyxis.wallpaper.motion` (flow|still),
+  `pyxis.wallpaper.pinnedTime` (null|0..1439), `pyxis.location`
+  (null|`{lat, lon, label, source}`), `pyxis.clock24h`; `pyxis.theme` gained
+  `auto` (dark below -6° sun elevation); `pyxis.wallpaper` defaults to
+  `daylight`.
+- **Time and place** (`org.geckoOS.time`, `echo/src/services/time.rs`, jiff
+  over the image's own zone files): `getClock` → `{epoch_ms, timezone,
+  utc_offset_minutes, abbreviation, dst, next_transition_ms}`, `listTimezones`
+  (`zone1970.tab`, ISO 6709 coordinates), `setTimezone` (`settings:write`;
+  validated against the table or `UTC`, relinks `/etc/localtime` atomically,
+  writes `/etc/timezone`, emits `TimezoneChanged`), `getLocation` (the
+  `pyxis.location` setting, else the zone's city, `source: "none"` for UTC).
+  **Pages take the offset from Echo, never from `Intl`**: vela caches the zone
+  it started with. SDK `useClock()` (one shared clock per document, ticks on
+  Echo's minute, re-syncs on `TimezoneChanged`, every 10 min and after a DST
+  transition) and `useLocation()`; the top bar's clock uses it and
+  `pyxis.clock24h`. `PYXIS_TIME_ROOT` points the service at a test root.
+- **Daylight** (`packages/app-sdk/src/wallpaper/`, `sun.ts`): five gaussian
+  colour masses on slow two-sine paths, a domain-warped field, mixed in OKLab,
+  with a static full-resolution grain against banding. The palette is
+  keyframed on the sun's elevation (night, blue hour, dawn/dusk, golden
+  morning/evening, day; morning and evening blended by the hour angle), from
+  NOAA's formulas at `useLocation`'s place, or a fixed 06:30/18:30 day when
+  there is none (UTC, the image default). Aurora, Sunset, Forest and Mochi are
+  fixed palettes on the same engine. The scene is pure (`scene.ts`), drawn by
+  a WebGL fragment shader on a canvas at a quarter of the output's resolution,
+  CSS-upscaled, at **10 fps** (motion is a few px a second, so 10 fps reads as
+  60), or by CSS transforms when there is no WebGL. vela on the VM's llvmpipe
+  gets WebGL (Firefox reports it as "Radeon R9 200 Series"), so the device
+  draws webgl. `DynamicWallpaper` has a `preview` mode (Settings' thumbnails,
+  css; its large preview, webgl).
+- **When it moves**: `full` animations flow; `reduced` stands still with the
+  palette crossfading each minute; `off` stands still; `pyxis.wallpaper.motion
+  = still` and `pinnedTime` likewise. It stops drawing frames while a
+  maximized or fullscreen app is up (the flag, at once), while at most 15% of
+  the desktop shows (`useWallpaperExposure`: output minus the union of app
+  frames; the bar and dock strips are exactly 15% of 800 px), and while the
+  document is hidden; paused, the palette still updates each minute. **Evo
+  sends no signal on a resize**, so the desktop re-lists frames itself 300 ms
+  and 1.5 s after any window signal and every 10 s while a window is up.
+- **On-device log** (vela.log, through `dump()`: a page's `console.log` does
+  not reach it): `PYXIS-WALLPAPER state=flowing|paused|still backend=webgl|css
+  mode=… exposed=… …` once per change of state, and
+  `PYXIS-WALLPAPER-SETTING wallpaper=<id> motion=<m> pinned=<min|none>` once
+  per change of what the desktop shows (how a suite knows a click in Settings
+  reached the shell), and `PYXIS-WALLPAPER-EXPOSURE exposed=… windows=…`
+  when the exposure moves by 0.05 or more. Read exposure from that line, not
+  the state line: a state change is written when a flag arrives by signal,
+  before the frames are re-read, so its `exposed=` is stale.
+- **Bloom's window store could lose a window for good** (found by
+  `alpha5-wallpaper`, fixed 2026-11-09; `CompositorWindowsProvider`, used by
+  the overlay's dock and overview and by the desktop). A list replaced the
+  store, and Evo's `ListWindows` is a sample up to 250 ms old: a list that a
+  signal about an unknown window asked for could land after `WindowCreated`
+  and erase the window, and with no later signal naming it (Files opening
+  maximized sends its signals in one burst) it stayed missing. A list now
+  keeps windows a signal created, and drops ones a signal closed, since
+  shortly before it was asked for (`keep`/`drop` on the `list` action), a
+  request made while one is out runs after it, and a list that may have
+  missed a signal is followed by another once the sample has caught up
+  (`compositorWindowsProvider.test.tsx` replays the race).
+- **Cost** (4 GB VM, software GL, Evo plus every geckouser process): idle
+  desktop +5.0 points of one core flowing against still (budget 8); a floating
+  app on screen +7.1-7.6; a maximized app 0 (paused); a Files open 45-47 fps
+  over a flowing wallpaper against ~46 over a still one. If a later
+  measurement goes over, lower `WALLPAPER_FPS` to 6 before simplifying the look.
+- **Settings app** (`packages/apps/settings/src/sections/`, split from one
+  845-line file): Appearance (Light/Dark/Auto with the next switch; a live
+  thumbnail per wallpaper; a large Daylight preview with a time scrubber that
+  previews without moving the desktop; Follow the day / Pin this time;
+  Flowing/Still), Date & Time (new: clock, 24-hour, searchable zones, location
+  from the zone or by hand, today's sunrise and sunset), About from
+  `system.getInfo`. `strictTime.ts` calls the bridge directly on a device so a
+  refused `setTimezone` shows as an error instead of the SDK's silent mock
+  success. Suite selectors (`data-wallpaper`, `data-theme-choice`,
+  `data-settings-section`, `data-timezone-search`, `data-timezone`, …) are
+  listed in the lane P hand-over and used by `alpha5-settings-live`.
+- **AppShell no longer remounts apps on a theme change.** It keyed remochi's
+  `ThemeWrapper` by the theme, which rebuilt every app (losing what was on
+  screen) at every change, twice a day with Auto. `ThemeSync` now steers the
+  wrapper's own theme from inside (`appShellTheme.test.tsx`).
+- Not done: More Daylight families, the bar and dock tinting from the
+  wallpaper, a GeoIP/Wi-Fi location. remochi's `Button` draws its "( )" caps
+  as text, so a bare `Button` reads as "(Set by hand…)" on device; not worth
+  working around, since the apps are to be rebased onto Duyo (the user's new
+  UI framework, a separate integration path).
+
+## Global shortcuts (Evo)
+
+Bloom's own hotkeys (Ctrl+Space, Meta+K in `DesktopSearch.tsx`) only fire while
+Bloom has the keyboard, never while an app does, so shortcuts that must work
+anywhere live in Evo (`input_handler.rs`, `process_keyboard_shortcut`):
+
+- **Alt+Tab / Shift+Alt+Tab** is Evo's key and Evo's MRU order, drawn by
+  Bloom's overview (`evo/src/shell/switcher.rs`, built 2026-11-07).
+  `Switcher<T>` is a pure state machine (injected time, generic windows); the
+  `EvoState` methods wire it to the keyboard. A walk freezes `focus_history`'s
+  order at the first Tab and **no step raises or restores anything**. Evo
+  emits `org.geckoOS.evo` `SwitcherChanged {phase, selected, order}` (window
+  ids, MRU first, so `order[0]` is where the walk began; `windows:manage` in
+  `BRIDGE_SIGNALS`):
+  - `open`: Alt still held 150 ms after the first Tab (`QUICK_TAP`; a
+    per-loop `switcher_tick` from `process_pending_window_actions` sends it).
+    `step`: another Tab / Shift+Tab, only once shown. `commit`: Alt released:
+    Evo has already `focus_window`ed `selected` (restoring a minimized one,
+    which animates as lane B's restore). `cancel`: Escape while Alt is held
+    (intercepted via `KeyAction::CancelSwitcher`; focus stays).
+  - **A quick tap** (Alt up inside 150 ms) switches at once and sends only
+    `commit`, never `open`: a shell that was not showing anything ignores it.
+  - A `FocusWindow`/`RestoreWindow` request arriving mid-walk (a card clicked
+    in the switcher) is the commit (`switcher_chose`), so Alt's release can't
+    override the click.
+  - **No overlay alive** (no `bloom-overlay` window when the walk starts: dev
+    server, dead Bloom): the old direct cycling, each step focuses a window,
+    nothing is signalled.
+  - `evo.GetSwitcherState` (root, not in the bridge) gives suites
+    `{active, shown, selected, order, lastPhase, lastCommit, counts{open,
+    step, commit, cancel}}`.
+  - **Bloom** (`src/hooks/useSwitcher.ts`, `ShellLayer`, `CardOverview`'s
+    `switcher` prop): `open`/`step` show `CardOverview` with cards in Evo's
+    order and `selected` highlighted; `commit` zooms the chosen card onto its
+    window's real frame while the rest fade (see **Overview transitions and
+    thumbnails** below), then takes the overview down after
+    `commitMs(mode)` (`overview/flight.ts`: zoom plus fade; a fade in
+    `reduced`, nothing in `off`); `cancel` flies the cards back to their
+    windows. It covers the screen for clicks but **never asks for the
+    keyboard** (Alt is held in the app, Evo has the keys). A card click calls
+    the existing activate (Evo's `commit` closes it; a 1.2 s guard does if Evo
+    never answers). Super+Tab's overview is the same component.
+  - **Needs a vela rebuild** for Bloom to hear it (`SwitcherChanged` is new in
+    `BRIDGE_SIGNALS`). On the old vela Evo still switches on release but
+    nothing is drawn, and a long Alt+Tab walk gives no feedback.
+- **Overview transitions and thumbnails** (built 2026-11-07, `overview/`,
+  `shell/thumbnails.rs`). Cards are the windows themselves, flown between the
+  grid and each window's frame (`ListWindows` rect = the overlay's CSS px):
+  - **Open**: each card starts laid exactly over its window (a minimized one
+    over its dock icon) and springs (`TRANSITION.geometry`) into the grid, its
+    chrome (glass plate, title bar, icon badge) fading in. **Chosen** (click,
+    Enter, Alt released): it grows back onto the window's frame
+    (`TRANSITION.open`), the rest fade, then it fades over the last 100 ms to
+    reveal the window Evo has already raised; a minimized window lands where a
+    window of its size would sit centred (Evo does not report the restore
+    place). **Cancel** (Esc, backdrop, switcher cancel): every card returns to
+    its window and fades. Only `full` mode flies; `reduced`/`off` fade.
+  - How: `useCardFlight` in `CardOverview.tsx` runs on a plain wrapper
+    `div` around each card (so it never fights the card's selection lift),
+    with framer's `animate()` and `usePresence` for the exit. The maths
+    (`flightTransform`, `restRects`, `previewBox`, `commitMs`) is pure in
+    `overview/flight.ts` with tests. Rest boxes are measured with the wrapper's
+    current transform undone (`restRects`), so a card committed mid-rise (a
+    quick Alt+Tab) flies from where it is laid out. **The inner card's
+    `layout` prop is off until the card has landed**: framer takes the
+    wrapper's flight for a layout change otherwise and the start pose is
+    off by tens of px. The scrim, header and cards fade on their own (the
+    scrim is a separate element), so cards stay opaque while the overview dims.
+  - **`evo.GetWindowThumbnails {window_ids?, max_width, max_height}` →
+    `{thumbnails:[{window_id, width, height, data}]}`** (bridge
+    `windows:manage`; SDK `getWindowThumbnails` in `packages/app-sdk/src/thumbnails.ts`,
+    mock = placeholder SVGs). Evo draws each window offscreen with
+    `Backend::snapshot_window` at `thumbnail width / frame width` (never full
+    size), crops to the frame (SSD header in, CSD shadow margin out) so the
+    aspect is the frame's, and the Echo broker encodes JPEG q80 on a blocking
+    worker (`image` crate; its WebP encoder is lossless-only). `data` is a
+    `data:image/jpeg;base64,` URL; rounded corners come out black (Bloom
+    clips). Bounds default 480x300 and clamp to 480x480. The request is queued
+    from the broker and served by the compositor thread's next loop pass
+    (`serve_thumbnail_requests`, <= 16 ms).
+  - Cache (`Cache` in `thumbnails.rs`): per window, keyed on the surface's
+    commit counter and frame size and the requested bounds; a busy window
+    (commits every frame) is served as is for 150 ms (`GRACE`) rather than
+    redrawn per call; entries for dead windows are dropped. **A minimized
+    window gets its last entry however old**, and `minimize_window_after`
+    takes one as it minimizes (`thumbnail_at_minimize`). Windows with no
+    buffer yet, the shell and the overlay are left out.
+  - Bloom side: `overview/thumbnailStore.ts` holds the pictures
+    (`useSyncExternalStore`; refreshes coalesce into one follow-up);
+    `useThumbnailPrefetch` (ShellLayer) refreshes 350 ms after windows or
+    focus change so Alt+Tab, which opens 150 ms after the first Tab, has
+    pictures on its first frame; the overview also refreshes on open and
+    shows the icon card until a picture loads, then crossfades it in. It
+    never blocks the open. Cards are `previewBox` sized: 170 px high, the
+    window's aspect, 150-400 px wide.
+  - **Needs a vela rebuild**: `GetWindowThumbnails` is a new bridge entry.
+    On the old vela the call is refused and every card keeps its icon.
+  - On-device: `scripts/serial-tests/alpha5-thumbnails.txt` (count, aspect,
+    bounds, JPEG URLs, id filter, minimized, closed, latency).
+- **Super+Q** closes the focused app window (xdg close, as the SSD X does;
+  never the shell or overlay). Nothing in Evo quits the compositor: Super+Q
+  and Ctrl+Alt+Backspace used to, which ended the session, and Super+Enter
+  ran `weston-terminal` as root. All gone. VT switching stays; the debug
+  toggles (scale/rotate/tint/preview/decorations) exist only with the `debug`
+  feature.
+- **Shell actions** go out as the `org.geckoOS.evo` signal
+  `ShortcutTriggered {action, timestamp}`: `launcher` (Super tapped alone),
+  `overview` (Super+Tab), `search` (Super+Space), `show-desktop` (Super+D).
+  Gated by `windows:manage` in `BRIDGE_SIGNALS`. Bloom reacts in
+  `ShellLayer.tsx` via `useGlobalShortcuts`: the panels are drawn by the
+  overlay, above apps, so they open over whatever is running (only
+  `show-desktop` minimizes windows; see [Shell overlay](#shell-overlay-bloom-above-apps)).
+- A client's `keyboard-shortcuts-inhibit` is honoured, judged by the
+  keyboard-focused surface: while inhibited, every key (VT switch included)
+  goes to the client.
+- `evo.SwitchWorkspace`/`CreateWorkspace` are not implemented and say so.
+- On-device suites: `scripts/serial-tests/alpha5-shortcuts.txt` (Evo half,
+  Alt+Tab switcher included, fully asserted from `GetSwitcherState`) and
+  `alpha5-shortcuts-shell.txt` (Bloom half). The signal half needs a vela
+  rebuilt with the patched `PyxisBridgeParent` (`BRIDGE-OLD-VELA` otherwise).
+  `serial-test.py` has `#!keydown`/`#!keyup` to hold Alt across steps.
+
+## Window animations (Evo)
+
+**Foundation and open/close built 2026-11-07** (`evo/src/anim/`; design,
+motion spec and lane split in `docs/internal/evo-animation-plan.md`; the
+module's API for later lanes is the header of `anim/mod.rs`).
+
+- **Animation is a render-time transform, never input.** Hit-testing, focus,
+  `ListWindows`, BindSurface and the work area use a window's final geometry
+  from the first frame. A ghost (a window that left the Space but is still
+  drawn) takes no input. Interactive move/resize are never smoothed.
+- **`render::stack_elements` walks the Space itself** (it replaced
+  `space_render_elements`, which gives no per-window transform): layer
+  surfaces above, windows front to back, layer surfaces below. A window with a
+  running `WindowAnim` is drawn through `anim::transform::wrap` (Rescale then
+  Relocate, SSD header included; alpha is passed to `render_elements`).
+  **Alpha-only changes do produce damage**: smithay's damage tracker compares
+  each element's alpha and geometry per frame and the wrappers report the
+  wrapped values (tests in `anim/transform.rs` pin this against a
+  `DummyRenderer`, so a smithay bump that breaks it fails at the desk). The
+  exclusive-fullscreen branch of `output_elements` skips this path, so a window
+  entering or leaving fullscreen is drawn through it until its geometry
+  transition ends (see **Geometry transitions**).
+- **Ghosts** (`anim/ghosts.rs`, thread-local) are drawn directly above their
+  `anchor`, the window that was next below when they left; with no anchor
+  left they sit above Bloom, beneath every app. Sources: a `Snapshot` (close)
+  or a live `WindowElement` (minimize, or its warp, below).
+- **Snapshots are CPU pixels, uploaded on first draw.** udev's renderer is a
+  `MultiRenderer`, whose `MultiTexture` can't wrap the `GlesTexture` an
+  offscreen draw makes, so `anim/snapshot.rs` renders offscreen
+  (`render_to_mem`, factored out of screencopy, which now calls it), reads
+  back, and `import_memory`s on the first draw. One readback per close (4 MB at
+  1280x800). They need the renderer, so they are `Backend::snapshot_window`,
+  which only udev implements; winit/x11 close without an animation.
+- **Who animates** (`EvoState::animation_eligible`, `shell/animation.rs`):
+  an app with a bindable claimed app id. The vela about:blank pre-window
+  (`vela-default`) never animates (it would flash a card open and shut on
+  every launch); neither do the shell and the overlay. **Open** fires once per
+  showing at the first commit where the window is mapped with a bindable id
+  (drawn as Lumen's Bloom, below).
+  **Close** snapshots in `remove_window_from_workspace` (before anything is
+  unmapped) or in a pre-commit hook for a null-buffer unmap (before the buffer
+  goes). **Popups** fade in 120 ms on their own clock (state in the popup
+  surface's data map); popup-out is not built.
+- **Counters are RAII** (`anim/window.rs`): a `WindowAnim` is *started* when
+  made and *completed* when dropped, however it ended, so with nothing in
+  flight `started == completed` and `active == 0`. Hold one forever and the
+  suite fails.
+- **Modes**: `EVO_ANIMATIONS=full|reduced|off`, `EVO_ANIMATION_SCALE` (0 =
+  off, 10 = slow motion, max 100; the suite uses 60) at start; `org.geckoOS.evo SetAnimationSettings
+  {mode?, scale?}` (bridge `settings:write`) and `GetAnimationState` (bridge
+  `null`; mode, scale, `active`, `started{}`/`completed{}` per kind) after.
+  Reduced is opacity only, capped at 150 ms; the cap applies before the scale.
+  New bridge entries need a vela rebuild for *apps* to call them; echo-cli
+  needs none.
+- **Minimize, restore and show desktop** (lane B, built 2026-11-07;
+  `shell/minimize.rs`, poses in `anim/minimize.rs`). Placement stays instant:
+  `minimize_window` takes the window out of the Space at once and focus moves
+  on. What is *drawn* is a `ghosts::Live` ghost of the same window at its old
+  z-slot, springing (`spec` minimize spring, ~320 ms) from its frame into its
+  dock icon, alpha going to 0 over the last 30%. **x leads y**: the offset
+  spring (horizontal travel) is a bit faster than the scale spring, which also
+  carries the vertical travel by scaling about a virtual fixed point chosen so
+  the frame's centre lands on the icon's (`anim::minimize::plan`). Restore runs
+  on the window itself, from the moment it is back in the Space (it's
+  `Restore` in its own animation slot, so it is drawn at its real z-position).
+  **Interrupting** is `anim::minimize::retarget`: it samples the running
+  animation (open, restore, or the minimize ghost, which `unminimize_window`
+  takes with `ghosts::take_live`), re-expresses the pose about the new origin so
+  no point jumps, and starts new springs with the old velocity. **A close
+  mid-open** now starts from the current pose too (`minimize::close_from`;
+  `begin_close_animation` reads the slot before cancelling it).
+  A window not yet shown (`has_opened`), not eligible, in exclusive fullscreen
+  (restore only) or with animation off just appears/vanishes.
+- **Lumen** (the second motion language, the user's call 2026-11-08: the
+  genie was "too macOS"; spec and lane split in
+  `docs/internal/evo-animation-plan.md`, "Lumen"). Windows behave like light
+  through a lens: focus (blur), shape (round off to an orb of the app's
+  accent), light (glow, ripples). The genie funnel is retired, drawn in no
+  mode (`anim/genie.rs` is a three-name shim over `anim/droplet.rs`).
+- **The Lumen program** (`anim/lumen.rs`, lane L1, 2026-11-08): the shared
+  snapshot-draw program the effects draw through. One quad of our own
+  (`GlesFrame::with_context` behind `GlesAccess`) drawing a `lumen::Source`
+  (a `Snapshot` uploaded once, mipmapped) into a rect with a rounded clip of any
+  radius (clamped to half the short side: up to a circle), a **blur by mip LOD
+  bias** plus four taps (no extra passes), an accent **tint** that keeps some
+  of the picture's light and dark (with a lens highlight when round), an outer
+  **glow**, alpha, and **squash/stretch** along an angle (applied to the quad's
+  corners, so the texture follows; bounded to 1.5). API for other lanes:
+  `Source::new(snapshot)`, then per frame `Params::picture(&source, top_left)`
+  edited and `source.element(renderer, &params, Effect::X)` →
+  `Option<LumenElement>` (`None` = draw your plain fallback); `GhostElement::Warp`
+  holds a `LumenElement` (`warp::WarpElement` is an alias). Each element drawn
+  counts a frame for its `Effect`; `record_progress` is what suites poll. Shared
+  GL helpers: `compile_shader`, `link_program`, `scissor_box`.
+  - **The old warp's gotchas still apply and are handled there**: smithay's
+    instanced draws leave `VertexAttribDivisor 1` on attribute slots (a program
+    of ours must set 0, or every vertex reads the first: the whole window one
+    texel of its corner), damage is a per-rect scissor converted through
+    `GlesFrame::projection()`, every piece of state touched is put back. A live
+    surface can't be sampled by our program (on udev it is a `MultiTexture`),
+    hence snapshots.
+  - **Accent**: the app's own, from an optional `accent: "#rrggbb"` on each
+    `SetMinimizeTargets` entry (Bloom's `PYXIS_APPS` accent; a bad one is
+    ignored, never costing the target), else the snapshot's alpha-weighted
+    average pushed to saturation >= 0.55 and lightness 0.48-0.64; a colourless
+    (white, grey) window borrows Pyxis's default hue so it never makes a grey
+    orb (`lumen::accent_from_average`).
+  - **Switch and state** (echo-cli only, no bridge): `EVO_LUMEN=off` at start,
+    `evo.SetLumen {enabled, mipmaps?}` after; off, every effect draws its plain
+    fallback (genie-lite for minimize), logged. `evo.GetLumenState` →
+    `{enabled, program: untried|compiled|failed, frames{bloom, droplet,
+    evaporate, recede, glint}, last_progress{…}, landed{land, rise}}` (other
+    lanes add their own fields). A failed build, no GLES, a failed upload or a
+    backend with no `snapshot_window` (winit/x11) fall back, logged once.
+- **Droplet (minimize) and Rise (restore)** (lane L1, 2026-11-08;
+  `anim/droplet.rs` the pose maths, `anim/warp.rs` the payload and draw). Over
+  the first 60% the window's size goes geometrically to its icon's short side
+  and its corner radius to half of it (a circle); blur grows to 6 px, accent
+  tint and glow to 1 by ~50%; the centre travels a quadratic arc (control 40%
+  across, 70 px above the higher end, smoothstep-eased); once orb-like it
+  squashes and stretches along its velocity (up to 1.3 : 1/1.3, by how orb-like
+  it is); the last 18% shrinks it by 55% and the last 14% fades it. The window's
+  shadow (drawn at the frame) fades over the first 15%. Rise is the same with
+  `p` running back.
+  - **Driven by lane B's spring, not a new animation**: `p` is read off the
+    minimize `TransformAnim`'s `scale.y` (`droplet::progress_for`), so
+    counters, stagger and **retargeting** are unchanged: a restore that
+    interrupts a minimize turns the same spring round, and the pose (a function
+    of `p` and of the spring's rate, both continuous) cannot jump. The rate is
+    measured across frames on the payload (samples under 4 ms apart, the same
+    frame drawn for another output, don't count). The spring's envelope is
+    `minimize::DROPLET` 720 ms / `RISE` 680 ms when Lumen will draw
+    (genie-lite keeps 320/300): the spring is front-loaded, so this *reads*
+    ~480 ms (p >= 0.99 at 481 ms, a unit test). Slow-motion shots therefore use
+    scale 13, since a spring's run is capped at 10 s.
+  - Tests: `p=0` is exactly the frame (size, centre, 16 px corners, sharp,
+    untinted, opaque, unstretched), `p=1` is centred on the icon, no bigger,
+    invisible; radius <= half the short side and stretch in bounds for any
+    frame, icon, `p` and speed; every quantity continuous in `p`; the arc lifts.
+  - **`MinimizeLanded {app_id, window_id, phase: "land"|"rise", timestamp}`**
+    on `org.geckoOS.evo` (bridge `BRIDGE_SIGNALS` `windows:manage`; needs a
+    vela rebuild for Bloom to hear it): `land` at 90% of a minimize's run,
+    found by scanning the spring when it starts (in reduced, at 90% faded; with
+    animation off, at once; show desktop's Recede sends none), `rise` as a
+    restore starts. Queued per window on the compositor thread (a restore
+    drops a pending land) and sent from `EvoState::minimize_landed_tick` in
+    `process_pending_window_actions`, so it fires the same whether or not Lumen
+    draws. Bloom ripples the icon on both (lane L4).
+  - **Cost** (4 GB VM, software GL): four windows minimizing at once,
+    `GetRenderingStatus` fps **40 / 49 / 50 with Lumen** (three samples a
+    second apart, scale 10) against **28 / 37 / 37 genie-lite** (`SetLumen
+    false`), which draws four live windows' elements: no loss (a second run:
+    43 / 44 / 50 against 38 / 37 / 37). Snapshots took
+    6-32 ms each (the first, 31.6 ms, is the cold one). One snapshot per window per minimize, as before
+    (`lumen droplet: snapshot ... took` in evo.log).
+  - **Ghost z-order**: ghosts are kept in stack order (`ghosts::add`). A ghost
+    anchored to a window that is itself leaving is re-anchored to what that
+    window was anchored to, and the leaving window's own ghost goes in just
+    *below* it, so two separate minimizes keep the windows' order
+    (`Ghost::owner`; shot in `droplet-zorder`).
+  - `echo-cli watch [--signal S] [--interface I] [--seconds N] [--count K]`
+    prints signals as JSON lines (every connection hears every signal); the
+    suite reads `MinimizeLanded` with it, so it needs a new echo-cli pushed
+    (`--push target/release/echo-cli:/usr/bin/echo-cli`) until the next image.
+- **Evaporate (close)** (Lumen, lane L2, 2026-11-08; `anim/evaporate.rs`).
+  The close snapshot burns away from its close button: a threshold dissolve
+  over a field `0.5 × value noise (16 × 11 cells over the frame, plus 12% at
+  64 × 44) + 0.5 × distance from the SSD close button` (normalised so the far
+  corner is 1), threshold −0.10 → 1.02 linear in `p`, so nothing has gone at
+  `p = 0` and everything has at `p = 1`. Pixels within 0.06 of the threshold
+  glow, mixed toward `accent·0.45 + white·0.55` by `k²`. The picture swells
+  1 → 1.04 (cubic out), blurs to 2.5 px (mip LOD bias), loses its shadow by
+  30% and fades over the last 20%; ~380 ms. Accent: Bloom's from
+  `SetMinimizeTargets`, else `lumen::accent_of` on the snapshot.
+  - **Its own program**, not Lumen's shared one (that one clips, blurs and
+    tints; it has no field or threshold): one quad, the noise computed in the
+    fragment shader (Dave Hoskins' `hash12`, no `sin`), one texture fetch per
+    pixel. `field()` in Rust is the same sum line for line, so the unit tests
+    check what the shader draws (and an offscreen render of the shader on the
+    host matched the model's fraction gone to within 1%). It uses Lumen's
+    `link_program`/`scissor_box` and the same GL rules (divisor 0, a scissor
+    per damage rect, state put back).
+  - `GhostSource::Evaporate` carries the `Evaporate` (snapshot + accent); the
+    pose is an ordinary `TransformAnim` (`evaporate::transform`), so **a close
+    mid-open starts from the open's scale, place and opacity**, and progress is
+    read off its scale animation. `evaporate::choose` picks Evaporate (full
+    mode, `evaporate::usable()`: Lumen on and the program not failed), else the
+    foundation's scale/fade (reduced: a plain fade ≤ 150 ms; off: nothing). A
+    program that fails on the first frame of a running Evaporate draws the
+    plain snapshot fading evenly for the rest of it; a failure is logged once.
+  - Counters: `GetLumenState` `frames.evaporate`, `last_progress.evaporate`,
+    and `evaporate_program` (untried|compiled|failed). The close kind's
+    `started`/`completed` balance as before.
+  - **Polling gotcha (cost a debugging round):** a suite loop that polls
+    echo-cli with no `sleep` burns its count in a second or two (each call
+    takes a few ms) and falls through *silently*, so the 25/50/75% shots land
+    early and look like a shader that under-dissolves. `wait_ep` sleeps 0.1 s
+    per poll and prints `EP-REACHED`/`EP-MISSED`, which the suite asserts.
+  - **Cost** (4 GB VM, software GL): three windows closing at once at scale
+    10, `GetRenderingStatus` fps **41 / 39** with Evaporate against **43 / 43**
+    with Lumen off (other runs: 39 / 37 against 41 / 41, 38 / 37 against
+    46 / 46), so a few fps under the plain close. The first sample
+    after the three closes reads 0-1 in both: that is the three snapshot
+    readbacks, not the shader. One snapshot per close, as before.
+- **`evo.SetMinimizeTargets {targets:[{app_id,x,y,w,h}]}` → `{ok}`**
+  (bridge `windows:manage`; needs a vela rebuild for Bloom to call it, echo-cli
+  needs none): the whole table of dock icon rects, output-logical, relative to
+  the output's origin; it replaces the last one. Parsed in `shell/minimize.rs`
+  and held in a process-wide table (read only when a window minimizes, so it is
+  set on the Echo thread like the overlay region, not queued). An app with no
+  entry minimizes to a 48 px stand-in at the output's bottom centre
+  (`resolve_target`). Reset in `toplevel_destroyed` when the overlay dies, with
+  the work area. Bloom: `src/overlay/useMinimizeTargets.ts` measures every
+  `[data-shell-edge="bottom"] [data-app]` button by layout (`offsetParent`
+  chain, not the transformed box) and sends it through
+  `setMinimizeTargets` (`packages/app-sdk/src/overlay.ts`).
+- **Bloom (open)** (Lumen, lane L3, 2026-11-08; `anim/bloom.rs` the look and
+  its maths, `anim/shader.rs` the two programs). It replaces the plain open
+  (scale 0.92 + fade, `TransformAnim::open`), which is now drawn only with
+  Lumen off (`EVO_LUMEN=off`, `SetLumen {enabled:false}`) or when Bloom's shader
+  failed to compile (logged once). ~420 ms: `TransformAnim::bloom` is scale
+  0.90 -> 1 on a ζ 0.86 spring about the frame's centre, a 16 px rise (expo
+  out) and alpha done by 35%, so counters, a close mid-open
+  (`minimize::close_from`) and a minimize mid-open treat it as any open.
+  `WindowAnim::bloom` (`BloomFx`) carries the rest, as a function of time
+  progress `p` (`bloom::look_at`, tested): blur 10 px -> 0 as `(1-p)^3` (the
+  focus pull; under 0.3 px it samples once), corner radius 42 -> the frame's
+  own (0 when maximized), accent tint 0.45 -> 0 by half-way, and a radial glow
+  of the accent beneath the window, `0.33 sin(πp)`, out to 0.75 x its long
+  side. Accent: `shell::minimize::accent_for` (Bloom's `SetMinimizeTargets`
+  `accent`), else a neutral cool white (`bloom::NEUTRAL_ACCENT`). A window that
+  is only appearing has no snapshot to average.
+  - **On the live surface.** There is no snapshot to draw, so
+    `render::stack_elements` hands the window's elements to `bloom::apply`,
+    which swaps each textured one (client surfaces, lane D's `ClippedSurface`
+    unwrapped, the title bar's memory buffers) for a `shader::BloomSurface`.
+    That is a smithay texture-shader override like `ClippedSurface`: a 13-tap
+    two-ring disc turned per pixel by a hash (fine grain, not doubled
+    images), the tint, and a rounded clip on all four corners with an edge
+    softened by the blur, so the silhouette goes out of focus too. The title
+    bar's solid border edges can't be shaded, so they fade in once the
+    corners are within ~2 px of landing (`bloom::border_alpha`). The glow is
+    `shader::GlowElement` (a pixel shader, `OutputRenderElements::Glow`),
+    drawn below the window and above its shadow. Both carry a fresh `Id`
+    every frame, which is what makes the damage tracker repaint a surface
+    whose commit hasn't moved, and repaint the plain element that replaces
+    it when Bloom ends. Popups are drawn plain.
+  - Programs: compiled on the first opening window, per `GlesRenderer`, own
+    status (independent of `EVO_DEPTH`). No program means the same
+    `TransformAnim` drawn plain (Bloom's scale, rise and fade). Reduced is the
+    150 ms fade; off is nothing. Blur alone can be switched off with
+    `EVO_BLOOM_BLUR=off` or `SetLumen {enabled, bloom_blur}`.
+  - State: `GetLumenState` `frames.bloom`, `last_progress.bloom` (both
+    counted in `anim::lumen`), plus `bloom_program`, `bloom_blur` and
+    `bloom_blurred_frames` at the top level.
+  - **Cost** (4 GB VM, software GL, three apps opening 2 s apart at scale 5,
+    `GetRenderingStatus` fps while opens run, four runs): with blur
+    28 49 49 46 46 46 / 27 47 47 44 42 42 / 47 49 49 45 45 47 /
+    26 46 48 36 44, without 27 47 40 40 40 45 / 27 48 48 41 41 48 /
+    27 47 47 39 39 44 / 45 45 44 41: no measurable cost,
+    so there is no lighter blur mode. (Lumen off read 16-19, two samples
+    each, with the launches still loading the VM.)
+  - Seen in slow-motion shots of a fresh Files launch: soft, washed toward
+    the accent, wide corners, sharp by ~75%. Files' first buffer already has
+    content, so the blank-first-buffer case wasn't seen; a blank one would show
+    as a soft tinted card, not a white flash. The shadow keeps the frame's
+    16 px corners while Bloom's are wider.
+  - On-device: the "bloom" section of `alpha5-animations.txt` (frames
+    through Bloom and blurred, none in reduced/off or with Lumen off, counters
+    balanced, `bloom-08/25/50/75` and `bloom-noblur-25` shots at Bloom's own
+    progress, fps with and without blur). Its launches wait for the last vela
+    of the app to exit (`bgone`) and for the window (`bmapped`). **The
+    "flake" in about half the full-length runs** (the Files launch after the
+    off-mode one never mapping) was Gecko's automatic safe mode: the suite
+    closes several vela before their start-up finishes, each counts as a
+    start-up crash, and past three a chromeless vela exited at once on every
+    launch, for good. Fixed in Nova's `user.js` (see "On-device verification").
+    `bmapped` alone can't see such a failure, since `ListWindows` lists the
+    about:blank pre-window under the app's id too.
+- **Show desktop (Super+D) is Evo's, drawn as Lumen's Recede** (lane L4,
+  2026-11-08; `shell/recede.rs` the state and stagger, `anim/recede.rs` the
+  poses and draw). `EvoState::show_desktop` (called from the
+  `KeyAction::Shell("show-desktop")` handler, which still emits the
+  `ShortcutTriggered` signal) minimizes every app window on screen, front-most
+  first, 45 ms x scale apart (`spec::SHOW_DESKTOP_STAGGER`), each drawn as a
+  **Recede** (~460 ms: scale 1 -> 0.88 about the centre, 14 px down, blur
+  0 -> 10 px, alpha on a power-1.6 curve, a bezier fit) from a snapshot through
+  the Lumen program (`Effect::Recede`). It goes through
+  `minimize_window_as(.., MinimizeStyle::Recede(delay))`, so placement, focus
+  and `Suspended` are a minimize's; it sends **no `MinimizeLanded`** (nothing
+  lands in an icon). Ghosts are made back to front so the stack's order holds.
+  - **State model: the desktop is shown.** Evo remembers the set it sent away
+    (thread-local, front-most first). Super+D **emerges exactly that set** when
+    no app window is on screen and one of them is still minimized
+    (`recede::toggle`): back-most first, same stagger, ~440 ms each (**Emerge**,
+    the Recede run back on mirrored curves; from the pose of a Recede still
+    running, on its picture), through `unminimize_window_as(..,
+    RestoreStyle::Emerge(delay))`, mapping back to front so the stack returns as
+    it was, and the front-most is focused. Otherwise it recedes what is on
+    screen. So a **dock restore** after a show desktop is a Rise of that one
+    window (as any restore) and ends the shown state by putting a window on
+    screen; the next Super+D sends *it* away rather than bringing the rest back.
+    No hook in the restore or open paths: "shown" is judged at the keypress.
+  - Counters: a Recede is a `minimize`, an Emerge a `restore` (no new kinds, so
+    `GetAnimationState`'s shape is unchanged). `GetLumenState.recede` =
+    `{shown, recedes, emerges, recede_order, emerge_order}` (window ids, in the
+    order their animations start) for the suites; `frames.recede` counts frames
+    of both. Reduced: an opacity fade in place (<= 150 ms, no stagger, no
+    snapshot); off: instant; Lumen off: the live window under the same motion,
+    unblurred. Bloom's `show-desktop` handler no longer moves windows.
+  - **Cost** (4 GB VM, software GL): three windows receding at scale 10,
+    `GetRenderingStatus` fps 45/37/38 through Lumen against 50/48/45 plain
+    (`SetLumen false`); one snapshot per window at the keypress, 5-6 ms each at
+    1280x680 (`lumen recede: snapshot ... took` in evo.log). Shots
+    `recede-*`/`emerge-*` in `alpha5-animations.txt`.
+- **Bloom's side of Lumen** (lane L4, 2026-11-08; `pyxis-experience`):
+  - **Dock ripple and dip** on `MinimizeLanded` (`land` and `rise`): the icon
+    rings in its app's hue, the ring spreading 14 px past the icon over 620 ms
+    (expo out) while its light fades evenly, and the glyph dips a damped 5 px
+    (`components/DockLanding.tsx`, state per app in `hooks/useDockLandings.ts`,
+    SDK `onMinimizeLanded` / `MINIMIZE_LANDED_SIGNAL` in
+    `packages/app-sdk/src/overlay.ts`). Reduced: the ring alone, fading in
+    place (<= 150 ms); off: nothing. The dev server's mock emits `land` 430 ms
+    after `MinimizeWindow` and `rise` on `RestoreWindow`. **Needs the vela
+    rebuild** on device (the bridge entry is new).
+  - **Accent** on each `setMinimizeTargets` entry: `accent: "#rrggbb"` from
+    `APP_ACCENTS[id].hue` (`apps/registry.ts`, `appHue`), left out for an app
+    Bloom has no accent for (`minimizeTargetPayload` drops an invalid one).
+  - **Wallpaper drift** (`Desktop.tsx`, `hooks/useWallpaperDrift.ts`): while
+    the desktop is shown the wallpaper layer scales 1 -> 1.035 over 700 ms
+    (ease in-out), and back. Bloom mirrors Evo's rule from the signals:
+    `ShortcutTriggered show-desktop` toggles, `WindowMinimized {minimized:
+    false}` or `WindowCreated` ends it. Full mode only. Tokens: `LUMEN` in
+    `src/motion.ts`. Tests: `src/overlay/__tests__/lumen.test.tsx`.
+- Counters: `minimize`/`restore` kinds. Reduced is an opacity fade in place
+  (<= 150 ms), off is instant. A spring's run is capped at 10 s
+  (`REST_SCAN_LIMIT`), so slow-motion shots of a minimize use scale 30, not 60.
+- **Geometry transitions** (lane G, built 2026-11-07, `anim/geometry.rs`,
+  `shell/geometry_anim.rs`): maximize, unmaximize, fullscreen in and out, a
+  fit to the work area and a work-area change (`refit_to_work_area`) move the
+  window's *visible rect* from the old frame to the new with a ζ = 1 spring
+  (about 280 ms, `spec::GEOMETRY`).
+  - **Technique.** Every request handler calls
+    `EvoState::begin_geometry_transition(window, expected_size)` **first,
+    before the configure and before `place_window`** (and before fullscreen
+    suppresses the header): it snapshots the window, SSD included, and the
+    transition **waits**, drawing the snapshot at the old frame with the live
+    window hidden (the live window is already at its final place with its old
+    size, which would look like a jump; it still gets frame callbacks, which
+    go to every Space window, so it can paint). The spring starts when the
+    client's new size **lands** (`geometry().size` differs from the stale one,
+    seen at draw time), or after `PENDING_LIMIT` (750 ms, inside the Settling
+    marker's 2 s) if the client never resizes (a refusal, a minimum), and then
+    settles onto whatever frame the window has. From then both the snapshot
+    (opaque, underneath) and the live window (fading in over the first 40%)
+    are drawn *scaled* to the moving rect, then the snapshot is freed. Only
+    scaled textures are drawn, so the header text is never re-rasterized per
+    frame (the live header was drawn once, at its final width).
+  - **Placement and input stay instant and final.** The transition is a
+    render-time pose (`GeoMotion::pose` takes the live frame; nothing reads
+    the animated rect back). `GeoMotion` is a pure state machine with
+    injected time; `GeoTransition` (snapshot + RAII counter, kind `geometry`)
+    sits in the window's user_data and `render::stack_elements` draws it when
+    the window has no `WindowAnim` (which wins, and cancels it).
+  - **Interruptible.** The rect is two springs (location, size, in px), so a
+    retarget keeps value and velocity. A live frame that changes under a
+    running transition (a re-fit, a late size) retargets it by itself at the
+    next frame. A new request that changes the size (maximize then unmaximize)
+    takes a fresh snapshot of the live window and goes back to waiting while
+    the springs carry on: no jump, one transition, one count.
+  - **Only when there is a frame to leave.** Skipped (instant) for a window
+    that has not opened yet, has `placement_pending`, is not mapped, or holds
+    another animation, and when the backend can't snapshot. Unmaximize and
+    unfullscreen only begin if the layout says the window *is* maximized or
+    fullscreen: a client letting go of a flag it never had must not freeze its
+    picture waiting for a size that will not change. A request whose expected
+    size equals the current one (a pure move) needs no snapshot and no
+    waiting: the live window slides.
+  - **Fullscreen.** `output_elements` takes the exclusive branch only when the
+    fullscreen window has no geometry transition, so entering and leaving draw
+    through the normal stack (overlay above) until the transition ends, then
+    hand over. `geometry::sweep`, run at the top of `output_elements`, ends
+    transitions nobody draws (a window minimized or closed mid-transition) by
+    the clock, so they can't hold the hand-over or a counter open.
+  - **Modes.** Reduced: no scaling; the snapshot stays at the old frame and
+    crossfades symmetrically with the live window at the new one, at most 150
+    ms (instant when there is no snapshot). Off, or scale 0: nothing starts.
+    Interactive move and resize start no transition (`DRAG-NO-TRANSITION`).
+  - **Cost.** One GPU readback per transition (4 MB at 1280x800; another on an
+    interrupt). `GetRenderingStatus` fps read 47-49 in the 4 GB VM (software
+    GL) with two full-size layers on screen. The slow-motion shots at scale 60
+    outlast a spring's 10 s run cap (`REST_SCAN_LIMIT`), so a spring that slow
+    ends a few pixels early; only slow motion is affected.
+  - **The shadow follows the moving rect.** `geometry::Drawn::shadow_pose`
+    (live frame → the rect being drawn, alpha 1; the snapshot's rect while
+    waiting) is what `stack_elements` hands `window_shadow` in place of an
+    animation pose. A maximized layout casts none, so a maximize shows no
+    shadow on the way and an unmaximize has it from the start.
+  - X11 windows take the same hook (`x11.rs` maximize/fullscreen); that path
+    has no on-device test.
+  - **Settle glint** (Lumen, lane L4, 2026-11-08; `anim/glint.rs`): from 42%
+    of the transition's nominal duration to its end, a soft diagonal band of
+    white light (along `x + 0.6y`, a gaussian core with a faint tail, peak
+    alpha `0.32 x sin(pi g)`) crosses the window from its top-left corner to
+    its bottom-right, clipped to the frame drawn now, with the frame's corners
+    as they are at that moment (16 px times the shadow's `appear`, which fades
+    as a window goes square). A pixel shader (`GlintElement`,
+    `OutputRenderElements::Glint`, in front of the live window), its own
+    program in the EGL context's user data beside lane D's, through
+    `GlesAccess`. The transition is held until the band is across
+    (`GeoMotion::glint_pending`), so it never stops half way when the springs
+    rest early. Full motion and Lumen on only; a failed compile draws none.
+    Counted under `GetLumenState` `frames.glint` / `last_progress.glint`, with
+    `glint_program` beside them. **On a white window it barely reads** (white
+    over near-white is a couple of levels: measured, the band is there and
+    moving, at x+0.6y ~900 at 50% and ~1500 at 75%); it shows on dark ones
+    (`glint-term-*` shots, the Terminal).
+- **Depth (lane D)**: shadows, rounded bottom corners, the focus crossfade and
+  the grab lift, all following the window's pose through open, close, minimize
+  and geometry transitions. Design and plumbing in
+  [Window decoration model](#window-decoration-model).
+- **Not done**: the open does not wait for a blank
+  first buffer. A window minimized within ~260 ms of opening jumps from its
+  open pose to the Droplet's start (the open's own pose and alpha are not
+  folded into the Droplet's). The Droplet's picture is a snapshot, so a window that repaints while
+  it flies (a video) freezes. On a multi-GPU setup the snapshot texture is
+  uploaded to the render node's GLES context, which is the frame's only when
+  both are one device (true of the VM and a single GPU). Minimize targets are
+  relative to the output of the window being minimized, which is right for the
+  one output Bloom's overlay covers.
+- On-device suite: `scripts/serial-tests/alpha5-animations.txt` (counters,
+  `off`, `reduced`, and slow-motion shots of a window mid-open and mid-close to
+  look at; minimize/restore, the two interruptions, show desktop with three
+  apps, and a close mid-open; targets set with echo-cli). Its geometry
+  sections assert the counters, the final frames against the work-area maths,
+  the interrupt, a work-area change and F11 fullscreen, and take the `geo-*`
+  shots caught part-way at scale 60. Its Droplet section takes `droplet-*` /
+  `rise-*` shots when `GetLumenState.last_progress.droplet` reaches 25/50/75%
+  (icons below, left and right of the window, a restore, both interruptions,
+  two windows' z-order, the lite fallback), asserts the program compiled,
+  frames went through it (none with Lumen off, or in reduced/off),
+  `MinimizeLanded` seen with `echo-cli watch` and landing between 75% and 95%,
+  and prints the fps of four simultaneous minimizes with and without Lumen.
+
 ## Known code-level issues to track
 
 - `echo/src/services/appmanager.rs:102` — no signature verification before tarball extraction (Nova's install plan formalizes the fix; not yet implemented). `appmanager` is superseded by Nova and should probably just be deleted.
 - `evo` TODOs: HiDPI scale not read from render surface (`udev.rs`), X11 override-redirect ordering (`shell/x11.rs`). (`GetRenderingStatus` answers with real fps/memory since alpha 5.)
 - `evo` resize (#11) works since alpha 5: an invisible 8 px band **outside** the SSD frame starts the grab (`WindowElement::ssd_resize_band`), because vela never sends `xdg_toplevel.resize` itself. Resize grabs work in **frame** size (header included) and convert to client size only in the configure they send (`grabs.rs::client_size`). Sending the frame size grew every SSD window by 32 px the moment a resize began. `cargo test --workspace` now has no expected failures.
 - `evo`'s Echo broker matches replies by `reply_to`, and it re-registers `org.geckoOS.evo` after any reconnect (alpha 5). It used to take the next frame as a request's reply: a signal, or a call forwarded to Evo, could be eaten and never answered. It also never re-registered, so a dropped connection lost the service for the rest of the session. Its signals are fire-and-forget: a signal never waits on the compositor thread, and a request waits at most 3 s.
-- `evo.ListWindows` lists the live toplevels (`EvoState::sync_toplevels`), with frame geometry. It used to read the create/claim map, which holds only windows Evo created itself, so it was empty on every device (the same two-registries trap the window-action handlers once fell into).
+- `evo.ListWindows` lists the live toplevels (`EvoState::sync_toplevels`), with frame geometry. It used to read a map that held only windows Evo created itself (the old create/claim path, since deleted), so it was empty on every device (the same two-registries trap the window-action handlers once fell into).
+- **A window's place, layout and keyboard focus each have one path** (`evo/src/shell/placement.rs`, since 2026-11-07). Move grabs, maximize, fullscreen, resize and X11 configure all go through `EvoState::place_window` and `set_window_layout`, which write the workspace record and map the element only if the window should be on screen; before, they wrote the Space directly and the record held only a window's birth location, so minimize/restore put windows back where they were born. Nothing may call `space.map_element` for a managed window. `focus_window` is the only way an app takes the keyboard (new windows on their first mapped commit, the dock, xdg-activation, click); closing or minimizing the focused window hands focus to the next app down the stack, else the shell. A minimized window is out of the Space but stays in the workspace and `windows_by_id`: look windows up with `tracked_window_for_surface`/`_toplevel`/`_x11`, not `space.elements()`, or a window closed while minimized leaks. `WindowElement::is_ssd()` is a `Cell` read, never `decoration_state()`, so geometry/hit-testing can't hit the RefCell re-entrancy panic. X11 windows are registered like xdg ones. BindSurface/UnbindSurface are fire-and-forget through the broker (sent once per window, when its app id first appears or changes, with the client's pid); a bind lost to an Echo reconnect is not retried. Minimize sets `xdg_toplevel` `Suspended`: that, not SIGSTOP, is the app's background hint. On-device suite: `scripts/serial-tests/alpha5-windows.txt`.
 - `echo`'s `org.geckoOS.Echo` `ListServices` reads only `ServiceRegistry`, which
   is written solely by the over-the-wire `RegisterService` call — never by the
   in-process services `daemon.rs` installs via `register_handler`, so it answers
@@ -115,7 +1076,64 @@ decision — the decision is above.
   never pruned on disconnect, so a registered-then-crashed client keeps its
   entry forever — the listing now shows it as unreachable instead of implying
   it is running.
-- **Permissions ARE enforced at the bridge** — this file said the opposite for months. `PyxisBridgeParent.sys.mjs`'s `_capabilityFor(service, method)` maps each call to a capability (`filesystem.writeFile` → `filesystem:write`, `readFile`/`readDirectory`/`exists`/`stat` → `filesystem:read`, …) and throws `Pyxis capability denied: app '<id>' did not declare '<cap>'` when the app's declared list lacks it. Verified on device 2026-09-21 the hard way: a probe page dropped into the `files` app wrote nothing at all, because `files`' `manifest.webapp` declares only `filesystem:read`. What is still missing is the *visible* half — an install-time prompt, a per-app view, and revocation (roadmap item 6) — not the check itself.
+- **Permissions ARE enforced at the bridge, deny by default** (since
+  2026-09-27). `PyxisBridgeParent.sys.mjs`'s `BRIDGE_CAPABILITIES` lists
+  every (service, method) the bridge forwards with the capability it needs
+  (`audio.setVolume` → `audio`, `evo.SetOverlayRegion` → `windows:manage`,
+  …), or `null` for the few that need none (`system.getInfo`,
+  `settings.get`, power/deviceInfo readings). An unlisted pair is refused
+  (`Pyxis capability denied: app '<id>' called <svc>.<m>, which no app may
+  call`), including `process.*`, `Echo.*`, Rockhopper/Shift and the device
+  identifiers. Before that, an unlisted pair was *allowed*: any app could
+  open a root shell (`terminal`), `process.spawn` as root, and drive evo,
+  nova, appHost, installer, audio, sound and settings. The vocabulary lives
+  in the table, `nova.rs` and vroom (config.rs + both schemas); two nova
+  tests fail when they drift. Privileged: `notifications:manage`,
+  `appManager:*`, `settings:write`, `windows:manage`, `terminal`, and
+  `filesystem:user`/`system`/`apps` (trusted ids: bloom, installer,
+  settings, terminal, files). Each refusal is logged once
+  (shell: /var/log/vela.log; launched apps: /var/log/echo.log) — look
+  there, since EchoClient falls back to its mock and a refused app looks
+  fine. On-device suite: `scripts/serial-tests/alpha5-bridge-deny.txt`.
+  **Signals are gated the same way** (since 2026-09-28). Echo sends every
+  signal to every connection, so the bridge alone decides what an app
+  hears: `BRIDGE_SIGNALS` lists each (service, event) with its capability
+  (`notification.*` needs `notifications:manage`, `terminal.*` `terminal`,
+  `appHost.*` and `nova.*` `appManager:manage`, …), checked when an app
+  subscribes and again at delivery. Before, any app heard every app's
+  notification text and the root shell's output. A refused subscription
+  is logged like a refused call, and the app is told nothing: its listener
+  never fires. Subscriptions belong to the document that made them (one
+  actor each), not to its browsing context. On-device suite:
+  `scripts/serial-tests/alpha5-bridge-signals.txt`.
+  **Filesystem calls are confined** (since 2026-10-06). echo-daemon is
+  root, and its filesystem service used to do whatever path a call named:
+  any app with `filesystem:write` could rewrite /etc/shadow or delete
+  /usr/bin. Echo can't tell apps apart (no peer credentials; `sender` is
+  whatever the client writes), so the bridge stamps every filesystem call
+  with a `scope` over what the page sent, and echo enforces it
+  (`echo/src/services/filesystem/scope.rs`): every path resolves with
+  `openat2(RESOLVE_BENEATH | NO_XDEV | NO_MAGICLINKS)` beneath the scope's
+  root, on a thread that has dropped to the scope's user (no groups, no caps):
+  pyxisapp for `app:<id>`, geckouser (uid/gid 1000) for `user`/`system`. Scopes: `app:<id>`, the app's own `/var/lib/pyxis/data/<id>`
+  (made on first use, 0700, which the app sees as `~`; deleted, with the
+  app's Gecko profile, by `installer.Remove`/`nova.Uninstall`, which wait
+  for a running app to exit first); `user`, the home
+  (`filesystem:user`, Files); `system`, the root filesystem read-only, by
+  absolute path (`filesystem:system`, Files; /proc, /sys, /dev, /run and
+  /tmp are other mounts and out of reach); and another app's own data,
+  named by the call's `app` field (`filesystem:apps`, Bloom's desktop
+  search over Notes/Contacts/Tasks). The bridge lists these in
+  `FILESYSTEM_SCOPES`. Paths in a scope are `~`-rooted both ways, `..` and
+  (outside `system`) absolute paths are refused, and a call with no
+  `scope` is the old unconfined service, reachable only by clients that
+  hold the socket. `deviceInfo.getStorageInfo` now answers for `/`
+  whatever path it is given. Writing outside the home is planned as a
+  sudo-backed "privileged access" unlock
+  (`docs/internal/pyxis-privileged-access-plan.md`). On-device suite:
+  `scripts/serial-tests/alpha5-fs-confine.txt`; hello-pyxis's proof file
+  moved with it, to `/var/lib/pyxis/data/com.pyxis.hello/proof-<ms>.txt`.
+  Still open: the visible half (prompt, per-app view, revoke).
 - `pyxis-experience`'s README is still the stock Vite template. Test coverage is no longer zero — Vitest is wired up (`npm test`), with `src/hooks/__tests__/novaContract.test.ts` asserting the mock's `nova.List` shape against fields **parsed out of `nova.rs` itself**, so adding a field to `to_info_json` without teaching the mock fails at the desk. That suite is the pattern to extend; it is still the only one.
 - **App windows must stay out of SessionStore, and chrome must be measured
   *settled*.** `SessionStore.restoreWindowFeatures()` reasserts every
@@ -139,7 +1157,33 @@ decision — the decision is above.
   that hides that warning in app windows stays, as belt and braces. Verified
   with `--kernel`: namespaces work, and apps launch and render under the
   sandbox. The image picks the kernel up at its next rebuild.
-- **remochi's `Toggle` types don't match its runtime**: `index.d.ts` declares a `checked` prop, but the exported component reads `value` and calls `onChange({ value })`. Passing `checked` type-checks and is silently ignored. Bloom bridges this with a locally-typed `Switch` cast in `QuickSettingsMenu.tsx` and `SettingsApp.tsx` — check for that trap before adding a new `Toggle`.
+- **echo-daemon must never `waitpid(-1)`.** AppHost's SIGCHLD reaper used to,
+  and it collected the exit status of every child, including `wpctl`, `opkg`
+  and `pw-play`, before the code running them could. That code then failed
+  with ECHILD ("No child processes"), even though the command had worked.
+  The reaper now waits only on the pids it launched
+  (`AppHost::reap_once`). Anything else that spawns must wait on its own
+  child (`process.rs` and `terminal.rs` do).
+- **remochi is 0.4.0 since 2026-11-09** (with `@duyojs/duyo` 1.1.0; port plan
+  `docs/internal/pyxis-duyo-port-plan.md`). 0.4 renamed `Button`'s `variant`
+  to `type` (`htmlType` is the native one). It also fixed the two traps
+  below, whose workarounds are still in the code until the Duyo port removes
+  them:
+  - `Slider` was uncontrolled in 0.3 (copied `value` at mount); 0.4 re-syncs
+    `value` when not dragging. The volume sliders' `revision` key is now
+    redundant.
+  - `Toggle`'s types said `checked` while 0.3 read only `value`; 0.4 takes
+    both. The locally-typed `Switch` cast in `QuickSettingsMenu.tsx` is now
+    redundant (Settings' went with its Duyo port).
+- **The eight apps are Duyo since 2026-11-09** (Phase 2; Bloom is still React,
+  blocked on Duyo's whole-tree re-render). Each app is `*.view.json` +
+  code-behind over `@pyxis/app-sdk/duyo` (`mountDuyoApp`, `pyxis.*` kinds,
+  binders); React islands go in the app's own pack (`mountDuyoApp(kind,
+  { packs })`), never into `pyxisPack`. Read `docs/internal/duyo-idioms.md`
+  before touching one, and `duyo-upstream-gaps.md` for Duyo's limits (a
+  published `path` silently has no setter; a remochi Dialog's `onClose`
+  bubbles; hidden components stay in the DOM). Dev servers need
+  `optimizeDeps.exclude: ['@duyojs/duyo']` (every config has it).
 
 ### Corrected 2026-08-16 (were stale, verified fixed — do not re-investigate)
 
@@ -147,14 +1191,50 @@ decision — the decision is above.
 
 ## The one thing webOS got right that Pyxis hasn't built
 
-webOS's LS2 bus enforced a **JSON role-file allow-list per identity** *at the bus itself*, before any message was delivered. Pyxis enforces at the **bridge** instead (`PyxisBridgeParent._capabilityFor`, checked against the app's declared `permissions[]` — confirmed working on device 2026-09-21), which covers every `pyxis://` app but **not** a native client that opens the Echo socket directly: `echo-cli` can still call anything. So the gap is narrower than this section used to claim — it is bus-level enforcement for non-bridge clients, plus the user-visible half (install-time prompt, per-app view, revoke) in roadmap item 6. See `nova-runtime-host-plan.md` §5/§7 and `pyxis-webos-parity-analysis.md` §4 item 6.
+webOS's LS2 bus enforced a **JSON role-file allow-list per identity** *at the bus itself*, before any message was delivered. Pyxis enforces at the **bridge** instead (`PyxisBridgeParent`'s `BRIDGE_CAPABILITIES`, deny-by-default since 2026-09-27, checked against the app's declared `permissions[]`), which covers every `pyxis://` app but **not** a native client that opens the Echo socket directly: `echo-cli` can still call anything. So the gap is narrower than this section used to claim — it is bus-level enforcement for non-bridge clients, plus the user-visible half (install-time prompt, per-app view, revoke) in roadmap item 6. See `nova-runtime-host-plan.md` §5/§7 and `pyxis-webos-parity-analysis.md` §4 item 6.
+
+**The Wayland half has the same shape, and is narrower since 2026-11-07**: Evo
+separates apps from the system by connection class (see [Wayland trust
+classes](#wayland-trust-classes-evo)), an app launched by Nova can't bind
+screencopy, data-control, virtual-keyboard, input-method or the security-context
+manager and can't claim a shell role, **and (since the app-uid lane) it can't
+dial the host socket to escape that**: apps run as `pyxisapp`, `wayland-0` is
+`geckouser:geckouser 0600`, and `pyxis-wlctx` hides it in the app's mount
+namespace besides. The same split closes the shared-uid holes that no Wayland
+filter could: an app can no longer `ptrace` the shell, read its `/proc/<pid>`
+or its profile (`/var/lib/pyxis/profiles/bloom` is geckouser 0700). What remains
+open:
+
+- **Apps share one uid with each other** (see above), so the kernel doesn't
+  keep one app out of another's process or profile; a uid per app is the next step.
+- **Echo's socket is mode 0666 and has no peer credentials**, and an app has to
+  reach it (the bridge connects to it), so a native client that opens the
+  socket directly can still call anything on the bus (`echo-cli` does). The
+  bridge's deny-by-default table covers only `pyxis://` apps. Closing this
+  needs identity on the bus (peer credentials plus a role file), which the uid
+  split makes possible and nobody has built.
+- **Anything root or geckoOS-boot starts that draws a window is trusted**, by
+  design. Check new launch paths. The one that looked like a gap, Puppis's
+  `GeckoAppLauncher` (reached from Rockhopper), isn't a launch path: it **starts
+  no process at all** (it records an app and allocates its own ids; nothing
+  in Rockhopper's daemon even calls it, the service it registers has no
+  handlers), so there was nothing to route through `pyxis-wlctx` and nothing to
+  remove for it. It was kept because roadmap item 3 builds on its suspend/resume
+  bookkeeping, and `launcher_spawns_nothing` (puppis) fails if it ever gains an
+  exec, so that can't happen unwrapped by accident. Every launch Nova makes
+  (vela apps, native ipk apps, the external browser) goes through
+  `contained_launch`; a nova test counts the call sites.
+- A **window's title** is still the client's text; and apps can still use
+  `/tmp` (sticky, shared with the shell's uid for reading world-readable files).
+- `PR_SET_NO_NEW_PRIVS` is not set on the app (Gecko's own sandbox sets it for
+  content); setting it at the launch would be a further hardening.
 
 ## Consolidated roadmap (dependency order)
 
 0. **Decide + build the app-serving strategy** — `pyxis://` scheme + from-source `vela` Gecko build. Blocking prerequisite for real web-app launching; the biggest unplanned workstream. (`pyxis-gecko-embedding-plan.md`, `pyxis-scheme-and-kiosk-plan.md`)
 1. **Unify the JS bridge contract** — ✅ done: Bloom talks to the real `window.geckoOS` bridge (now an `@pyxis/app-sdk` monorepo package with `EchoClient`/`useEcho`/`useAppHost`).
-2. **Build Nova** — ✅ done (in-process at `echo/src/services/nova.rs`, not the standalone crate `nova-runtime-host-plan.md` §8 describes). Registry/discovery, launch composition (setpriv-wrapped `vela`, delegates to `appHost`), install/uninstall, suspend/resume, origins map, permissions vocabulary all real. Bloom launches via `nova.Launch` and reads its app list from `nova.List` (alpha 4, `useApps.ts`). Standalone-crate extraction is a deferred follow-up.
-3. **Wire Puppis's card lifecycle** (`suspend_app`/`resume_app`, already real code, not yet called by anything) behind `appHost`/Nova, driven by Evo visibility/focus events, wired to Gecko's own background-tab throttling. (Nova's own `handle_window_minimized`/`handle_window_restored` already drive `appHost.suspend`/`resume` off Evo's `WindowMinimized` signal — this item now covers wiring Puppis's freeze/thaw specifics on top.)
+2. **Build Nova** — ✅ done (in-process at `echo/src/services/nova.rs`, not the standalone crate `nova-runtime-host-plan.md` §8 describes). Registry/discovery, launch composition (`pyxis-wlctx`-wrapped `vela` run as the app user, delegates to `appHost`), install/uninstall, suspend/resume, origins map, permissions vocabulary all real. Bloom launches via `nova.Launch` and reads its app list from `nova.List` (alpha 4, `useApps.ts`). Standalone-crate extraction is a deferred follow-up.
+3. **Wire Puppis's card lifecycle** (`suspend_app`/`resume_app`, already real code, not yet called by anything) behind `appHost`/Nova, driven by Evo visibility/focus events, wired to Gecko's own background-tab throttling. (Nova no longer suspends on minimize, since 2026-11-07: SIGSTOP silenced minimized music and left a minimized app unable to handle SIGTERM. `appHost.suspend`/`resume` stay as explicit calls on the process group, and `close`/`kill` SIGCONT a suspended group first. Evo's xdg `suspended` hint is the background signal.)
 4. **Wire real status/notifications** — replace Bloom's static mock battery/network values with real Rockhopper Echo signals.
 5. **Delete `WaylandSurfaceView`** — replace with chrome-only card metadata + `wlr-screencopy` thumbnails.
 6. **Build the security/capability model** — per-app permission allow-list at the bridge boundary, tarball signature verification, sandboxing/cgroups for spawned apps.
@@ -172,6 +1252,9 @@ serial console. Since alpha 5 it can also **see, click and hear**:
   the PNG: a capture succeeding says nothing about whether the screen is right.
 - `#!pointer move|click|drag X Y …` drives a virtio tablet over QMP. A
   coordinate can be `$VAR`, read from the guest shell.
+- `#!type TEXT` and `#!key QCODE…` drive the virtio keyboard the same way
+  (click into a field first). `alpha5-fs-confine.txt` types into Bloom's
+  desktop search.
 - `#!listen <name>` saves what the guest's HDA card played since the last
   listen, and reports `silent` when nothing did.
 - `--push LOCAL:/path` files are laid over the rootfs by geckoOS-boot
@@ -190,11 +1273,78 @@ Suites assert: a `#!must <text>` / `#!must-not <text>` line applies to the
 next command and fails the run. Without them a suite only *prints*, and a
 run in which every step errored still exits 0 — which has happened, twice.
 The suites live in `scripts/serial-tests/`, including `alpha5-*.txt` for
-screenshots, resize, notifications and audio.
+screenshots, resize, notifications, audio and the overlay.
+`alpha5-app-uid.txt` checks the app-user split (see [Wayland trust
+classes](#wayland-trust-classes-evo)): the app uid can't dial `wayland-0`, an app
+runs as `pyxisapp` under the root `pyxis-wlctx`, killing the helper kills the
+app, sound and data work as `pyxisapp`. **It needs a rootfs rebuild for the
+user/group, `/home/pyxisapp`, and geckoOS-boot's runtime-dir modes**; on an old
+image its first step does those by hand and prints `ROOTFS=stand-in` (a rebuilt
+image prints `ROOTFS=rebuilt`). Any other suite run on an old image must do the
+same stand-in or apps can't reach Echo/PulseAudio (two lines at the top of that
+suite). `alpha5-fs-confine` still asserts data dirs are `1000 1000`: they are
+`1001 1001` now.
+
+Every suite passes, with no known failures: all 26, swept 2026-11-09 against
+the rebuilt image (09:01, Daylight and live settings included) with no
+`--push`, except `alpha5-wallpaper`, which needs Bloom's window-store fix
+(found by that sweep; see [Daylight wallpaper and live
+settings](#daylight-wallpaper-and-live-settings)) pushed until the next image:
+`--push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot`.
+With it, `alpha5-wallpaper` passed three runs of three, and the overlay suites
+(`shell-layering`, `shortcuts-shell`, `thumbnails`, `overlay`, `windows`,
+`settings-live`, `bridge-deny`) pass too. The next image also sets the kernel
+hostname from `/etc/hostname` (About read "(none)"). The sweep of 2026-11-08
+(16:24 image) found three bugs, fixed since. First, **an app closed during start-up four times could never be
+launched again** (Gecko counts each as a start-up crash, and past
+`toolkit.startup.max_resumed_crashes` a chromeless vela exits at once; nothing
+reset the count). Nova's `user.js` and the shell's profile set it to -1.
+Second, **windows closed while restoring left their restore
+animation active for good** (an animation completes only when drawn; a killed
+client has no buffer, so no close was made and nothing cancelled it):
+`remove_window_from_workspace` now ends a window's own animations, and
+`alpha5-close-mid-restore` checks it. Third, **a large frame could cost a
+connection**: echo-daemon's per-connection loop and Evo's broker each read a
+frame as one `select!` branch, which is not cancel-safe, so a signal arriving
+while a frame was half read (a thumbnail reply is hundreds of KB) dropped the
+half that was read and put the stream out of step; echo-daemon closed Evo's
+connection, the call in flight failed with "Connection task dropped the
+request", and `org.geckoOS.evo` was unregistered until the broker came back.
+Both now read frames in a task of their own and wait on its channel
+(`UnixSocketTransport::recv_message` says so; test
+`broker_keeps_a_frame_split_by_its_own_signal`). `alpha5-app-uid` reports `ROOTFS=rebuilt`, `alpha5-echo-restart`
+`SUPERVISOR-OK`, and `alpha5-shell-layering` and `alpha5-shortcuts-shell` have
+their `BRIDGE-OK` lines (the rebuilt vela). `system-service` prints a
+`✗ Rockhopper` line in a service listing; that is its expected output (a
+registered-but-unreachable entry), not an assertion. If one of these fails on a
+fresh image, it is a regression. Check first that the image is current: an
+older one needs `--push` of the binaries, and an app can only reach Echo while
+`geckoOS-boot` leaves `/run/user/1000` at 711 (it once reset it to 700).
+`alpha5-shortcuts-shell` covers Super, Super+Space and Super+Tab opening the
+launcher, search and overview over a running app.
+
+How the suites find the shell: Bloom's bar and dock are the overlay's input
+rects (`evo.GetOverlayState`), so `alpha5-bridge-deny` reads them from the
+guest and places its clicks relative to them (the Bell, the Settings gear, the
+dock's Files button). The quick-settings panel is one rectangle to Evo, so the
+volume slider and Do Not Disturb switch inside it are placed from its anchors
+(14 px from the right edge, 8 px under the bar); if a panel layout change
+breaks them, look at `bridge-volume.png` and `bridge-dnd.png`. The notification
+centre re-reads `notification.list` each time it opens, since signals are lost
+while the overlay restarts. `kiosk-relaunch` counts app windows (`ListWindows`
+minus Bloom) rather than the workspace's "total windows", which also counts the
+shell and each launch's short-lived `about:blank` vela window.
+
+A suite that reads hello-pyxis's proof file waits for it, since the page
+writes it only once every probe has answered.
 
 It runs on a qcow2 overlay, so the image is never mutated and each run
 starts clean. Note that `make run` does NOT use an overlay: a hand-booted image
-keeps whatever you did in it, such as an installed package. The script's
+keeps whatever you did in it, such as an installed package. `make run` also
+keeps its UEFI NVRAM (`target/build/images/OVMF_VARS.fd`), and the harness
+never does. The harness therefore can't catch boot-order bugs: adding the
+sound card moved the disk's PCI slot, and the saved NVRAM left `make run` at
+"Start PXE over IPv4". Both now pin the disk with `bootindex=0`. The script's
 docstring carries the serial gotchas that have each cost hours.
 
 A full rebuild + verify is one command, `bash scripts/rebuild-and-verify.sh`

@@ -4,61 +4,121 @@
     {
       "name": "bloom-dist-preview",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "4173", "--directory", "/home/andrew/geckos/pyxis-experience/dist"],
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "4173",
+        "--directory",
+        "/home/andrew/geckos/pyxis-experience/dist"
+      ],
       "port": 4173
     },
     {
       "name": "bloom-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience && npm run dev -- --host"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience && npm run dev -- --host"
+      ],
       "port": 5173
     },
     {
       "name": "bloom-dev-altport",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience && npx vite --host --port 5178 --strictPort"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience && npx vite --host --port 5178 --strictPort"
+      ],
       "port": 5178
+    },
+    {
+      "name": "bloom-dev-lumen",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience && npx vite --host --port 5191 --strictPort"
+      ],
+      "port": 5191
+    },
+    {
+      "name": "bloom-dev-time",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience && npx vite --host --port 5193 --strictPort"
+      ],
+      "port": 5193
     },
     {
       "name": "app-contacts-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience/packages/apps/contacts && npm run dev"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/contacts && npm run dev"
+      ],
       "port": 5184
+    },
+    {
+      "name": "app-settings-dev-alt",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/settings && npx vite --port 5199 --strictPort"
+      ],
+      "port": 5199
     },
     {
       "name": "app-notes-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience/packages/apps/notes && npm run dev"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/notes && npm run dev"
+      ],
       "port": 5183
     },
     {
       "name": "app-tasks-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience/packages/apps/tasks && npm run dev"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/tasks && npm run dev"
+      ],
       "port": 5185
     },
     {
       "name": "app-settings-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience/packages/apps/settings && npm run dev"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/settings && npm run dev"
+      ],
       "port": 5186
     },
     {
       "name": "app-files-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience/packages/apps/files && npm run dev"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/files && npm run dev"
+      ],
       "port": 5182
     },
     {
       "name": "app-browser-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience/packages/apps/browser && npm run dev"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/browser && npm run dev"
+      ],
       "port": 5181
     },
     {
       "name": "app-installer-dev",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-c", "cd /home/andrew/geckos/pyxis-experience/packages/apps/installer && npm run dev"],
+      "runtimeArgs": [
+        "-c",
+        "cd /home/andrew/geckos/pyxis-experience/packages/apps/installer && npm run dev"
+      ],
       "port": 5187
     }
   ]

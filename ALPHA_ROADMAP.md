@@ -362,12 +362,21 @@ only read the serial console. `scripts/serial-test.py` now has:
       layers entirely.
 - [ ] Move the wallpaper to a real background-layer client, so it sits below
       Bloom rather than inside it. Enables shell transparency, "show desktop",
-      and a wallpaper that survives a shell restart. **Open design question**,
-      shared with the lock screen and with toasts over app windows: Evo stacks
-      Bloom *beneath* every app, so shell UI that must sit above apps needs
-      either compositor-drawn system UI or a transparent Bloom overlay surface
-      (Gecko supports transparent toplevels via
-      `mozilla.widget.use-argb-visuals` and `browser.tabs.allow_transparent_browser`).
+      and a wallpaper that survives a shell restart.
+- [x] **Shell UI above apps: Bloom's overlay** *(decided and built
+      2026-09-27)*. Evo stacks Bloom beneath every app, so shell UI that must
+      be seen over apps had nowhere to go. The decision: a transparent Bloom
+      overlay window, not compositor-drawn UI, so shell UI stays web tech.
+      vela opens it in the shell's own process (`--pyxis-overlay
+      overlay.html`, from geckoOS-boot) with the app id `bloom-overlay`.
+      Evo stacks that above apps, never decorates or focuses it, and gives it
+      input only where Bloom says it draws (`evo.SetOverlayRegion`).
+      Everywhere else, clicks pass through. Toasts live there now. Verified on
+      device by `alpha5-overlay.txt`: a toast's X, clicked over a maximized
+      app, dismisses it, and clicks beside the toast reach the app.
+      *Takes effect in the image at the next rebuild.* The lock screen goes
+      here next (B). The top bar, dock and panels could follow: today a
+      maximized app covers them, and nothing reserves their space.
 
 **B. Session control** (audit §4.1)
 
@@ -375,10 +384,11 @@ only read the serial console. `scripts/serial-test.py` now has:
       calling `org.geckoOS.power` (fixed in alpha 3). *Shut down, Restart
       and Sleep exist and are real. Lock and Log out do not.* Shut down and
       restart now play the shutdown sound first.
-- [ ] Lock screen as an `overlay`-layer client — input-exclusive, unlocked by
-      a credential check against the geckouser account. (smithay also offers
-      `ext-session-lock`, which gives the compositor-enforced guarantee a lock
-      needs; see A's design question.)
+- [ ] Lock screen in Bloom's overlay (A), input-exclusive, unlocked by a
+      credential check against the geckouser account. Evo must enforce the
+      lock itself, not trust the overlay to cover the screen: while locked it
+      should draw and route input to nothing but the overlay. smithay's
+      `ext-session-lock` is the protocol-level version of that guarantee.
 - [ ] A confirm-before-shutdown flow that gives running apps a chance to close.
 
 **C. Notifications** (audit §3.6, §4.2)
@@ -390,8 +400,8 @@ only read the serial console. `scripts/serial-test.py` now has:
       all, so Bloom's centre could never have shown anything.
 - [x] Notification centre in Bloom, on the Bell button, with a badge count;
       toasts; dismiss. Do Not Disturb holds toasts (not critical ones) and the
-      notification sound. **Known limit:** toasts draw inside Bloom, beneath
-      app windows (see A).
+      notification sound. Toasts draw in Bloom's overlay, above app windows
+      (see A).
 - [x] Expose notifications through `@pyxis/app-sdk` (`showNotification` and
       friends). The bridge stamps the caller's app id, so an app cannot post as
       another. Reading and clearing the centre needs the new privileged
@@ -420,19 +430,111 @@ only read the serial console. `scripts/serial-test.py` now has:
       This was effectively forced: vela's build defines `MOZ_PULSEAUDIO` and
       not `MOZ_ALSA`, so it can only play through a Pulse server. The kernel
       had `# CONFIG_SOUND is not set`. `build-kernel.sh` now builds HDA and
-      virtio-snd in, verified on device (`--kernel`). *The rootfs half (the
-      packages, the boot wiring, the sounds) needs the next image rebuild.*
+      virtio-snd in. The 2026-09-25 image has the whole stack, verified by
+      `alpha5-audio.txt`.
 - [x] Volume control in quick-settings (the slider used to write a setting
       nothing read) and output device selection in Settings → Sound, over the
       new `org.geckoOS.audio`. System sounds (`system-sounds/` at the repo
       root) play through `org.geckoOS.sound`: boot, shutdown, notification,
-      error.
-- [ ] Verify vela plays audio: `alpha5-audio.txt` is ready, and runs once the
-      image has PipeWire.
+      error. Setting the volume changed it and then reported "No child
+      processes", because AppHost's reaper collected every child of
+      echo-daemon, `wpctl` included. It now waits only on the apps it
+      launched. The quick-settings knob sat at 0 beside a label reading 75%:
+      remochi's Slider reads `value` only when it mounts.
+- [x] Verify vela plays audio: `alpha5-audio.txt` passes all 19 checks on
+      device (2026-09-27), and its recording of hello-pyxis holds a 440 Hz
+      tone lasting 1.00 s. The boot and notification sounds are recorded too,
+      and Do Not Disturb is silent. *Not yet confirmed by ear* through
+      `make run`, which went to PXE until 2026-09-27 (the sound card moved
+      the disk's PCI slot, and the saved NVRAM buried it; emulate.sh pins it
+      now with bootindex).
 
 **F. Display settings** (audit §4.4)
 
 - [ ] Settings → Display: resolution, scale, and multi-monitor arrangement.
+
+**G. Window animations** *(added 2026-11-07; plan:
+`docs/internal/evo-animation-plan.md`)*
+
+- [x] Evo animation core (`evo/src/anim/`) + open / close / popup animations
+      (lane F, 2026-11-07; verified in `alpha5-animations.txt`).
+- [x] Bloom motion tokens shared with Evo, and Settings → Animations
+      (Full / Reduced / Off) (lane M, 2026-11-07; verified in Vitest and the
+      dev server; the setting reaches Evo only after the vela rebuild, which
+      adds `SetAnimationSettings` to the bridge).
+- [x] Minimize / restore toward the dock icon, and show-desktop (lane B,
+      2026-11-07: ghosts springing into `SetMinimizeTargets` rects, interruptible,
+      Super+D staggered by Evo; verified in `alpha5-animations.txt`).
+- [x] Maximize / unmaximize / fullscreen / fit-to-work-area transitions.
+- [x] Depth: drop shadows, rounded corners, focus crossfade, grab lift (lane D,
+      2026-11-07: GLES shaders through `GlesAccess`, following every pose;
+      verified in `alpha5-animations.txt`'s depth section).
+- [x] Alt+Tab through the existing overview (`CardOverview` switcher mode,
+      driven by Evo's `SwitcherChanged`; lane S, 2026-11-07). Evo half fully
+      verified on device (`alpha5-shortcuts.txt`); Bloom's half is asserted in
+      `alpha5-shortcuts-shell.txt` and **needs the vela rebuild** to be heard
+      (`BRIDGE-OLD-VELA` on the current image).
+- [x] Genie mesh warp for minimize and restore (lane G2, 2026-11-08: a
+      textured mesh through our own GL program, driven by the minimize spring;
+      falls back to genie-lite; verified in `alpha5-animations.txt`'s genie
+      section). **Superseded 2026-11-08 by Lumen's Droplet** (the user found the
+      funnel too macOS); its GL plumbing is what Lumen draws through.
+- [x] Lumen: Droplet and Rise (lane L1, 2026-11-08: minimize rounds off into
+      an orb of the app's accent and lands in its dock icon, restore rises out
+      of it; the shared Lumen program in `anim/lumen.rs`, `MinimizeLanded`;
+      the genie funnel retired; verified on device in `alpha5-animations.txt`'s
+      Droplet section, with `alpha5-windows` and `alpha5-shortcuts` green).
+- [x] Lumen: Bloom (lane L3, 2026-11-08: the open comes into focus: the live
+      window blurred 10 px -> 0, tinted toward its accent, corners 42 -> 16,
+      over a radial glow, growing from 0.90 on a spring and rising 16 px; a
+      texture shader on the live surface beside lane D's; the plain open with
+      Lumen off; verified in `alpha5-animations.txt`'s bloom section, no
+      measurable fps cost for the blur).
+- [x] Lumen: Evaporate (lane L2, 2026-11-08: the close snapshot burns away
+      from its close button in a noisy front with a glowing accent rim,
+      swelling to 1.04 and going soft; its own program in
+      `anim/evaporate.rs`, the plain close with Lumen off; a close mid-open
+      starts from the open's pose; verified on device in
+      `alpha5-animations.txt`'s Evaporate section, the whole suite 143/143 and
+      `alpha5-windows` green; fps with three windows closing 38-41 against
+      41-46 plain).
+- [x] Lumen: Recede and glint (lane L4, 2026-11-08: show desktop recedes each
+      window through the Lumen program, front-most first, 45 ms apart, and a
+      second Super+D emerges exactly that set, back-most first; the Settle
+      glint crosses a window as maximize/unmaximize/fit end; verified in
+      `alpha5-animations.txt`'s show-desktop and glint sections, fps with three
+      windows receding 45/37/38 Lumen against 50/48/45 plain).
+- [x] Lumen: Bloom ripple, accent, wallpaper (lane L4, 2026-11-08: the dock
+      icon rings and dips on `MinimizeLanded`, minimize targets carry each
+      app's accent, the wallpaper eases in while the desktop is shown;
+      verified in Vitest and the dev server; the ripple **needs the vela
+      rebuild** on device).
+- [x] Overview polish: live window thumbnails (`evo.GetWindowThumbnails`, JPEG
+      from `snapshot_window`, cached per commit) and transitions matched to
+      Evo's: cards rise from their windows' frames, the chosen one zooms onto
+      its window, a cancel returns them (2026-11-07; Evo half verified in
+      `alpha5-thumbnails.txt`, Bloom's half in the dev server; **needs the vela
+      rebuild** for the bridge entry).
+- [x] `alpha5-animations.txt`, and all suites green with animations on. Swept
+  2026-11-08 on the 20:04 image with no `--push`: 24 suites, all green. The
+  sweep before it (16:24 image) found three bugs, fixed in the 20:04 image: an app
+  closed during start-up four times could never launch again (Gecko's
+  automatic safe mode; `toolkit.startup.max_resumed_crashes` -1,
+  `alpha5-startup-lockout`); windows closed mid-restore kept their animation
+  active (`alpha5-close-mid-restore`); and echo-daemon and Evo's broker read
+  frames inside `select!`, which is not cancel-safe, so a signal arriving
+  mid-frame cost Evo its Echo connection.
+
+- [x] Daylight wallpaper and live settings (2026-11-09, four lanes; plan
+  `docs/internal/pyxis-wallpaper-settings-plan.md`): a flowing gradient that
+  follows the sun (WebGL at 10 fps on the VM, +5.0 points of one core idle,
+  paused under a maximized app); Echo's settings validated, written atomically
+  and signalled (`SettingChanged`), so a change in Settings reaches the shell
+  live across origins; `org.geckoOS.time` (time zone, clock, location);
+  Settings' Appearance, Date & Time and About pages. Verified in
+  `alpha5-wallpaper.txt` and `alpha5-settings-live.txt`; all 26 suites green
+  on the 09:01 image. The sweep found Bloom's window store losing a freshly
+  opened window to a stale list (fixed; push the shell until the next image).
 
 **Pulled forward from alpha 6:** unprivileged user namespaces
 (`CONFIG_USER_NS`), in the same kernel rebuild as sound. vela's content sandbox
@@ -446,6 +548,8 @@ apps still launch and render under the sandbox.
 - Audio plays from a web page in vela; volume control works.
 - Wallpaper survives a Bloom restart.
 - Every control in quick-settings and Settings does something real.
+- Windows open, close, minimize, restore and maximize with animation, and
+  Alt+Tab walks windows in the overview; Reduced and Off modes are honoured.
 
 ---
 
@@ -472,6 +576,18 @@ a demo from something you'd leave running.
       clients bypass it entirely (`echo-cli` can call anything), so
       enforcement is per-bridge, not per-bus the way webOS's LS2 role files
       were.
+- [x] Confine each app's filesystem calls to its own data (2026-10-06).
+      echo-daemon is root, and its filesystem service took any path, so
+      `filesystem:write`, which any .ipk may hold, was root over the whole
+      disk. The bridge now stamps a scope on each call, and echo resolves
+      the call's paths beneath it with `openat2(RESOLVE_BENEATH)` as
+      geckouser. Apps get `/var/lib/pyxis/data/<id>` (deleted with the
+      app); Files gets the home and a read-only view of `/`; Bloom gets the
+      PIM apps' data for desktop search. Verified on device by
+      `scripts/serial-tests/alpha5-fs-confine.txt`. See CLAUDE.md.
+- [ ] "Privileged access": a sudo-backed unlock that lets an app change
+      files outside the home for a few minutes, with the prompt drawn by
+      the shell. Plan: `docs/internal/pyxis-privileged-access-plan.md`.
 
 **B. Package integrity**
 

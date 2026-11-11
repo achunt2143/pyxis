@@ -692,6 +692,20 @@ Condensed from CLAUDE.md, updated with this session's progress.
 
 ## Change log
 
+### Daylight wallpaper and live settings (2026-11-09, alpha 5, uncommitted)
+
+The desktop draws Daylight, a flowing gradient whose palette follows the sun
+(WebGL at 10 fps on the VM; paused under a maximized app). Settings now reach
+every page live: Echo validates each `pyxis.*` key, writes atomically under a
+lock and emits `SettingChanged`, which the bridge passes to any page, so a
+choice in Settings (another origin) reaches the shell without a restart.
+`org.geckoOS.time` sets the time zone and gives the clock and a location for
+the sun. The Settings app gained Appearance (theme with Auto, wallpaper with
+live previews and a time scrubber), Date & Time and a real About. The sweep
+found and fixed Bloom's window store losing a freshly opened window to a stale
+`ListWindows` sample. Details in CLAUDE.md, "Daylight wallpaper and live
+settings"; plan in `docs/internal/pyxis-wallpaper-settings-plan.md`.
+
 ### Alpha 4 released (2026-09-25)
 
 Tagged `alpha4` in both repos and pushed with its `release/alpha4` branch.
@@ -951,8 +965,8 @@ not working; a null app id means the flag and env were both lost on the
 second exec.
 
 **Found while chasing it — a real gap, now fixed:** `evo.CloseWindow` was a
-stub. It deleted an id from `EchoIpcService::windows` (the create/claim map,
-which never holds app windows) and reported success from that, never
+stub. It deleted an id from a map of windows Evo itself created (the create/claim
+map, since deleted, which never held app windows) and reported success from that, never
 sending the client anything. There was no way to close an app window from
 the shell at all — only `nova.Close`, which signals the process. Now queued
 like the other window actions and applied against `windows_by_id`, sending
@@ -1013,14 +1027,16 @@ that likely mistake.
 
 ⚠️ **A regression I caused and caught on-device — do not re-add it.** The
 first version of that fix also checked the id against
-`EchoIpcService::windows`, which rejected *every real window* and broke
-`nova.Focus` outright. Evo has **two** window registries and they hold
-different things:
+that create/claim map, which rejected *every real window* and broke
+`nova.Focus` outright. Evo had **two** window registries and they held
+different things (the second was deleted 2026-11-07 — `GeckoEchoService::windows`,
+`track_window`, `untrack_window` had no callers since `CreateWindow` went — so
+the broker now has no window map at all; the table is history):
 
 | map | holds | reachable from |
 |---|---|---|
 | `EvoState::windows_by_id` (`state.rs`) | every live toplevel, via `register_window` on map | the compositor event loop |
-| `EchoIpcService::windows` (`echo_ipc.rs`) | only windows Evo *created* itself via the two-step create/claim contract, via `track_window` | the async Echo broker task |
+| ~~`EchoIpcService::windows`~~ (deleted) | only windows Evo *created* itself via the two-step create/claim contract, via `track_window` | the async Echo broker task |
 
 Nova-launched apps are in the first and never the second, and the async
 broker cannot reach the first. So the IPC reply fundamentally cannot confirm
@@ -1454,3 +1470,20 @@ record of what was attempted and why.)
 - **Echo/rootfs:** settings → persistent `/var/lib/pyxis`, terminal terminfo +
   bash-completion packages, Nova kiosk-consistency (`MOZ_NO_REMOTE` + session
   prefs).
+
+### Echo restart: appHost bindings are replayed (2026-11-07)
+
+`appHost.BindSurface` is fire-and-forget and sent once per window, so a
+restarted echo-daemon (the boot supervisor does that) left its fresh appHost
+with no bindings: the window→session map was empty and `nova.Launch` of a
+running app could not raise it. The broker now raises a flag after each
+*re*connect (`GeckoEchoService::take_rebind_request`); the compositor thread
+sees it in `process_pending_window_actions` and `EvoState::replay_surface_bindings`
+(`placement.rs`) resends a bind for every window bound under a bindable app id
+(`BoundAppId`, the client's current pid). The broker keeps no window list.
+AppHost's bind is idempotent (`AppSurfaceMapped` only for a new surface). After
+a restart the old session is gone, so the replay synthesizes a *foreign*
+session per client pid: not a child of the new daemon, so `close` goes through
+the window and the entry is dropped with its last surface. Launch raises it.
+Suite: `scripts/serial-tests/alpha5-echo-restart.txt`.
+
