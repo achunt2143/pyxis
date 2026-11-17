@@ -14,21 +14,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::time::SystemTime;
-use std::path::PathBuf;
 
 use crate::services::apphost::AppHost;
-
-const APPS_ROOT: &str = "/usr/share/geckoOS/apps";
+use crate::services::nova::Nova;
 
 pub struct AppManagerService;
-
-fn apps_root() -> PathBuf {
-    PathBuf::from(APPS_ROOT)
-}
 
 impl AppManagerService {
     /// Launch by app id. Behaviour preserved from the old service: if the app
@@ -97,79 +89,22 @@ impl AppManagerService {
         }))
     }
 
+    /// Install by delegating to `Nova::install`, which does all verification
+    /// and extraction (this module never extracts anything itself).
     pub fn install(app_path: &str) -> Result<Value> {
-        // Tarball install — same logic as the previous AppManagerService.
-        // No integrity verification here: this is the LEGACY native-app
-        // path (a tarball containing manifest.json + an already-native
-        // exec), kept only for old-style installs. The real, verified
-        // install path for actual pyxis:// web apps is now
-        // `services::nova::Nova::install` (SHA-256 `integrity.sha256` check
-        // against `manifest.webapp`, atomic staging + rename — see that
-        // module's doc comment) — new callers should prefer
-        // `org.geckoOS.nova` -> `Install`, not this shim.
-        let path = Path::new(app_path);
-        if !path.exists() {
-            return Err(anyhow!("install source not found: {}", app_path));
+        let mut res = Nova::global().install(app_path)?;
+        if let Some(obj) = res.as_object_mut() {
+            obj.insert("success".to_string(), json!(true));
         }
-
-        let root = apps_root();
-        fs::create_dir_all(&root)
-            .with_context(|| format!("create {}", root.display()))?;
-
-        let status = Command::new("tar")
-            .arg("-xf")
-            .arg(path)
-            .arg("-C")
-            .arg(&root)
-            .status()
-            .with_context(|| format!("invoke tar on {}", path.display()))?;
-        if !status.success() {
-            return Err(anyhow!("tar exited with {} extracting {}", status, app_path));
-        }
-
-        let mut newest: Option<(SystemTime, PathBuf)> = None;
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            let p = entry.path();
-            if !p.is_dir() {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            match &newest {
-                Some((t, _)) if modified <= *t => {}
-                _ => newest = Some((modified, p)),
-            }
-        }
-        let dir = newest
-            .map(|(_, p)| p)
-            .ok_or_else(|| anyhow!("no app directory found after extraction"))?;
-        let app_id = dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("invalid app dir name"))?
-            .to_string();
-
-        // Validate
-        let _ = AppHost::read_manifest(&app_id)
-            .with_context(|| format!("invalid manifest after install for {}", app_id))?;
-        Ok(json!({ "success": true, "appId": app_id }))
+        Ok(res)
     }
 
     pub fn uninstall(app_id: &str) -> Result<Value> {
-        // Close any running session first.
-        if let Some(session) = AppHost::global().find_session_by_app(app_id) {
-            let _ = AppHost::global().close(&session.session_id);
+        let mut res = Nova::global().uninstall(app_id)?;
+        if let Some(obj) = res.as_object_mut() {
+            obj.insert("success".to_string(), json!(true));
         }
-        let dir = apps_root().join(app_id);
-        if !dir.exists() {
-            return Err(anyhow!("app '{}' is not installed", app_id));
-        }
-        fs::remove_dir_all(&dir)
-            .with_context(|| format!("remove {}", dir.display()))?;
-        Ok(json!({ "success": true, "appId": app_id }))
+        Ok(res)
     }
 
     pub fn kill(app_id: &str) -> Result<Value> {
@@ -231,5 +166,114 @@ impl AppManagerService {
             }
             None => Ok(json!({ "appId": null, "sessionId": null })),
         }
+    }
+}
+
+/// Inspect `package_path` and reject any unsafe member: absolute or `..`
+/// paths, and anything that is not a regular file or directory (symlinks,
+/// hardlinks, devices, fifos). Callers pass their own private copy of the
+/// package and extract that same copy, never the original.
+pub(crate) fn validate_tar_file(package_path: &Path) -> Result<()> {
+    let run = |args: &[&str]| -> Result<String> {
+        let out = Command::new("tar")
+            .args(args)
+            .arg("-f")
+            .arg(package_path)
+            .output()
+            .with_context(|| format!("list archive {}", package_path.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "tar exited with {} inspecting {}",
+                out.status,
+                package_path.display()
+            ));
+        }
+        String::from_utf8(out.stdout).context("archive contains non-UTF-8 entry names")
+    };
+    // Escaped names keep one member per line; a backslash then means the
+    // name held a control character or a backslash, which we refuse.
+    let names = run(&["-t", "--quoting-style=escape"])?;
+    if names.contains('\\') {
+        return Err(anyhow!("archive member name contains control characters"));
+    }
+    validate_tar_entries(&names)?;
+    let verbose = run(&["-tv", "--quoting-style=escape"])?;
+    validate_tar_types(&verbose, names.lines().count())
+}
+
+/// `tar -tv` lines start with a type letter: `-` file, `d` directory,
+/// `l` symlink, `h` hardlink, `c`/`b`/`p` devices and fifos.
+pub(crate) fn validate_tar_types(verbose_listing: &str, expected: usize) -> Result<()> {
+    let lines: Vec<&str> = verbose_listing.lines().collect();
+    if lines.len() != expected {
+        return Err(anyhow!("archive listing is inconsistent"));
+    }
+    for line in lines {
+        match line.chars().next() {
+            Some('-') | Some('d') => {}
+            _ => return Err(anyhow!("unsupported archive member (not a plain file or directory): {:?}", line)),
+        }
+    }
+    Ok(())
+}
+
+/// Validates every archive member path returned by `tar -tf` to block
+/// absolute paths, empty lines, and `..` traversal components.
+pub(crate) fn validate_tar_entries(listing: &str) -> Result<()> {
+    let entries: Vec<&str> = listing.lines().collect();
+    if entries.is_empty() {
+        return Err(anyhow!("archive has no entries"));
+    }
+    for entry in entries {
+        if entry.is_empty()
+            || entry.starts_with('/')
+            || entry.split('/').any(|seg| seg == "..")
+            || Path::new(entry).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(anyhow!("unsafe archive entry path: {:?}", entry));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_tar_entries;
+    use std::process::Command;
+
+    #[test]
+    fn validates_safe_and_unsafe_tar_entries() {
+        assert!(validate_tar_entries("com.example.app/\ncom.example.app/index.html\n./manifest.webapp\n").is_ok());
+        assert!(validate_tar_entries("").is_err());
+        assert!(validate_tar_entries("\n").is_err());
+        assert!(validate_tar_entries("/etc/passwd\n").is_err());
+        assert!(validate_tar_entries("../evil\n").is_err());
+        assert!(validate_tar_entries("app/../../etc/shadow\n").is_err());
+        assert!(super::validate_tar_types("-rw-r--r-- 0/0 1 d a\ndrwxr-xr-x 0/0 0 d b/\n", 2).is_ok());
+        assert!(super::validate_tar_types("lrwxrwxrwx 0/0 0 d a -> /etc\n", 1).is_err());
+        assert!(super::validate_tar_types("hrwxr-xr-x 0/0 0 d a link to b\n", 1).is_err());
+    }
+
+    #[test]
+    fn real_tar_with_a_symlink_member_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("manifest.webapp"), "{}").unwrap();
+        let good = dir.path().join("good.tar");
+        let run = |args: &[&str]| assert!(Command::new("tar").args(args).status().unwrap().success());
+        run(&["-cf", good.to_str().unwrap(), "-C", src.to_str().unwrap(), "manifest.webapp"]);
+        assert!(super::validate_tar_file(&good).is_ok());
+        std::os::unix::fs::symlink("/etc/shadow", src.join("evil")).unwrap();
+        let bad = dir.path().join("bad.tar");
+        run(&["-cf", bad.to_str().unwrap(), "-C", src.to_str().unwrap(), "manifest.webapp", "evil"]);
+        assert!(super::validate_tar_file(&bad).is_err());
     }
 }

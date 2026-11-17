@@ -26,6 +26,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["v4"] }
 # Time
 chrono = { workspace = true }
+# HMAC-SHA256 for the lock signal's mac (services/session.rs), written by hand
+# over the hash. Already in the lockfile.
+sha2 = "0.10"
 # Time zones for the time service (services/time.rs): offsets and DST from
 # the image's own TZif files. Already in the lockfile through env_logger;
 # no bundled tz database, so Echo agrees with the image's tzdata.

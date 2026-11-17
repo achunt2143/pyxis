@@ -20,6 +20,14 @@ pub struct PowerService;
 
 impl PowerService {
     pub fn shutdown(delay: Option<u64>) -> Result<Value> {
+        let closed = crate::services::AppHost::global()
+            .close_all_for_shutdown(std::time::Duration::from_millis(1500));
+        if closed > 0 {
+            tracing::info!(
+                "Gracefully closed {} running app session(s) before shutdown",
+                closed
+            );
+        }
         busybox_halt("poweroff", delay)?;
 
         Ok(json!({
@@ -30,6 +38,14 @@ impl PowerService {
     }
 
     pub fn reboot(delay: Option<u64>) -> Result<Value> {
+        let closed = crate::services::AppHost::global()
+            .close_all_for_shutdown(std::time::Duration::from_millis(1500));
+        if closed > 0 {
+            tracing::info!(
+                "Gracefully closed {} running app session(s) before reboot",
+                closed
+            );
+        }
         busybox_halt("reboot", delay)?;
 
         Ok(json!({

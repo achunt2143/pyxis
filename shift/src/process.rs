@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use parking_lot::Mutex;
 use chrono::{DateTime, Utc};
-use nix::unistd::Pid;
 use libc;
 
 /// Represents a running process
@@ -123,7 +122,6 @@ impl ProcessInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_process_creation() {

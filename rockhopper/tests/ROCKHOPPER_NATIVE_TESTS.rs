@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use geckoOS_rockhopper::elf_loader::ElfLoader;
     use geckoOS_rockhopper::runtime::Runtime;
     use geckoOS_rockhopper::compatibility::CompatibilityLayer;
     

@@ -64,6 +64,14 @@ pub const SCHEMA: &[Spec] = &[
     Spec { key: "pyxis.brightness", kind: Kind::Number { min: 0.0, max: 100.0, integer: false, nullable: false }, default: Default::Int(80) },
     Spec { key: "pyxis.dnd", kind: Kind::Bool, default: Default::Bool(false) },
     Spec { key: "pyxis.animations", kind: Kind::OneOf(&["full", "reduced", "off"]), default: Default::Str("full") },
+    Spec { key: "pyxis.launchBar.position", kind: Kind::OneOf(&["bottom", "left"]), default: Default::Str("bottom") },
+    Spec { key: "pyxis.lock.after", kind: Kind::Number { min: 1.0, max: 120.0, integer: true, nullable: true }, default: Default::Int(10) },
+    Spec { key: "pyxis.lock.onSleep", kind: Kind::Bool, default: Default::Bool(true) },
+    Spec { key: "pyxis.lock.notifications", kind: Kind::OneOf(&["hidden", "count", "full"]), default: Default::Str("count") },
+    Spec { key: "pyxis.accessibility.textScale", kind: Kind::Number { min: 75.0, max: 150.0, integer: true, nullable: false }, default: Default::Int(100) },
+    Spec { key: "pyxis.accessibility.highContrast", kind: Kind::Bool, default: Default::Bool(false) },
+    Spec { key: "pyxis.accessibility.reduceTransparency", kind: Kind::Bool, default: Default::Bool(false) },
+    Spec { key: "pyxis.accessibility.cursorSize", kind: Kind::OneOf(&["default", "large", "xlarge"]), default: Default::Str("default") },
 ];
 
 pub fn spec(key: &str) -> Option<&'static Spec> {
@@ -180,6 +188,13 @@ mod tests {
         }
         assert_eq!(default_for("pyxis.wallpaper"), json!("daylight"));
         assert_eq!(default_for("pyxis.theme"), json!("light"));
+        // The launch bar sits at the bottom until someone picks the rail.
+        assert_eq!(default_for("pyxis.launchBar.position"), json!("bottom"));
+        // The screen locks after ten idle minutes, on sleep, and shows only a
+        // count of notifications.
+        assert_eq!(default_for("pyxis.lock.after"), json!(10));
+        assert_eq!(default_for("pyxis.lock.onSleep"), json!(true));
+        assert_eq!(default_for("pyxis.lock.notifications"), json!("count"));
     }
 
     #[test]
@@ -199,6 +214,17 @@ mod tests {
             ("pyxis.volume", json!(101)),
             ("pyxis.brightness", Value::Null),
             ("pyxis.animations", json!("fancy")),
+            ("pyxis.launchBar.position", json!("right")),
+            ("pyxis.launchBar.position", json!(true)),
+            ("pyxis.launchBar.position", Value::Null),
+            ("pyxis.lock.after", json!(0)),
+            ("pyxis.lock.after", json!(121)),
+            ("pyxis.lock.after", json!(7.5)),
+            ("pyxis.lock.after", json!("10")),
+            ("pyxis.lock.onSleep", json!("yes")),
+            ("pyxis.lock.onSleep", Value::Null),
+            ("pyxis.lock.notifications", json!("some")),
+            ("pyxis.lock.notifications", Value::Null),
             ("pyxis.location", json!("Los Angeles")),
             ("pyxis.location", json!({"lat": 91, "lon": 0, "label": "x", "source": "manual"})),
             ("pyxis.location", json!({"lat": 0, "lon": 181, "label": "x", "source": "manual"})),
@@ -206,6 +232,12 @@ mod tests {
             ("pyxis.location", json!({"lat": 0, "lon": 0, "source": "manual"})),
             ("pyxis.location", json!({"lat": 0, "lon": 0, "label": "x", "source": "zone", "alt": 3})),
             ("pyxis.location", json!({"lat": 0, "lon": 0, "label": "x".repeat(LABEL_MAX + 1), "source": "zone"})),
+            ("pyxis.accessibility.textScale", json!(50)),
+            ("pyxis.accessibility.textScale", json!(200)),
+            ("pyxis.accessibility.textScale", json!(112.5)),
+            ("pyxis.accessibility.highContrast", json!("yes")),
+            ("pyxis.accessibility.reduceTransparency", json!(1)),
+            ("pyxis.accessibility.cursorSize", json!("huge")),
             ("pyxis.nonsense", json!(true)),
         ];
         for (key, value) in cases {
@@ -223,6 +255,23 @@ mod tests {
             ("pyxis.wallpaper.pinnedTime", json!(720.0)),
             ("pyxis.brightness", json!(37.5)),
             ("pyxis.clock24h", json!(true)),
+            ("pyxis.launchBar.position", json!("bottom")),
+            ("pyxis.launchBar.position", json!("left")),
+            ("pyxis.lock.after", Value::Null),
+            ("pyxis.lock.after", json!(1)),
+            ("pyxis.lock.after", json!(120)),
+            ("pyxis.lock.onSleep", json!(false)),
+            ("pyxis.lock.notifications", json!("hidden")),
+            ("pyxis.lock.notifications", json!("count")),
+            ("pyxis.lock.notifications", json!("full")),
+            ("pyxis.accessibility.textScale", json!(75)),
+            ("pyxis.accessibility.textScale", json!(125)),
+            ("pyxis.accessibility.textScale", json!(150)),
+            ("pyxis.accessibility.highContrast", json!(true)),
+            ("pyxis.accessibility.reduceTransparency", json!(true)),
+            ("pyxis.accessibility.cursorSize", json!("default")),
+            ("pyxis.accessibility.cursorSize", json!("large")),
+            ("pyxis.accessibility.cursorSize", json!("xlarge")),
             ("pyxis.location", Value::Null),
             ("pyxis.location", json!({"lat": 34.05, "lon": -118.24, "label": "Los Angeles", "source": "zone"})),
             ("pyxis.location", json!({"lat": -90, "lon": 180, "label": "", "source": "manual"})),

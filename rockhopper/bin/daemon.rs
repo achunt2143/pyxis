@@ -7,8 +7,7 @@ use std::sync::Arc;
 use geckoOS_echo::EchoClient;
 use geckoOS_echo::{ArgumentDefinition, SignalDefinition, ServiceInterface, MethodDefinition};
 use geckoOS_rockhopper::CompatibilityLayer;
-use geckoOS_puppis::{GeckoAppLauncher};
-use geckoOS_puppis::gecko_app_launcher::{AppDescriptor, GeckoApp};
+use geckoOS_puppis::GeckoAppLauncher;
 use tokio::signal;
 use tracing::{info, error};
 
@@ -50,7 +49,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// 
 /// Registers Rockhopper as a service on the Echo IPC bus so that
 /// Shift and other system components can request application launches.
-async fn connect_to_shift(launcher: &Arc<GeckoAppLauncher>) -> Result<(), Box<dyn Error>> {
+async fn connect_to_shift(_launcher: &Arc<GeckoAppLauncher>) -> Result<(), Box<dyn Error>> {
     info!("Connecting to Shift Process Manager...");
     
     // Connect to Echo IPC daemon

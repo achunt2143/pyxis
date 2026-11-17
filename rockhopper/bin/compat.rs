@@ -3,8 +3,7 @@
 // Purpose: Test and verify Linux application compatibility
 
 use std::error::Error;
-use std::path::Path;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use geckoOS_rockhopper::ElfLoader;
 use geckoOS_rockhopper::CompatibilityLayer;
 use geckoOS_rockhopper::Runtime;
@@ -110,7 +109,7 @@ async fn check_binary(path: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn list_syscalls(list: bool) -> Result<(), Box<dyn Error>> {
-    let compat = CompatibilityLayer::new();
+    let _compat = CompatibilityLayer::new();
     
     println!("Linux Syscall Compatibility");
     println!("============================");
@@ -141,7 +140,7 @@ fn show_capabilities() -> Result<(), Box<dyn Error>> {
     println!("========================");
     println!();
     
-    let compat = CompatibilityLayer::new();
+    let _compat = CompatibilityLayer::new();
     
     println!("Capabilities managed:");
     println!("  ✓ CAP_CHOWN");

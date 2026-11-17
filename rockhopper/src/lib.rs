@@ -34,6 +34,7 @@ pub struct Rockhopper {
     wayland_adapter: Arc<WaylandClientAdapter>,
     x11_compat: Arc<X11CompatibilityLayer>,
     dbus_manager: Arc<DBusSessionManager>,
+    #[allow(dead_code)]
     elf_loader: Arc<ElfLoader>,
     runtime: Arc<Runtime>,
     compat_layer: Arc<CompatibilityLayer>,

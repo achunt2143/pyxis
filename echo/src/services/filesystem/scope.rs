@@ -113,6 +113,9 @@ pub enum Scope {
     User,
     /// `system`: the root filesystem, read-only.
     System,
+    /// `system` upgraded to root-writable when `appId` holds an active
+    /// privilege grant (`services::privilege::has_grant`).
+    SystemElevated(String),
 }
 
 impl Scope {
@@ -126,6 +129,31 @@ impl Scope {
                 None => Err(anyhow!("unknown filesystem scope {raw:?}")),
             },
         }
+    }
+
+    /// Parses `scope` from a filesystem request body, upgrading `system` to
+    /// [`Scope::SystemElevated`] when the stamped `appId` currently holds an
+    /// active privilege grant.
+    pub fn from_body(body: &Value) -> Result<Self> {
+        let raw = body
+            .get("scope")
+            .ok_or_else(|| anyhow!("missing filesystem scope"))?;
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| anyhow!("a filesystem scope is a string, not {raw}"))?;
+        let parsed = Self::parse(raw)?;
+        if parsed == Scope::System {
+            if let Some(app_id) = body
+                .get("appId")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            {
+                if crate::services::privilege::has_grant(app_id) {
+                    return Ok(Scope::SystemElevated(app_id.to_string()));
+                }
+            }
+        }
+        Ok(parsed)
     }
 }
 
@@ -149,16 +177,39 @@ pub(crate) fn valid_app_id(id: &str) -> bool {
 
 /// Answers one scoped call, on a thread of its own (see the module doc).
 pub async fn call(scope: Scope, method: &str, body: &Value) -> Result<Value> {
-    let (method, body) = (method.to_string(), body.clone());
+    let (method_owned, body_owned) = (method.to_string(), body.clone());
+    let scope_for_run = scope.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("fs-scoped".to_string())
         .spawn(move || {
-            let _ = tx.send(run(&scope, &method, &body));
+            let _ = tx.send(run(&scope_for_run, &method_owned, &body_owned));
         })
         .context("start a thread for a scoped filesystem call")?;
-    rx.await
-        .map_err(|_| anyhow!("the scoped filesystem call ended without an answer"))?
+    let result = rx
+        .await
+        .map_err(|_| anyhow!("the scoped filesystem call ended without an answer"))??;
+    if let Scope::SystemElevated(ref app_id) = scope {
+        if WRITES.contains(&method) {
+            let logged_path = elevated_log_path(body);
+            crate::services::privilege::log_elevated_op(app_id, method, &logged_path);
+        }
+    }
+    Ok(result)
+}
+
+fn elevated_log_path(body: &Value) -> String {
+    if let (Some(src), Some(dst)) = (
+        body.get("source").and_then(Value::as_str),
+        body.get("destination").and_then(Value::as_str),
+    ) {
+        format!("{src} -> {dst}")
+    } else {
+        body.get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
 }
 
 fn run(scope: &Scope, method: &str, body: &Value) -> Result<Value> {
@@ -207,6 +258,23 @@ impl Owner {
     fn of_app(id: &str) -> Owner {
         let (uid, gid) = app_owner(id);
         Owner { uid, gid }
+    }
+
+    /// The active session user's `(Owner, home_path)`, falling back to `geckouser`.
+    fn active_user_home() -> (Owner, PathBuf) {
+        let active = crate::services::session::current_session_user();
+        if active != crate::services::session::SESSION_USER {
+            if let Ok(entry) = crate::services::accounts::Users::system().require_real(&active) {
+                return (
+                    Owner {
+                        uid: entry.uid,
+                        gid: entry.gid,
+                    },
+                    PathBuf::from(entry.home),
+                );
+            }
+        }
+        (Self::SHELL, PathBuf::from(GECKO_HOME))
     }
 }
 
@@ -318,6 +386,17 @@ fn app_dir(id: &str, owner: Owner) -> Result<PathBuf> {
         Err(e) => return Err(e).with_context(|| format!("inspect {}", dir.display())),
     }
     Ok(dir)
+}
+
+/// Makes sure app `id`'s data dir exists and belongs to the app's owner
+/// (taking over one an earlier uid left, contents included, without following
+/// links). Nova calls it before a launch, since an app's `$HOME` is this dir
+/// once it has a uid of its own.
+pub(crate) fn ensure_app_data_dir(id: &str) -> Result<PathBuf> {
+    if !valid_app_id(id) {
+        bail!("not an app id: {id:?}");
+    }
+    app_dir(id, Owner::of_app(id))
 }
 
 /// Deletes an uninstalled app's own data, `/var/lib/pyxis/data/<id>`, and
@@ -445,19 +524,29 @@ impl Jail {
                     owner,
                 }
             }
-            Scope::User => Jail {
-                root: PathBuf::from(GECKO_HOME),
-                writable: true,
-                absolute: false,
-                name: "the home folder",
-                owner: Owner::SHELL,
-            },
+            Scope::User => {
+                let (owner, root) = Owner::active_user_home();
+                Jail {
+                    root,
+                    writable: true,
+                    absolute: false,
+                    name: "the home folder",
+                    owner,
+                }
+            }
             Scope::System => Jail {
                 root: PathBuf::from("/"),
                 writable: false,
                 absolute: true,
                 name: "the root filesystem",
                 owner: Owner::SHELL,
+            },
+            Scope::SystemElevated(_) => Jail {
+                root: PathBuf::from("/"),
+                writable: true,
+                absolute: true,
+                name: "the root filesystem",
+                owner: Owner { uid: 0, gid: 0 },
             },
         })
     }
@@ -1081,16 +1170,27 @@ mod tests {
 
     #[test]
     fn an_app_call_runs_as_the_app_user_and_the_shells_scopes_as_the_shell() {
-        use crate::services::nova::{APP_GID, APP_UID};
+        use crate::services::nova::{app_gid, app_uid};
         // Apps are not the shell's user: that is what stops one opening the
-        // host Wayland socket. Their own data is theirs.
-        assert_eq!(Owner::of_app("com.test.app"), Owner { uid: APP_UID, gid: APP_GID });
+        // host Wayland socket.
+        assert_eq!(
+            Owner::of_app("com.test.app"),
+            Owner {
+                uid: app_uid("com.test.app"),
+                gid: app_gid("com.test.app")
+            }
+        );
         assert_ne!(Owner::of_app("com.test.app"), Owner::SHELL);
+        assert_ne!(app_uid("com.test.app"), app_uid("notes"));
         // The shell's own app (bloom) keeps its own state under its own user.
         assert_eq!(Owner::of_app("bloom"), Owner::SHELL);
         // `user` and `system` serve geckouser's home and the system's files.
         assert_eq!(Jail::for_scope(&Scope::User).unwrap().owner, Owner::SHELL);
         assert_eq!(Jail::for_scope(&Scope::System).unwrap().owner, Owner::SHELL);
+        assert_eq!(
+            Jail::for_scope(&Scope::SystemElevated("files".into())).unwrap().owner,
+            Owner { uid: 0, gid: 0 }
+        );
     }
 
     #[test]
@@ -1360,7 +1460,7 @@ mod tests {
             "a", "b", "f", "in", "out", "abs", "loop", "fifo", "..", ".", "new", "secret.txt", "sub",
         ];
         const STARTS: &[&str] = &["~/", "~/", "~/", "", "/", "~"];
-        let mut path = |next: &mut dyn FnMut() -> u64| {
+        let path = |next: &mut dyn FnMut() -> u64| {
             let mut p = STARTS[(next() % STARTS.len() as u64) as usize].to_string();
             let parts = 1 + next() % 4;
             let names: Vec<&str> = (0..parts)
@@ -1391,5 +1491,80 @@ mod tests {
         }
         assert!(answered > 100, "only {answered} calls succeeded: the walk barely ran");
         assert_eq!(snapshot(outside.path()), before, "something outside the jail changed");
+    }
+
+    #[test]
+    fn system_scope_allows_writes_and_logs_while_granted_then_reverts_on_revoke() {
+        use crate::services::privilege;
+
+        let app_id = "com.test.scope.elevated";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("etc")).unwrap();
+
+        let write_body = json!({
+            "scope": "system",
+            "appId": app_id,
+            "path": "/etc/elevated.txt",
+            "content": "hello root\n",
+        });
+
+        // Before grant: parses as read-only Scope::System and refuses writes.
+        let scope_before = Scope::from_body(&write_body).unwrap();
+        assert_eq!(scope_before, Scope::System);
+        let jail_before = Jail {
+            root: dir.path().to_path_buf(),
+            ..Jail::for_scope(&scope_before).unwrap()
+        };
+        assert!(!jail_before.writable);
+        let root_before = jail_before.open_root().unwrap();
+        let err = jail_before.call(&root_before, "writeFile", &write_body).unwrap_err();
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+
+        // Grant privilege: parses as Scope::SystemElevated, allows write inside
+        // the temp root jail, and records the write in the audit log.
+        privilege::grant_for_test(app_id);
+        let scope_granted = Scope::from_body(&write_body).unwrap();
+        assert_eq!(scope_granted, Scope::SystemElevated(app_id.to_string()));
+        let base_jail = Jail::for_scope(&scope_granted).unwrap();
+        assert!(base_jail.writable);
+        assert_eq!(base_jail.owner, Owner { uid: 0, gid: 0 });
+        let jail_granted = Jail {
+            root: dir.path().to_path_buf(),
+            ..base_jail
+        };
+        let root_granted = jail_granted.open_root().unwrap();
+        jail_granted
+            .call(&root_granted, "writeFile", &write_body)
+            .expect("elevated write should succeed");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("etc/elevated.txt")).unwrap(),
+            "hello root\n"
+        );
+        if let Scope::SystemElevated(ref id) = scope_granted {
+            if WRITES.contains(&"writeFile") {
+                privilege::log_elevated_op(id, "writeFile", &elevated_log_path(&write_body));
+            }
+        }
+        let state = privilege::PrivilegeService::new()
+            .get_state(&json!({ "appId": app_id }))
+            .unwrap();
+        assert!(state["auditLog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["appId"] == app_id && e["method"] == "writeFile" && e["path"] == "/etc/elevated.txt"));
+
+        // Revoke: reverts to read-only Scope::System and refuses further writes.
+        assert!(privilege::revoke_for_app(app_id, "test_done"));
+        let scope_after = Scope::from_body(&write_body).unwrap();
+        assert_eq!(scope_after, Scope::System);
+        let jail_after = Jail {
+            root: dir.path().to_path_buf(),
+            ..Jail::for_scope(&scope_after).unwrap()
+        };
+        assert!(!jail_after.writable);
+        let root_after = jail_after.open_root().unwrap();
+        let err_after = jail_after.call(&root_after, "writeFile", &write_body).unwrap_err();
+        assert!(format!("{err_after:#}").contains("read-only"), "{err_after:#}");
     }
 }

@@ -70,6 +70,20 @@ impl ServiceRegistry {
         }
     }
 
+    pub fn remove_service_by_name(&self, service_name: &str) -> bool {
+        if let Some((_, service_id)) = self.name_to_id.remove(service_name) {
+            self.services.remove(&service_id);
+            tracing::info!(
+                "Removed external service from registry: {} ({})",
+                service_name,
+                service_id
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn get_service(&self, service_name: &str) -> Result<ServiceInfo> {
         if let Some(service_id) = self.name_to_id.get(service_name) {
             self.services

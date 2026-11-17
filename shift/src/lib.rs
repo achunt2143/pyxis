@@ -16,7 +16,6 @@ use anyhow::Result;
 use dashmap::DashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing::{info, debug, error};
 use std::collections::HashMap;
 
 /// Shift: Process Manager for GeckoOS
@@ -41,7 +40,15 @@ impl Shift {
         let resource_manager = Arc::new(ResourceManager::new()?);
         let signal_handler = Arc::new(SignalHandler::new()?);
         let lifecycle = Arc::new(ProcessLifecycle::new());
-        let echo_service = Arc::new(ShiftEchoService::new()?);
+        let next_pid = Arc::new(parking_lot::Mutex::new(1000));
+        let echo_service = Arc::new(ShiftEchoService::with_state(
+            processes.clone(),
+            process_tree.clone(),
+            resource_manager.clone(),
+            signal_handler.clone(),
+            lifecycle.clone(),
+            next_pid.clone(),
+        )?);
 
         let shift = Shift {
             processes,
@@ -50,7 +57,7 @@ impl Shift {
             signal_handler,
             lifecycle,
             echo_service,
-            next_pid: Arc::new(parking_lot::Mutex::new(1000)),
+            next_pid,
         };
 
         tracing::info!("Shift initialized successfully");
@@ -99,7 +106,6 @@ impl Shift {
         process_arc.update_state(ProcessState::Running);
 
         // Emit ECHO signal
-        let process_info = process_arc.get_info();
         self.echo_service.emit_process_created(pid, &config.app_id).await?;
 
         tracing::info!("Process launched: pid={}, os_pid={:?}", pid, os_pid);

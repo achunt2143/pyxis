@@ -10,7 +10,8 @@
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use anyhow::{Result, anyhow, Context};
-use tracing::{debug, info, warn, error};
+use tracing::debug;
+use tracing::info;
 
 /// ECHO IPC service for Linux application launching
 pub struct RockhopperEchoService {
@@ -23,6 +24,7 @@ struct AppProcess {
     pid: u32,
     app_id: String,
     executable: String,
+    #[allow(dead_code)]
     wayland_display: String,
 }
 
@@ -128,7 +130,7 @@ impl RockhopperEchoService {
 
         let mut apps = self.running_apps.lock().unwrap();
 
-        if let Some(app) = apps.remove(&pid) {
+        if let Some(_app) = apps.remove(&pid) {
             // Try graceful terminate first
             let mut cmd = Command::new("kill")
                 .arg("-TERM")

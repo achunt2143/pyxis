@@ -11,10 +11,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use goblin::elf::header::{ET_DYN, ET_EXEC};
-use goblin::elf::program_header::{PT_DYNAMIC, PT_GNU_RELRO, PT_INTERP, PT_LOAD};
+use goblin::elf::program_header::{PT_INTERP, PT_LOAD};
 use goblin::elf::section_header::SHT_RELA;
 use goblin::elf::Elf;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -328,7 +327,7 @@ impl ElfLoader {
         let mut relocations = Vec::new();
 
         // Process RELA relocations (.rela.dyn, .rela.plt)
-        for (name, sh) in elf.section_headers.iter().enumerate() {
+        for (_idx, sh) in elf.section_headers.iter().enumerate() {
             if sh.sh_type != SHT_RELA {
                 continue;
             }
@@ -407,35 +406,27 @@ impl ElfLoader {
                 match dyn_entry.d_tag {
                     goblin::elf::dynamic::DT_NEEDED => {
                         if let Some(lib_name) = elf.dynstrtab.get_at(dyn_entry.d_val as usize) {
-                            if let name = lib_name {
-                                info.needed_libraries.push(name.to_string());
-                                debug!("Found needed library: {}", name);
-                            }
+                            info.needed_libraries.push(lib_name.to_string());
+                            debug!("Found needed library: {}", lib_name);
                         }
                     }
                     goblin::elf::dynamic::DT_RPATH => {
                         if let Some(rpath_result) = elf.dynstrtab.get_at(dyn_entry.d_val as usize) {
-                            if let path_string = rpath_result {
-                                info.rpath =
-                                    path_string.split(':').map(|s| s.to_string()).collect();
-                            }
+                            info.rpath =
+                                rpath_result.split(':').map(|s| s.to_string()).collect();
                         }
                     }
                     goblin::elf::dynamic::DT_RUNPATH => {
                         if let Some(runpath_result) = elf.dynstrtab.get_at(dyn_entry.d_val as usize)
                         {
-                            if let path_string = runpath_result {
-                                info.runpath =
-                                    path_string.split(':').map(|s| s.to_string()).collect();
-                            }
+                            info.runpath =
+                                runpath_result.split(':').map(|s| s.to_string()).collect();
                         }
                     }
 
                     goblin::elf::dynamic::DT_SONAME => {
                         if let Some(soname) = elf.dynstrtab.get_at(dyn_entry.d_val as usize) {
-                            if let name = soname {
-                                info.soname = Some(name.to_string());
-                            }
+                            info.soname = Some(soname.to_string());
                         }
                     }
                     goblin::elf::dynamic::DT_GNU_HASH => {

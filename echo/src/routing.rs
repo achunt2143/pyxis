@@ -31,7 +31,7 @@ impl MessageRouter {
     }
 
     /// Route a message based on its type
-    pub async fn route_message(&self, mut message: Message) -> Result<Message> {
+    pub async fn route_message(&self, message: Message) -> Result<Message> {
         info!(
             "Routing message to {} ({})",
             message.header.destination,
@@ -209,4 +209,67 @@ mod tests {
     //     router.register_handler("org.geckoOS.test", "TestMethod", handler);
     //     assert_eq!(router.handler_count(), 1);
     // }
+
+    /// A writer the test reads back what the subscriber logged from.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// echo-daemon logs at DEBUG, and the router prints the whole message
+    /// there: a password in the body must not reach the log, whichever call
+    /// carries it, and a call that finds no handler must not either.
+    #[tokio::test]
+    async fn routing_a_password_call_logs_no_password() {
+        let secret = "hunter2-do-not-log";
+        let log = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(log.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let router = MessageRouter::new().unwrap();
+        for (destination, method) in [("org.geckoOS.session", "unlock"), ("org.geckoOS.accounts", "setPassword")] {
+            router.register_handler(
+                destination,
+                method,
+                Arc::new(crate::handler(|msg| {
+                    Box::pin(async move { Ok(Message::method_return(msg.header.message_id, json!({"ok": true}))) })
+                })),
+            );
+        }
+        for (destination, method) in [
+            ("org.geckoOS.session", "unlock"),
+            ("org.geckoOS.accounts", "setPassword"),
+            // Nothing registered here: the "No handler" path.
+            ("org.geckoOS.session", "Unlock"),
+        ] {
+            let body = json!({ "password": secret, "current": secret, "new": secret });
+            let msg = Message::method_call(destination, destination, method, body).unwrap();
+            router.route_message(msg).await.unwrap();
+        }
+
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        // The router did log these calls (at debug), so the test can fail.
+        assert!(logged.contains("handler key org.geckoOS.session.unlock"), "{logged}");
+        assert!(logged.contains(crate::message::REDACTED), "{logged}");
+        assert!(!logged.contains(secret), "{logged}");
+    }
 }

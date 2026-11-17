@@ -22,7 +22,9 @@
 //!    user being able to enter the shell's own runtime dir beyond that;
 //! 4. optionally hides paths from the app in a mount namespace of its own
 //!    (`--hide`: a bind mount of /dev/null, so the host socket is not merely
-//!    refused but absent);
+//!    refused but absent), and gives every dropped app a private /tmp (a
+//!    fresh nosuid,nodev 256 MB tmpfs, mode 1777, with the host's
+//!    /tmp/.X11-unix bound back in for XWayland clients), best effort;
 //! 5. forks the app, drops to its uid, gid and supplementary groups in the
 //!    child, and only then arms `PR_SET_PDEATHSIG`; execs the command with
 //!    `WAYLAND_DISPLAY` pointing at the app's socket; and stays as the
@@ -366,8 +368,8 @@ fn make_context(
 /// which each of `paths` is /dev/null. Best effort, and said so: the host
 /// socket is already refused to the app by its owner and mode, and this makes
 /// it absent too, which matters for whoever later loosens the mode.
-fn hide_paths(paths: &[PathBuf]) {
-    if paths.is_empty() {
+fn hide_paths(paths: &[PathBuf], private_tmp: bool) {
+    if paths.is_empty() && !private_tmp {
         return;
     }
     unsafe {
@@ -382,6 +384,9 @@ fn hide_paths(paths: &[PathBuf]) {
             return;
         }
     }
+    if private_tmp {
+        mount_private_tmp();
+    }
     let null = CString::new("/dev/null").unwrap();
     for path in paths {
         let Ok(target) = CString::new(path.as_os_str().as_bytes()) else { continue };
@@ -390,6 +395,43 @@ fn hide_paths(paths: &[PathBuf]) {
         };
         if rc != 0 {
             eprintln!("pyxis-wlctx: cannot hide {}: {}", path.display(), std::io::Error::last_os_error());
+        }
+    }
+}
+
+/// Mount a fresh tmpfs on /tmp in this process's mount namespace, so the app
+/// has a /tmp of its own and shares none with the shell or other apps. Runs
+/// while still root, before the drop. The host's /tmp/.X11-unix, if there is
+/// one, is bound back in (XWayland clients dial their X server through it);
+/// it is opened first, since the tmpfs hides it. Best effort, and said so.
+fn mount_private_tmp() {
+    use std::os::fd::AsRawFd;
+    let x11 = fs::File::open("/tmp/.X11-unix").ok().filter(|f| f.metadata().map(|m| m.is_dir()).unwrap_or(false));
+    let (src, dst, fstype) = (CString::new("tmpfs").unwrap(), CString::new("/tmp").unwrap(), CString::new("tmpfs").unwrap());
+    let opts = CString::new("mode=1777,size=256m").unwrap();
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            opts.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        eprintln!("pyxis-wlctx: cannot give the app a private /tmp, it shares the host's: {}", std::io::Error::last_os_error());
+        return;
+    }
+    if let Some(x11) = x11 {
+        let target = Path::new("/tmp/.X11-unix");
+        let made = fs::create_dir(target);
+        let from = CString::new(format!("/proc/self/fd/{}", x11.as_raw_fd())).unwrap();
+        let to = CString::new(target.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe {
+            libc::mount(from.as_ptr(), to.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null())
+        };
+        if made.is_err() || rc != 0 {
+            eprintln!("pyxis-wlctx: cannot bind /tmp/.X11-unix into the private /tmp (X11 clients will not connect): {:?} {}", made.err(), std::io::Error::last_os_error());
         }
     }
 }
@@ -486,7 +528,8 @@ fn main() {
         }
     };
 
-    hide_paths(&args.hide);
+    // Every app launch (a drop to an app uid) also gets a /tmp of its own.
+    hide_paths(&args.hide, owner.is_some() && unsafe { libc::geteuid() } == 0);
 
     let mut cmd = Command::new(&args.command[0]);
     cmd.args(&args.command[1..]);
@@ -518,6 +561,9 @@ fn main() {
             // helper's pid as the session's, so a kill aimed at the session
             // must take the app with it, and an app that outlived its helper
             // would have no one to clean up after it.
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }

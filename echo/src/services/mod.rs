@@ -8,6 +8,7 @@ pub mod appmanager;
 pub mod apphost;
 pub mod nova;
 pub mod installer;
+pub mod package_sig;
 pub mod power;
 pub mod settings;
 pub mod network;
@@ -19,6 +20,9 @@ pub mod process;
 pub mod system;
 pub mod terminal;
 pub mod time;
+pub mod session;
+pub mod accounts;
+pub mod privilege;
 
 // Re-exports for convenience
 pub use filesystem::FilesystemService;
@@ -33,4 +37,7 @@ pub use deviceinfo::DeviceInfoService;
 pub use notification::NotificationStore;
 pub use process::ProcessService;
 pub use system::SystemService;
+pub use session::{SessionService, SESSION_IFACE};
+pub use accounts::{AccountsService, ACCOUNTS_IFACE};
+pub use privilege::{PrivilegeService, PRIVILEGE_IFACE, PRIVILEGE_SERVICE};
 pub use terminal::{TerminalService, TERMINAL_IFACE};

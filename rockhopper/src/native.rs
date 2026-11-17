@@ -1,13 +1,10 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use tracing;
 use dashmap::DashMap;
 use std::sync::Arc;
-use uuid::Uuid;
-#[cfg(unix)]
-use libc::{ptrace, PTRACE_TRACEME, PTRACE_SYSCALL, PTRACE_GETREGS};
 
 /// Native Linux binary executor
 pub struct NativeExecutor {

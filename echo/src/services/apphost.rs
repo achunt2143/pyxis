@@ -58,6 +58,10 @@ const USER_APPS_ROOT: &str = "/var/lib/pyxis/apps";
 /// comment for why those manifests can't live in the app dir itself).
 /// Checked last: system, then user, then ipk-derived.
 const NOVA_NATIVE_ROOT: &str = "/var/lib/pyxis/nova/native";
+const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup/pyxis.slice";
+const DEFAULT_MEMORY_HIGH_BYTES: u64 = 768 * 1024 * 1024;
+const DEFAULT_MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_PIDS_MAX: u32 = 256;
 
 /// Interface name for app host IPC + signals.
 pub const APPHOST_IFACE: &str = "org.geckoOS.appHost";
@@ -126,7 +130,7 @@ pub struct AppSession {
     /// Orders sessions finer than `started_at`'s whole seconds, so "the
     /// newest session" is never a tie. Not part of the wire format.
     #[serde(skip)]
-    seq: u64,
+    pub(crate) seq: u64,
     pub state: AppState,
     /// Compositor surfaces (Wayland window ids in evo) currently bound to
     /// this session. A session may have 0..N surfaces; 0 means the process
@@ -188,7 +192,7 @@ pub struct AppHost {
 }
 
 impl AppHost {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             sessions: DashMap::new(),
             active: RwLock::new(None),
@@ -436,6 +440,8 @@ impl AppHost {
         // this pid, via waitpid(pid, WNOHANG).
         // The Child handle is forgotten so its Drop doesn't try to wait().
         std::mem::forget(child);
+        let cgroup_root = Self::cgroup_root();
+        let _ = apply_cgroup_limits(&cgroup_root, &session_id, pid);
         // Track pid -> session_id so the reaper can look it up O(1).
         if let Ok(mut idx) = self.pid_index.write() {
             idx.insert(pid, session_id.clone());
@@ -640,14 +646,15 @@ impl AppHost {
                 session.state.as_str()
             ));
         }
+        let _ = set_cgroup_freeze(&Self::cgroup_root(), session_id, true);
         if session.pid > 0 {
-            Self::send_group_signal(session.pid, Signal::SIGSTOP)?;
+            Self::signal_process_tree(session.pid, Signal::SIGSTOP)?;
         }
         let suspended = self.transition(session_id, AppState::Suspended);
         Ok(suspended.unwrap_or(session))
     }
 
-    /// Thaw a suspended session with `SIGCONT`.
+    /// Thaw a suspended session with `SIGCONT` (and cgroup.freeze = 0).
     pub fn resume(&self, session_id: &str) -> Result<AppSession> {
         let session = self
             .sessions
@@ -661,11 +668,53 @@ impl AppHost {
                 session.state.as_str()
             ));
         }
+        let _ = set_cgroup_freeze(&Self::cgroup_root(), session_id, false);
         if session.pid > 0 {
-            Self::send_group_signal(session.pid, Signal::SIGCONT)?;
+            Self::signal_process_tree(session.pid, Signal::SIGCONT)?;
         }
         let resumed = self.transition(session_id, AppState::Running);
         Ok(resumed.unwrap_or(session))
+    }
+
+    /// Gracefully drain all active sessions prior to system shutdown or reboot.
+    /// Thaws any suspended session so its SIGTERM handler can run, sends SIGTERM
+    /// across each session's process tree, waits up to `grace`, and escalates any
+    /// remaining processes to SIGKILL. Returns the number of sessions signalled.
+    pub fn close_all_for_shutdown(&self, grace: std::time::Duration) -> usize {
+        let targets: Vec<(String, u32, AppState)> = self
+            .sessions
+            .iter()
+            .filter(|e| e.value().is_live() && e.value().pid > 0)
+            .map(|e| (e.value().session_id.clone(), e.value().pid, e.value().state))
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+        let cgroup_root = Self::cgroup_root();
+        for (sid, pid, state) in &targets {
+            if let Ok(mut set) = self.expected_stops.write() {
+                set.insert(sid.clone());
+            }
+            if *state == AppState::Suspended {
+                let _ = set_cgroup_freeze(&cgroup_root, sid, false);
+                let _ = Self::signal_process_tree(*pid, Signal::SIGCONT);
+            }
+            let _ = Self::signal_process_tree(*pid, Signal::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            self.reap_once();
+            if targets.iter().all(|(_, pid, _)| Self::session_gone(*pid)) {
+                return targets.len();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for (_, pid, _) in &targets {
+            if !Self::session_gone(*pid) {
+                let _ = Self::signal_process_tree(*pid, Signal::SIGKILL);
+            }
+        }
+        targets.len()
     }
 
     /// Close + relaunch.
@@ -746,6 +795,12 @@ impl AppHost {
             set.remove(session_id);
         }
         self.sessions.remove(session_id);
+        cleanup_cgroup(&Self::cgroup_root(), session_id);
+        if let Some(ref s) = snapshot {
+            if self.find_live_session_by_app(&s.app_id).is_none() {
+                crate::services::privilege::revoke_for_app(&s.app_id, "app_closed");
+            }
+        }
         if let Ok(mut slot) = self.active.write() {
             if slot.as_deref() == Some(session_id) {
                 *slot = None;
@@ -957,6 +1012,27 @@ impl AppHost {
         (session, added)
     }
 
+    /// Resolve the live `app_id` that owns an OS process `pid` (checking exact
+    /// session PIDs, process-group leaders, and up to 16 ancestor `ppid` hops
+    /// via `/proc/<pid>/stat` for forked/sandboxed helper subprocesses).
+    pub fn app_id_for_pid(&self, pid: u32) -> Option<String> {
+        if let Some(session) = self.find_session_by_client(Some(pid)) {
+            return Some(session.app_id);
+        }
+        let mut cur = pid;
+        for _ in 0..16 {
+            let ppid = Self::parent_pid_of(cur)?;
+            if ppid <= 1 || ppid == cur {
+                break;
+            }
+            if let Some(session) = self.find_session_by_client(Some(ppid)) {
+                return Some(session.app_id);
+            }
+            cur = ppid;
+        }
+        None
+    }
+
     /// The live session a Wayland client belongs to: the one whose pid is the
     /// client's, else the one whose process group the client is in. Apps are
     /// spawned as group leaders (pgid == recorded pid), and vela may re-exec
@@ -970,13 +1046,27 @@ impl AppHost {
         self.newest_session(|s| s.is_live() && s.pid == pgid)
     }
 
-    /// Process group of `pid`, from `/proc/<pid>/stat` (field 5, after the
-    /// parenthesised command name, which may itself hold spaces and parens).
-    fn process_group_of(pid: u32) -> Option<u32> {
+    /// Parse `(ppid, pgrp)` from `/proc/<pid>/stat` after the parenthesised comm name.
+    fn proc_stat_relations(pid: u32) -> Option<(u32, u32)> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let (_, rest) = stat.rsplit_once(") ")?;
         // rest: state ppid pgrp ...
-        rest.split(' ').nth(2)?.parse().ok()
+        let mut fields = rest.split(' ');
+        let _state = fields.next()?;
+        let ppid: u32 = fields.next()?.parse().ok()?;
+        let pgrp: u32 = fields.next()?.parse().ok()?;
+        Some((ppid, pgrp))
+    }
+
+    /// Parent PID of `pid`, from `/proc/<pid>/stat`.
+    fn parent_pid_of(pid: u32) -> Option<u32> {
+        Self::proc_stat_relations(pid).map(|(ppid, _)| ppid)
+    }
+
+    /// Process group of `pid`, from `/proc/<pid>/stat` (field 5, after the
+    /// parenthesised command name, which may itself hold spaces and parens).
+    fn process_group_of(pid: u32) -> Option<u32> {
+        Self::proc_stat_relations(pid).map(|(_, pgrp)| pgrp)
     }
 
     /// Detach a surface from whichever session currently owns it. If the
@@ -1078,6 +1168,23 @@ impl AppHost {
         PathBuf::from(NOVA_NATIVE_ROOT)
     }
 
+    fn cgroup_root() -> PathBuf {
+        std::env::var("PYXIS_CGROUP_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CGROUP_ROOT))
+    }
+
+    /// Signal a session's process group AND any out-of-group descendant PIDs
+    /// discovered via `/proc` (e.g. forked helpers or Gecko content children).
+    fn signal_process_tree(root_pid: u32, signal: Signal) -> Result<()> {
+        let descendants = collect_descendant_pids(root_pid);
+        let group_res = Self::send_group_signal(root_pid, signal);
+        for child_pid in descendants {
+            let _ = kill(Pid::from_raw(child_pid as i32), signal);
+        }
+        group_res
+    }
+
     /// Signal a session's process group, falling back to the bare pid, and
     /// report failure only if neither exists.
     fn send_group_signal(pid: u32, signal: Signal) -> Result<()> {
@@ -1120,6 +1227,90 @@ impl AppHost {
     fn pid_alive(pid: u32) -> bool {
         kill(Pid::from_raw(pid as i32), None).is_ok()
     }
+}
+
+fn sanitize_cgroup_component(session_id: &str) -> String {
+    session_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Create a cgroup v2 leaf under `cgroup_root/app-<session_id>`, apply soft/hard
+/// memory and PID limits, and move `pid` into it. Returns `None` quietly when
+/// cgroupfs is unavailable (e.g. non-root containers or unit tests).
+pub(crate) fn apply_cgroup_limits(cgroup_root: &Path, session_id: &str, pid: u32) -> Option<PathBuf> {
+    if !cgroup_root.exists() && fs::create_dir_all(cgroup_root).is_err() {
+        return None;
+    }
+    let leaf = cgroup_root.join(format!("app-{}", sanitize_cgroup_component(session_id)));
+    if fs::create_dir_all(&leaf).is_err() {
+        return None;
+    }
+    let _ = fs::write(leaf.join("memory.high"), DEFAULT_MEMORY_HIGH_BYTES.to_string());
+    let _ = fs::write(leaf.join("memory.max"), DEFAULT_MEMORY_MAX_BYTES.to_string());
+    let _ = fs::write(leaf.join("pids.max"), DEFAULT_PIDS_MAX.to_string());
+    if pid > 0 {
+        let _ = fs::write(leaf.join("cgroup.procs"), pid.to_string());
+    }
+    Some(leaf)
+}
+
+fn set_cgroup_freeze(cgroup_root: &Path, session_id: &str, frozen: bool) -> bool {
+    let freeze_file = cgroup_root
+        .join(format!("app-{}", sanitize_cgroup_component(session_id)))
+        .join("cgroup.freeze");
+    if !freeze_file.exists() {
+        return false;
+    }
+    fs::write(freeze_file, if frozen { "1" } else { "0" }).is_ok()
+}
+
+fn cleanup_cgroup(cgroup_root: &Path, session_id: &str) {
+    let leaf = cgroup_root.join(format!("app-{}", sanitize_cgroup_component(session_id)));
+    let _ = fs::remove_dir(leaf);
+}
+
+/// Walk `/proc/<pid>/stat` to collect all transitive child PIDs of `root_pid`.
+pub(crate) fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    if root_pid == 0 {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        // Field 1 after ") " is state, field 2 is ppid.
+        if let Some(ppid) = rest.split(' ').nth(1).and_then(|s| s.parse::<u32>().ok()) {
+            children_by_parent.entry(ppid).or_default().push(pid);
+        }
+    }
+    let mut result = Vec::new();
+    let mut stack = vec![root_pid];
+    while let Some(parent) = stack.pop() {
+        if let Some(kids) = children_by_parent.get(&parent) {
+            for &kid in kids {
+                if kid != root_pid && !result.contains(&kid) {
+                    result.push(kid);
+                    stack.push(kid);
+                }
+            }
+        }
+    }
+    result
 }
 
 // ---------- JSON helpers consumed by the daemon dispatcher ----------
@@ -1556,5 +1747,61 @@ mod tests {
             host.get_state("sess-stop").is_none(),
             "stopped session should be removed after reap"
         );
+    }
+
+    #[test]
+    fn cgroup_limits_and_freeze_write_expected_control_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let leaf = apply_cgroup_limits(dir.path(), "sess/with:chars", 4242)
+            .expect("creates cgroup leaf");
+        assert!(leaf.ends_with("app-sess_with_chars"));
+        assert_eq!(
+            fs::read_to_string(leaf.join("memory.high")).unwrap(),
+            DEFAULT_MEMORY_HIGH_BYTES.to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(leaf.join("memory.max")).unwrap(),
+            DEFAULT_MEMORY_MAX_BYTES.to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(leaf.join("pids.max")).unwrap(),
+            DEFAULT_PIDS_MAX.to_string()
+        );
+        assert_eq!(fs::read_to_string(leaf.join("cgroup.procs")).unwrap(), "4242");
+
+        // Pre-seed cgroup.freeze so set_cgroup_freeze writes "1" then "0".
+        fs::write(leaf.join("cgroup.freeze"), "0").unwrap();
+        assert!(set_cgroup_freeze(dir.path(), "sess/with:chars", true));
+        assert_eq!(fs::read_to_string(leaf.join("cgroup.freeze")).unwrap(), "1");
+        assert!(set_cgroup_freeze(dir.path(), "sess/with:chars", false));
+        assert_eq!(fs::read_to_string(leaf.join("cgroup.freeze")).unwrap(), "0");
+    }
+
+    #[test]
+    fn collect_descendant_pids_finds_spawned_child() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 2"])
+            .spawn()
+            .expect("spawn child");
+        let child_pid = child.id();
+        let descendants = collect_descendant_pids(std::process::id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            descendants.contains(&child_pid),
+            "expected descendant pid {} in {:?}",
+            child_pid,
+            descendants
+        );
+    }
+
+    #[test]
+    fn app_id_for_pid_resolves_direct_and_descendant_processes() {
+        let host = AppHost::new();
+        let child = launch_sh(&host, "settings", "sleep 2");
+        assert_eq!(host.app_id_for_pid(child.pid).as_deref(), Some("settings"));
+        assert!(host.app_id_for_pid(999_999_999).is_none());
+        let _ = host.kill(&child.session_id);
+        let _ = waitpid(Pid::from_raw(child.pid as i32), None);
     }
 }

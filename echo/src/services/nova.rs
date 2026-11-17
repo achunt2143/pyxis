@@ -39,8 +39,9 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::services::apphost::{AppHost, AppSession};
@@ -70,12 +71,33 @@ pub const NOVA_NATIVE_ROOT: &str = "/var/lib/pyxis/nova/native";
 const PROFILES_ROOT: &str = "/var/lib/pyxis/profiles";
 /// Registry index file.
 const REGISTRY_FILE: &str = "/var/lib/pyxis/nova/registry.json";
+/// Persisted per-app revoked capabilities map (`{ "<appId>": ["perm", ...] }`).
+const REVOKED_PERMISSIONS_FILE: &str = "/var/lib/pyxis/nova/revoked_permissions.json";
 /// Origin map consumed by `PyxisOriginMap` (netwerk/protocol/pyxis/).
 const ORIGINS_MAP_FILE: &str = "/run/pyxis/nova/origins.map";
 /// Path to the real `vela` binary (matches `gecko/src/gecko.rs`'s
 /// `DEFAULT_VELA_PATH` and `scripts/create-rootfs.sh`'s install
 /// location).
 const VELA_BIN: &str = "/usr/lib/pyxis-gecko/vela";
+/// Vela's start page, its homepage and new tab: a static page the browser
+/// app ships (`packages/apps/browser/public/start/`), opened as a file so the
+/// ordinary browser window gives it no bridge.
+const BROWSER_START_URL: &str = "file:///usr/share/geckoOS/apps/browser/webroot/start/index.html";
+
+/// The browser window's own prefs, after the shared set: open on the start
+/// page (the shared set's `browser.startup.page` 0 is a blank window), and
+/// use it for new tabs (`pyxis.newtab.url`, read by the AboutNewTab patch).
+/// Firefox shows its empty bookmarks bar ("For quick access, place your
+/// bookmarks here") over a new tab; the page has its own pinned sites.
+fn browser_start_prefs() -> String {
+    format!(
+        "// Vela's start page.\n\
+         user_pref(\"browser.startup.page\", 1);\n\
+         user_pref(\"browser.startup.homepage\", \"{BROWSER_START_URL}\");\n\
+         user_pref(\"pyxis.newtab.url\", \"{BROWSER_START_URL}\");\n\
+         user_pref(\"browser.toolbars.bookmarks.visibility\", \"never\");\n"
+    )
+}
 
 // --- Who an app runs as. Two users, on purpose:
 //
@@ -89,10 +111,8 @@ const VELA_BIN: &str = "/usr/lib/pyxis-gecko/vela";
 //   needed anyway; it is done by `pyxis-wlctx`, not `setpriv` (see
 //   `echo/src/bin/wlctx.rs` for why the order matters).
 //
-// All apps share the one uid, so apps are not isolated from *each other* by
-// the kernel (that stays the bridge's and the filesystem service's job); a
-// uid per app is the next step and touches only the constants and
-// `app_uid` below.
+// Each app has its own uid (the persisted table below; `PYXIS_PER_APP_UID=0`
+// puts every app back on the shared `APP_UID`, the fallback user).
 //
 // These MUST stay in lockstep with the users, groups and paths
 // scripts/create-rootfs.sh sets up. `--groups video,render` is what grants
@@ -107,6 +127,7 @@ pub(crate) const APP_HOME: &str = "/home/pyxisapp";
 /// Apps' `$XDG_RUNTIME_DIR`: theirs, so Gecko can keep what it wants there.
 /// `pyxis-wlctx` makes it. The shell's own runtime dir is not one an app can
 /// list or write (see `SHELL_RUNTIME_DIR`).
+#[allow(dead_code)]
 const APP_RUNTIME_DIR: &str = "/run/user/1001";
 /// Gives the launched app its own Wayland socket (a `wp_security_context_v1`
 /// listener carrying its app id), so Evo can tell it from the system, and
@@ -119,6 +140,7 @@ const APP_GROUPS: &str = "video,render";
 /// The shell's session runtime dir: Evo's host socket, Echo's socket and the
 /// Pulse socket live here. Mode 0711, so an app can reach a path it knows
 /// (Echo's socket, which is mode 0666; the Pulse socket) but not list it.
+#[allow(dead_code)]
 const SHELL_RUNTIME_DIR: &str = "/run/user/1000";
 /// Evo's own socket: geckouser's and mode 0600, so only the shell and root can
 /// open it. Apps get it hidden from their mount namespace too.
@@ -136,7 +158,164 @@ const PULSE_SERVER: &str = "unix:/run/pyxis/pulse/native";
 /// Apps the boot script starts as the shell's user. Nova never launches
 /// these, so it must not hand their state to the app user either. The boot
 /// script names its own boot app in `PYXIS_SHELL_APPS` for echo-daemon.
-const SHELL_APP_IDS: &[&str] = &["bloom"];
+const SHELL_APP_IDS: &[&str] = &["bloom", "bloom-overlay"];
+
+/// Base UID and span for per-app UIDs (`10_000..60_000`). Each non-shell app
+/// gets its own uid, and a private gid of the same number, from the persisted
+/// table below, so apps are kernel-isolated from one another (cannot ptrace
+/// each other or read/write another app's `0700` profile, data dir, or
+/// `/run/user/<uid>` runtime dir).
+pub(crate) const APP_UID_BASE: u32 = 10_000;
+pub(crate) const APP_UID_SPAN: u32 = 50_000;
+
+/// Where app uids are recorded: `{"high_water": N, "apps": {id: uid}}`, root's
+/// and 0644. Overridable with `PYXIS_UIDS_FILE` (tests, and the harness).
+const UIDS_PATH: &str = "/var/lib/pyxis/uids.json";
+
+fn uids_path() -> PathBuf {
+    if let Ok(p) = std::env::var("PYXIS_UIDS_FILE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if cfg!(test) {
+        // Unit tests never write under /var/lib.
+        return std::env::temp_dir().join(format!("pyxis-uids-test-{}.json", std::process::id()));
+    }
+    PathBuf::from(UIDS_PATH)
+}
+
+/// `PYXIS_PER_APP_UID=0` is the escape hatch: every app shares `APP_UID`.
+fn shared_uid_mode() -> bool {
+    matches!(std::env::var("PYXIS_PER_APP_UID").as_deref(), Ok("0"))
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct UidTable {
+    /// The highest uid ever handed out. A uid is never reused, even after the
+    /// app that held it is uninstalled and forgotten, so a new app can never
+    /// inherit files an old one left behind.
+    #[serde(default)]
+    high_water: u32,
+    #[serde(default)]
+    apps: std::collections::BTreeMap<String, u32>,
+}
+
+impl UidTable {
+    fn load(path: &Path) -> Result<UidTable> {
+        match fs::read_to_string(path) {
+            Ok(s) => serde_json::from_str(&s).with_context(|| format!("parse {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UidTable::default()),
+            Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    fn next_free(&self) -> u32 {
+        let top = self.apps.values().copied().max().unwrap_or(0).max(self.high_water);
+        top.max(APP_UID_BASE - 1) + 1
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path).with_context(|| format!("rename onto {}", path.display()))?;
+        Ok(())
+    }
+}
+
+static UID_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The uid recorded for `app_id` in the table at `path`, allocating the next
+/// unused one (from `APP_UID_BASE` up, never a hash) on first sight. Never
+/// hands out a uid that is already in the table to another app.
+fn allocate_app_uid(path: &Path, app_id: &str) -> Result<u32> {
+    let _guard = UID_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut table = UidTable::load(path)?;
+    if let Some(uid) = table.apps.get(app_id) {
+        return Ok(*uid);
+    }
+    let uid = table.next_free();
+    if uid >= APP_UID_BASE + APP_UID_SPAN {
+        anyhow::bail!("app uid range exhausted");
+    }
+    if table.apps.values().any(|u| *u == uid) {
+        anyhow::bail!("uid {uid} is already allocated");
+    }
+    table.apps.insert(app_id.to_string(), uid);
+    table.high_water = uid;
+    table.save(path)?;
+    Ok(uid)
+}
+
+/// The uid app `app_id` runs as under `path`'s table, or the shared one.
+fn app_uid_in(path: &Path, shared: bool, app_id: &str) -> u32 {
+    if shared || app_id.is_empty() {
+        return APP_UID;
+    }
+    match allocate_app_uid(path, app_id) {
+        Ok(uid) => uid,
+        Err(e) => {
+            // Fall back to the shared app user rather than to nothing: still
+            // not the shell, still the App tier. Loud, since it shares a uid.
+            tracing::error!("nova: no uid for app {app_id:?}, using the shared {APP_UID}: {e:#}");
+            APP_UID
+        }
+    }
+}
+
+/// Effective UID for `app_id`: its own, from the persisted table, unless
+/// `PYXIS_PER_APP_UID=0` (the shared `APP_UID`, `1001`). The shell's apps get
+/// no table entry: the boot script runs them as geckouser (`app_owner` says
+/// so), and Nova, which pre-composes a launch for every app at reload, used
+/// to allocate one for `bloom` here. A Nova launch of a shell app (not a path
+/// the image uses) runs as the shared app user, as before per-app uids.
+pub fn app_uid(app_id: &str) -> u32 {
+    if is_shell_app(app_id) {
+        return APP_UID;
+    }
+    app_uid_in(&uids_path(), shared_uid_mode(), app_id)
+}
+
+/// The gid an app runs as: a private group of the uid's number, or the shared
+/// `APP_GID` when the uid is the shared one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn app_gid(app_id: &str) -> u32 {
+    app_gid_of(app_uid(app_id))
+}
+
+fn app_gid_of(uid: u32) -> u32 {
+    if uid == APP_UID { APP_GID } else { uid }
+}
+
+/// Per-app `$XDG_RUNTIME_DIR` (`/run/user/<app_uid>`), created mode `0700`
+/// by `pyxis-wlctx`, owned by the app.
+pub(crate) fn app_runtime_dir(app_id: &str) -> String {
+    format!("/run/user/{}", app_uid(app_id))
+}
+
+/// An app's `$HOME`: its own data dir when it has its own uid (the shared
+/// `/home/pyxisapp` is 1001's and must not be shared), else `APP_HOME`.
+pub(crate) fn app_home(app_id: &str) -> String {
+    if app_uid(app_id) == APP_UID {
+        APP_HOME.to_string()
+    } else {
+        format!("{}/{}", crate::services::filesystem::scope::APP_DATA_ROOT, app_id)
+    }
+}
 
 /// Whether `app_id` is part of the shell, run by the boot script as
 /// geckouser. Its profile stays geckouser's.
@@ -152,7 +331,8 @@ pub(crate) fn app_owner(app_id: &str) -> (u32, u32) {
     if is_shell_app(app_id) {
         (GECKO_UID, GECKO_GID)
     } else {
-        (APP_UID, APP_GID)
+        let uid = app_uid(app_id);
+        (uid, app_gid_of(uid))
     }
 }
 
@@ -173,7 +353,8 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "power",
     "notifications",
     "audio",
-    "network",
+    "network:read",
+    "network:manage",
     "browser",
     "notifications:manage",
     "appManager:install",
@@ -195,6 +376,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
 /// Gating only the `appinfo.json` path would leave the identical escalation
 /// reachable by shipping the same app as a `.tar.gz` instead of an `.ipk`.
 pub const PRIVILEGED_CAPABILITIES: &[&str] = &[
+    "network:manage",
     "notifications:manage",
     "appManager:install",
     "appManager:manage",
@@ -216,6 +398,8 @@ pub const PRIVILEGED_CAPABILITIES: &[&str] = &[
 /// authorization").
 pub const APPINFO_PERMISSIONS: &[&str] = &[
     "network",
+    "network.read",
+    "network.manage",
     "notifications",
     "camera",
     "microphone",
@@ -256,6 +440,7 @@ pub const APPINFO_PERMISSIONS: &[&str] = &[
 /// installed, which is precisely the escalation the deny-by-default model
 /// exists to prevent.
 pub const PRIVILEGED_APPINFO_PERMISSIONS: &[&str] = &[
+    "network.manage",
     "notifications.manage",
     "appmanager.install",
     "appmanager.manage",
@@ -328,7 +513,10 @@ pub fn appinfo_permission_to_capability(perm: &str) -> Option<&'static str> {
         "notifications.manage" => Some("notifications:manage"),
         "power" => Some("power"),
         "audio" => Some("audio"),
-        "network" => Some("network"),
+        // Plain `network` is the legacy declaration; it never covered more
+        // than reading once the capability was split.
+        "network" | "network.read" => Some("network:read"),
+        "network.manage" => Some("network:manage"),
         "browser" => Some("browser"),
         "appmanager.install" => Some("appManager:install"),
         "appmanager.manage" => Some("appManager:manage"),
@@ -393,8 +581,10 @@ pub struct WebAppManifest {
     #[serde(default)]
     pub icons: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "singleInstance")]
     pub single_instance: bool,
     #[serde(default = "default_display")]
     pub display: String,
@@ -419,10 +609,32 @@ fn default_display() -> String {
     "windowed".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Integrity {
     #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(default, rename = "keyId", alias = "key_id")]
+    pub key_id: Option<String>,
+}
+
+fn normalize_accent(raw: Option<String>, id: &str, manifest_kind: &str) -> Result<Option<String>> {
+    let Some(accent) = raw else {
+        return Ok(None);
+    };
+    if accent.len() != 7
+        || !accent.starts_with('#')
+        || !accent[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(anyhow!(
+            "{} for '{}' has invalid accent '{}' (must be #rrggbb)",
+            manifest_kind,
+            id,
+            accent
+        ));
+    }
+    Ok(Some(accent.to_ascii_lowercase()))
 }
 
 impl WebAppManifest {
@@ -431,7 +643,7 @@ impl WebAppManifest {
     /// install dir, `entry` has no path traversal, every declared
     /// permission is from the known vocabulary.
     fn parse(raw: &str, dir_id: &str) -> Result<Self> {
-        let manifest: WebAppManifest =
+        let mut manifest: WebAppManifest =
             serde_json::from_str(raw).context("parse manifest.webapp")?;
         if manifest.id != dir_id {
             return Err(anyhow!(
@@ -446,6 +658,15 @@ impl WebAppManifest {
                 manifest.entry
             ));
         }
+        manifest.accent = normalize_accent(manifest.accent.take(), &manifest.id, "manifest.webapp")?;
+        // Legacy `network` meant the whole service; it is now read-only.
+        for perm in manifest.permissions.iter_mut() {
+            if perm == "network" {
+                *perm = "network:read".to_string();
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        manifest.permissions.retain(|p| seen.insert(p.clone()));
         for perm in &manifest.permissions {
             if !KNOWN_CAPABILITIES.contains(&perm.as_str()) {
                 return Err(anyhow!(
@@ -465,6 +686,7 @@ impl WebAppManifest {
             "type": self.r#type,
             "entry": self.entry,
             "icons": self.icons,
+            "accent": self.accent,
             "category": self.category,
             "singleInstance": self.single_instance,
             "display": self.display,
@@ -493,6 +715,8 @@ pub struct AppInfoManifest {
     pub main: String,
     pub icon: String,
     #[serde(default)]
+    pub accent: Option<String>,
+    #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
     pub fullscreen: bool,
@@ -510,7 +734,7 @@ impl AppInfoManifest {
     /// native `main` must be absolute, permissions must come from the §19
     /// vocabulary.
     fn parse(raw: &str, dir_id: &str) -> Result<Self> {
-        let info: AppInfoManifest = serde_json::from_str(raw).context("parse appinfo.json")?;
+        let mut info: AppInfoManifest = serde_json::from_str(raw).context("parse appinfo.json")?;
         if info.id != dir_id {
             return Err(anyhow!(
                 "appinfo.json id '{}' does not match install dir '{}'",
@@ -518,6 +742,7 @@ impl AppInfoManifest {
                 dir_id
             ));
         }
+        info.accent = normalize_accent(info.accent.take(), &info.id, "appinfo.json")?;
         match info.app_type.as_str() {
             "web" => {
                 if info.main.starts_with('/') || info.main.contains("..") {
@@ -607,13 +832,16 @@ impl AppTier {
     /// `installer` into the writable root would inherit the real installer's
     /// authority.
     pub fn may_hold_privileged(self) -> bool {
-        matches!(self, AppTier::System | AppTier::Opkg)
+        // Only the image tier: an ipk (opkg tier) may be named anything, and
+        // an id on PRIVILEGED_APP_IDS the image doesn't ship (no built-in
+        // terminal installed) would otherwise be free for it to take.
+        matches!(self, AppTier::System)
     }
 
     /// Whether this tier's ids are owned by a root-mediated installer, and so
     /// may not be claimed by a user-installed app.
     pub fn owns_its_ids(self) -> bool {
-        self.may_hold_privileged()
+        matches!(self, AppTier::System | AppTier::Opkg)
     }
 
     /// Whether `nova.Uninstall` may delete this app's files. Nova removes
@@ -727,13 +955,20 @@ pub struct Nova {
     /// Keyed by app id.
     registry: RwLock<HashMap<String, RegistryEntry>>,
     bus: RwLock<Option<Arc<IPCBus>>>,
+    /// Per-app runtime-revoked capabilities (`app_id -> revoked permissions`).
+    revoked: RwLock<HashMap<String, Vec<String>>>,
+    revoked_path: PathBuf,
 }
 
 impl Nova {
     fn new() -> Self {
+        let revoked_path = PathBuf::from(REVOKED_PERMISSIONS_FILE);
+        let initial_revoked = load_revoked_permissions(&revoked_path);
         Self {
             registry: RwLock::new(HashMap::new()),
             bus: RwLock::new(None),
+            revoked: RwLock::new(initial_revoked),
+            revoked_path,
         }
     }
 
@@ -965,6 +1200,7 @@ impl Nova {
                 info.main.clone()
             },
             icons,
+            accent: info.accent.clone(),
             category: info.category.clone(),
             // GUI apps launched from the shell: one card per app.
             single_instance: true,
@@ -1068,12 +1304,26 @@ impl Nova {
 
     // ---------- Queries ----------
 
+    /// List user-launchable installed apps. Shell components (`bloom`,
+    /// `bloom-overlay`) stay in `self.registry` for startup/info lookup but are
+    /// excluded so launchers never expose the desktop shell as a user app.
     pub fn list(&self) -> Result<Value> {
         let reg = self
             .registry
             .read()
             .map_err(|_| anyhow!("registry lock poisoned"))?;
-        let mut apps: Vec<Value> = reg.values().map(|e| e.info_json()).collect();
+        let mut apps: Vec<Value> = reg
+            .values()
+            .filter(|e| !is_shell_app(&e.manifest.id))
+            .map(|e| {
+                let mut v = e.info_json();
+                v["permissions"] = json!(self.effective_permissions(
+                    &e.manifest.id,
+                    &e.manifest.permissions
+                ));
+                v
+            })
+            .collect();
         apps.sort_by(|a, b| {
             a["id"]
                 .as_str()
@@ -1084,6 +1334,7 @@ impl Nova {
     }
 
     pub fn get_info(&self, app_id: &str) -> Result<Value> {
+        let app_id = Self::normalize_app_id(app_id.trim());
         let reg = self
             .registry
             .read()
@@ -1092,7 +1343,13 @@ impl Nova {
             .get(app_id)
             .ok_or_else(|| anyhow!("app '{}' is not installed", app_id))?;
         let mut info = entry.info_json();
-        let running = AppHost::global().find_live_session_by_app(app_id);
+        info["permissions"] = json!(self.effective_permissions(
+            &entry.manifest.id,
+            &entry.manifest.permissions
+        ));
+        info["declaredPermissions"] = json!(entry.manifest.permissions);
+        info["revokedPermissions"] = json!(self.revoked_for(&entry.manifest.id));
+        let running = Self::find_live_session_for(AppHost::global(), app_id, None);
         info["running"] = json!(running.is_some());
         if let Some(s) = running {
             info["sessionId"] = json!(s.session_id);
@@ -1100,16 +1357,311 @@ impl Nova {
         Ok(info)
     }
 
-    /// Declared `permissions[]` for an app id, or an empty vec if unknown —
-    /// deny-by-default, matching `PyxisBridgeParent.sys.mjs`'s existing
-    /// conservative placeholder. This is the real backing store that
-    /// placeholder's doc comment says to wire up once Nova exists.
+    /// Safely resolve and base64-encode an installed app's primary icon from
+    /// inside its canonical `webroot`, enforcing path-traversal confinement,
+    /// image extension allowlist, and a 256 KiB ceiling (`MAX_APP_ICON_BYTES`).
+    pub fn get_app_icon(&self, app_id: &str) -> Result<Value> {
+        let raw_id = app_id.trim();
+        if raw_id.is_empty() {
+            return Err(anyhow!("nova.GetAppIcon requires a non-empty app id"));
+        }
+        let app_id = Self::normalize_app_id(raw_id);
+        let entry = {
+            let reg = self
+                .registry
+                .read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            reg.get(app_id)
+                .cloned_entry()
+                .ok_or_else(|| anyhow!("app '{}' is not installed", app_id))?
+        };
+        Self::read_app_icon_from_entry(&entry)
+    }
+
+    fn select_icon_rel_path(icons: &HashMap<String, String>) -> Option<String> {
+        for preferred in ["128", "64", "256", "96", "48", "32"] {
+            if let Some(path) = icons.get(preferred).map(|p| p.trim()).filter(|p| !p.is_empty()) {
+                return Some(path.to_string());
+            }
+        }
+        let mut keys: Vec<&String> = icons.keys().collect();
+        keys.sort();
+        for key in keys {
+            if let Some(path) = icons.get(key).map(|p| p.trim()).filter(|p| !p.is_empty()) {
+                return Some(path.to_string());
+            }
+        }
+        None
+    }
+
+    fn read_app_icon_from_entry(entry: &RegistryEntry) -> Result<Value> {
+        let icons = entry.web_icons();
+        let rel = Self::select_icon_rel_path(&icons)
+            .ok_or_else(|| anyhow!("app '{}' declares no icon", entry.manifest.id))?;
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.contains('\\')
+            || rel.contains('\0')
+            || !Path::new(&rel)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return Err(anyhow!(
+                "refusing unsafe icon path '{}' for '{}'",
+                rel,
+                entry.manifest.id
+            ));
+        }
+
+        let canonical_root = fs::canonicalize(&entry.webroot).with_context(|| {
+            format!(
+                "canonicalize webroot {} for '{}'",
+                entry.webroot.display(),
+                entry.manifest.id
+            )
+        })?;
+        let candidate = entry.webroot.join(&rel);
+        let canonical_file = fs::canonicalize(&candidate).with_context(|| {
+            format!(
+                "icon '{}' missing under {} for '{}'",
+                rel,
+                entry.webroot.display(),
+                entry.manifest.id
+            )
+        })?;
+        if !canonical_file.starts_with(&canonical_root) {
+            return Err(anyhow!(
+                "icon path '{}' escapes webroot for '{}'",
+                rel,
+                entry.manifest.id
+            ));
+        }
+
+        let meta = fs::metadata(&canonical_file).with_context(|| {
+            format!("stat icon '{}' for '{}'", rel, entry.manifest.id)
+        })?;
+        if !meta.is_file() {
+            return Err(anyhow!(
+                "icon '{}' for '{}' is not a regular file",
+                rel,
+                entry.manifest.id
+            ));
+        }
+        if meta.len() == 0 {
+            return Err(anyhow!(
+                "icon '{}' for '{}' is empty",
+                rel,
+                entry.manifest.id
+            ));
+        }
+        if meta.len() > Self::MAX_APP_ICON_BYTES as u64 {
+            return Err(anyhow!(
+                "icon '{}' for '{}' exceeds {} bytes",
+                rel,
+                entry.manifest.id,
+                Self::MAX_APP_ICON_BYTES
+            ));
+        }
+
+        let mime_type = match canonical_file
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("svg") => "image/svg+xml",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("webp") => "image/webp",
+            Some("gif") => "image/gif",
+            Some("ico") => "image/x-icon",
+            _ => {
+                return Err(anyhow!(
+                    "unsupported icon format '{}' for '{}'",
+                    rel,
+                    entry.manifest.id
+                ));
+            }
+        };
+
+        let file = File::open(&canonical_file).with_context(|| {
+            format!("open icon '{}' for '{}'", rel, entry.manifest.id)
+        })?;
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        file.take((Self::MAX_APP_ICON_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read icon '{}' for '{}'", rel, entry.manifest.id))?;
+        if bytes.is_empty() || bytes.len() > Self::MAX_APP_ICON_BYTES {
+            return Err(anyhow!(
+                "icon '{}' for '{}' exceeds allowed size bounds",
+                rel,
+                entry.manifest.id
+            ));
+        }
+
+        let encoded = crate::services::filesystem::base64_encode(&bytes);
+        Ok(json!({
+            "id": entry.manifest.id,
+            "dataUrl": format!("data:{mime_type};base64,{encoded}"),
+            "mimeType": mime_type,
+        }))
+    }
+
+    /// Effective `permissions[]` for an app id (declared minus runtime revocations),
+    /// or an empty vec if unknown — deny-by-default.
     pub fn declared_permissions(&self, app_id: &str) -> Vec<String> {
         self.registry
             .read()
             .ok()
-            .and_then(|reg| reg.get(app_id).map(|e| e.manifest.permissions.clone()))
+            .and_then(|reg| {
+                reg.get(app_id).map(|e| {
+                    self.effective_permissions(app_id, &e.manifest.permissions)
+                })
+            })
             .unwrap_or_default()
+    }
+
+    fn revoked_for(&self, app_id: &str) -> Vec<String> {
+        self.revoked
+            .read()
+            .ok()
+            .and_then(|map| map.get(app_id).cloned())
+            .unwrap_or_default()
+    }
+
+    fn effective_permissions(&self, app_id: &str, declared: &[String]) -> Vec<String> {
+        let revoked = self.revoked_for(app_id);
+        if revoked.is_empty() {
+            return declared.to_vec();
+        }
+        declared
+            .iter()
+            .filter(|perm| !revoked.iter().any(|r| r == *perm))
+            .cloned()
+            .collect()
+    }
+
+    fn persist_revoked_permissions(&self) {
+        let Some(parent) = self.revoked_path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let Ok(guard) = self.revoked.read() else {
+            return;
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&*guard) {
+            let _ = fs::write(&self.revoked_path, text);
+        }
+    }
+
+    fn clear_revoked_for(&self, app_id: &str) {
+        let removed = self
+            .revoked
+            .write()
+            .ok()
+            .and_then(|mut map| map.remove(app_id))
+            .is_some();
+        if removed {
+            self.persist_revoked_permissions();
+        }
+    }
+
+    pub fn get_permissions(&self, app_id: Option<&str>) -> Result<Value> {
+        let reg = self
+            .registry
+            .read()
+            .map_err(|_| anyhow!("registry lock poisoned"))?;
+        if let Some(id) = app_id {
+            let entry = reg
+                .get(id)
+                .ok_or_else(|| anyhow!("app '{}' is not installed", id))?;
+            let revoked = self.revoked_for(id);
+            let effective = self.effective_permissions(id, &entry.manifest.permissions);
+            return Ok(json!({
+                "id": entry.manifest.id,
+                "name": entry.manifest.name,
+                "declared": entry.manifest.permissions,
+                "revoked": revoked,
+                "effective": effective,
+            }));
+        }
+        let mut apps: Vec<Value> = reg
+            .values()
+            .map(|entry| {
+                let id = &entry.manifest.id;
+                let revoked = self.revoked_for(id);
+                let effective = self.effective_permissions(id, &entry.manifest.permissions);
+                json!({
+                    "id": entry.manifest.id,
+                    "name": entry.manifest.name,
+                    "declared": entry.manifest.permissions,
+                    "revoked": revoked,
+                    "effective": effective,
+                })
+            })
+            .collect();
+        apps.sort_by(|a, b| {
+            a["id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["id"].as_str().unwrap_or(""))
+        });
+        Ok(json!({ "apps": apps }))
+    }
+
+    pub fn set_permission(&self, app_id: &str, permission: &str, granted: bool) -> Result<Value> {
+        let declared = {
+            let reg = self
+                .registry
+                .read()
+                .map_err(|_| anyhow!("registry lock poisoned"))?;
+            let entry = reg
+                .get(app_id)
+                .ok_or_else(|| anyhow!("app '{}' is not installed", app_id))?;
+            if !entry.manifest.permissions.iter().any(|p| p == permission) {
+                return Err(anyhow!(
+                    "app '{}' does not declare capability '{}'",
+                    app_id,
+                    permission
+                ));
+            }
+            entry.manifest.permissions.clone()
+        };
+
+        {
+            let mut revoked = self
+                .revoked
+                .write()
+                .map_err(|_| anyhow!("revoked permissions lock poisoned"))?;
+            let list = revoked.entry(app_id.to_string()).or_default();
+            if granted {
+                list.retain(|p| p != permission);
+                if list.is_empty() {
+                    revoked.remove(app_id);
+                }
+            } else if !list.iter().any(|p| p == permission) {
+                list.push(permission.to_string());
+            }
+        }
+        self.persist_revoked_permissions();
+
+        let effective = self.effective_permissions(app_id, &declared);
+        self.emit(
+            "PermissionsChanged",
+            json!({
+                "appId": app_id,
+                "permission": permission,
+                "granted": granted,
+                "effective": effective,
+            }),
+        );
+        self.emit(
+            "RegistryChanged",
+            json!({ "reason": "permissions", "appId": app_id }),
+        );
+        self.get_permissions(Some(app_id))
     }
 
     /// The ids of the registered apps of one tier. The installer compares
@@ -1134,6 +1686,64 @@ impl Nova {
     /// dir, derived native manifest, origins map) exist, then delegate to
     /// `AppHost::launch` unchanged. See `nova-runtime-host-plan.md` §6.
     pub async fn launch(&self, app_id: &str, params: Option<Value>) -> Result<Value> {
+        let window_id = Self::extract_window_id(params.as_ref());
+        self.launch_with_window(app_id, params, window_id).await
+    }
+
+    pub async fn launch_with_window(
+        &self,
+        raw_app_id: &str,
+        params: Option<Value>,
+        window_id: Option<u32>,
+    ) -> Result<Value> {
+        let app_id = Self::normalize_app_id(raw_app_id.trim());
+        let target_window_id = window_id.or_else(|| Self::extract_window_id(params.as_ref()));
+
+        // When the real vela browser runtime is present, `"browser"` launches
+        // straight into the shared vela session (reusing/raising if live)
+        // rather than Bloom's legacy BrowserApp stub. Fall through to the
+        // manifest path if the binary is absent (e.g. unit tests).
+        if app_id == Self::EXTERNAL_BROWSER_APP_ID && Path::new(VELA_BIN).exists() {
+            let url = params
+                .as_ref()
+                .and_then(|p| p.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let res = self.open_external_browser_inner(
+                AppHost::global(),
+                Path::new(PROFILES_ROOT),
+                url,
+                false,
+                Self::spawn_transient_command,
+            )?;
+            let already_running = res
+                .get("alreadyRunning")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut resolved_window_id = res.get("windowId").and_then(|v| v.as_u64()).map(|n| n as u32);
+            if already_running {
+                if let Some(existing) =
+                    Self::find_live_session_for(AppHost::global(), app_id, target_window_id)
+                {
+                    let _ = AppHost::global().set_active(&existing.session_id);
+                    let chosen_wid = target_window_id.or_else(|| existing.surfaces.first().copied());
+                    if let (Some(wid), Some(bus)) = (chosen_wid, self.bus_snapshot()) {
+                        Self::send_restore_and_focus(bus, wid).await;
+                        resolved_window_id = Some(wid);
+                    }
+                }
+            }
+            let mut out = json!({
+                "sessionId": res["sessionId"],
+                "appId": app_id,
+                "raised": already_running,
+            });
+            if let Some(wid) = resolved_window_id {
+                out["windowId"] = json!(wid);
+            }
+            return Ok(out);
+        }
+
         let entry = {
             let reg = self
                 .registry
@@ -1144,18 +1754,20 @@ impl Nova {
                 .ok_or_else(|| anyhow!("app '{}' is not installed", app_id))?
         };
 
-        // Single-instance: raise the live session instead of spawning. A
+        // Single-instance: raise (restore + focus) the live session instead of spawning. A
         // session `close` has stopped but not yet drained doesn't count, or
         // relaunching right after a close would be swallowed.
         if entry.manifest.single_instance {
-            if let Some(existing) = AppHost::global().find_live_session_by_app(app_id) {
-                let window_id = self.raise_session(&existing).await?;
+            if let Some(existing) =
+                Self::find_live_session_for(AppHost::global(), app_id, target_window_id)
+            {
+                let wid = self.raise_session(&existing, target_window_id).await?;
                 let mut out = json!({
                     "sessionId": existing.session_id,
                     "appId": app_id,
                     "raised": true,
                 });
-                if let Some(id) = window_id {
+                if let Some(id) = wid {
                     out["windowId"] = json!(id);
                 }
                 return Ok(out);
@@ -1179,116 +1791,197 @@ impl Nova {
         }))
     }
 
-    pub fn close(&self, app_id: &str) -> Result<Value> {
-        let session = AppHost::global()
-            .find_live_session_by_app(app_id)
+    pub fn close(&self, raw_app_id: &str) -> Result<Value> {
+        let app_id = Self::normalize_app_id(raw_app_id.trim());
+        let session = Self::find_live_session_for(AppHost::global(), app_id, None)
             .ok_or_else(|| anyhow!("app '{}' is not running", app_id))?;
         let closed = AppHost::global().close(&session.session_id)?;
+        crate::services::privilege::revoke_for_app(app_id, "app_closed");
+        if session.app_id != app_id {
+            crate::services::privilege::revoke_for_app(&session.app_id, "app_closed");
+        }
         Ok(json!({ "appId": app_id, "sessionId": closed.session_id }))
     }
 
-    /// Make `session` the active one and, if it has a mapped window, have Evo
-    /// raise and focus it. Returns that window id; `None` means the app has
-    /// no surface yet (still starting), which is not an error: there is
-    /// nothing to raise until it maps, and it will appear on top then.
-    async fn raise_session(&self, session: &AppSession) -> Result<Option<u32>> {
+    /// Make `session` the active one and, if it has a mapped window (or
+    /// `target_window_id` is supplied), ask Evo to restore (unminimize) and
+    /// focus it. Returns that window id; `None` means the app has no surface
+    /// yet (still starting).
+    async fn raise_session(
+        &self,
+        session: &AppSession,
+        target_window_id: Option<u32>,
+    ) -> Result<Option<u32>> {
         AppHost::global().set_active(&session.session_id)?;
-        let Some(window_id) = session.surfaces.first().copied() else {
+        let Some(window_id) = target_window_id.or_else(|| session.surfaces.first().copied()) else {
             return Ok(None);
         };
         let bus = self
             .bus_snapshot()
             .ok_or_else(|| anyhow!("nova: no IPC bus available"))?;
-        bus.call_method(
-            "org.geckoOS.evo",
-            "org.geckoOS.evo",
-            "FocusWindow",
-            json!({ "window_id": window_id }),
-        )
-        .await?;
+        Self::send_restore_and_focus_checked(bus, window_id).await?;
         Ok(Some(window_id))
     }
 
-    /// `nova.Focus(appId)` — raise and give keyboard focus to an already-running
-    /// app's compositor window. `launch`'s single-instance path does the same
-    /// through `raise_session`; Focus differs in refusing, rather than
-    /// succeeding quietly, when there is no window to focus yet. Evo's
-    /// `FocusWindow` (evo/src/enhancements/echo_ipc.rs) does the real work:
-    /// moving input focus and restacking. Bloom's dock calls this for an
-    /// "orphan session" icon.
+    /// `nova.Focus(appId, windowId?)` — raise (unminimize + focus) and give
+    /// keyboard focus to an already-running app's compositor window.
     pub async fn focus(&self, app_id: &str) -> Result<Value> {
-        let session = AppHost::global()
-            .find_live_session_by_app(app_id)
-            .ok_or_else(|| anyhow!("app '{}' is not running", app_id))?;
-        let window_id = self.raise_session(&session).await?.ok_or_else(|| {
-            anyhow!("app '{}' has no mapped compositor window yet", app_id)
-        })?;
+        self.focus_window(app_id, None).await
+    }
+
+    pub async fn focus_window(&self, raw_app_id: &str, window_id: Option<u32>) -> Result<Value> {
+        let trimmed = raw_app_id.trim();
+        let app_id = Self::normalize_app_id(trimmed);
+        let session = Self::find_live_session_for(AppHost::global(), app_id, window_id)
+            .ok_or_else(|| {
+                if app_id.is_empty() {
+                    match window_id {
+                        Some(wid) => anyhow!("no live app owns window {}", wid),
+                        None => anyhow!("app '' is not running"),
+                    }
+                } else {
+                    anyhow!("app '{}' is not running", app_id)
+                }
+            })?;
+        let canonical_app = Self::normalize_app_id(&session.app_id);
+        let wid = self
+            .raise_session(&session, window_id)
+            .await?
+            .ok_or_else(|| anyhow!("app '{}' has no mapped compositor window yet", canonical_app))?;
         Ok(json!({
-            "appId": app_id,
+            "appId": canonical_app,
             "sessionId": session.session_id,
-            "windowId": window_id,
+            "windowId": wid,
         }))
     }
 
-    /// Pseudo app-id used to track external-browser sessions in AppHost
-    /// (surfaces, lifecycle signals, suspend/resume) even though there's no
-    /// real `manifest.webapp`/`manifest.json` for it — see `open_external_browser`.
-    const EXTERNAL_BROWSER_APP_ID: &str = "browser-window";
+    /// Unified app-id used to track real vela browser sessions in AppHost
+    /// (matching the pinned `"browser"` dock entry, manifest, and profile) —
+    /// see `open_external_browser`.
+    const EXTERNAL_BROWSER_APP_ID: &str = "browser";
+    const LEGACY_EXTERNAL_BROWSER_APP_ID: &str = "browser-window";
+    const MAX_APP_ICON_BYTES: usize = 256 * 1024;
+
+    /// Canonicalize historical external-browser window class aliases onto
+    /// `EXTERNAL_BROWSER_APP_ID` (`"browser"`).
+    pub fn normalize_app_id(app_id: &str) -> &str {
+        match app_id {
+            Self::EXTERNAL_BROWSER_APP_ID | Self::LEGACY_EXTERNAL_BROWSER_APP_ID => {
+                Self::EXTERNAL_BROWSER_APP_ID
+            }
+            other => other,
+        }
+    }
+
+    fn extract_window_id(body: Option<&Value>) -> Option<u32> {
+        let obj = body?;
+        obj.get("windowId")
+            .or_else(|| obj.get("window_id"))
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    }
+
+    fn session_matches_app(session_app_id: &str, normalized_app_id: &str) -> bool {
+        if normalized_app_id == Self::EXTERNAL_BROWSER_APP_ID {
+            Self::normalize_app_id(session_app_id) == Self::EXTERNAL_BROWSER_APP_ID
+        } else {
+            session_app_id == normalized_app_id
+        }
+    }
+
+    fn find_live_session_for(
+        host: &AppHost,
+        normalized_app_id: &str,
+        target_window_id: Option<u32>,
+    ) -> Option<AppSession> {
+        if normalized_app_id.is_empty() {
+            return target_window_id
+                .and_then(|wid| host.session_for_surface(wid))
+                .filter(|s| s.is_live());
+        }
+        let matching: Vec<AppSession> = host
+            .list_running()
+            .into_iter()
+            .filter(|s| s.is_live() && Self::session_matches_app(&s.app_id, normalized_app_id))
+            .collect();
+        if let Some(wid) = target_window_id {
+            if let Some(by_surface) = matching
+                .iter()
+                .filter(|s| s.surfaces.contains(&wid))
+                .max_by_key(|s| s.seq)
+                .cloned()
+            {
+                return Some(by_surface);
+            }
+        }
+        // Prefer exact canonical app_id first, then fallback (e.g. "browser-window").
+        matching
+            .iter()
+            .filter(|s| s.app_id == normalized_app_id)
+            .max_by_key(|s| s.seq)
+            .cloned()
+            .or_else(|| matching.into_iter().max_by_key(|s| s.seq))
+    }
 
     /// `nova.OpenExternalBrowser(url)` — open `url` in a real, independent
-    /// vela browser window instead of Bloom's `BrowserApp` trying to embed
-    /// it in an `<iframe>`.
+    /// vela browser window under the unified `"browser"` session identity.
     ///
-    /// The iframe approach cannot work for most real sites: X-Frame-Options/
-    /// CSP `frame-ancestors` are a browser-enforced security boundary against
-    /// being *framed*, and no amount of client-side code in Bloom can lift
-    /// that. A real top-level browsing context isn't framing anything, so
-    /// it's never subject to those headers at all — this is the fix the
-    /// project's own "apps are independent Wayland clients, Evo composites
-    /// everything" architecture already implies (see CLAUDE.md), just
-    /// applied to ad hoc external URLs instead of an installed `pyxis://`
-    /// app.
-    ///
-    /// Deliberately does NOT go through `launch`/`write_native_manifest`:
-    /// those are keyed on an installed app's manifest (fixed `exec`/`args`),
-    /// but here the "args" (the URL) are different on every call and there's
-    /// no manifest.webapp/webroot to register. Composes the vela command
-    /// directly and hands it to `AppHost::launch_raw`, added alongside this
-    /// for exactly this case. No `--pyxis-app`/`--app-entry` (those are for
-    /// the internal `pyxis://<id>` origin mapping) and no kiosk flag — this
-    /// is a plain `vela <url>` invocation, so the window gets vela's own
-    /// normal GTK chrome (titlebar, address bar, tabs) rather than Bloom's.
-    /// The profile dir is shared and NOT wiped between calls (unlike the
-    /// kiosk boot app's profile) so login sessions/cookies persist across
-    /// navigations, matching what a user expects from "a real browser".
+    /// Enforces a single live `"browser"` session:
+    /// - When a live session already exists and `url` is empty / `"about:blank"`,
+    ///   it activates, restores, and focuses the existing window without
+    ///   spawning a duplicate `AppSession`.
+    /// - When a live session already exists and `url` is a real `http(s)` URL,
+    ///   it invokes `vela --profile <profile_dir> <url>` as a transient remote
+    ///   command (outside `AppHost`, reaped cleanly) so the existing browser
+    ///   instance opens the URL without adding a duplicate dock item.
+    /// - When no live `"browser"` session exists, it launches one through
+    ///   `AppHost::launch_raw` with `PYXIS_WINDOW_CLASS="browser"` so Evo and
+    ///   Bloom bind its Wayland window under `"browser"`.
     pub fn open_external_browser(&self, url: &str) -> Result<Value> {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(anyhow!(
-                "refusing to open external browser for non-http(s) url: {}",
-                url
-            ));
-        }
+        self.open_external_browser_inner(
+            AppHost::global(),
+            Path::new(PROFILES_ROOT),
+            url,
+            true,
+            Self::spawn_transient_command,
+        )
+    }
 
-        self.ensure_profile_dir(Self::EXTERNAL_BROWSER_APP_ID)?;
-        let profile_dir = Path::new(PROFILES_ROOT)
+    fn compose_external_browser_command_at(
+        &self,
+        profiles_root: &Path,
+        target_url: Option<&str>,
+    ) -> Result<(&'static str, Vec<String>, HashMap<String, String>)> {
+        self.ensure_profile_dir_at(profiles_root, Self::EXTERNAL_BROWSER_APP_ID)?;
+        if profiles_root == Path::new(PROFILES_ROOT) {
+            Self::ensure_app_home(Self::EXTERNAL_BROWSER_APP_ID);
+        }
+        let profile_dir = profiles_root
             .join(Self::EXTERNAL_BROWSER_APP_ID)
             .to_string_lossy()
             .to_string();
 
-        let (exec, args) = Self::contained_launch(
-            Self::EXTERNAL_BROWSER_APP_ID,
-            vec![
-                VELA_BIN.to_string(),
-                "--profile".to_string(),
-                profile_dir,
-                url.to_string(),
-            ],
-        );
+        let mut launch_args = vec![
+            VELA_BIN.to_string(),
+            "--profile".to_string(),
+            profile_dir,
+        ];
+        if let Some(u) = target_url {
+            launch_args.push(u.to_string());
+        }
+        let (exec, args) = Self::contained_launch(Self::EXTERNAL_BROWSER_APP_ID, launch_args);
 
         let mut env = HashMap::new();
         env.insert("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string());
         env.insert("GDK_BACKEND".to_string(), "wayland".to_string());
-        Self::insert_app_session_env(&mut env);
+        Self::insert_app_session_env(Self::EXTERNAL_BROWSER_APP_ID, &mut env);
+        // Stamp Wayland `app_id` as `"browser"` without setting `PYXIS_APP_ID`
+        // (which enables Gecko's chromeless kiosk mode), so Evo/Bloom keep
+        // one unified `"browser"` dock entry with normal browser chrome.
+        env.insert(
+            "PYXIS_WINDOW_CLASS".to_string(),
+            Self::EXTERNAL_BROWSER_APP_ID.to_string(),
+        );
         // Same decoration handoff every other vela launch uses (Evo draws
         // no SSD; GTK draws its own titlebar) — see evo-firefox-decoration
         // notes / write_native_manifest above.
@@ -1298,7 +1991,123 @@ impl Nova {
         );
         env.insert("GTK_CSD".to_string(), "0".to_string());
 
-        let session = AppHost::global().launch_raw(
+        Ok((exec, args, env))
+    }
+
+    fn spawn_transient_command(
+        exec_path: &Path,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<()> {
+        let mut cmd = std::process::Command::new(exec_path);
+        cmd.args(args);
+        cmd.envs(env);
+        cmd.stdin(std::process::Stdio::null());
+        let mut child = cmd.spawn().with_context(|| {
+            format!("spawn '{}' for browser navigation", exec_path.display())
+        })?;
+        // Reap the short-lived remote client on a background thread so it never
+        // lingers as a zombie outside AppHost's pid_index.
+        std::thread::Builder::new()
+            .name("browser-remote-reap".to_string())
+            .spawn(move || {
+                let _ = child.wait();
+            })
+            .with_context(|| "spawn browser-remote reaper thread")?;
+        Ok(())
+    }
+
+    async fn send_restore_and_focus_checked(bus: Arc<IPCBus>, window_id: u32) -> Result<()> {
+        if let Err(e) = bus
+            .call_method(
+                "org.geckoOS.evo",
+                "org.geckoOS.evo",
+                "RestoreWindow",
+                json!({ "window_id": window_id }),
+            )
+            .await
+        {
+            tracing::debug!("nova: RestoreWindow({}) failed: {:#}", window_id, e);
+        }
+        bus.call_method(
+            "org.geckoOS.evo",
+            "org.geckoOS.evo",
+            "FocusWindow",
+            json!({ "window_id": window_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn send_restore_and_focus(bus: Arc<IPCBus>, window_id: u32) {
+        if let Err(e) = Self::send_restore_and_focus_checked(bus, window_id).await {
+            tracing::debug!("nova: FocusWindow({}) failed: {:#}", window_id, e);
+        }
+    }
+
+    fn trigger_restore_and_focus(&self, session: &AppSession) {
+        let Some(window_id) = session.surfaces.first().copied() else {
+            return;
+        };
+        let Some(bus) = self.bus_snapshot() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(Self::send_restore_and_focus(bus, window_id));
+        }
+    }
+
+    fn open_external_browser_inner<F>(
+        &self,
+        host: &AppHost,
+        profiles_root: &Path,
+        url: &str,
+        focus_async: bool,
+        spawn_remote: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce(&Path, &[String], &HashMap<String, String>) -> Result<()>,
+    {
+        let url = url.trim();
+        let target_url = if url.is_empty() || url.eq_ignore_ascii_case("about:blank") {
+            None
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            Some(url)
+        } else {
+            return Err(anyhow!(
+                "refusing to open external browser for non-http(s) url: {}",
+                url
+            ));
+        };
+
+        if let Some(existing) =
+            Self::find_live_session_for(host, Self::EXTERNAL_BROWSER_APP_ID, None)
+        {
+            let _ = host.set_active(&existing.session_id);
+            if let Some(nav_url) = target_url {
+                let (exec, args, env) =
+                    self.compose_external_browser_command_at(profiles_root, Some(nav_url))?;
+                spawn_remote(Path::new(exec), &args, &env)?;
+            }
+            if focus_async {
+                self.trigger_restore_and_focus(&existing);
+            }
+            let mut out = json!({
+                "sessionId": existing.session_id,
+                "appId": Self::EXTERNAL_BROWSER_APP_ID,
+                "pid": existing.pid,
+                "url": url,
+                "alreadyRunning": true,
+            });
+            if let Some(window_id) = existing.surfaces.first().copied() {
+                out["windowId"] = json!(window_id);
+            }
+            return Ok(out);
+        }
+
+        let (exec, args, env) =
+            self.compose_external_browser_command_at(profiles_root, target_url)?;
+        let session = host.launch_raw(
             Self::EXTERNAL_BROWSER_APP_ID,
             Path::new(exec),
             &args,
@@ -1311,7 +2120,9 @@ impl Nova {
         Ok(json!({
             "sessionId": session.session_id,
             "appId": Self::EXTERNAL_BROWSER_APP_ID,
+            "pid": session.pid,
             "url": url,
+            "alreadyRunning": false,
         }))
     }
 
@@ -1322,7 +2133,24 @@ impl Nova {
     // `AppHost::suspend`/`resume` remain as explicit calls.
 
     fn ensure_profile_dir(&self, app_id: &str) -> Result<()> {
-        let dir = Path::new(PROFILES_ROOT).join(app_id);
+        self.ensure_profile_dir_at(Path::new(PROFILES_ROOT), app_id)?;
+        Self::ensure_app_home(app_id);
+        Ok(())
+    }
+
+    /// An app with a uid of its own has its data dir for `$HOME`, so it must
+    /// exist and be the app's before the launch. Best effort, logged.
+    fn ensure_app_home(app_id: &str) {
+        if is_shell_app(app_id) || app_uid(app_id) == APP_UID {
+            return;
+        }
+        if let Err(e) = crate::services::filesystem::scope::ensure_app_data_dir(app_id) {
+            tracing::warn!("nova: preparing the home of {app_id}: {e:#}");
+        }
+    }
+
+    fn ensure_profile_dir_at(&self, profiles_root: &Path, app_id: &str) -> Result<()> {
+        let dir = profiles_root.join(app_id);
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         #[cfg(unix)]
         {
@@ -1343,6 +2171,10 @@ impl Nova {
                     if let Err(e) = chown_tree(&dir, uid, gid) {
                         tracing::warn!("nova: giving {} to the app user: {:#}", dir.display(), e);
                     }
+                }
+                let app_home = Path::new(APP_HOME);
+                if app_home.is_dir() {
+                    let _ = fs::set_permissions(app_home, fs::Permissions::from_mode(0o750));
                 }
             }
         }
@@ -1450,6 +2282,10 @@ user_pref("browser.aboutConfig.showWarning", false);
 user_pref("datareporting.policy.firstRunURL", "");
 user_pref("browser.startup.homepage_override.mstone", "ignore");
 "#;
+        let mut prefs = prefs.to_string();
+        if app_id == Self::EXTERNAL_BROWSER_APP_ID {
+            prefs.push_str(&browser_start_prefs());
+        }
         let path = dir.join("user.js");
         // The profile dir is the app user's, and root writes into it, so the
         // app can have left anything at `user.js`, a symlink included. Remove
@@ -1482,9 +2318,9 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
     /// The environment every app launch shares, besides what the app is: the
     /// app user's runtime dir and home, and where PipeWire's Pulse server is.
     /// `pyxis-wlctx` adds `WAYLAND_DISPLAY` (a path to the app's own socket).
-    fn insert_app_session_env(env: &mut HashMap<String, String>) {
-        env.insert("XDG_RUNTIME_DIR".to_string(), APP_RUNTIME_DIR.to_string());
-        env.insert("HOME".to_string(), APP_HOME.to_string());
+    fn insert_app_session_env(app_id: &str, env: &mut HashMap<String, String>) {
+        env.insert("XDG_RUNTIME_DIR".to_string(), app_runtime_dir(app_id));
+        env.insert("HOME".to_string(), app_home(app_id));
         env.insert("PULSE_SERVER".to_string(), PULSE_SERVER.to_string());
     }
 
@@ -1496,17 +2332,19 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
     /// that makes a kill of the session pid take the app with it; the helper
     /// sets it after dropping. See `echo/src/bin/wlctx.rs`.
     fn contained_launch(app_id: &str, command: Vec<String>) -> (&'static str, Vec<String>) {
+        let uid = app_uid(app_id);
+        let runtime_dir = app_runtime_dir(app_id);
         let mut args = vec![
             "--app-id".to_string(),
             app_id.to_string(),
             "--uid".to_string(),
-            APP_UID.to_string(),
+            uid.to_string(),
             "--gid".to_string(),
-            APP_GID.to_string(),
+            app_gid_of(uid).to_string(),
             "--groups".to_string(),
             APP_GROUPS.to_string(),
             "--runtime-dir".to_string(),
-            APP_RUNTIME_DIR.to_string(),
+            runtime_dir,
             "--host-socket".to_string(),
             HOST_SOCKET.to_string(),
             "--hide".to_string(),
@@ -1539,7 +2377,7 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
         // Session env vela needs: its runtime dir, its $HOME and the Pulse
         // server. They are applied by AppHost via Command::env and inherited
         // through pyxis-wlctx, which adds WAYLAND_DISPLAY (the app's own socket).
-        Self::insert_app_session_env(&mut env);
+        Self::insert_app_session_env(&entry.manifest.id, &mut env);
         env.insert("PYXIS_APP_ID".to_string(), entry.manifest.id.clone());
         env.insert("PYXIS_PROFILE_DIR".to_string(), profile_arg.clone());
         env.insert(
@@ -1614,7 +2452,7 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
             .ok_or_else(|| anyhow!("app '{}' has no native main", entry.manifest.id))?;
 
         let mut env = HashMap::new();
-        Self::insert_app_session_env(&mut env);
+        Self::insert_app_session_env(&entry.manifest.id, &mut env);
         env.insert("GDK_BACKEND".to_string(), "wayland".to_string());
         env.insert("QT_QPA_PLATFORM".to_string(), "wayland".to_string());
         env.insert("PYXIS_APP_ID".to_string(), entry.manifest.id.clone());
@@ -1667,76 +2505,58 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
 
     /// Install a packaged app (a `.tar.gz`/`.tar` containing
     /// `manifest.webapp` + `webroot/` at its root) into the user apps root.
-    /// Verifies `integrity.sha256` if the manifest declares one *before*
-    /// touching disk further than staging; unsigned/unhashed packages are
-    /// accepted (dev policy) but logged loudly, matching the "reject unless
-    /// --allow-unsigned" spirit without yet having a signing trust-root
-    /// story (see this file's header comment).
+    ///
+    /// Trust decision, in order, all on a root-owned private *copy* of the
+    /// package so nothing a user can write is ever re-read after a check:
+    /// the path is confined to the install roots; the package is copied
+    /// (O_NOFOLLOW, regular file) into a 0700 work dir; its detached
+    /// signature (`<package>.sig`, optional `<package>.sig.keyid`) is
+    /// verified against `/etc/pyxis/keys` unless the unsigned marker
+    /// `/etc/pyxis/allow-unsigned-packages` exists; the member list is
+    /// validated (regular files and directories only, no absolute or `..`
+    /// paths); then the copy is extracted. A sha256 declared inside the
+    /// package is never part of the decision (the package vouches for itself).
     pub fn install(&self, package_path: &str) -> Result<Value> {
-        let package = Path::new(package_path);
-        if !package.exists() {
-            return Err(anyhow!("install source not found: {}", package_path));
-        }
+        let package = confine_install_path(Path::new(package_path), &install_roots())?;
 
         let user_root = Path::new(USER_APPS_ROOT);
         fs::create_dir_all(user_root)
             .with_context(|| format!("create {}", user_root.display()))?;
 
-        let staging = user_root.join(format!(".staging-{}", std::process::id()));
-        fs::create_dir_all(&staging)?;
-        let cleanup_staging = || {
-            let _ = fs::remove_dir_all(&staging);
-        };
+        let work = WorkDir::create(user_root)?;
+        let copy = prepare_verified_copy(
+            &package,
+            work.path(),
+            unsigned_packages_allowed(),
+            &crate::services::package_sig::keys_dir(),
+        )?;
 
+        crate::services::appmanager::validate_tar_file(&copy)?;
+
+        let staging = work.path().join("extract");
+        fs::create_dir(&staging)?;
         let status = std::process::Command::new("tar")
+            .arg("--no-same-owner")
+            .arg("--no-same-permissions")
             .arg("-xf")
-            .arg(package)
+            .arg(&copy)
             .arg("-C")
             .arg(&staging)
             .status()
-            .with_context(|| format!("invoke tar on {}", package.display()))?;
+            .with_context(|| format!("invoke tar on {}", copy.display()))?;
         if !status.success() {
-            cleanup_staging();
             return Err(anyhow!("tar exited with {} extracting {}", status, package_path));
         }
 
         let manifest_path = staging.join("manifest.webapp");
-        let raw = fs::read_to_string(&manifest_path).with_context(|| {
-            cleanup_staging();
-            format!("read {} after extraction", manifest_path.display())
-        })?;
+        let raw = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read {} after extraction", manifest_path.display()))?;
         let manifest: WebAppManifest =
             serde_json::from_str(&raw).context("parse manifest.webapp (pre-id-check)")?;
-
-        if let Some(integrity) = &manifest.integrity {
-            if let Some(expected) = &integrity.sha256 {
-                let actual = sha256_hex(package)?;
-                if &actual != expected {
-                    cleanup_staging();
-                    return Err(anyhow!(
-                        "integrity check failed for {}: expected sha256 {}, got {}",
-                        package_path,
-                        expected,
-                        actual
-                    ));
-                }
-            } else {
-                tracing::warn!(
-                    "nova: installing '{}' with no integrity.sha256 declared (unverified package)",
-                    manifest.id
-                );
-            }
-        } else {
-            tracing::warn!(
-                "nova: installing '{}' with no integrity block at all (unverified package)",
-                manifest.id
-            );
-        }
 
         // Re-validate with the real id check now that we trust the bytes.
         let manifest = WebAppManifest::parse(&raw, &manifest.id)?;
         if !staging.join("webroot").is_dir() {
-            cleanup_staging();
             return Err(anyhow!("package for '{}' has no webroot/", manifest.id));
         }
 
@@ -1746,7 +2566,6 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
         // success and then silently never appears.
         let incumbent = self.tier_of(&manifest.id);
         if !tier_may_claim_id(AppTier::User, incumbent) {
-            cleanup_staging();
             return Err(anyhow!(
                 "cannot install '{}': that id belongs to a {} app; \
                  update it through the channel that installed it",
@@ -1812,6 +2631,7 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
         AppHost::global().close_and_wait(app_id, APP_EXIT_LIMIT);
         fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
         let forgotten = forget_app_state(app_id);
+        self.clear_revoked_for(app_id);
         let count = self.reload()?;
         self.emit("AppUninstalled", json!({ "appId": app_id }));
         tracing::info!("nova: uninstalled '{}' ({} apps remain)", app_id, count);
@@ -1855,23 +2675,168 @@ pub fn forget_app_state(app_id: &str) -> Vec<&'static str> {
     removed
 }
 
-/// `sha256sum <path>` — shells out rather than adding a new crate
-/// dependency (`sha2`) purely for this one call site; acceptable since
-/// install is not a hot path.
-fn sha256_hex(path: &Path) -> Result<String> {
-    let output = std::process::Command::new("sha256sum")
-        .arg(path)
-        .output()
-        .context("invoke sha256sum")?;
-    if !output.status.success() {
-        return Err(anyhow!("sha256sum failed on {}", path.display()));
+
+fn load_revoked_permissions(path: &Path) -> HashMap<String, Vec<String>> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+
+// ---------- Install hardening ----------
+
+const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SIG_BYTES: u64 = 64 * 1024;
+/// Where `nova.Install` may read a package from: the installer service's
+/// drop locations minus /tmp and /root (world-writable / pointless).
+const NOVA_INSTALL_ROOTS: &[&str] = &["/var/lib/pyxis/incoming", "/media", "/home"];
+const DEFAULT_UNSIGNED_MARKER: &str = "/etc/pyxis/allow-unsigned-packages";
+
+fn install_roots() -> Vec<PathBuf> {
+    NOVA_INSTALL_ROOTS.iter().map(PathBuf::from).collect()
+}
+
+fn unsigned_marker_path() -> PathBuf {
+    std::env::var("PYXIS_ALLOW_UNSIGNED_MARKER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_UNSIGNED_MARKER))
+}
+
+/// The installer's rule (`package_sig::signatures_required`): signatures are
+/// required unless the dev-image marker file exists.
+fn unsigned_packages_allowed() -> bool {
+    !crate::services::package_sig::signatures_required()
+}
+
+/// Canonicalize `path` (so `..` and symlinks resolve) and require a regular
+/// file under one of `roots` (themselves canonicalized when they exist).
+fn confine_install_path(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
+    let canon = path
+        .canonicalize()
+        .with_context(|| format!("install source not found: {}", path.display()))?;
+    if !canon.is_file() {
+        return Err(anyhow!("install source is not a file: {}", canon.display()));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let hex = stdout
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow!("unexpected sha256sum output: {}", stdout))?;
-    Ok(hex.to_string())
+    let ok = roots.iter().any(|r| {
+        let r = r.canonicalize().unwrap_or_else(|_| r.clone());
+        canon.starts_with(&r)
+    });
+    if !ok {
+        return Err(anyhow!(
+            "packages may only be installed from {} (got {})",
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            canon.display()
+        ));
+    }
+    Ok(canon)
+}
+
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn open_regular_nofollow(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    if !f.metadata()?.is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    Ok(f)
+}
+
+/// Copy a regular file (no symlink at the final component) to `dest`
+/// (created exclusively, 0600), reading at most `max` bytes.
+fn copy_regular_nofollow(src: &Path, dest: &Path, max: u64) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let input = open_regular_nofollow(src)?;
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dest)
+        .with_context(|| format!("create {}", dest.display()))?;
+    let copied = std::io::copy(&mut input.take(max + 1), &mut out)?;
+    if copied > max {
+        return Err(anyhow!("{} is larger than {} bytes", src.display(), max));
+    }
+    out.sync_all()?;
+    Ok(())
+}
+
+
+/// A private (0700) scratch directory removed on drop.
+struct WorkDir(PathBuf);
+impl WorkDir {
+    fn create(parent: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = parent.join(format!(".verify-{}", uuid::Uuid::new_v4()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+        Ok(WorkDir(dir))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Copy `package` into `work` and, unless `unsigned_ok`, verify its detached
+/// signature (`<package>.sig`, raw `openssl dgst -sha256 -sign` bytes,
+/// optional `<package>.sig.keyid`) against the copy, with
+/// `package_sig::verify_detached`. Returns the verified copy's path.
+fn prepare_verified_copy(
+    package: &Path,
+    work: &Path,
+    unsigned_ok: bool,
+    keys_dir: &Path,
+) -> Result<PathBuf> {
+    let copy = work.join("package.tar");
+    copy_regular_nofollow(package, &copy, MAX_PACKAGE_BYTES)?;
+    if unsigned_ok {
+        tracing::warn!(
+            "nova: installing {} UNSIGNED: {} exists",
+            package.display(),
+            unsigned_marker_path().display()
+        );
+        return Ok(copy);
+    }
+    // The signature (and its key id, if any) are copied beside the package
+    // copy too, and verified there by the installer's own verifier, so both
+    // install paths read one format: raw `openssl dgst -sha256 -sign` bytes.
+    let sig_path = sibling_with_suffix(package, ".sig");
+    let sig_copy = sibling_with_suffix(&copy, ".sig");
+    copy_regular_nofollow(&sig_path, &sig_copy, MAX_SIG_BYTES).map_err(|e| {
+        anyhow!(
+            "package {} is unsigned (no readable {}: {}); signatures are required",
+            package.display(),
+            sig_path.display(),
+            e
+        )
+    })?;
+    let keyid_path = sibling_with_suffix(package, ".sig.keyid");
+    if keyid_path.exists() {
+        copy_regular_nofollow(&keyid_path, &sibling_with_suffix(&copy, ".sig.keyid"), 256)?;
+    }
+    crate::services::package_sig::verify_detached(&copy, &sig_copy, keys_dir)
+        .map_err(|e| anyhow!("package {} signature: {}", package.display(), e))?;
+    Ok(copy)
 }
 
 /// Small helper trait so `Option<&RegistryEntry>` can be cloned out of the
@@ -1895,6 +2860,9 @@ mod tests {
             "com.test.app",
             vec!["/usr/bin/app".to_string(), "--flag".to_string()],
         );
+        let expected_uid = app_uid("com.test.app").to_string();
+        let expected_gid = app_gid("com.test.app").to_string();
+        let expected_rt = app_runtime_dir("com.test.app");
         // The helper is the program the launch runs, as root, so the app
         // can't be started without it, and it is the helper that drops (a
         // `setpriv` in front would clear the parent-death signal the helper
@@ -1907,13 +2875,13 @@ mod tests {
                 "--app-id",
                 "com.test.app",
                 "--uid",
-                "1001",
+                &expected_uid,
                 "--gid",
-                "1001",
+                &expected_gid,
                 "--groups",
                 APP_GROUPS,
                 "--runtime-dir",
-                APP_RUNTIME_DIR,
+                &expected_rt,
                 "--host-socket",
                 HOST_SOCKET,
                 "--hide",
@@ -1937,10 +2905,87 @@ mod tests {
         assert_ne!(APP_HOME, GECKO_HOME);
         assert_ne!(APP_RUNTIME_DIR, SHELL_RUNTIME_DIR);
         assert!(HOST_SOCKET.starts_with(SHELL_RUNTIME_DIR));
-        assert_eq!(app_owner("com.test.app"), (APP_UID, APP_GID));
-        assert_eq!(app_owner("browser-window"), (APP_UID, APP_GID));
+        assert_eq!(app_owner("com.test.app"), (app_uid("com.test.app"), app_gid("com.test.app")));
+        assert_ne!(app_owner("com.test.app").0, GECKO_UID);
+        assert_ne!(app_uid("com.test.app"), app_uid("browser-window"));
         // The shell's own state stays the shell's.
         assert_eq!(app_owner("bloom"), (GECKO_UID, GECKO_GID));
+    }
+
+    #[test]
+    fn different_apps_get_distinct_uids_and_runtime_dirs() {
+        let ids = [
+            "terminal", "browser", "files", "notes", "contacts", "tasks", "settings",
+            "installer", "com.pyxis.hello",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            let uid = app_uid(id);
+            assert!(uid >= APP_UID_BASE && uid < APP_UID_BASE + APP_UID_SPAN);
+            assert!(seen.insert(uid), "duplicate uid {uid} for {id}");
+            assert_eq!(app_runtime_dir(id), format!("/run/user/{uid}"));
+            assert_eq!(app_gid(id), uid);
+            assert!(app_home(id).ends_with(&format!("/{id}")), "{}", app_home(id));
+            assert_eq!(app_uid(id), uid, "stable across calls");
+        }
+    }
+
+    fn uids_file(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pyxis-uids-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d.join("uids.json")
+    }
+
+    #[test]
+    fn uid_allocation_is_sequential_persisted_and_never_reused() {
+        let path = uids_file("seq");
+        assert_eq!(app_uid_in(&path, false, "a"), 10_000);
+        assert_eq!(app_uid_in(&path, false, "b"), 10_001);
+        assert_eq!(app_uid_in(&path, false, "a"), 10_000);
+        // Survives a reload (a fresh read of the file).
+        let t = UidTable::load(&path).unwrap();
+        assert_eq!(t.apps["b"], 10_001);
+        assert_eq!(t.high_water, 10_001);
+        // An uninstalled app's uid stays spent, even for the highest one.
+        let mut t = t;
+        t.apps.remove("b");
+        t.save(&path).unwrap();
+        assert_eq!(app_uid_in(&path, false, "c"), 10_002);
+        // Ids are distinct from each other whatever they hash to.
+        let uids: std::collections::HashSet<u32> =
+            (0..50).map(|i| app_uid_in(&path, false, &format!("app{i}"))).collect();
+        assert_eq!(uids.len(), 50);
+        // The file is 0644 and has no stray temp left.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn uid_allocation_refuses_a_uid_already_given_to_another_app() {
+        let path = uids_file("dup");
+        // A table whose high-water mark lags its entries (hand-edited).
+        let mut t = UidTable::default();
+        t.apps.insert("x".into(), 10_005);
+        t.save(&path).unwrap();
+        let y = allocate_app_uid(&path, "y").unwrap();
+        assert_eq!(y, 10_006, "the next uid is above everything in the table");
+        // A corrupt table fails closed to the shared user, not to a guess.
+        fs::write(&path, "not json").unwrap();
+        assert!(allocate_app_uid(&path, "z").is_err());
+        assert_eq!(app_uid_in(&path, false, "z"), APP_UID);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_escape_hatch_and_the_shell_keep_their_users() {
+        let path = uids_file("esc");
+        assert_eq!(app_uid_in(&path, true, "files"), APP_UID);
+        assert!(!path.exists(), "shared mode records nothing");
+        assert_eq!(app_gid_of(APP_UID), APP_GID);
+        assert_eq!(app_owner("bloom"), (GECKO_UID, GECKO_GID));
+        assert_eq!(app_owner("bloom-overlay"), (GECKO_UID, GECKO_GID));
     }
 
     #[test]
@@ -1949,9 +2994,10 @@ mod tests {
         // the app user's runtime dir and home are in its env, and the shell's
         // are nowhere.
         let mut env = HashMap::new();
-        Nova::insert_app_session_env(&mut env);
-        assert_eq!(env["XDG_RUNTIME_DIR"], APP_RUNTIME_DIR);
-        assert_eq!(env["HOME"], APP_HOME);
+        Nova::insert_app_session_env("com.test.app", &mut env);
+        assert_eq!(env["XDG_RUNTIME_DIR"], app_runtime_dir("com.test.app"));
+        assert_eq!(env["HOME"], app_home("com.test.app"));
+        assert_ne!(env["HOME"], GECKO_HOME);
         assert_eq!(env["PULSE_SERVER"], PULSE_SERVER);
         assert!(!env.values().any(|v| v == GECKO_HOME || v == SHELL_RUNTIME_DIR));
         let src = include_str!("nova.rs");
@@ -1999,6 +3045,33 @@ mod tests {
     }
 
     #[test]
+    fn only_the_browser_opens_on_the_start_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let nova = Nova::new();
+        let read = |app: &str| {
+            let d = dir.path().join(app);
+            fs::create_dir_all(&d).unwrap();
+            nova.write_profile_prefs(&d, app).unwrap();
+            fs::read_to_string(d.join("user.js")).unwrap()
+        };
+        let browser = read(Nova::EXTERNAL_BROWSER_APP_ID);
+        assert!(browser.contains(&format!(r#"user_pref("pyxis.newtab.url", "{BROWSER_START_URL}");"#)));
+        assert!(browser.contains(r#"user_pref("browser.startup.page", 1);"#));
+        // After the shared set's 0, so it wins.
+        assert!(browser.rfind("browser.startup.page\", 1)").unwrap() > browser.find("browser.startup.page\", 0)").unwrap());
+        let notes = read("notes");
+        assert!(!notes.contains("pyxis.newtab.url") && !notes.contains("browser.startup.homepage\""));
+        // The page the prefs name is the one the browser app ships.
+        // (Checked when the sibling pyxis-experience checkout is there.)
+        let experience = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pyxis-experience");
+        if experience.is_dir() {
+            let page = experience.join("packages/apps/browser/public/start/index.html");
+            assert!(page.exists(), "{} missing", page.display());
+        }
+        assert!(BROWSER_START_URL.ends_with("/browser/webroot/start/index.html"));
+    }
+
+    #[test]
     fn rejects_unknown_permission() {
         let raw = r#"{"id":"com.test.app","name":"Test","permissions":["not-a-real-perm"]}"#;
         let err = WebAppManifest::parse(raw, "com.test.app").unwrap_err();
@@ -2027,6 +3100,33 @@ mod tests {
         assert_eq!(m.r#type, "web");
         assert!(m.single_instance);
         assert_eq!(m.display, "windowed");
+        assert_eq!(m.accent, None);
+    }
+
+    #[test]
+    fn normalizes_and_validates_accent_across_manifests() {
+        let raw = r##"{"id":"com.test.app","name":"Test","accent":"#EAB308"}"##;
+        let m = WebAppManifest::parse(raw, "com.test.app").unwrap();
+        assert_eq!(m.accent.as_deref(), Some("#eab308"));
+        assert_eq!(m.to_info_json(true)["accent"], "#eab308");
+
+        let bad = r#"{"id":"com.test.app","name":"Test","accent":"gold"}"#;
+        assert!(WebAppManifest::parse(bad, "com.test.app")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid accent"));
+
+        let appinfo = r##"{"id":"com.test.app","version":"1.0.0","vendor":"T","title":"Test",
+            "type":"web","main":"index.html","icon":"icon.png","accent":"#0D9488"}"##;
+        let info = AppInfoManifest::parse(appinfo, "com.test.app").unwrap();
+        assert_eq!(info.accent.as_deref(), Some("#0d9488"));
+
+        let bad_appinfo = r##"{"id":"com.test.app","version":"1.0.0","vendor":"T","title":"Test",
+            "type":"web","main":"index.html","icon":"icon.png","accent":"#123"}"##;
+        assert!(AppInfoManifest::parse(bad_appinfo, "com.test.app")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid accent"));
     }
 
     // ---------- appinfo.json (ipk apps) ----------
@@ -2178,7 +3278,7 @@ mod tests {
     #[test]
     fn privileged_permissions_granted_to_trusted_id_at_root_tiers() {
         assert!(app_id_is_privileged("installer"));
-        for tier in [AppTier::System, AppTier::Opkg] {
+        for tier in [AppTier::System] {
             assert_eq!(
                 appinfo_capabilities_for("installer", tier, &app_mgmt_declaration()),
                 vec![
@@ -2435,8 +3535,9 @@ mod tests {
         // System and opkg are root-mediated: they own their ids and may hold
         // privilege, but Nova never deletes their files. Only the user tier
         // is Nova's to remove — and it may hold no privilege at all.
+        assert!(AppTier::System.may_hold_privileged());
+        assert!(!AppTier::Opkg.may_hold_privileged());
         for tier in [AppTier::System, AppTier::Opkg] {
-            assert!(tier.may_hold_privileged(), "{}", tier.as_str());
             assert!(tier.owns_its_ids(), "{}", tier.as_str());
             assert!(!tier.removable_by_nova(), "{}", tier.as_str());
         }
@@ -2508,6 +3609,7 @@ mod tests {
                 r#type: "web".to_string(),
                 entry: "index.html".to_string(),
                 icons,
+                accent: None,
                 category: None,
                 single_instance: true,
                 display: "windowed".to_string(),
@@ -2560,5 +3662,523 @@ mod tests {
             AppTier::Opkg,
         );
         assert_eq!(e.info_json()["icons"]["64"], "/opt/somewhere/else.png");
+    }
+
+    #[test]
+    fn set_permission_revokes_persists_and_regrants_capabilities() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let revoked_path = dir.path().join("revoked_permissions.json");
+        let make_nova = |path: PathBuf| Nova {
+            registry: RwLock::new(HashMap::new()),
+            bus: RwLock::new(None),
+            revoked: RwLock::new(load_revoked_permissions(&path)),
+            revoked_path: path,
+        };
+        let nova = make_nova(revoked_path.clone());
+
+        let mut entry = entry_with_icon(
+            "/usr/share/geckoOS/apps/com.example.app",
+            "icon.png",
+            AppTier::System,
+        );
+        entry.manifest.permissions = vec!["audio".to_string(), "network".to_string()];
+        nova.registry
+            .write()
+            .unwrap()
+            .insert("com.example.app".to_string(), entry.clone());
+
+        assert_eq!(
+            nova.declared_permissions("com.example.app"),
+            vec!["audio".to_string(), "network".to_string()]
+        );
+
+        let updated = nova
+            .set_permission("com.example.app", "network", false)
+            .expect("revoke network");
+        assert_eq!(updated["revoked"], json!(["network"]));
+        assert_eq!(updated["effective"], json!(["audio"]));
+        assert_eq!(
+            nova.declared_permissions("com.example.app"),
+            vec!["audio".to_string()]
+        );
+        assert_eq!(
+            nova.list().unwrap()["apps"][0]["permissions"],
+            json!(["audio"])
+        );
+
+        // Persisted across a fresh Nova instance reading the same file.
+        let reloaded = make_nova(revoked_path);
+        reloaded
+            .registry
+            .write()
+            .unwrap()
+            .insert("com.example.app".to_string(), entry);
+        assert_eq!(
+            reloaded.declared_permissions("com.example.app"),
+            vec!["audio".to_string()]
+        );
+
+        // Reject unknown capabilities cleanly.
+        assert!(reloaded
+            .set_permission("com.example.app", "power", false)
+            .is_err());
+
+        let restored = reloaded
+            .set_permission("com.example.app", "network", true)
+            .expect("re-grant network");
+        assert_eq!(restored["revoked"], json!([]));
+        assert_eq!(restored["effective"], json!(["audio", "network"]));
+    }
+
+    #[test]
+    fn install_path_must_be_under_the_install_roots() {
+        let root = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        let ok = root.path().join("a.tar");
+        fs::write(&ok, b"x").unwrap();
+        let bad = other.path().join("b.tar");
+        fs::write(&bad, b"x").unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        assert!(confine_install_path(&ok, &roots).is_ok());
+        assert!(confine_install_path(&bad, &roots).is_err());
+        // `..` and symlinks resolve before the prefix check.
+        let dotdot = root.path().join("..").join(other.path().file_name().unwrap()).join("b.tar");
+        assert!(confine_install_path(&dotdot, &roots).is_err());
+        let link = root.path().join("link.tar");
+        std::os::unix::fs::symlink(&bad, &link).unwrap();
+        assert!(confine_install_path(&link, &roots).is_err());
+        assert!(confine_install_path(root.path(), &roots).is_err());
+    }
+
+    fn openssl_available() -> bool {
+        std::process::Command::new("openssl").arg("version").output().is_ok()
+    }
+
+    /// Makes keys/k.pub and signs `pkg` into `pkg.sig` (raw signature bytes).
+    fn sign_pkg(dir: &Path, pkg: &Path) -> PathBuf {
+        let keys = dir.join("keys");
+        fs::create_dir_all(&keys).unwrap();
+        let key = dir.join("k.pem");
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("openssl").args(args).output().unwrap().status.success());
+        };
+        run(&["genrsa", "-out", key.to_str().unwrap(), "2048"]);
+        run(&["rsa", "-in", key.to_str().unwrap(), "-pubout", "-out", keys.join("k.pub").to_str().unwrap()]);
+        let sig = dir.join("sig.bin");
+        run(&["dgst", "-sha256", "-sign", key.to_str().unwrap(), "-out", sig.to_str().unwrap(), pkg.to_str().unwrap()]);
+        fs::copy(&sig, sibling_with_suffix(pkg, ".sig")).unwrap();
+        keys
+    }
+
+    #[test]
+    fn unsigned_package_refused_unless_allowed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let pkg = dir.path().join("p.tar");
+        fs::write(&pkg, b"payload").unwrap();
+        let keys = dir.path().join("keys");
+        fs::create_dir_all(&keys).unwrap();
+        let err = prepare_verified_copy(&pkg, work.path(), false, &keys).unwrap_err();
+        assert!(err.to_string().contains("unsigned"), "{err}");
+        // With the marker policy it is allowed.
+        let work2 = tempfile::TempDir::new().unwrap();
+        assert!(prepare_verified_copy(&pkg, work2.path(), true, &keys).is_ok());
+    }
+
+    #[test]
+    fn signed_package_verifies_and_tampering_the_original_after_copy_is_irrelevant() {
+        if !openssl_available() {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        let pkg = dir.path().join("p.tar");
+        fs::write(&pkg, b"payload").unwrap();
+        let keys = sign_pkg(dir.path(), &pkg);
+        let copy = prepare_verified_copy(&pkg, work.path(), false, &keys).unwrap();
+        // The attacker swaps the original after the check: the copy is what
+        // gets extracted, and it is still the verified bytes.
+        fs::write(&pkg, b"evil").unwrap();
+        assert_eq!(fs::read(&copy).unwrap(), b"payload");
+        // A package tampered before the copy fails verification.
+        let work2 = tempfile::TempDir::new().unwrap();
+        assert!(prepare_verified_copy(&pkg, work2.path(), false, &keys).is_err());
+    }
+
+    #[test]
+    fn symlink_source_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real.tar");
+        fs::write(&real, b"x").unwrap();
+        let link = dir.path().join("l.tar");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let work = tempfile::TempDir::new().unwrap();
+        assert!(copy_regular_nofollow(&link, &work.path().join("c"), 100).is_err());
+    }
+
+    #[test]
+    fn opkg_tier_terminal_gets_no_privileged_capabilities() {
+        assert!(app_id_is_privileged("terminal"));
+        let declared: Vec<String> = vec!["terminal".to_string(), "audio".to_string()];
+        let caps = appinfo_capabilities_for("terminal", AppTier::Opkg, &declared);
+        assert!(!caps.iter().any(|c| c == "terminal"), "{caps:?}");
+        let sys = appinfo_capabilities_for("terminal", AppTier::System, &declared);
+        assert!(sys.iter().any(|c| c == "terminal"), "{sys:?}");
+    }
+
+    fn make_test_nova(revoked_path: PathBuf) -> Nova {
+        Nova {
+            registry: RwLock::new(HashMap::new()),
+            bus: RwLock::new(None),
+            revoked: RwLock::new(load_revoked_permissions(&revoked_path)),
+            revoked_path,
+        }
+    }
+
+    #[test]
+    fn list_excludes_shell_apps_while_keeping_them_registered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nova = make_test_nova(dir.path().join("revoked.json"));
+
+        for (id, name) in [
+            ("bloom", "Bloom Shell"),
+            ("bloom-overlay", "Bloom Overlay"),
+            ("notes", "Notes"),
+            ("browser", "Vela"),
+        ] {
+            let mut entry = entry_with_icon(
+                &format!("/usr/share/geckoOS/apps/{id}"),
+                "icon.png",
+                AppTier::System,
+            );
+            entry.manifest.id = id.to_string();
+            entry.manifest.name = name.to_string();
+            nova.registry.write().unwrap().insert(id.to_string(), entry);
+        }
+
+        let listed = nova.list().unwrap();
+        let ids: Vec<&str> = listed["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["browser", "notes"]);
+        assert!(is_shell_app("bloom"));
+        assert!(is_shell_app("bloom-overlay"));
+        assert_eq!(app_owner("bloom-overlay"), (GECKO_UID, GECKO_GID));
+        assert_eq!(app_owner("browser"), (app_uid("browser"), app_gid("browser")));
+        // The shell's apps never take a uid from the table (Nova pre-composes
+        // a launch for every app at reload, the shell's included).
+        assert_eq!(app_uid("bloom"), APP_UID);
+        let table = fs::read_to_string(uids_path()).unwrap_or_default();
+        assert!(!table.contains("\"bloom\""), "bloom in the uid table: {table}");
+        // Still reachable in registry for shell startup & queries.
+        assert!(nova.get_info("bloom").is_ok());
+        assert!(nova.get_info("bloom-overlay").is_ok());
+    }
+
+    #[test]
+    fn external_browser_uses_browser_identity_sets_window_class_and_avoids_duplicates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profiles = dir.path().join("profiles");
+        let nova = make_test_nova(dir.path().join("revoked.json"));
+
+        assert_eq!(Nova::EXTERNAL_BROWSER_APP_ID, "browser");
+
+        // Command composition writes user.js and sets PYXIS_WINDOW_CLASS="browser"
+        // without chromeless kiosk PYXIS_APP_ID or MOZ_NO_REMOTE.
+        let (exec, args, env) = nova
+            .compose_external_browser_command_at(&profiles, Some("https://example.org"))
+            .unwrap();
+        assert_eq!(exec, WLCTX_BIN);
+        assert_eq!(env.get("PYXIS_WINDOW_CLASS").map(String::as_str), Some("browser"));
+        assert!(!env.contains_key("PYXIS_APP_ID"));
+        assert!(!env.contains_key("MOZ_NO_REMOTE"));
+        let expected_profile = profiles.join("browser").to_string_lossy().to_string();
+        assert!(args.ends_with(&[
+            "--".to_string(),
+            VELA_BIN.to_string(),
+            "--profile".to_string(),
+            expected_profile.clone(),
+            "https://example.org".to_string(),
+        ]));
+
+        // Simulate an already-running browser session with a bound window surface.
+        let host = AppHost::new();
+        let existing = host.bind_surface("browser", 42, None, Some(std::process::id()));
+        assert_eq!(host.list_running().len(), 1);
+
+        // Calling with empty or about:blank reuses the live session without spawning.
+        for empty_url in ["", "about:blank", "ABOUT:BLANK"] {
+            let mut spawned = false;
+            let res = nova
+                .open_external_browser_inner(&host, &profiles, empty_url, false, |_, _, _| {
+                    spawned = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!spawned, "must not spawn for {empty_url:?} while live");
+            assert_eq!(res["appId"], "browser");
+            assert_eq!(res["sessionId"], existing.session_id);
+            assert_eq!(res["windowId"], 42);
+            assert_eq!(res["alreadyRunning"], true);
+            assert_eq!(host.list_running().len(), 1);
+        }
+
+        // Calling with a real URL dispatches a transient remote command (without
+        // creating a second AppSession) and returns the same "browser" session.
+        let mut remote_calls: Vec<(PathBuf, Vec<String>, HashMap<String, String>)> = Vec::new();
+        let res = nova
+            .open_external_browser_inner(
+                &host,
+                &profiles,
+                "https://pyxis.example/docs",
+                false,
+                |exec_path, cmd_args, cmd_env| {
+                    remote_calls.push((
+                        exec_path.to_path_buf(),
+                        cmd_args.to_vec(),
+                        cmd_env.clone(),
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(remote_calls.len(), 1);
+        assert_eq!(remote_calls[0].0, Path::new(WLCTX_BIN));
+        assert!(remote_calls[0].1.ends_with(&[
+            "--".to_string(),
+            VELA_BIN.to_string(),
+            "--profile".to_string(),
+            expected_profile,
+            "https://pyxis.example/docs".to_string(),
+        ]));
+        assert_eq!(
+            remote_calls[0].2.get("PYXIS_WINDOW_CLASS").map(String::as_str),
+            Some("browser")
+        );
+        assert_eq!(res["appId"], "browser");
+        assert_eq!(res["sessionId"], existing.session_id);
+        assert_eq!(res["url"], "https://pyxis.example/docs");
+        assert_eq!(res["alreadyRunning"], true);
+        assert_eq!(host.list_running().len(), 1);
+
+        // Non-http(s) URLs (other than empty / about:blank) are still rejected.
+        assert!(nova
+            .open_external_browser_inner(&host, &profiles, "javascript:alert(1)", false, |_, _, _| {
+                unreachable!("must reject non-http(s) URL before spawning")
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn normalize_app_id_maps_legacy_browser_window_to_browser() {
+        assert_eq!(Nova::normalize_app_id("browser"), "browser");
+        assert_eq!(Nova::normalize_app_id("browser-window"), "browser");
+        assert_eq!(Nova::normalize_app_id("files"), "files");
+        assert_eq!(Nova::normalize_app_id("com.example.app"), "com.example.app");
+    }
+
+    #[test]
+    fn find_live_session_for_matches_browser_alias_and_window_id() {
+        let host = AppHost::new();
+        let legacy = host.bind_surface("browser-window", 101, None, Some(std::process::id()));
+        let direct = host.bind_surface("browser", 202, None, Some(std::process::id()));
+
+        // Without windowId, canonical "browser" is preferred over "browser-window".
+        let found_default = Nova::find_live_session_for(&host, "browser", None).unwrap();
+        assert_eq!(found_default.session_id, direct.session_id);
+
+        // Specifying windowId selects the matching window's session across the alias.
+        let found_legacy = Nova::find_live_session_for(&host, "browser", Some(101)).unwrap();
+        assert_eq!(found_legacy.session_id, legacy.session_id);
+
+        // Empty appId with explicit windowId resolves the owning live session.
+        let found_by_win = Nova::find_live_session_for(&host, "", Some(202)).unwrap();
+        assert_eq!(found_by_win.session_id, direct.session_id);
+    }
+
+    #[tokio::test]
+    async fn raise_session_sends_restore_then_focus_for_target_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nova = make_test_nova(dir.path().join("revoked.json"));
+        let bus = Arc::new(
+            IPCBus::new(dir.path().join("test-echo.sock"))
+                .await
+                .unwrap(),
+        );
+
+        let recorded = Arc::new(parking_lot::Mutex::new(Vec::<(String, Value)>::new()));
+        let rec1 = recorded.clone();
+        bus.register_handler(
+            "org.geckoOS.evo",
+            "RestoreWindow",
+            Arc::new(move |msg: crate::message::Message| {
+                let rec1 = rec1.clone();
+                Box::pin(async move {
+                    rec1.lock()
+                        .push(("RestoreWindow".to_string(), msg.body.clone()));
+                    Ok(crate::message::Message::method_return(
+                        msg.header.message_id,
+                        json!({ "success": true }),
+                    ))
+                })
+            }),
+        )
+        .await;
+        let rec2 = recorded.clone();
+        bus.register_handler(
+            "org.geckoOS.evo",
+            "FocusWindow",
+            Arc::new(move |msg: crate::message::Message| {
+                let rec2 = rec2.clone();
+                Box::pin(async move {
+                    rec2.lock()
+                        .push(("FocusWindow".to_string(), msg.body.clone()));
+                    Ok(crate::message::Message::method_return(
+                        msg.header.message_id,
+                        json!({ "success": true }),
+                    ))
+                })
+            }),
+        )
+        .await;
+        nova.set_bus(bus);
+
+        let host = AppHost::global();
+        let s = host.bind_surface("com.test.nova.raise", 7001, None, None);
+        let _ = host.bind_surface("com.test.nova.raise", 7002, Some(&s.session_id), None);
+        let updated = host
+            .find_live_session_by_app("com.test.nova.raise")
+            .expect("bound test session");
+
+        // Omitted windowId targets first mapped surface (7001) and sends RestoreWindow + FocusWindow.
+        let wid = nova.raise_session(&updated, None).await.unwrap();
+        assert_eq!(wid, Some(7001));
+        // Explicit target_window_id overrides first surface to target 7002.
+        let wid2 = nova.raise_session(&updated, Some(7002)).await.unwrap();
+        assert_eq!(wid2, Some(7002));
+
+        let _ = host.unbind_surface(7001);
+        let _ = host.unbind_surface(7002);
+
+        let calls = recorded.lock();
+        assert_eq!(
+            *calls,
+            vec![
+                ("RestoreWindow".to_string(), json!({ "window_id": 7001 })),
+                ("FocusWindow".to_string(), json!({ "window_id": 7001 })),
+                ("RestoreWindow".to_string(), json!({ "window_id": 7002 })),
+                ("FocusWindow".to_string(), json!({ "window_id": 7002 })),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_app_icon_reads_valid_icons_and_blocks_traversal_and_oversize() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nova = make_test_nova(dir.path().join("revoked.json"));
+
+        // 1. Valid PNG icon inside webroot.
+        let app_dir = dir.path().join("com.example.png");
+        let webroot = app_dir.join("webroot");
+        fs::create_dir_all(webroot.join("assets")).unwrap();
+        let png_bytes = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        fs::write(webroot.join("assets/icon.png"), png_bytes).unwrap();
+        let mut png_entry = entry_with_icon(
+            &app_dir.to_string_lossy(),
+            "assets/icon.png",
+            AppTier::System,
+        );
+        png_entry.manifest.id = "com.example.png".to_string();
+        png_entry.webroot = webroot.clone();
+        nova.registry
+            .write()
+            .unwrap()
+            .insert("com.example.png".to_string(), png_entry);
+
+        let png_res = nova.get_app_icon("com.example.png").unwrap();
+        assert_eq!(png_res["id"], "com.example.png");
+        assert_eq!(png_res["mimeType"], "image/png");
+        assert!(png_res["dataUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,iVBORw0K"));
+
+        // 2. Valid SVG icon (appinfo-style stripped prefix).
+        let svg_dir = dir.path().join("com.example.svg");
+        fs::create_dir_all(&svg_dir).unwrap();
+        fs::write(svg_dir.join("logo.svg"), b"<svg/>").unwrap();
+        let mut svg_entry = entry_with_icon(
+            &svg_dir.to_string_lossy(),
+            &format!("{}/logo.svg", svg_dir.display()),
+            AppTier::Opkg,
+        );
+        svg_entry.manifest.id = "com.example.svg".to_string();
+        nova.registry
+            .write()
+            .unwrap()
+            .insert("com.example.svg".to_string(), svg_entry);
+
+        let svg_res = nova.get_app_icon("com.example.svg").unwrap();
+        assert_eq!(svg_res["mimeType"], "image/svg+xml");
+        assert!(svg_res["dataUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/svg+xml;base64,"));
+
+        // 3. Rejects path traversal ("..") and symlinks escaping webroot.
+        let mut traversal = entry_with_icon(
+            &svg_dir.to_string_lossy(),
+            "../com.example.png/webroot/assets/icon.png",
+            AppTier::System,
+        );
+        traversal.manifest.id = "com.example.traversal".to_string();
+        traversal.webroot = webroot.clone();
+        nova.registry
+            .write()
+            .unwrap()
+            .insert("com.example.traversal".to_string(), traversal);
+        assert!(nova.get_app_icon("com.example.traversal").is_err());
+
+        let secret = dir.path().join("outside.png");
+        fs::write(&secret, png_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, webroot.join("escape.png")).unwrap();
+            let mut symlink_entry =
+                entry_with_icon(&app_dir.to_string_lossy(), "escape.png", AppTier::System);
+            symlink_entry.manifest.id = "com.example.symlink".to_string();
+            symlink_entry.webroot = webroot.clone();
+            nova.registry
+                .write()
+                .unwrap()
+                .insert("com.example.symlink".to_string(), symlink_entry);
+            assert!(nova.get_app_icon("com.example.symlink").is_err());
+        }
+
+        // 4. Rejects unsupported extensions (.html) and icons > 256 KiB.
+        fs::write(webroot.join("icon.html"), b"<html></html>").unwrap();
+        let mut bad_ext =
+            entry_with_icon(&app_dir.to_string_lossy(), "icon.html", AppTier::System);
+        bad_ext.manifest.id = "com.example.badext".to_string();
+        bad_ext.webroot = webroot.clone();
+        nova.registry
+            .write()
+            .unwrap()
+            .insert("com.example.badext".to_string(), bad_ext);
+        assert!(nova.get_app_icon("com.example.badext").is_err());
+
+        let big_bytes = vec![b'A'; Nova::MAX_APP_ICON_BYTES + 1];
+        fs::write(webroot.join("huge.png"), big_bytes).unwrap();
+        let mut huge = entry_with_icon(&app_dir.to_string_lossy(), "huge.png", AppTier::System);
+        huge.manifest.id = "com.example.huge".to_string();
+        huge.webroot = webroot;
+        nova.registry
+            .write()
+            .unwrap()
+            .insert("com.example.huge".to_string(), huge);
+        assert!(nova.get_app_icon("com.example.huge").is_err());
     }
 }

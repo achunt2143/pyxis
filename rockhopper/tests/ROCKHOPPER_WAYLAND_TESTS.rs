@@ -4,8 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    
     #[test]
     fn test_wayland_protocol() {
         println!("Testing Wayland protocol");

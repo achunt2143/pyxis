@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use std::process::Command;
 use tracing::{info, debug, error};
 
 pub struct Runtime {

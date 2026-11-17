@@ -2,7 +2,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use tracing;
 
 /// Lifecycle event tracking for processes

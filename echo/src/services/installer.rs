@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::services::apphost::AppHost;
+use crate::services::package_sig;
 use crate::services::nova::{forget_app_state, AppTier, Nova, APP_EXIT_LIMIT};
 use crate::IPCBus;
 
@@ -40,7 +41,6 @@ pub const INSTALLER_IFACE: &str = "org.geckoOS.installer";
 const PACKAGE_SEARCH_ROOTS: &[&str] = &[
     "/var/lib/pyxis/incoming",
     "/media",
-    "/tmp",
 ];
 
 /// Directories an `.ipk` may legitimately be installed *from*. Installing a
@@ -50,14 +50,14 @@ const PACKAGE_SEARCH_ROOTS: &[&str] = &[
 const ALLOWED_INSTALL_ROOTS: &[&str] = &[
     "/var/lib/pyxis/incoming",
     "/media",
-    "/tmp",
     "/home",
-    "/root",
 ];
 
 /// Package metadata read out of an `.ipk` without installing it.
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageInfo {
+    /// `true` (verifies), `false` (no signature) or `"bad"`. Advisory.
+    pub signed: Value,
     pub path: String,
     pub package: String,
     pub version: String,
@@ -163,6 +163,7 @@ impl InstallerService {
                 }
                 match Self::inspect_path(&path) {
                     Ok(mut info) => {
+                        info.signed = package_sig::status(&path);
                         if let Some(v) = installed.get(&info.package) {
                             info.installed = true;
                             info.installed_version = Some(v.clone());
@@ -184,6 +185,7 @@ impl InstallerService {
     pub fn inspect(&self, package_path: &str) -> Result<Value> {
         let path = Self::validate_package_path(package_path)?;
         let mut info = Self::inspect_path(&path)?;
+        info.signed = package_sig::status(&path);
         if let Some(v) = self.installed_versions().unwrap_or_default().get(&info.package) {
             info.installed = true;
             info.installed_version = Some(v.clone());
@@ -288,6 +290,7 @@ impl InstallerService {
             required_permissions: perms,
             installed: false,
             installed_version: None,
+            signed: json!(false),
         })
     }
 
@@ -362,8 +365,32 @@ impl InstallerService {
     /// refresh Nova's registry so the app is immediately launchable.
     /// Emits progress signals throughout and returns the terminal result.
     pub async fn install(&self, package_path: &str, force: bool) -> Result<Value> {
-        let path = Self::validate_package_path(package_path)?;
-        let info = Self::inspect_path(&path)?;
+        let original = Self::validate_package_path(package_path)?;
+
+        // Verify a root-owned private copy and give opkg that same copy: the
+        // original sits in a user-writable drop directory and could change
+        // between the check and opkg reading it.
+        let private = package_sig::PrivateCopy::make(&original, &std::env::temp_dir())
+            .map_err(|e| anyhow!("cannot copy package for verification: {e}"))?;
+        if package_sig::signatures_required() {
+            let refuse = |reason: &str, detail: String| {
+                let msg = format!("{reason}: {detail}");
+                self.fail(&original.to_string_lossy(), &msg);
+                anyhow!("{{\"reason\":\"{reason}\",\"error\":{}}}", json!(detail))
+            };
+            let Some(sig) = private.sig.as_ref() else {
+                return Err(refuse(
+                    "unsigned",
+                    format!("{} has no detached signature (.sig) and signatures are required", original.display()),
+                ));
+            };
+            if let Err(e) = package_sig::verify_detached(&private.pkg, sig, &package_sig::keys_dir()) {
+                return Err(refuse("bad-signature", e.to_string()));
+            }
+        }
+        let path = private.pkg.clone();
+        let mut info = Self::inspect_path(&path)?;
+        info.path = original.to_string_lossy().to_string();
         let package = info.package.clone();
 
         self.emit(
@@ -762,8 +789,8 @@ mod tests {
         assert_eq!(info.title.as_deref(), Some("Fixture App"));
         assert_eq!(info.app_type.as_deref(), Some("web"));
         assert_eq!(info.required_permissions, vec!["filesystem.read"]);
-        // /tmp is an allowed install root, so the same path must validate.
-        InstallerService::validate_package_path(ipk.to_str().unwrap()).expect("path allowed");
+        // /tmp is no longer an install root (world-writable drop point).
+        assert!(InstallerService::validate_package_path(ipk.to_str().unwrap()).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }

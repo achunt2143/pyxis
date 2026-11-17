@@ -2,7 +2,7 @@
 // File: rockhopper/src/compatibility.rs
 // Purpose: Provide Linux system compatibility shims
 
-use std::{collections::HashMap, path::PathBuf, fs};
+use std::{collections::HashMap, path::PathBuf};
 use std::error::Error;
 use tracing::{info, debug, warn};
 use anyhow::anyhow;

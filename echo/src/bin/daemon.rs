@@ -118,7 +118,12 @@ async fn register_internal_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn Err
                             .clone(),
                     )?;
 
-                    let service_id = bus.register_service(name, interface).await?;
+                    let peer = msg
+                        .header
+                        .sender
+                        .as_deref()
+                        .and_then(|id| bus.connection_peer(id));
+                    let service_id = bus.register_service(name, interface, peer.as_ref()).await?;
 
                     if let Some(sender_id) = &msg.header.sender {
                         bus.register_external_service(name, sender_id).await;
@@ -292,7 +297,7 @@ fn start_connection_handler(bus: Arc<IPCBus>) {
 async fn handle_connection(
     bus: Arc<IPCBus>,
     connection_id: String,
-    mut stream: UnixStream,
+    stream: UnixStream,
 ) -> Result<(), Box<dyn Error>> {
     info!("Handling connection: {}", connection_id);
 
@@ -307,12 +312,14 @@ async fn handle_connection(
     let (broadcast_tx, mut broadcast_rx) = mpsc::channel::<Message>(64);
     bus.add_broadcast_sender(connection_id.clone(), broadcast_tx);
 
+    // Replies of held (root-action) calls: they are dispatched in tasks of
+    // their own so the connection keeps reading (the shell's Authenticate may
+    // arrive on this very connection), and write back through this channel.
+    let (held_tx, mut held_rx) = mpsc::channel::<Message>(32);
+
     // Tracks in-flight forwarded calls that are waiting for a reply from THIS socket
     let pending_replies: Arc<DashMap<String, oneshot::Sender<anyhow::Result<Message>>>> =
         Arc::new(DashMap::new());
-
-    // Track if we've completed handshake
-    let mut handshake_completed = false;
 
     // The socket is read in a task of its own, and the loop below waits on its
     // channel. Reading a frame inside the `select!` was not cancel-safe: a
@@ -340,6 +347,7 @@ async fn handle_connection(
         }
     }
     let _reader = AbortOnDrop(reader);
+    let mut refused_signal_logged = false;
 
     loop {
         tokio::select! {
@@ -386,7 +394,6 @@ async fn handle_connection(
                         let ack_data = serde_json::to_vec(&ack)?;
                         UnixSocketTransport::send_message(&mut stream, &ack_data).await?;
 
-                        handshake_completed = true;
                         info!("Handshake ACK sent to {}", connection_id);
                     }
 
@@ -398,6 +405,28 @@ async fn handle_connection(
                         // this is the path external processes like Evo use,
                         // as opposed to in-process services which go through
                         // IPCBus::emit_signal instead).
+                        let daemon_uid = rustix::process::geteuid().as_raw();
+                        let allowed = match bus.connection_peer(&connection_id) {
+                            Some(p) => geckoOS_echo::signal_policy::may_emit(
+                                p.uid,
+                                daemon_uid,
+                                &message.header.interface,
+                            ),
+                            None => false,
+                        };
+                        if !allowed {
+                            if !refused_signal_logged {
+                                refused_signal_logged = true;
+                                warn!(
+                                    "SECURITY DENY: connection {} (peer {:?}) emitted signal {}.{}; only root may emit on org.geckoOS.* (further refusals on this connection not logged)",
+                                    connection_id,
+                                    bus.connection_peer(&connection_id),
+                                    message.header.interface,
+                                    message.header.method
+                                );
+                            }
+                            continue;
+                        }
                         bus.broadcast_to_all_connections(&message).await;
                         if let Err(e) = bus.signal_bus().broadcast(message).await {
                             error!("Failed to broadcast signal: {}", e);
@@ -408,24 +437,100 @@ async fn handle_connection(
                         let message_id = message.header.message_id.clone();
                         let dest = message.header.destination.clone();
 
-                        // First try local/router handlers (internal services)
-                        let response_res = if bus.router().has_handler(&dest, &message.header.method) {
-                            bus.send_message(message).await
-                        } else {
-                            // External service: look up owning connection
-                            if let Some(target_conn_id) = bus.get_connection_for_service(&dest).await {
-                                // Avoid infinite loop: if this connection already owns the service,
-                                // treat as not registered instead of re-forwarding to itself.
-                                if target_conn_id == connection_id {
-                                    Err(anyhow::anyhow!("Service not registered: {}", dest))
+                        let auth_result = match bus.connection_peer(&connection_id) {
+                            Some(peer_id) => {
+                                let app_id = if peer_id.tier.is_privileged()
+                                {
+                                    None
                                 } else {
-                                    // Forward to the external service owner (e.g. WM)
-                                    bus.forward_call(&target_conn_id, message).await
-                                }
-                            } else {
-                                Err(anyhow::anyhow!("Service not registered: {}", dest))
+                                    services::AppHost::global().app_id_for_pid(peer_id.pid)
+                                };
+                                let caps = app_id.as_deref().map(|id| {
+                                    services::Nova::global()
+                                        .declared_permissions(services::Nova::normalize_app_id(id))
+                                });
+                                let ctx = geckoOS_echo::security::AppCallContext {
+                                    app_id: app_id.as_deref(),
+                                    granted_capabilities: caps.as_deref(),
+                                };
+                                geckoOS_echo::security::check_method_call_with_context(
+                                    &peer_id,
+                                    &dest,
+                                    &message.header.method,
+                                    Some(&message.body),
+                                    ctx,
+                                )
+                                .map_err(|reason| (Some(peer_id), reason))
                             }
+                            None => Err((None, "unknown peer identity".to_string())),
                         };
+                        if let Err((peer_id, reason)) = auth_result {
+                            warn!(
+                                "SECURITY DENY: peer={:?} {}.{}: {}",
+                                peer_id, dest, message.header.method, reason
+                            );
+                            let err_msg = Message::error(
+                                message_id,
+                                &format!("Permission denied: {}", reason),
+                            );
+                            let err_data = serde_json::to_vec(&err_msg)?;
+                            UnixSocketTransport::send_message(&mut stream, &err_data).await?;
+                            continue;
+                        }
+
+                        // Root actions (package install, Wi-Fi, users...): hold the
+                        // call until the user answers the shell's dialog. Root peers
+                        // never hold.
+                        if let Some(peer) = bus.connection_peer(&connection_id) {
+                            let resolved = if peer.tier.is_privileged() {
+                                None
+                            } else {
+                                services::AppHost::global().app_id_for_pid(peer.pid)
+                            };
+                            match hold_decision(
+                                peer.tier,
+                                resolved.as_deref(),
+                                &dest,
+                                &message.header.method,
+                                &message.body,
+                            ) {
+                                Hold::None => {}
+                                Hold::Refuse => {
+                                    let err_msg = Message::error(
+                                        message_id,
+                                        &services::privilege::ActionDenied::Denied
+                                            .to_error_json(),
+                                    );
+                                    let err_data = serde_json::to_vec(&err_msg)?;
+                                    UnixSocketTransport::send_message(&mut stream, &err_data).await?;
+                                    continue;
+                                }
+                                Hold::Ask(app_id, req) => {
+                                    let bus = bus.clone();
+                                    let conn = connection_id.clone();
+                                    let tx = held_tx.clone();
+                                    let privilege = privilege_service(&bus);
+                                    tokio::spawn(async move {
+                                        let reply = match privilege.authorize(&app_id, req).await {
+                                            Ok(()) => match dispatch_call(&bus, &conn, message).await {
+                                                Ok(response) => response,
+                                                Err(e) => {
+                                                    error!("Method call error: {}", e);
+                                                    Message::error(message_id, &format!("Method failed: {}", e))
+                                                }
+                                            },
+                                            Err(denied) => {
+                                                Message::error(message_id, &denied.to_error_json())
+                                            }
+                                        };
+                                        let _ = tx.send(reply).await;
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let response_res = dispatch_call(&bus, &connection_id, message).await;
 
                         match response_res {
                             Ok(response) => {
@@ -485,8 +590,24 @@ async fn handle_connection(
 
             // CASE 2: Another connection wants this one to handle a call (forwarded request)
             Some(req) = forward_rx.recv() => {
-                // Store the reply sender keyed by this message_id so we can match the reply later
+                // Prune already-timed-out/cancelled callers before checking capacity.
+                pending_replies.retain(|_, tx| !tx.is_closed());
                 let msg_id = req.message.header.message_id.clone();
+                if pending_replies.len() >= geckoOS_echo::MAX_PENDING_REPLIES {
+                    warn!(
+                        "Connection {} pending_replies limit ({}) reached; rejecting {}",
+                        connection_id,
+                        geckoOS_echo::MAX_PENDING_REPLIES,
+                        msg_id
+                    );
+                    let _ = req.response_tx.send(Err(anyhow::anyhow!(
+                        "Too many pending forwarded calls on connection {}",
+                        connection_id
+                    )));
+                    continue;
+                }
+
+                // Store the reply sender keyed by this message_id so we can match the reply later
                 pending_replies.insert(msg_id.clone(), req.response_tx);
 
                 // Forward the message over THIS socket to the process on this connection (e.g. WM)
@@ -494,18 +615,17 @@ async fn handle_connection(
                 if let Err(e) = UnixSocketTransport::send_message(&mut stream, &data).await {
                     // If sending failed, clean up and return error to caller
                     error!("Failed to forward message {} on {}: {}", msg_id, connection_id, e);
-                    // FIXED: Use reply_to to find original caller
-                    let lookup_id = req.message.header.reply_to.clone()
-                        .unwrap_or_else(|| req.message.header.message_id.clone());
-
-                    if let Some((_msgid, tx)) = pending_replies.remove(&lookup_id) {
-                        // Send the full Message back to the origin connection task
-                        let _ = tx.send(Ok(req.message));
-                    } else {
-                        debug!("No pending reply entry for lookup_id {} on connection {}",
-                            lookup_id, connection_id);
+                    if let Some((_id, tx)) = pending_replies.remove(&msg_id) {
+                        let _ = tx.send(Err(anyhow::anyhow!("Failed to forward message: {}", e)));
                     }
+                }
+            }
 
+            // CASE 2b: a held call finished (answered or refused): write its reply
+            Some(reply) = held_rx.recv() => {
+                let data = serde_json::to_vec(&reply)?;
+                if let Err(e) = UnixSocketTransport::send_message(&mut stream, &data).await {
+                    warn!("Failed to send held reply on {}: {}", connection_id, e);
                 }
             }
 
@@ -522,6 +642,74 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// The one privilege service (the bus-backed instance the privilege handlers
+/// use), so held calls and `privilege.Authenticate` share one store and signal.
+static PRIVILEGE: std::sync::OnceLock<Arc<services::PrivilegeService>> = std::sync::OnceLock::new();
+
+fn privilege_service(bus: &Arc<IPCBus>) -> Arc<services::PrivilegeService> {
+    PRIVILEGE
+        .get_or_init(|| Arc::new(services::PrivilegeService::with_bus(bus.clone())))
+        .clone()
+}
+
+/// What to do with a call that passed the access check.
+#[derive(Debug, PartialEq)]
+enum Hold {
+    /// Dispatch inline.
+    None,
+    /// Hold until the user answers, as this app id.
+    Ask(String, geckoOS_echo::actions::ActionRequest),
+    /// Refuse at once (an app we cannot name can't be shown in the dialog).
+    Refuse,
+}
+
+fn hold_decision(
+    tier: geckoOS_echo::security::Tier,
+    resolved_app_id: Option<&str>,
+    dest: &str,
+    method: &str,
+    body: &serde_json::Value,
+) -> Hold {
+    use geckoOS_echo::security::Tier;
+    if tier == Tier::Root {
+        return Hold::None;
+    }
+    let Some(req) = geckoOS_echo::actions::action_for(dest, method, body) else {
+        return Hold::None;
+    };
+    match tier {
+        Tier::Shell => Hold::Ask("bloom".to_string(), req),
+        _ => match resolved_app_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => Hold::Ask(id.to_string(), req),
+            None => Hold::Refuse,
+        },
+    }
+}
+
+/// Runs a call: a local router handler, else the connection that owns the service.
+async fn dispatch_call(
+    bus: &Arc<IPCBus>,
+    connection_id: &str,
+    message: Message,
+) -> anyhow::Result<Message> {
+    let dest = message.header.destination.clone();
+    // First try local/router handlers (internal services)
+    if bus.router().has_handler(&dest, &message.header.method) {
+        bus.send_message(message).await
+    } else if let Some(target_conn_id) = bus.get_connection_for_service(&dest).await {
+        // Avoid infinite loop: if this connection already owns the service,
+        // treat as not registered instead of re-forwarding to itself.
+        if target_conn_id == connection_id {
+            Err(anyhow::anyhow!("Service not registered: {}", dest))
+        } else {
+            // Forward to the external service owner (e.g. WM)
+            bus.forward_call(&target_conn_id, message).await
+        }
+    } else {
+        Err(anyhow::anyhow!("Service not registered: {}", dest))
+    }
 }
 
 fn start_statistics_reporter(bus: Arc<IPCBus>) {
@@ -606,8 +794,18 @@ async fn register_all_services(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::err
     // ==================== TERMINAL SERVICE (real PTY-backed shell) ====================
     register_terminal_handlers(bus).await?;
 
+    // ==================== SESSION + ACCOUNTS (lock screen) ====================
+    // One limiter for both: a wrong `current` in setPassword counts against
+    // the same tries as a wrong unlock. Built before power, whose sleep locks.
+    let limiter = Arc::new(services::session::Limiter::new());
+    let session = Arc::new(services::SessionService::start(services::accounts::Users::system(), limiter.clone()));
+    services::SessionService::register_active(&session);
+    register_session_handlers(bus, session.clone()).await?;
+    register_accounts_handlers(bus, Arc::new(services::AccountsService::system(limiter)), session.clone()).await?;
+    register_privilege_handlers(bus, privilege_service(bus)).await?;
+
     // ==================== POWER SERVICE ====================
-    register_power_handlers(bus).await?;
+    register_power_handlers(bus, session).await?;
 
     // ==================== SETTINGS SERVICE ====================
     register_settings_handlers(bus).await?;
@@ -719,7 +917,10 @@ async fn register_sound_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
 
 // ==================== AUDIO SERVICE HANDLERS ====================
 async fn register_audio_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
-    use services::audio::{AudioService, AUDIO_IFACE, SIGNAL_OUTPUT_CHANGED, SIGNAL_VOLUME_CHANGED};
+    use services::audio::{
+        AudioService, AUDIO_IFACE, SIGNAL_INPUT_CHANGED, SIGNAL_INPUT_VOLUME_CHANGED,
+        SIGNAL_OUTPUT_CHANGED, SIGNAL_VOLUME_CHANGED,
+    };
     info!("Registering audio service handlers");
 
     /// Reply with `result`, and on success also signal it under `signal`,
@@ -823,6 +1024,98 @@ async fn register_audio_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
         .into(),
     );
 
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "getInputVolume",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                reply(&bus, msg.header.message_id, AudioService::input_volume().await, None).await
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "setInputVolume",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = match msg.body.get("volume").and_then(|v| v.as_u64()) {
+                    Some(volume) => AudioService::set_input_volume(volume.min(100) as u8).await,
+                    None => Err(anyhow::anyhow!("setInputVolume needs a numeric `volume`, 0-100")),
+                };
+                reply(
+                    &bus,
+                    msg.header.message_id,
+                    result,
+                    Some(SIGNAL_INPUT_VOLUME_CHANGED),
+                )
+                .await
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "setInputMute",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = match msg.body.get("muted").and_then(|v| v.as_bool()) {
+                    Some(muted) => AudioService::set_input_mute(muted).await,
+                    None => Err(anyhow::anyhow!("setInputMute needs a boolean `muted`")),
+                };
+                reply(
+                    &bus,
+                    msg.header.message_id,
+                    result,
+                    Some(SIGNAL_INPUT_VOLUME_CHANGED),
+                )
+                .await
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "listInputs",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = AudioService::inputs().await.map(|inputs| json!({ "inputs": inputs }));
+                reply(&bus, msg.header.message_id, result, None).await
+            })
+        })
+        .into(),
+    );
+
+    let bus_clone = bus.clone();
+    bus.router().register_handler(
+        AUDIO_IFACE,
+        "setDefaultInput",
+        handler(move |msg| {
+            let bus = bus_clone.clone();
+            Box::pin(async move {
+                let result = match msg.body.get("id").and_then(|v| v.as_u64()) {
+                    Some(id) => AudioService::set_default_input(id as u32)
+                        .await
+                        .map(|inputs| json!({ "inputs": inputs })),
+                    None => Err(anyhow::anyhow!("setDefaultInput needs a numeric `id`")),
+                };
+                reply(&bus, msg.header.message_id, result, Some(SIGNAL_INPUT_CHANGED)).await
+            })
+        })
+        .into(),
+    );
+
     info!("✓ Audio service handlers registered");
     Ok(())
 }
@@ -898,8 +1191,321 @@ async fn register_time_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+// ==================== SESSION SERVICE HANDLERS ====================
+
+/// Lock the session and tell every client (Evo above all). Also what
+/// `power.sleep` calls. The state change and its signal go out together under
+/// the session's gate, so their order is their `seq`s' order.
+async fn lock_session(bus: &IPCBus, session: &services::SessionService) {
+    use services::session::{SESSION_IFACE, SIGNAL_LOCK_CHANGED};
+    let _gate = session.change_gate().await;
+    let change = session.lock();
+    if let Err(e) = bus.emit_signal(SESSION_IFACE, SIGNAL_LOCK_CHANGED, change.signal_body()).await {
+        warn!("session signal {} failed: {}", SIGNAL_LOCK_CHANGED, e);
+    }
+}
+
+async fn register_privilege_handlers(
+    bus: &Arc<IPCBus>,
+    privilege: Arc<services::PrivilegeService>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use services::privilege::PRIVILEGE_SERVICE;
+    info!("Registering privilege service handlers");
+
+    for method in [
+        "Request",
+        "request",
+        "Authenticate",
+        "authenticate",
+        "Dismiss",
+        "dismiss",
+        "Revoke",
+        "revoke",
+        "GetState",
+        "getState",
+    ] {
+        let priv_svc = privilege.clone();
+        let method_name = method;
+        bus.router().register_handler(
+            PRIVILEGE_SERVICE,
+            method_name,
+            handler(move |msg| {
+                let svc = priv_svc.clone();
+                Box::pin(async move {
+                    let res = if matches!(method_name, "Authenticate" | "authenticate") {
+                        let body = msg.body.clone();
+                        tokio::task::spawn_blocking(move || svc.call(method_name, &body))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("privilege authenticate task failed: {e}"))
+                            .and_then(|r| r)
+                    } else {
+                        svc.call(method_name, &msg.body)
+                    };
+                    match res {
+                        Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                        Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                    }
+                })
+            })
+            .into(),
+        );
+    }
+
+    info!("✓ Privilege service handlers registered");
+    Ok(())
+}
+
+async fn register_session_handlers(
+    bus: &Arc<IPCBus>,
+    session: Arc<services::SessionService>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use services::session::{
+        METHOD_GET_STATE, METHOD_LOCK, METHOD_LOGOUT, METHOD_SWITCH_USER, METHOD_UNLOCK,
+        SESSION_IFACE, SIGNAL_LOCK_CHANGED, SIGNAL_UNLOCK_FAILED,
+    };
+    info!("Registering session service handlers");
+
+    // lock {} -> {locked: true}
+    let (bus_clone, session_clone) = (bus.clone(), session.clone());
+    bus.router().register_handler(
+        SESSION_IFACE,
+        METHOD_LOCK,
+        handler(move |msg| {
+            let (bus, session) = (bus_clone.clone(), session_clone.clone());
+            Box::pin(async move {
+                lock_session(&bus, &session).await;
+                Ok(Message::method_return(msg.header.message_id, json!({ "locked": true })))
+            })
+        })
+        .into(),
+    );
+
+    // logout {} -> {ok: true, locked: true, closed_apps: usize}
+    let (bus_clone, session_clone) = (bus.clone(), session.clone());
+    bus.router().register_handler(
+        SESSION_IFACE,
+        METHOD_LOGOUT,
+        handler(move |msg| {
+            let (bus, session) = (bus_clone.clone(), session_clone.clone());
+            Box::pin(async move {
+                let closed_apps = services::AppHost::global()
+                    .close_all_for_shutdown(std::time::Duration::from_millis(500));
+                let _gate = session.change_gate().await;
+                let change = session.logout();
+                if let Err(e) = bus
+                    .emit_signal(SESSION_IFACE, SIGNAL_LOCK_CHANGED, change.signal_body())
+                    .await
+                {
+                    warn!("session signal {} failed: {}", SIGNAL_LOCK_CHANGED, e);
+                }
+                Ok(Message::method_return(
+                    msg.header.message_id,
+                    json!({ "ok": true, "locked": true, "closed_apps": closed_apps }),
+                ))
+            })
+        })
+        .into(),
+    );
+
+    // switchUser {user} -> {ok: true, locked: true, user}
+    let (bus_clone, session_clone) = (bus.clone(), session.clone());
+    bus.router().register_handler(
+        SESSION_IFACE,
+        METHOD_SWITCH_USER,
+        handler(move |msg| {
+            let (bus, session) = (bus_clone.clone(), session_clone.clone());
+            Box::pin(async move {
+                let Some(user) = msg.body.get("user").and_then(|v| v.as_str()).map(str::to_owned) else {
+                    return Ok(Message::error(msg.header.message_id, "switchUser needs a string `user`"));
+                };
+                let _gate = session.change_gate().await;
+                match session.switch_user(&user) {
+                    Ok(change) => {
+                        services::privilege::revoke_all("session_locked");
+                        if let Err(e) = bus
+                            .emit_signal(SESSION_IFACE, SIGNAL_LOCK_CHANGED, change.signal_body())
+                            .await
+                        {
+                            warn!("session signal {} failed: {}", SIGNAL_LOCK_CHANGED, e);
+                        }
+                        Ok(Message::method_return(
+                            msg.header.message_id,
+                            json!({ "ok": true, "locked": true, "user": user }),
+                        ))
+                    }
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // unlock {password, user?} -> {ok: true} | {ok: false, reason, attempts_left, retry_at_ms}.
+    // A refusal is a normal answer. The password is checked on a blocking
+    // thread (crypt is slow on purpose), and never logged: see
+    // Message::body_is_secret.
+    let (bus_clone, session_clone) = (bus.clone(), session.clone());
+    bus.router().register_handler(
+        SESSION_IFACE,
+        METHOD_UNLOCK,
+        handler(move |msg| {
+            let (bus, session) = (bus_clone.clone(), session_clone.clone());
+            Box::pin(async move {
+                let Some(password) = msg.body.get("password").and_then(|v| v.as_str()).map(str::to_owned) else {
+                    return Ok(Message::error(msg.header.message_id, "unlock needs a string `password`"));
+                };
+                let user = msg.body.get("user").and_then(|v| v.as_str()).map(str::to_owned);
+                let checking = session.clone();
+                let check = tokio::task::spawn_blocking(move || {
+                    checking.check_password_for(user.as_deref(), &password)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("password check task failed: {e}"))
+                .and_then(|checked| checked);
+                match check {
+                    Ok(check) => {
+                        if check == services::session::Check::Granted {
+                            let _gate = session.change_gate().await;
+                            let change = session.set_locked(false);
+                            if let Err(e) = bus.emit_signal(SESSION_IFACE, SIGNAL_LOCK_CHANGED, change.signal_body()).await {
+                                warn!("session signal {} failed: {}", SIGNAL_LOCK_CHANGED, e);
+                            }
+                        } else if let Some(body) = check.failed_signal() {
+                            if let Err(e) = bus.emit_signal(SESSION_IFACE, SIGNAL_UNLOCK_FAILED, body).await {
+                                warn!("session signal {} failed: {}", SIGNAL_UNLOCK_FAILED, e);
+                            }
+                        }
+                        Ok(Message::method_return(msg.header.message_id, check.reply()))
+                    }
+                    // An unreadable shadow refuses; it never unlocks.
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // getState {}
+    bus.router().register_handler(
+        SESSION_IFACE,
+        METHOD_GET_STATE,
+        handler(move |msg| {
+            let session = session.clone();
+            Box::pin(async move {
+                match session.state() {
+                    Ok(state) => Ok(Message::method_return(msg.header.message_id, state)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Session service handlers registered");
+    Ok(())
+}
+
+// ==================== ACCOUNTS SERVICE HANDLERS ====================
+async fn register_accounts_handlers(
+    bus: &Arc<IPCBus>,
+    accounts: Arc<services::AccountsService>,
+    session: Arc<services::SessionService>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use services::accounts::{
+        METHOD_CREATE, METHOD_DELETE, METHOD_LIST, METHOD_SET_PASSWORD, METHOD_SET_PROFILE,
+        ACCOUNTS_IFACE,
+    };
+    info!("Registering accounts service handlers");
+
+    fn reply(message_id: String, result: anyhow::Result<serde_json::Value>) -> anyhow::Result<Message> {
+        match result {
+            Ok(value) => Ok(Message::method_return(message_id, value)),
+            Err(e) => Ok(Message::error(message_id, &format!("{e:#}"))),
+        }
+    }
+
+    let accounts_clone = accounts.clone();
+    bus.router().register_handler(
+        ACCOUNTS_IFACE,
+        METHOD_LIST,
+        handler(move |msg| {
+            let accounts = accounts_clone.clone();
+            Box::pin(async move { reply(msg.header.message_id, accounts.list()) })
+        })
+        .into(),
+    );
+
+    let accounts_clone = accounts.clone();
+    bus.router().register_handler(
+        ACCOUNTS_IFACE,
+        METHOD_CREATE,
+        handler(move |msg| {
+            let accounts = accounts_clone.clone();
+            Box::pin(async move {
+                let body = msg.body;
+                let result = tokio::task::spawn_blocking(move || accounts.create(&body))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create account task failed: {e}"))
+                    .and_then(|result| result);
+                reply(msg.header.message_id, result)
+            })
+        })
+        .into(),
+    );
+
+    let (accounts_clone, session_clone) = (accounts.clone(), session.clone());
+    bus.router().register_handler(
+        ACCOUNTS_IFACE,
+        METHOD_DELETE,
+        handler(move |msg| {
+            let (accounts, session) = (accounts_clone.clone(), session_clone.clone());
+            Box::pin(async move {
+                let active = session.active_user();
+                reply(msg.header.message_id, accounts.delete(&msg.body, &active))
+            })
+        })
+        .into(),
+    );
+
+    let accounts_clone = accounts.clone();
+    bus.router().register_handler(
+        ACCOUNTS_IFACE,
+        METHOD_SET_PROFILE,
+        handler(move |msg| {
+            let accounts = accounts_clone.clone();
+            Box::pin(async move { reply(msg.header.message_id, accounts.set_profile(&msg.body)) })
+        })
+        .into(),
+    );
+
+    // setPassword runs crypt and a child process, so off the runtime's
+    // threads. The body holds passwords and is never logged.
+    bus.router().register_handler(
+        ACCOUNTS_IFACE,
+        METHOD_SET_PASSWORD,
+        handler(move |msg| {
+            let accounts = accounts.clone();
+            Box::pin(async move {
+                let body = msg.body;
+                let result = tokio::task::spawn_blocking(move || accounts.set_password(&body))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("setPassword task failed: {e}"))
+                    .and_then(|result| result);
+                reply(msg.header.message_id, result)
+            })
+        })
+        .into(),
+    );
+
+    info!("✓ Accounts service handlers registered");
+    Ok(())
+}
+
 // ==================== POWER SERVICE HANDLERS ====================
-async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::error::Error>> {
+async fn register_power_handlers(
+    bus: &Arc<IPCBus>,
+    session: Arc<services::SessionService>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Registering power service handlers");
 
     // shutdown
@@ -936,12 +1542,30 @@ async fn register_power_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::e
         .into(),
     );
 
-    // sleep
+    // sleep: locks first when `pyxis.lock.onSleep` is set (true until the
+    // user turns it off), in-process, so the lock is on before the kernel
+    // freezes anything and the screen is locked when it wakes.
+    let sleep_bus = bus.clone();
     bus.router().register_handler(
         "org.geckoOS.power",
         "sleep",
         handler(move |msg| {
+            let bus = sleep_bus.clone();
+            let session = session.clone();
             Box::pin(async move {
+                let lock_first = match services::SettingsService::get(services::session::LOCK_ON_SLEEP_SETTING) {
+                    Ok(value) => value.as_bool().unwrap_or(true),
+                    Err(e) => {
+                        // Can't tell: lock, the safe way to be wrong.
+                        warn!("power.sleep: can't read {}: {e:#}; locking", services::session::LOCK_ON_SLEEP_SETTING);
+                        true
+                    }
+                };
+                if lock_first {
+                    lock_session(&bus, &session).await;
+                    // Give Evo a moment to draw the lock before the freeze.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
                 match services::power::PowerService::sleep() {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
@@ -1242,6 +1866,110 @@ async fn register_network_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std:
         handler(move |msg| {
             Box::pin(async move {
                 match services::network::NetworkService::get_dns() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        "org.geckoOS.network",
+        "scanWifi",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::network::NetworkService::scan_wifi() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        "org.geckoOS.network",
+        "connectWifi",
+        handler(move |msg| {
+            Box::pin(async move {
+                let ssid = msg.body.get("ssid").and_then(|v| v.as_str()).unwrap_or("");
+                let password = msg.body.get("password").and_then(|v| v.as_str());
+                match services::network::NetworkService::connect_wifi(ssid, password) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        "org.geckoOS.network",
+        "disconnectWifi",
+        handler(move |msg| {
+            Box::pin(async move {
+                match services::network::NetworkService::disconnect_wifi() {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        "org.geckoOS.network",
+        "setInterfaceEnabled",
+        handler(move |msg| {
+            Box::pin(async move {
+                let iface = msg.body.get("interface").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(enabled) = msg.body.get("enabled").and_then(|v| v.as_bool()) else {
+                    return Ok(Message::error(
+                        msg.header.message_id,
+                        "setInterfaceEnabled needs boolean `enabled`",
+                    ));
+                };
+                match services::network::NetworkService::set_interface_enabled(iface, enabled) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        "org.geckoOS.network",
+        "setDNS",
+        handler(move |msg| {
+            Box::pin(async move {
+                let nameservers: Vec<String> = msg
+                    .body
+                    .get("nameservers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match services::network::NetworkService::set_dns(&nameservers) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    bus.router().register_handler(
+        "org.geckoOS.network",
+        "setHostname",
+        handler(move |msg| {
+            Box::pin(async move {
+                let hostname = msg.body.get("hostname").and_then(|v| v.as_str()).unwrap_or("");
+                match services::network::NetworkService::set_hostname(hostname) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
@@ -2122,7 +2850,7 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
         tracing::warn!("nova: initial registry scan failed: {}", e);
     }
 
-    // Launch(appId, params?) -> { sessionId, appId, raised, windowId? }
+    // Launch(appId, params?, windowId?) -> { sessionId, appId, raised, windowId? }
     bus.router().register_handler(
         "org.geckoOS.nova",
         "Launch",
@@ -2130,7 +2858,16 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
             Box::pin(async move {
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 let params = msg.body.get("params").cloned();
-                match services::Nova::global().launch(app_id, params).await {
+                let window_id = msg
+                    .body
+                    .get("windowId")
+                    .or_else(|| msg.body.get("window_id"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok());
+                match services::Nova::global()
+                    .launch_with_window(app_id, params, window_id)
+                    .await
+                {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
@@ -2155,16 +2892,21 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
         .into(),
     );
 
-    // Focus(appId) -> { appId, sessionId, windowId } — raise + give keyboard
-    // focus to an already-running app's real compositor window (see
-    // Nova::focus's doc comment for why this exists alongside Launch/Close).
+    // Focus(appId, windowId?) -> { appId, sessionId, windowId } — restore + raise +
+    // focus an already-running app's real compositor window.
     bus.router().register_handler(
         "org.geckoOS.nova",
         "Focus",
         handler(move |msg| {
             Box::pin(async move {
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
-                match services::Nova::global().focus(app_id).await {
+                let window_id = msg
+                    .body
+                    .get("windowId")
+                    .or_else(|| msg.body.get("window_id"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok());
+                match services::Nova::global().focus_window(app_id, window_id).await {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
@@ -2215,6 +2957,79 @@ async fn register_nova_handlers(bus: &Arc<IPCBus>) -> Result<(), Box<dyn std::er
             Box::pin(async move {
                 let app_id = msg.body.get("appId").and_then(|v| v.as_str()).unwrap_or("");
                 match services::Nova::global().get_info(app_id) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // GetAppIcon(id | appId) -> { id, dataUrl, mimeType }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "GetAppIcon",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg
+                    .body
+                    .get("id")
+                    .or_else(|| msg.body.get("appId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match services::Nova::global().get_app_icon(app_id) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // GetPermissions(appId?) -> { id, declared, revoked, effective } | { apps: [...] }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "GetPermissions",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg
+                    .body
+                    .get("appId")
+                    .or_else(|| msg.body.get("id"))
+                    .and_then(|v| v.as_str());
+                match services::Nova::global().get_permissions(app_id) {
+                    Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
+                    Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
+                }
+            })
+        })
+        .into(),
+    );
+
+    // SetPermission(appId, permission, granted) -> { id, declared, revoked, effective }
+    bus.router().register_handler(
+        "org.geckoOS.nova",
+        "SetPermission",
+        handler(move |msg| {
+            Box::pin(async move {
+                let app_id = msg
+                    .body
+                    .get("appId")
+                    .or_else(|| msg.body.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let permission = msg
+                    .body
+                    .get("permission")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let Some(granted) = msg.body.get("granted").and_then(|v| v.as_bool()) else {
+                    return Ok(Message::error(
+                        msg.header.message_id,
+                        "Missing 'granted' boolean parameter",
+                    ));
+                };
+                match services::Nova::global().set_permission(app_id, permission, granted) {
                     Ok(result) => Ok(Message::method_return(msg.header.message_id, result)),
                     Err(e) => Ok(Message::error(msg.header.message_id, &format!("{e:#}"))),
                 }
@@ -2518,4 +3333,39 @@ fn print_startup_info() {
     println!("║ Status: READY                          ║");
     println!("╚════════════════════════════════════════╝");
     println!();
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+    use geckoOS_echo::security::Tier;
+
+    #[test]
+    fn root_never_holds() {
+        let b = json!({"path": "/tmp/x.ipk"});
+        assert_eq!(hold_decision(Tier::Root, None, "org.geckoOS.installer", "Install", &b), Hold::None);
+    }
+
+    #[test]
+    fn shell_holds_as_bloom_and_app_as_its_id() {
+        let b = json!({"path": "/tmp/x.ipk"});
+        match hold_decision(Tier::Shell, None, "org.geckoOS.installer", "Install", &b) {
+            Hold::Ask(id, req) => {
+                assert_eq!(id, "bloom");
+                assert_eq!(req.action, "package.install");
+            }
+            other => panic!("{other:?}"),
+        }
+        match hold_decision(Tier::App, Some("settings"), "org.geckoOS.installer", "Install", &b) {
+            Hold::Ask(id, _) => assert_eq!(id, "settings"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_app_is_refused_and_plain_calls_pass() {
+        let b = json!({"path": "/tmp/x.ipk"});
+        assert_eq!(hold_decision(Tier::App, None, "org.geckoOS.installer", "Install", &b), Hold::Refuse);
+        assert_eq!(hold_decision(Tier::Shell, None, "org.geckoOS.audio", "setVolume", &json!({})), Hold::None);
+    }
 }

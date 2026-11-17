@@ -39,10 +39,10 @@ impl ProcessService {
     }
 
     pub fn kill(pid: u32, signal: Option<&str>) -> Result<Value> {
-        let signal = signal.unwrap_or("SIGTERM");
-        
+        let arg = kill_signal_arg(signal.unwrap_or("TERM"))?;
+
         let mut cmd = Command::new("kill");
-        cmd.arg(format!("-{}", signal))
+        cmd.arg(format!("-{}", arg))
             .arg(pid.to_string());
 
         cmd.output()
@@ -51,15 +51,15 @@ impl ProcessService {
         Ok(json!({
             "success": true,
             "pid": pid,
-            "signal": signal
+            "signal": signal_display(&arg)
         }))
     }
 
     pub fn kill_group(pgid: u32, signal: Option<&str>) -> Result<Value> {
-        let signal = signal.unwrap_or("SIGTERM");
-        
+        let arg = kill_signal_arg(signal.unwrap_or("TERM"))?;
+
         Command::new("kill")
-            .arg(format!("-{}", signal))
+            .arg(format!("-{}", arg))
             .arg(format!("-{}", pgid))
             .output()
             .map_err(|e| anyhow!("Failed to kill process group {}: {}", pgid, e))?;
@@ -67,7 +67,7 @@ impl ProcessService {
         Ok(json!({
             "success": true,
             "pgid": pgid,
-            "signal": signal
+            "signal": signal_display(&arg)
         }))
     }
 
@@ -152,6 +152,38 @@ impl ProcessService {
     }
 }
 
+/// Signal names `kill` may be asked for. Anything else is refused.
+const KNOWN_SIGNALS: &[&str] = &["TERM", "KILL", "INT", "HUP", "STOP", "CONT", "USR1", "USR2"];
+
+/// Turn caller text into the argument `kill` takes after its dash: a known
+/// signal name (any case, with or without `SIG`) or a number 1-64. Anything
+/// else is refused, so caller text never reaches `kill`'s argv unchecked.
+fn kill_signal_arg(signal: &str) -> Result<String> {
+    let s = signal.trim();
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        return match s.parse::<u8>() {
+            Ok(n) if (1..=64).contains(&n) => Ok(n.to_string()),
+            _ => Err(anyhow!("Signal number must be 1-64, got `{}`", s)),
+        };
+    }
+    let upper = s.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if KNOWN_SIGNALS.contains(&name) {
+        Ok(name.to_string())
+    } else {
+        Err(anyhow!("Unsupported signal `{}`", s))
+    }
+}
+
+/// Reply form of a validated signal: `SIGTERM` for a name, `15` for a number.
+fn signal_display(arg: &str) -> String {
+    if arg.bytes().all(|b| b.is_ascii_digit()) {
+        arg.to_string()
+    } else {
+        format!("SIG{}", arg)
+    }
+}
+
 fn parse_ps_line(line: &str) -> Option<Value> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     
@@ -172,4 +204,43 @@ fn parse_ps_line(line: &str) -> Option<Value> {
         "time": parts[9],
         "command": parts[10..].join(" ")
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_known_signal_names_in_any_form() {
+        assert_eq!(kill_signal_arg("TERM").unwrap(), "TERM");
+        assert_eq!(kill_signal_arg("SIGKILL").unwrap(), "KILL");
+        assert_eq!(kill_signal_arg("sigint").unwrap(), "INT");
+        assert_eq!(kill_signal_arg("Hup").unwrap(), "HUP");
+        assert_eq!(kill_signal_arg("usr1").unwrap(), "USR1");
+        assert_eq!(kill_signal_arg("SIGCONT").unwrap(), "CONT");
+        assert_eq!(kill_signal_arg("STOP").unwrap(), "STOP");
+    }
+
+    #[test]
+    fn accepts_numbers_from_1_to_64() {
+        assert_eq!(kill_signal_arg("1").unwrap(), "1");
+        assert_eq!(kill_signal_arg("15").unwrap(), "15");
+        assert_eq!(kill_signal_arg("64").unwrap(), "64");
+    }
+
+    #[test]
+    fn refuses_everything_else() {
+        for bad in [
+            "", "SIG", "0", "65", "1000", "-9", "TERM -9", "KILL;reboot",
+            "$(id)", "--", "-TERM", "SIGFOO", "9 HUP", "`reboot`",
+        ] {
+            assert!(kill_signal_arg(bad).is_err(), "should refuse {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn kill_refuses_a_bad_signal_before_running_anything() {
+        assert!(ProcessService::kill(1, Some("-9 --all")).is_err());
+        assert!(ProcessService::kill_group(1, Some("bogus")).is_err());
+    }
 }

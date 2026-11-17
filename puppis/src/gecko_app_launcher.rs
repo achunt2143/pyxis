@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::Mutex;
 use anyhow::{Result, anyhow};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 use serde_json::json;
 use std::time::{SystemTime, Duration};
 

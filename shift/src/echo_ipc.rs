@@ -5,36 +5,92 @@
 //! - Method call handling for process operations
 //! - Signal emission for process lifecycle events
 
-use anyhow::{Result, anyhow};
-use tracing::{debug, info, warn, error};
+use anyhow::{anyhow, Result};
+use dashmap::DashMap;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use tracing::{debug, info, warn};
 
 use geckoOS_echo::{
-    EchoClient, ServiceInterface, MethodDefinition, SignalDefinition,
-    ArgumentDefinition,
+    ArgumentDefinition, EchoClient, MethodDefinition, ServiceInterface, SignalDefinition,
 };
+
+use crate::lifecycle::{LifecycleEvent, ProcessLifecycle};
+use crate::process::{Process, ProcessState};
+use crate::resources::{ResourceLimit, ResourceManager};
+use crate::signals::SignalHandler;
+use crate::tree::ProcessTree;
+use crate::ProcessLaunchConfig;
 
 /// ECHO IPC service for process management
 #[derive(Clone)]
 pub struct ShiftEchoService {
     service_name: String,
     client: Option<Arc<TokioMutex<EchoClient>>>,
+    processes: Arc<DashMap<u32, Arc<Process>>>,
+    process_tree: Arc<RwLock<ProcessTree>>,
+    resource_manager: Arc<ResourceManager>,
+    signal_handler: Arc<SignalHandler>,
+    lifecycle: Arc<ProcessLifecycle>,
+    next_pid: Arc<ParkingMutex<u32>>,
 }
 
 impl ShiftEchoService {
-    /// Create new CRONUS ECHO service (does not connect yet)
+    /// Create new Shift ECHO service with isolated state (does not connect yet).
     pub fn new() -> Result<Self> {
-        debug!("Initializing CRONUS ECHO service");
-        
+        let processes = Arc::new(DashMap::new());
+        let process_tree = Arc::new(RwLock::new(ProcessTree::new()));
+        let resource_manager = Arc::new(ResourceManager::new()?);
+        let signal_handler = Arc::new(SignalHandler::new()?);
+        let lifecycle = Arc::new(ProcessLifecycle::new());
+        let next_pid = Arc::new(ParkingMutex::new(1000));
+        Self::with_state(
+            processes,
+            process_tree,
+            resource_manager,
+            signal_handler,
+            lifecycle,
+            next_pid,
+        )
+    }
+
+    /// Create a Shift ECHO service sharing state with a `Shift` instance.
+    pub fn with_state(
+        processes: Arc<DashMap<u32, Arc<Process>>>,
+        process_tree: Arc<RwLock<ProcessTree>>,
+        resource_manager: Arc<ResourceManager>,
+        signal_handler: Arc<SignalHandler>,
+        lifecycle: Arc<ProcessLifecycle>,
+        next_pid: Arc<ParkingMutex<u32>>,
+    ) -> Result<Self> {
+        debug!("Initializing Shift ECHO service");
+
         let service = ShiftEchoService {
             service_name: "org.geckoOS.Shift".to_string(),
             client: None,
+            processes,
+            process_tree,
+            resource_manager,
+            signal_handler,
+            lifecycle,
+            next_pid,
         };
 
-        info!("CRONUS service created: {}", service.service_name);
+        info!("Shift service created: {}", service.service_name);
         Ok(service)
+    }
+
+    fn allocate_pid(&self) -> u32 {
+        let mut next = self.next_pid.lock();
+        let pid = *next;
+        *next += 1;
+        if *next > 65535 {
+            *next = 1000;
+        }
+        pid
     }
 
     /// Register with ECHO bus (async)
@@ -372,27 +428,82 @@ impl ShiftEchoService {
         args: &str,
         env: serde_json::Value,
     ) -> Result<u32> {
+        let app_id = app_id.trim();
+        if app_id.is_empty() {
+            return Err(anyhow!("LaunchProcess requires non-empty app_id"));
+        }
         debug!("LaunchProcess called: app_id={}, args={}", app_id, args);
 
-        // TODO: Integrate with actual process launcher
-        // For now, generate a mock PID
-        let pid = 1000u32;
+        let parsed_args: Vec<String> = if args.trim().is_empty() {
+            Vec::new()
+        } else {
+            args.split_whitespace().map(str::to_string).collect()
+        };
+        let mut env_map = HashMap::new();
+        if let Some(obj) = env.as_object() {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    env_map.insert(k.clone(), s.to_string());
+                } else {
+                    env_map.insert(k.clone(), v.to_string());
+                }
+            }
+        }
+        let parent_pid = env
+            .get("parent_pid")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u32);
 
-        // Emit signal
+        let pid = self.allocate_pid();
+        let config = ProcessLaunchConfig {
+            app_id: app_id.to_string(),
+            executable: app_id.to_string(),
+            args: parsed_args,
+            env: env_map,
+            parent_pid,
+            ..Default::default()
+        };
+
+        let process = Process::new(pid, None, config)?;
+        process.update_state(ProcessState::Running);
+        self.processes.insert(pid, Arc::new(process));
+        {
+            let mut tree = self.process_tree.write();
+            tree.add_process(pid, parent_pid, app_id)?;
+        }
+        self.resource_manager.account_process(pid)?;
+        self.signal_handler.register_handler(pid)?;
+        self.lifecycle.record_event(pid, LifecycleEvent::Started)?;
+
         self.emit_process_created(pid, app_id).await?;
 
         info!("Process launched: app_id={}, pid={}", app_id, pid);
         Ok(pid)
     }
 
+    fn cleanup_terminated_process(&self, pid: u32, process: &Process, signal: i32) -> Result<()> {
+        if process.os_pid.is_some() {
+            process.send_signal(signal)?;
+        }
+        self.lifecycle.record_event(pid, LifecycleEvent::Terminated)?;
+        self.resource_manager.cleanup_process(pid)?;
+        self.signal_handler.unregister_handler(pid)?;
+        let mut tree = self.process_tree.write();
+        let _ = tree.remove_process(pid);
+        Ok(())
+    }
+
     /// Handle TerminateProcess method call
     pub async fn handle_terminate_process(&self, pid: u32) -> Result<i32> {
         debug!("TerminateProcess called: pid={}", pid);
 
-        // TODO: Integrate with actual process manager
-        let exit_code = 0;
+        let (_k, process) = self
+            .processes
+            .remove(&pid)
+            .ok_or_else(|| anyhow!("Process {} not found", pid))?;
+        self.cleanup_terminated_process(pid, &process, libc::SIGTERM)?;
 
-        // Emit signal
+        let exit_code = 0;
         self.emit_process_terminated(pid, exit_code).await?;
 
         info!("Process terminated: pid={}, exit_code={}", pid, exit_code);
@@ -403,8 +514,20 @@ impl ShiftEchoService {
     pub async fn handle_kill_process(&self, pid: u32, signal: i32) -> Result<()> {
         debug!("KillProcess called: pid={}, signal={}", pid, signal);
 
-        // TODO: Integrate with actual process manager
-        // Send signal to process
+        if signal == libc::SIGKILL || signal == libc::SIGTERM {
+            let (_k, process) = self
+                .processes
+                .remove(&pid)
+                .ok_or_else(|| anyhow!("Process {} not found", pid))?;
+            self.cleanup_terminated_process(pid, &process, signal)?;
+            self.emit_process_terminated(pid, 128 + signal).await?;
+        } else {
+            let process = self
+                .processes
+                .get(&pid)
+                .ok_or_else(|| anyhow!("Process {} not found", pid))?;
+            process.send_signal(signal)?;
+        }
 
         info!("Process killed: pid={}, signal={}", pid, signal);
         Ok(())
@@ -414,8 +537,15 @@ impl ShiftEchoService {
     pub async fn handle_suspend_process(&self, pid: u32) -> Result<()> {
         debug!("SuspendProcess called: pid={}", pid);
 
-        // TODO: Integrate with actual process manager
-        // Suspend/pause the process
+        let process = self
+            .processes
+            .get(&pid)
+            .ok_or_else(|| anyhow!("Process {} not found", pid))?;
+        if process.os_pid.is_some() {
+            process.send_signal(libc::SIGSTOP)?;
+        }
+        process.update_state(ProcessState::Suspended);
+        self.lifecycle.record_event(pid, LifecycleEvent::Suspended)?;
 
         self.emit_process_suspended(pid).await?;
 
@@ -427,8 +557,15 @@ impl ShiftEchoService {
     pub async fn handle_resume_process(&self, pid: u32) -> Result<()> {
         debug!("ResumeProcess called: pid={}", pid);
 
-        // TODO: Integrate with actual process manager
-        // Resume/unpause the process
+        let process = self
+            .processes
+            .get(&pid)
+            .ok_or_else(|| anyhow!("Process {} not found", pid))?;
+        if process.os_pid.is_some() {
+            process.send_signal(libc::SIGCONT)?;
+        }
+        process.update_state(ProcessState::Running);
+        self.lifecycle.record_event(pid, LifecycleEvent::Resumed)?;
 
         self.emit_process_resumed(pid).await?;
 
@@ -440,57 +577,90 @@ impl ShiftEchoService {
     pub async fn handle_get_process(&self, pid: u32) -> Result<serde_json::Value> {
         debug!("GetProcess called: pid={}", pid);
 
-        // TODO: Get actual process info
-        let process_info = json!({
-            "pid": pid,
-            "state": "running",
-            "memory_mb": 128,
-            "cpu_percent": 5.0,
-        });
+        let process = self
+            .processes
+            .get(&pid)
+            .ok_or_else(|| anyhow!("Process {} not found", pid))?;
+        let info = process.get_info();
+        let usage = self.resource_manager.get_usage(pid).ok();
+        let limits = self.resource_manager.get_limits(pid);
 
-        Ok(process_info)
+        Ok(json!({
+            "pid": info.pid,
+            "os_pid": process.os_pid,
+            "app_id": info.app_id,
+            "executable": info.executable,
+            "state": info.state_string().to_lowercase(),
+            "created_at": info.created_at,
+            "uptime_seconds": info.uptime_seconds,
+            "memory_mb": usage.as_ref().map(|u| u.memory_mb).unwrap_or(0),
+            "cpu_percent": usage.as_ref().map(|u| u.cpu_percent).unwrap_or(0.0),
+            "limits": limits,
+        }))
     }
 
     /// Handle ListProcesses method call
     pub async fn handle_list_processes(&self) -> Result<serde_json::Value> {
         debug!("ListProcesses called");
 
-        // TODO: Get list of all processes
-        let processes = json!([
-            { "pid": 1000, "app_id": "firefox", "state": "running" },
-            { "pid": 1001, "app_id": "thunderbird", "state": "running" },
-        ]);
+        let mut list: Vec<serde_json::Value> = self
+            .processes
+            .iter()
+            .map(|entry| {
+                let p = entry.value();
+                let info = p.get_info();
+                json!({
+                    "pid": info.pid,
+                    "os_pid": p.os_pid,
+                    "app_id": info.app_id,
+                    "executable": info.executable,
+                    "state": info.state_string().to_lowercase(),
+                    "created_at": info.created_at,
+                    "uptime_seconds": info.uptime_seconds,
+                })
+            })
+            .collect();
+        list.sort_by_key(|v| v["pid"].as_u64().unwrap_or(0));
 
-        Ok(processes)
+        Ok(serde_json::Value::Array(list))
     }
 
     /// Handle GetProcessTree method call
     pub async fn handle_get_process_tree(&self, parent_pid: u32) -> Result<serde_json::Value> {
         debug!("GetProcessTree called: parent_pid={}", parent_pid);
 
-        // TODO: Build process tree
-        let tree = json!({
-            "pid": parent_pid,
-            "children": [],
-        });
+        let tree = self.process_tree.read();
+        if parent_pid == 0 {
+            let nodes = tree.get_tree_structure();
+            return Ok(json!({ "nodes": nodes }));
+        }
+        let node = tree.get_process_node(parent_pid);
+        let children = tree.get_children(parent_pid);
+        let descendants = tree.get_descendants(parent_pid);
 
-        Ok(tree)
+        Ok(json!({
+            "pid": parent_pid,
+            "node": node,
+            "children": children,
+            "descendants": descendants,
+        }))
     }
 
     /// Handle GetResourceUsage method call
     pub async fn handle_get_resource_usage(&self, pid: u32) -> Result<serde_json::Value> {
         debug!("GetResourceUsage called: pid={}", pid);
 
-        // TODO: Get actual resource usage
-        let usage = json!({
-            "pid": pid,
-            "memory_mb": 128,
-            "cpu_percent": 5.0,
-            "fds": 32,
-            "threads": 8,
-        });
-
-        Ok(usage)
+        let usage = self.resource_manager.get_usage(pid)?;
+        Ok(json!({
+            "pid": usage.pid,
+            "memory_mb": usage.memory_mb,
+            "cpu_percent": usage.cpu_percent,
+            "cpu_time_ms": usage.cpu_time_ms,
+            "io_read_bytes": usage.io_read_bytes,
+            "io_write_bytes": usage.io_write_bytes,
+            "fds": usage.num_fds,
+            "threads": usage.num_threads,
+        }))
     }
 
     /// Handle SetResourceLimits method call
@@ -501,7 +671,39 @@ impl ShiftEchoService {
     ) -> Result<()> {
         debug!("SetResourceLimits called: pid={}, limits={:?}", pid, limits);
 
-        // TODO: Set actual resource limits
+        if !self.processes.contains_key(&pid) {
+            return Err(anyhow!("Process {} not found", pid));
+        }
+
+        let current = self.resource_manager.get_limits(pid).unwrap_or_default();
+        let updated = ResourceLimit {
+            memory_limit_mb: limits
+                .get("memory_limit_mb")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(current.memory_limit_mb),
+            cpu_shares: limits
+                .get("cpu_shares")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(current.cpu_shares),
+            io_priority: limits
+                .get("io_priority")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u8)
+                .unwrap_or(current.io_priority),
+            max_fds: limits
+                .get("max_fds")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(current.max_fds),
+            max_threads: limits
+                .get("max_threads")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(current.max_threads),
+        };
+        self.resource_manager.set_limits(pid, updated)?;
         info!("Resource limits set for pid={}", pid);
         Ok(())
     }
@@ -561,13 +763,56 @@ mod tests {
     #[tokio::test]
     async fn test_method_handlers() {
         let service = ShiftEchoService::new().unwrap();
-        
-        assert!(service
-            .handle_launch_process("firefox", "about:blank", json!({}))
+
+        // Starts empty — no fabricated processes.
+        let initial = service.handle_list_processes().await.unwrap();
+        assert_eq!(initial.as_array().unwrap().len(), 0);
+        assert!(service.handle_get_process(1000).await.is_err());
+
+        let pid = service
+            .handle_launch_process("files", "--open /etc", json!({}))
             .await
-            .is_ok());
-        assert!(service.handle_terminate_process(1000).await.is_ok());
-        assert!(service.handle_suspend_process(1000).await.is_ok());
-        assert!(service.handle_resume_process(1000).await.is_ok());
+            .unwrap();
+        assert_eq!(pid, 1000);
+
+        let child_pid = service
+            .handle_launch_process("notes", "", json!({ "parent_pid": pid }))
+            .await
+            .unwrap();
+        assert_eq!(child_pid, 1001);
+
+        let listed = service.handle_list_processes().await.unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+
+        let info = service.handle_get_process(pid).await.unwrap();
+        assert_eq!(info["app_id"], "files");
+        assert_eq!(info["state"], "running");
+
+        let tree = service.handle_get_process_tree(pid).await.unwrap();
+        assert_eq!(tree["children"], json!([child_pid]));
+
+        service
+            .handle_set_resource_limits(pid, json!({ "memory_limit_mb": 512 }))
+            .await
+            .unwrap();
+        let info_after_limits = service.handle_get_process(pid).await.unwrap();
+        assert_eq!(info_after_limits["limits"]["memory_limit_mb"], 512);
+
+        let usage = service.handle_get_resource_usage(pid).await.unwrap();
+        assert_eq!(usage["pid"], pid);
+
+        service.handle_suspend_process(pid).await.unwrap();
+        assert_eq!(service.handle_get_process(pid).await.unwrap()["state"], "suspended");
+
+        service.handle_resume_process(pid).await.unwrap();
+        assert_eq!(service.handle_get_process(pid).await.unwrap()["state"], "running");
+
+        service.handle_terminate_process(child_pid).await.unwrap();
+        service.handle_terminate_process(pid).await.unwrap();
+        assert!(service.handle_get_process(pid).await.is_err());
+        assert_eq!(
+            service.handle_list_processes().await.unwrap().as_array().unwrap().len(),
+            0
+        );
     }
 }

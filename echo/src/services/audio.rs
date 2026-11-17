@@ -20,8 +20,11 @@ use super::sound::as_session_user;
 pub const AUDIO_IFACE: &str = "org.geckoOS.audio";
 pub const SIGNAL_VOLUME_CHANGED: &str = "VolumeChanged";
 pub const SIGNAL_OUTPUT_CHANGED: &str = "OutputChanged";
+pub const SIGNAL_INPUT_VOLUME_CHANGED: &str = "InputVolumeChanged";
+pub const SIGNAL_INPUT_CHANGED: &str = "InputChanged";
 
 const DEFAULT_SINK: &str = "@DEFAULT_AUDIO_SINK@";
+const DEFAULT_SOURCE: &str = "@DEFAULT_AUDIO_SOURCE@";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Volume {
@@ -44,25 +47,55 @@ pub struct Output {
 pub struct AudioService;
 
 impl AudioService {
+    async fn volume_for(target: &str) -> Result<Volume> {
+        parse_volume(&run("wpctl", &["get-volume", target]).await?)
+    }
+
+    async fn set_volume_for(target: &str, volume: u8) -> Result<Volume> {
+        let level = format!("{:.2}", f64::from(volume.min(100)) / 100.0);
+        run("wpctl", &["set-volume", "-l", "1.0", target, &level]).await?;
+        Self::volume_for(target).await
+    }
+
+    async fn set_mute_for(target: &str, muted: bool) -> Result<Volume> {
+        run("wpctl", &["set-mute", target, if muted { "1" } else { "0" }]).await?;
+        Self::volume_for(target).await
+    }
+
     pub async fn volume() -> Result<Volume> {
-        parse_volume(&run("wpctl", &["get-volume", DEFAULT_SINK]).await?)
+        Self::volume_for(DEFAULT_SINK).await
     }
 
     pub async fn set_volume(volume: u8) -> Result<Volume> {
-        let level = format!("{:.2}", f64::from(volume.min(100)) / 100.0);
-        run("wpctl", &["set-volume", "-l", "1.0", DEFAULT_SINK, &level]).await?;
-        Self::volume().await
+        Self::set_volume_for(DEFAULT_SINK, volume).await
     }
 
     pub async fn set_mute(muted: bool) -> Result<Volume> {
-        run("wpctl", &["set-mute", DEFAULT_SINK, if muted { "1" } else { "0" }]).await?;
-        Self::volume().await
+        Self::set_mute_for(DEFAULT_SINK, muted).await
+    }
+
+    pub async fn input_volume() -> Result<Volume> {
+        Self::volume_for(DEFAULT_SOURCE).await
+    }
+
+    pub async fn set_input_volume(volume: u8) -> Result<Volume> {
+        Self::set_volume_for(DEFAULT_SOURCE, volume).await
+    }
+
+    pub async fn set_input_mute(muted: bool) -> Result<Volume> {
+        Self::set_mute_for(DEFAULT_SOURCE, muted).await
     }
 
     pub async fn outputs() -> Result<Vec<Output>> {
         let dump: Value = serde_json::from_str(&run("pw-dump", &[]).await?)
             .map_err(|e| anyhow!("pw-dump gave no JSON: {e}"))?;
         Ok(parse_outputs(&dump))
+    }
+
+    pub async fn inputs() -> Result<Vec<Output>> {
+        let dump: Value = serde_json::from_str(&run("pw-dump", &[]).await?)
+            .map_err(|e| anyhow!("pw-dump gave no JSON: {e}"))?;
+        Ok(parse_inputs(&dump))
     }
 
     /// Make `id` the default output. It must be one of `outputs()`: `wpctl
@@ -74,6 +107,15 @@ impl AudioService {
         }
         run("wpctl", &["set-default", &id.to_string()]).await?;
         Self::outputs().await
+    }
+
+    /// Make `id` the default microphone/input.
+    pub async fn set_default_input(id: u32) -> Result<Vec<Output>> {
+        if !Self::inputs().await?.iter().any(|i| i.id == id) {
+            return Err(anyhow!("no audio input with id {id}"));
+        }
+        run("wpctl", &["set-default", &id.to_string()]).await?;
+        Self::inputs().await
     }
 }
 
@@ -111,20 +153,20 @@ fn parse_volume(line: &str) -> Result<Volume> {
     })
 }
 
-/// The audio sinks in a `pw-dump`, marked with which one the "default"
-/// metadata names as `default.audio.sink`.
-fn parse_outputs(dump: &Value) -> Vec<Output> {
+/// PipeWire nodes matching `media_class`, marked with the `default` metadata
+/// key (`default.audio.sink` or `default.audio.source`).
+fn parse_nodes_by_class(dump: &Value, media_class: &str, metadata_key: &str) -> Vec<Output> {
     let objects = dump.as_array().map(Vec::as_slice).unwrap_or(&[]);
     let default_name = objects
         .iter()
         .filter(|o| o["type"] == "PipeWire:Interface:Metadata" && o["props"]["metadata.name"] == "default")
         .flat_map(|o| o["metadata"].as_array().into_iter().flatten())
-        .find(|entry| entry["key"] == "default.audio.sink")
+        .find(|entry| entry["key"] == metadata_key)
         .and_then(|entry| entry["value"]["name"].as_str());
-    let mut outputs: Vec<Output> = objects
+    let mut nodes: Vec<Output> = objects
         .iter()
         .filter(|o| o["type"] == "PipeWire:Interface:Node")
-        .filter(|o| o["info"]["props"]["media.class"] == "Audio/Sink")
+        .filter(|o| o["info"]["props"]["media.class"] == media_class)
         .filter_map(|o| {
             let props = &o["info"]["props"];
             let name = props["node.name"].as_str()?.to_owned();
@@ -136,8 +178,19 @@ fn parse_outputs(dump: &Value) -> Vec<Output> {
             })
         })
         .collect();
-    outputs.sort_by_key(|o| o.id);
-    outputs
+    nodes.sort_by_key(|o| o.id);
+    nodes
+}
+
+/// The audio sinks in a `pw-dump`, marked with which one the "default"
+/// metadata names as `default.audio.sink`.
+fn parse_outputs(dump: &Value) -> Vec<Output> {
+    parse_nodes_by_class(dump, "Audio/Sink", "default.audio.sink")
+}
+
+/// The audio sources (microphones) in a `pw-dump`, marked with `default.audio.source`.
+fn parse_inputs(dump: &Value) -> Vec<Output> {
+    parse_nodes_by_class(dump, "Audio/Source", "default.audio.source")
 }
 
 #[cfg(test)]
@@ -180,5 +233,28 @@ mod tests {
     fn a_graph_with_no_sinks_is_an_empty_list() {
         assert!(parse_outputs(&json!([])).is_empty());
         assert!(parse_outputs(&json!({"not": "an array"})).is_empty());
+        assert!(parse_inputs(&json!([])).is_empty());
+    }
+
+    #[test]
+    fn lists_sources_only_and_marks_the_default_input() {
+        let dump = json!([
+            { "id": 32, "type": "PipeWire:Interface:Node", "info": { "props": {
+                "media.class": "Audio/Sink", "node.name": "speaker" } } },
+            { "id": 33, "type": "PipeWire:Interface:Node", "info": { "props": {
+                "media.class": "Audio/Source", "node.name": "alsa_input.mic",
+                "node.description": "Internal Microphone" } } },
+            { "id": 34, "type": "PipeWire:Interface:Node", "info": { "props": {
+                "media.class": "Audio/Source", "node.name": "usb_mic" } } },
+            { "id": 50, "type": "PipeWire:Interface:Metadata", "props": { "metadata.name": "default" },
+              "metadata": [ { "key": "default.audio.source",
+                              "value": { "name": "alsa_input.mic" } } ] }
+        ]);
+        let inputs = parse_inputs(&dump);
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].is_default);
+        assert_eq!(inputs[0].description, "Internal Microphone");
+        assert!(!inputs[1].is_default);
+        assert_eq!(inputs[1].description, "usb_mic");
     }
 }

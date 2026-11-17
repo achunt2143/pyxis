@@ -42,14 +42,10 @@ impl FilesystemService {
     /// service below. A `scope` that is present but not understood is
     /// refused, never taken for no scope at all.
     pub async fn call(method: &str, body: &Value) -> Result<Value> {
-        match body.get("scope") {
-            Some(scope) => {
-                let scope = scope
-                    .as_str()
-                    .ok_or_else(|| anyhow!("a filesystem scope is a string, not {scope}"))?;
-                scope::call(scope::Scope::parse(scope)?, method, body).await
-            }
-            None => Self::call_unscoped(method, body),
+        if body.get("scope").is_some() {
+            scope::call(scope::Scope::from_body(body)?, method, body).await
+        } else {
+            Self::call_unscoped(method, body)
         }
     }
 
@@ -458,7 +454,7 @@ fn unix_secs(time: std::io::Result<std::time::SystemTime>) -> Option<u64> {
 /// Hand-rolled rather than pulling in the `base64` crate for this one call
 /// site, matching the same call made for sha256 in `nova.rs`. Unlike that one
 /// this can't shell out -- it runs per `readFile`, on the bus thread.
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -514,19 +510,6 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(target_os = "unix")]
-trait MetadataExt {
-    fn mode(&self) -> u32;
-}
-
-#[cfg(target_os = "unix")]
-impl MetadataExt for std::fs::Metadata {
-    fn mode(&self) -> u32 {
-        use std::os::unix::fs::MetadataExt as UnixMetadataExt;
-        UnixMetadataExt::mode(self)
-    }
 }
 
 #[cfg(test)]

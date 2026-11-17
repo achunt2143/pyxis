@@ -185,14 +185,10 @@ impl DeviceInfoService {
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
             .map_err(|e| anyhow!("Failed to read /proc/cpuinfo: {}", e))?;
 
-        let mut count = 0;
         let mut model = String::new();
         let mut frequency = String::new();
 
         for line in cpuinfo.lines() {
-            if line.starts_with("processor") {
-                count += 1;
-            }
             if line.starts_with("model name") && model.is_empty() {
                 if let Some(val) = line.split(':').nth(1) {
                     model = val.trim().to_string();

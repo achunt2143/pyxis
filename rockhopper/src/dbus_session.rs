@@ -85,10 +85,10 @@ impl DBusSessionManager {
     pub async fn call_method(
         &self,
         service: &str,
-        object: &str,
+        _object: &str,
         interface: &str,
         method: &str,
-        args: serde_json::Value,
+        _args: serde_json::Value,
     ) -> Result<serde_json::Value> {
         if !self.enabled {
             return Err(anyhow::anyhow!("D-Bus disabled"));
@@ -109,7 +109,7 @@ impl DBusSessionManager {
     pub async fn listen_signal(
         &self,
         service: &str,
-        object: &str,
+        _object: &str,
         interface: &str,
         signal: &str,
     ) -> Result<()> {

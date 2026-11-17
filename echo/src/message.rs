@@ -4,10 +4,52 @@ use uuid::Uuid;
 use chrono::Utc;
 
 /// Represents a full message with header and body
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand (below) so a call that carries a password never
+/// prints its body: the router and the daemon log whole messages at debug, and
+/// echo-daemon runs at that level.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Message {
     pub header: MessageHeader,
     pub body: serde_json::Value,
+}
+
+/// The calls whose arguments are a password, as `(destination, method)`. Their
+/// bodies are never logged (see `Message::body_is_secret`).
+pub const SECRET_CALLS: &[(&str, &str)] = &[
+    (crate::services::session::SESSION_IFACE, crate::services::session::METHOD_UNLOCK),
+    (crate::services::accounts::ACCOUNTS_IFACE, crate::services::accounts::METHOD_CREATE),
+    (crate::services::accounts::ACCOUNTS_IFACE, crate::services::accounts::METHOD_SET_PASSWORD),
+    (crate::services::privilege::PRIVILEGE_SERVICE, "Authenticate"),
+    (crate::services::privilege::PRIVILEGE_SERVICE, "authenticate"),
+];
+
+/// What a logged secret body reads as.
+pub const REDACTED: &str = "<redacted>";
+
+impl Message {
+    /// Whether this message's body holds a password. Compared without regard
+    /// to case, so a miscased call (which finds no handler, and is logged as
+    /// "no handler") can't print one either.
+    pub fn body_is_secret(&self) -> bool {
+        SECRET_CALLS.iter().any(|(destination, method)| {
+            self.header.destination.eq_ignore_ascii_case(destination)
+                && self.header.method.eq_ignore_ascii_case(method)
+        })
+    }
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = f.debug_struct("Message");
+        shown.field("header", &self.header);
+        if self.body_is_secret() {
+            shown.field("body", &format_args!("{REDACTED}"));
+        } else {
+            shown.field("body", &self.body);
+        }
+        shown.finish()
+    }
 }
 
 /// Message header with metadata
@@ -172,5 +214,39 @@ mod tests {
         assert!(msg.matches_filter("org.geckoOS.Process", "ProcessTerminated"));
         assert!(msg.matches_filter("org.geckoOS.Process", ""));
         assert!(!msg.matches_filter("org.geckoOS.Other", ""));
+    }
+
+    #[test]
+    fn a_password_call_never_prints_its_body() {
+        let secret = "hunter2-do-not-log";
+        let calls = [
+            ("org.geckoOS.session", "unlock", serde_json::json!({ "password": secret })),
+            ("org.geckoOS.accounts", "setPassword", serde_json::json!({ "user": "u", "current": secret, "new": secret })),
+            // A miscased name finds no handler but must not print either.
+            ("org.geckoOS.SESSION", "Unlock", serde_json::json!({ "password": secret })),
+        ];
+        for (destination, method, body) in calls {
+            let msg = Message::method_call(destination, destination, method, body).unwrap();
+            assert!(msg.body_is_secret(), "{method}");
+            for shown in [format!("{msg:?}"), format!("{msg:#?}")] {
+                assert!(!shown.contains(secret), "{method}: {shown}");
+                assert!(shown.contains(REDACTED), "{method}: {shown}");
+                // The header is still there to debug with.
+                assert!(shown.contains(method), "{method}: {shown}");
+            }
+            // Redaction is for logs: the wire body is untouched.
+            assert!(serde_json::to_string(&msg).unwrap().contains(secret));
+        }
+    }
+
+    #[test]
+    fn other_calls_print_as_before() {
+        let msg = Message::method_call("org.geckoOS.session", "org.geckoOS.session", "lock",
+            serde_json::json!({ "why": "visible" })).unwrap();
+        assert!(!msg.body_is_secret());
+        assert!(format!("{msg:?}").contains("visible"));
+        let msg = Message::method_call("org.geckoOS.accounts", "org.geckoOS.accounts", "setProfile",
+            serde_json::json!({ "display_name": "visible" })).unwrap();
+        assert!(format!("{msg:?}").contains("visible"));
     }
 }

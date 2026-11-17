@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod message;
 pub mod registry;
 pub mod transport;
@@ -5,6 +6,11 @@ pub mod dbus;
 pub mod routing;
 pub mod signals;
 pub mod services;
+pub mod security;
+pub mod signal_policy;
+
+pub const MAX_PENDING_REPLIES: usize = 256;
+pub const FORWARD_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub use message::{Message, MessageType, MessageHeader};
 pub use registry::{ServiceRegistry, ServiceInfo};
@@ -19,7 +25,6 @@ use dashmap::DashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tracing;
 use uuid::Uuid;
 use std::path::{Path, PathBuf};
@@ -83,6 +88,7 @@ pub struct BusConnection {
     pub id: String,
     pub service_name: Option<String>,
     pub connected_at: String,
+    pub peer: security::PeerIdentity,
 }
 
 pub struct ForwardRequest {
@@ -125,12 +131,36 @@ impl IPCBus {
         Ok(())
     }
 
-    /// Register a service on the bus
-    pub async fn register_service(&self, name: &str, interface: ServiceInterface) -> Result<String> {
+    /// Register a service on the bus, enforcing caller registration rules when
+    /// called on behalf of a socket connection.
+    pub async fn register_service(
+        &self,
+        name: &str,
+        interface: ServiceInterface,
+        caller: Option<&security::PeerIdentity>,
+    ) -> Result<String> {
+        if let Some(peer) = caller {
+            security::check_service_registration(peer, name)
+                .map_err(|reason| anyhow::anyhow!("Service registration denied: {}", reason))?;
+        }
+        if let Some(existing_conn) = self.external_services.get(name) {
+            if self.active_connections.contains_key(existing_conn.value()) {
+                return Err(anyhow::anyhow!(
+                    "Service '{}' is already registered by an active connection",
+                    name
+                ));
+            }
+        }
         tracing::info!("Registering service: {}", name);
         let service_id = self.registry.register_service(name, interface).await?;
         tracing::info!("Service registered: {} ({})", name, service_id);
         Ok(service_id)
+    }
+
+    pub fn connection_peer(&self, connection_id: &str) -> Option<security::PeerIdentity> {
+        self.active_connections
+            .get(connection_id)
+            .map(|c| c.peer.clone())
     }
 
      pub async fn register_external_service(
@@ -206,7 +236,16 @@ impl IPCBus {
         self.active_connections.remove(id);
         self.connection_senders.remove(id);
         self.broadcast_senders.remove(id);
-        self.external_services.retain(|_, conn_id| conn_id != id);
+        let owned_services: Vec<String> = self
+            .external_services
+            .iter()
+            .filter(|entry| entry.value() == id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for service_name in &owned_services {
+            self.external_services.remove(service_name);
+            self.registry.remove_service_by_name(service_name);
+        }
     }
 
     /// Pushes `message` out over every currently-connected socket client
@@ -216,8 +255,29 @@ impl IPCBus {
     /// backed up; harmless to ignore since `remove_connection` handles
     /// actual cleanup when a connection closes.
     pub async fn broadcast_to_all_connections(&self, message: &Message) {
-        for entry in self.broadcast_senders.iter() {
-            let _ = entry.value().send(message.clone()).await;
+        // Who hears what is decided by the peer's uid and its app's declared
+        // permissions (signal_policy); the shell's bridge filters per page.
+        let rule = signal_policy::signal_rule(&message.header.interface, &message.header.method);
+        let daemon_uid = rustix::process::geteuid().as_raw();
+        let targets: Vec<(String, mpsc::Sender<Message>)> = self
+            .broadcast_senders
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        for (id, tx) in targets {
+            let Some(peer) = self.connection_peer(&id) else {
+                // Unknown identity: treat as the least privileged.
+                if rule == signal_policy::SignalRule::Public {
+                    let _ = tx.send(message.clone()).await;
+                }
+                continue;
+            };
+            let pid = peer.pid;
+            if signal_policy::may_hear(rule, peer.uid, daemon_uid, || {
+                signal_policy::app_permissions_for_pid(pid)
+            }) {
+                let _ = tx.send(message.clone()).await;
+            }
         }
     }
 
@@ -232,8 +292,16 @@ impl IPCBus {
         sender.send(ForwardRequest { message: msg, response_tx: tx }).await
             .map_err(|_| anyhow::anyhow!("Failed to communicate with connection task"))?;
 
-        // Wait for the specific response to this message
-        rx.await.map_err(|_| anyhow::anyhow!("Connection task dropped the request"))?
+        // Wait for the specific response to this message with a bounded timeout.
+        match tokio::time::timeout(FORWARD_CALL_TIMEOUT, rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(anyhow::anyhow!("Connection task dropped the request")),
+            Err(_) => Err(anyhow::anyhow!(
+                "Forwarded call to connection {} timed out after {}s",
+                target_id,
+                FORWARD_CALL_TIMEOUT.as_secs()
+            )),
+        }
     }
 
     // pub async fn forward_to_connection(
@@ -351,12 +419,14 @@ impl IPCBus {
     /// Handle new client connection
     pub async fn accept_connection(&self) -> Result<(String, UnixStream)> {
         let stream = self.transport.accept().await?;
+        let peer = security::PeerIdentity::from_stream(&stream)?;
         let connection_id = Uuid::new_v4().to_string();
         
         let connection = BusConnection {
             id: connection_id.clone(),
             service_name: None,
             connected_at: chrono::Utc::now().to_rfc3339(),
+            peer,
         };
         
         self.active_connections.insert(connection_id.clone(), connection);
@@ -492,12 +562,24 @@ impl EchoClient {
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let message = Message::method_call(service, interface, method, args)?;
+        let call_id = message.header.message_id.clone();
         let mut stream = self.stream.lock().await;
         let data = serde_json::to_vec(&message)?;
         UnixSocketTransport::send_message(&mut *stream, &data).await?;
 
-        let response_data = UnixSocketTransport::recv_message(&mut *stream).await?;
-        let response: Message = serde_json::from_slice(&response_data)?;
+        // Every connection hears signals, and a call Echo holds for the
+        // user's answer (a root action) leaves the connection free, so
+        // signals can arrive before the reply: skip anything that isn't the
+        // answer to this call.
+        let response = loop {
+            let frame = UnixSocketTransport::recv_message(&mut *stream).await?;
+            let msg: Message = serde_json::from_slice(&frame)?;
+            let answers_us = matches!(msg.header.message_type, MessageType::MethodReturn | MessageType::Error)
+                && msg.header.reply_to.as_deref().map_or(true, |id| id == call_id);
+            if answers_us {
+                break msg;
+            }
+        };
 
         match response.header.message_type {
             MessageType::MethodReturn => Ok(response.body),
@@ -603,25 +685,39 @@ pub struct ArgumentDefinition {
     pub arg_type: String,
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use tempFile::TempDir;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
 
-//     #[tokio::test]
-//     async fn test_ipc_bus_initialization() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let socket_path = temp_dir.path().join("test.sock");
-//         let bus = IPCBus::new(socket_path).await.unwrap();
-//         assert_eq!(bus.connection_count(), 0);
-//     }
+    #[tokio::test]
+    async fn remove_connection_prunes_registry_and_external_services() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        let bus = IPCBus::new(socket_path).await.unwrap();
 
-//     #[tokio::test]
-//     async fn test_service_count() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let socket_path = temp_dir.path().join("test.sock");
-//         let bus = IPCBus::new(socket_path).await.unwrap();
-//         let count = bus.service_count().await.unwrap();
-//         assert_eq!(count, 0);
-//     }
-// }
+        let iface = ServiceInterface {
+            name: "com.example.Test".to_string(),
+            methods: vec![],
+            signals: vec![],
+            properties: vec![],
+        };
+        bus.register_service("com.example.Test", iface, None)
+            .await
+            .unwrap();
+        bus.register_external_service("com.example.Test", "conn-1")
+            .await;
+
+        assert!(bus.registry.service_exists("com.example.Test").await.unwrap());
+        assert_eq!(
+            bus.get_connection_for_service("com.example.Test").await.as_deref(),
+            Some("conn-1")
+        );
+
+        bus.remove_connection("conn-1");
+
+        assert!(!bus.registry.service_exists("com.example.Test").await.unwrap());
+        assert!(bus.get_connection_for_service("com.example.Test").await.is_none());
+        assert!(bus.list_services().await.unwrap().is_empty());
+    }
+}
