@@ -6,7 +6,8 @@ artifact, not the source of truth. Everything Pyxis changes about Gecko must be
 reconstructible from this directory alone.
 
 Verified: applying this series to the pinned upstream commit reproduces the
-current checkout **byte-identically** across all 12 modified files.
+current checkout **byte-identically** across all 49 modified files (plus 17
+Pyxis-only source files).
 
 ## Contents
 

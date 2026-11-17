@@ -1,0 +1,55 @@
+Rebrand unified extensions panel blocklist warning and error messages from Mozilla policy wording to Pyxis.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/locales/en-US/browser/unifiedExtensions.ftl b/browser/locales/en-US/browser/unifiedExtensions.ftl
+index 8e0e50425cff..ba67dd6fabd7 100644
+--- a/browser/locales/en-US/browser/unifiedExtensions.ftl
++++ b/browser/locales/en-US/browser/unifiedExtensions.ftl
+@@ -23,7 +23,7 @@ unified-extensions-item-message-manage = Manage extension
+ 
+ # Variables:
+ #   $extensionName (String) - Name of the user-enabled soft-blocked extension.
+-unified-extensions-item-messagebar-softblocked = { $extensionName } violates Mozilla’s policies. Using it may be risky.
++unified-extensions-item-messagebar-softblocked = { $extensionName } violates Pyxis’s policies. Using it may be risky.
+ 
+ ## Extension's context menu
+ 
+@@ -62,7 +62,7 @@ unified-extensions-mb-about-addons-link = Go to extension settings
+ unified-extensions-mb-blocklist-warning-single =
+     .heading = { $extensionName } disabled
+     .message =
+-        This extension violates Mozilla’s policies and has been disabled.
++        This extension violates Pyxis’s policies and has been disabled.
+         You can enable it in settings, but this may be risky.
+ 
+ # Variables:
+@@ -70,7 +70,7 @@ unified-extensions-mb-blocklist-warning-single =
+ unified-extensions-mb-blocklist-error-single =
+     .heading = { $extensionName } disabled
+     .message =
+-        This extension violates Mozilla’s policies and has been disabled.
++        This extension violates Pyxis’s policies and has been disabled.
+ 
+ # Variables:
+ #   $extensionsCount (Number) - Number of extensions disabled through both soft and hard-blocks (always going to be greater than 1)
+@@ -80,7 +80,7 @@ unified-extensions-mb-blocklist-warning-multiple =
+             *[other] { $extensionsCount } extensions disabled
+         }
+     .message =
+-        Some of your extensions have been disabled for violating Mozilla’s policies.
++        Some of your extensions have been disabled for violating Pyxis’s policies.
+         You can enable them in settings, but this may be risky.
+ 
+ # Variables:
+@@ -91,4 +91,4 @@ unified-extensions-mb-blocklist-error-multiple =
+             *[other] { $extensionsCount } extensions disabled
+         }
+     .message =
+-        Some of your extensions have been disabled for violating Mozilla’s policies.
++        Some of your extensions have been disabled for violating Pyxis’s policies.

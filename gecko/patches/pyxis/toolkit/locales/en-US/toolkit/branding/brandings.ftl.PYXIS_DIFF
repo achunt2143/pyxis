@@ -1,0 +1,63 @@
+Rebrand Firefox and Mozilla feature brand terms in shared toolkit Fluent brandings to their Vela and Pyxis equivalents for dialogs, settings, and UI surfaces.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/toolkit/locales/en-US/toolkit/branding/brandings.ftl b/toolkit/locales/en-US/toolkit/branding/brandings.ftl
+index d9766a9e7968..ce8a9961a560 100644
+--- a/toolkit/locales/en-US/toolkit/branding/brandings.ftl
++++ b/toolkit/locales/en-US/toolkit/branding/brandings.ftl
+@@ -15,17 +15,17 @@
+ ## https://mozilla-l10n.github.io/styleguides/mozilla_general/#brands-copyright-and-trademark
+ 
+ -facebook-container-brand-name = Facebook Container
+--monitor-brand-name = Firefox Monitor
++-monitor-brand-name = Vela Monitor
+ -monitor-brand-short-name = Monitor
+--mozmonitor-brand-name = Mozilla Monitor
++-mozmonitor-brand-name = Pyxis Monitor
+ -pocket-brand-name = Pocket
+--send-brand-name = Firefox Send
+--screenshots-brand-name = Firefox Screenshots
+--mozilla-vpn-brand-name = Mozilla VPN
+--profiler-brand-name = Firefox Profiler
+--translations-brand-name = Firefox Translations
+--focus-brand-name = Firefox Focus
+--relay-brand-name = Firefox Relay
++-send-brand-name = Vela Send
++-screenshots-brand-name = Vela Screenshots
++-mozilla-vpn-brand-name = Pyxis VPN
++-profiler-brand-name = Vela Profiler
++-translations-brand-name = Vela Translations
++-focus-brand-name = Vela Focus
++-relay-brand-name = Vela Relay
+ -relay-brand-short-name = Relay
+ -fakespot-brand-name = Fakespot
+ -solo-ai-brand-name = Solo
+@@ -38,18 +38,18 @@
+ 
+ # “Suggest” can be localized, “Firefox” must be treated as a brand
+ # and kept in English.
+--firefox-suggest-brand-name = Firefox Suggest
++-firefox-suggest-brand-name = Vela Suggest
+ 
+ # ”Home" can be localized, “Firefox” must be treated as a brand
+ # and kept in English.
+--firefox-home-brand-name = Firefox Home
++-firefox-home-brand-name = Vela Home
+ 
+ # View" can be localized, “Firefox” must be treated as a brand
+ # and kept in English.
+--firefoxview-brand-name = Firefox View
++-firefoxview-brand-name = Vela View
+ 
+ # Firefox Labs is the name for a page in Settings to allow users to learn about
+ # experimental and in-development features, and turn those features on and off.
+ # The "Labs" portion can be localized, “Firefox” must be treated as a brand
+ # and kept in English.
+--firefoxlabs-brand-name = Firefox Labs
++-firefoxlabs-brand-name = Vela Labs

@@ -1,0 +1,32 @@
+Rebrand Fluent brand strings from Nightly/Firefox/Mozilla to Vela, Pyxis Vela, and Pyxis.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/branding/unofficial/locales/en-US/brand.ftl b/browser/branding/unofficial/locales/en-US/brand.ftl
+index 5eaea9a7c4e8..4ddeef857346 100644
+--- a/browser/branding/unofficial/locales/en-US/brand.ftl
++++ b/browser/branding/unofficial/locales/en-US/brand.ftl
+@@ -16,12 +16,10 @@
+ ## For further details, consult:
+ ## https://mozilla-l10n.github.io/styleguides/mozilla_general/#brands-copyright-and-trademark
+ 
+--brand-shorter-name = Nightly
+--brand-short-name = Nightly
+--brand-shortcut-name = Nightly
+--brand-full-name = Nightly
+-# This brand name can be used in messages where the product name needs to
+-# remain unchanged across different versions (Nightly, Beta, etc.).
+--brand-product-name = Firefox
+--vendor-short-name = Mozilla
++-brand-shorter-name = Vela
++-brand-short-name = Vela
++-brand-shortcut-name = Vela
++-brand-full-name = Pyxis Vela
++-brand-product-name = Vela
++-vendor-short-name = Pyxis
+ trademarkInfo = { " " }

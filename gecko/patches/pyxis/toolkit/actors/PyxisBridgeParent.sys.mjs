@@ -128,10 +128,85 @@ ChromeUtils.defineLazyGetter(lazy, "socketTransportService", () => {
 const gLiveActors = new Set();
 
 // Process-wide cache of app-id -> declared permissions[], populated by
-// _getDeclaredPermissions() below. Deliberately process-lifetime (not
+// fetchDeclaredPermissions() below. Deliberately process-lifetime (not
 // per-actor): every pyxis:// document for the same app-id shares the same
 // declared permission set, so there is nothing actor-specific to key on.
 const gPermissionsCache = new Map();
+const gPermissionsInflight = new Map(); // appId -> { epoch, promise }
+const gPermissionsAppEpoch = new Map(); // appId -> monotonic invalidation epoch
+let gPermissionsGlobalEpoch = 0;
+let gPermissionsEpochSeq = 0;
+
+function currentPermissionsEpoch(appId) {
+  return Math.max(
+    gPermissionsGlobalEpoch,
+    gPermissionsAppEpoch.get(appId) ?? 0
+  );
+}
+
+function invalidatePermissionsCache(targetAppId = null) {
+  gPermissionsEpochSeq += 1;
+  if (targetAppId) {
+    gPermissionsAppEpoch.set(targetAppId, gPermissionsEpochSeq);
+    gPermissionsCache.delete(targetAppId);
+    gPermissionsInflight.delete(targetAppId);
+  } else {
+    gPermissionsGlobalEpoch = gPermissionsEpochSeq;
+    gPermissionsCache.clear();
+    gPermissionsInflight.clear();
+  }
+}
+
+async function fetchDeclaredPermissions(appId, allowRetry = true) {
+  if (gPermissionsCache.has(appId)) {
+    return gPermissionsCache.get(appId);
+  }
+  const epoch = currentPermissionsEpoch(appId);
+  const existing = gPermissionsInflight.get(appId);
+  if (existing && existing.epoch === epoch) {
+    return existing.promise;
+  }
+
+  let shouldRefetch = false;
+  const entry = { epoch, promise: null };
+  entry.promise = (async () => {
+    try {
+      const connection = getEchoConnection();
+      const info = await connection.callMethod("nova", "GetInfo", { appId });
+      const perms = Array.isArray(info?.permissions) ? info.permissions : [];
+      if (currentPermissionsEpoch(appId) === epoch) {
+        gPermissionsCache.set(appId, perms);
+        return perms;
+      }
+      if (gPermissionsCache.has(appId)) {
+        return gPermissionsCache.get(appId);
+      }
+      shouldRefetch = true;
+    } catch (e) {
+      console.error(
+        `[PyxisBridge] failed to resolve permissions for '${appId}' from ` +
+          `Nova, denying all capability-gated calls: ${e}`
+      );
+      return [];
+    } finally {
+      if (gPermissionsInflight.get(appId) === entry) {
+        gPermissionsInflight.delete(appId);
+      }
+    }
+    if (shouldRefetch && allowRetry) {
+      return fetchDeclaredPermissions(appId, false);
+    }
+    return [];
+  })();
+
+  gPermissionsInflight.set(appId, entry);
+  return entry.promise;
+}
+
+// Window id -> pyxis app-id map maintained from evo ListWindows replies and
+// WindowCreated/WindowClosed signals so evo visibility transitions can throttle
+// or resume background app browsing contexts.
+const gWindowIdToAppId = new Map();
 
 function echoSocketPath() {
   const runtimeDir = Cc["@mozilla.org/process/environment;1"]
@@ -159,6 +234,25 @@ function echoSocketPath() {
  * handling and gecko/bridge/native/geckoOS-native-host.rs's echo_broker_loop
  * do on the Rust side.
  */
+// Request timeouts for calls to Echo. Most calls answer quickly and keep the
+// 25 s default. Some are HELD by Echo until the user answers the root-access
+// dialog (up to 120 s), so they get a longer timeout that outlasts the hold.
+const DEFAULT_CALL_TIMEOUT_MS = 25000;
+const HELD_CALL_TIMEOUT_MS_VALUE = 150000;
+const HELD_CALL_TIMEOUT_MS = new Set([
+  "org.geckoOS.installer.Install",
+  "org.geckoOS.installer.Remove",
+  "org.geckoOS.nova.Install",
+  "org.geckoOS.nova.Uninstall",
+  "org.geckoOS.network.connectWifi",
+  "org.geckoOS.network.disconnectWifi",
+  "org.geckoOS.network.setInterfaceEnabled",
+  "org.geckoOS.network.setDNS",
+  "org.geckoOS.network.setHostname",
+  "org.geckoOS.accounts.create",
+  "org.geckoOS.accounts.delete",
+]);
+
 class EchoConnection {
   constructor() {
     this._transport = null;
@@ -178,13 +272,26 @@ class EchoConnection {
     if (this._connectPromise) {
       return this._connectPromise;
     }
-    this._connectPromise = this._connect();
-    return this._connectPromise;
+    const promise = this._connect().catch(err => {
+      if (this._connectPromise === promise) {
+        this._connectPromise = null;
+      }
+      throw err;
+    });
+    this._connectPromise = promise;
+    return promise;
   }
 
   async _connect() {
     const path = echoSocketPath();
     tracingLog("Connecting to Echo daemon at", path.path);
+
+    // Reset closed/buffer state so a fresh connection after _failAllPending()
+    // or close() runs the read/write pumps normally with clean framing buffers.
+    this._closed = false;
+    this._writeQueue = [];
+    this._readBuffer = [];
+    this._readBufferLength = 0;
 
     const transport = lazy.socketTransportService.createUnixDomainTransport(
       path
@@ -198,8 +305,8 @@ class EchoConnection {
     );
     this._input.init(this._rawInput);
 
-    this._waitForOutput();
-    this._waitForInput();
+    this._waitForOutput(this._output);
+    this._waitForInput(this._rawInput);
 
     // Fire-and-forget handshake, matching every existing Rust Echo client's
     // behavior (see file-level notice: Echo's daemon does not gate
@@ -210,7 +317,12 @@ class EchoConnection {
       await this._sendHandshake();
     } catch (e) {
       console.error("[PyxisBridge] Echo handshake failed:", e);
-      // Non-fatal: proceed anyway, since MethodCall does not require it.
+      // If the socket itself died during handshake, fail connect so callers
+      // don't wait out a full MethodCall timeout on a closed connection.
+      if (this._closed) {
+        throw e;
+      }
+      // Otherwise (e.g. handshake timeout), proceed since MethodCall does not require it.
     }
   }
 
@@ -237,7 +349,10 @@ class EchoConnection {
       method,
       body: params ?? {},
     });
-    const response = await this._sendAndAwait(message, /* timeoutMs */ 25000);
+    const timeoutMs = HELD_CALL_TIMEOUT_MS.has(`${destination}.${method}`)
+      ? HELD_CALL_TIMEOUT_MS_VALUE
+      : DEFAULT_CALL_TIMEOUT_MS;
+    const response = await this._sendAndAwait(message, timeoutMs);
     if (response.header.message_type === "ERROR") {
       throw new Error(
         response.body?.message ?? response.body?.error ?? "Echo error"
@@ -300,6 +415,9 @@ class EchoConnection {
   // --- Outbound framing/write pump ---
 
   _enqueueWrite(message) {
+    if (this._closed || !this._output) {
+      throw new Error("Echo connection is closed");
+    }
     const json = JSON.stringify(message);
     const bodyBytes = stringToUTF8Bytes(json);
     const framed = new Uint8Array(4 + bodyBytes.length);
@@ -309,12 +427,19 @@ class EchoConnection {
     this._flushOutgoing();
   }
 
-  _waitForOutput() {
-    if (this._closed || !this._output) {
+  _waitForOutput(output = this._output) {
+    if (this._closed || !output || output !== this._output) {
       return;
     }
-    this._output.asyncWait(
-      { onOutputStreamReady: () => this._flushOutgoing() },
+    output.asyncWait(
+      {
+        onOutputStreamReady: () => {
+          if (output !== this._output) {
+            return;
+          }
+          this._flushOutgoing();
+        },
+      },
       0,
       0,
       Services.tm.currentThread
@@ -334,13 +459,13 @@ class EchoConnection {
         );
         if (written < chunk.length) {
           this._writeQueue[0] = chunk.subarray(written);
-          this._waitForOutput();
+          this._waitForOutput(this._output);
           return;
         }
         this._writeQueue.shift();
       } catch (e) {
         if (e.result === Cr.NS_BASE_STREAM_WOULD_BLOCK) {
-          this._waitForOutput();
+          this._waitForOutput(this._output);
           return;
         }
         this._failAllPending(e);
@@ -351,20 +476,20 @@ class EchoConnection {
 
   // --- Inbound framing/read pump ---
 
-  _waitForInput() {
-    if (this._closed || !this._rawInput) {
+  _waitForInput(rawInput = this._rawInput) {
+    if (this._closed || !rawInput || rawInput !== this._rawInput) {
       return;
     }
-    this._rawInput.asyncWait(
-      { onInputStreamReady: () => this._onInputReady() },
+    rawInput.asyncWait(
+      { onInputStreamReady: () => this._onInputReady(rawInput) },
       0,
       0,
       Services.tm.currentThread
     );
   }
 
-  _onInputReady() {
-    if (this._closed) {
+  _onInputReady(rawInput = this._rawInput) {
+    if (this._closed || !rawInput || rawInput !== this._rawInput) {
       return;
     }
     try {
@@ -381,10 +506,10 @@ class EchoConnection {
         this._readBufferLength += chunk.length;
         this._drainMessages();
       }
-      this._waitForInput();
+      this._waitForInput(rawInput);
     } catch (e) {
       if (e.result === Cr.NS_BASE_STREAM_WOULD_BLOCK) {
-        this._waitForInput();
+        this._waitForInput(rawInput);
         return;
       }
       // NS_BASE_STREAM_CLOSED or any other error: treat as connection loss.
@@ -438,6 +563,33 @@ class EchoConnection {
 
   _failAllPending(error) {
     this._closed = true;
+    const rawInput = this._rawInput;
+    const output = this._output;
+    const transport = this._transport;
+    this._rawInput = null;
+    this._input = null;
+    this._output = null;
+    this._transport = null;
+    this._writeQueue = [];
+    this._readBuffer = [];
+    this._readBufferLength = 0;
+
+    try {
+      rawInput?.close();
+    } catch (e) {
+      // ignore
+    }
+    try {
+      output?.close();
+    } catch (e) {
+      // ignore
+    }
+    try {
+      transport?.close(Cr.NS_OK);
+    } catch (e) {
+      // ignore
+    }
+
     for (const pending of this._pending.values()) {
       pending.reject(error);
     }
@@ -482,17 +634,6 @@ class EchoConnection {
   }
 
   close() {
-    this._closed = true;
-    try {
-      this._rawInput?.close();
-    } catch (e) {
-      // ignore
-    }
-    try {
-      this._output?.close();
-    } catch (e) {
-      // ignore
-    }
     this._failAllPending(new Error("Echo connection closed"));
   }
 }
@@ -598,9 +739,92 @@ function tracingLog(...args) {
 // reaches content is decided here alone. Each actor delivers a signal only
 // if its document subscribed to it, and only if BRIDGE_SIGNALS lists it
 // with a capability the document's app holds (forwardEventToContent).
+function applyEvoVisibilityToActors(service, eventName, body) {
+  if (service === "evo") {
+    if (
+      eventName === "WindowCreated" &&
+      body?.window_id !== undefined &&
+      typeof body?.app_id === "string"
+    ) {
+      gWindowIdToAppId.set(Number(body.window_id), body.app_id);
+    } else if (eventName === "WindowClosed" && body?.window_id !== undefined) {
+      gWindowIdToAppId.delete(Number(body.window_id));
+    } else if (eventName === "WindowMinimized") {
+      const targetAppId =
+        typeof body?.app_id === "string"
+          ? body.app_id
+          : gWindowIdToAppId.get(Number(body?.window_id));
+      const visible = body?.minimized === false;
+      if (targetAppId) {
+        for (const actor of gLiveActors) {
+          if (actor._safeAppId() === targetAppId) {
+            actor.setCompositorVisible(visible, visible ? "restored" : "minimized");
+          }
+        }
+      }
+    } else if (
+      eventName === "WindowFocusChanged" &&
+      body?.window_id !== undefined &&
+      body?.window_id !== null
+    ) {
+      const targetAppId = gWindowIdToAppId.get(Number(body.window_id));
+      if (targetAppId) {
+        for (const actor of gLiveActors) {
+          if (actor._safeAppId() === targetAppId) {
+            actor.setCompositorVisible(true, "focused");
+          }
+        }
+      }
+    }
+  } else if (service === "session" && eventName === "LockChanged") {
+    const visible = !body?.locked;
+    for (const actor of gLiveActors) {
+      actor.setCompositorVisible(visible, "session-lock");
+    }
+  }
+}
+
 function dispatchSignalToSubscribers(message) {
   const service = message.header.interface?.replace(/^org\.geckoOS\./, "");
   const eventName = message.header.method;
+  if (
+    service === "nova" &&
+    (eventName === "RegistryChanged" || eventName === "PermissionsChanged")
+  ) {
+    const targetAppId =
+      typeof message.body?.appId === "string" && message.body.appId
+        ? message.body.appId
+        : null;
+    invalidatePermissionsCache(targetAppId);
+    if (
+      eventName === "PermissionsChanged" &&
+      targetAppId &&
+      Array.isArray(message.body?.effective)
+    ) {
+      gPermissionsCache.set(
+        targetAppId,
+        message.body.effective.filter(p => typeof p === "string")
+      );
+    } else {
+      // Refresh cached permissions for live subscribed appIds asynchronously
+      // so subsequent capability-gated signals have a warm cache rather than
+      // sitting empty until the next callService.
+      const refreshAppIds = new Set();
+      for (const actor of gLiveActors) {
+        if (actor._subscriptions.size === 0) {
+          continue;
+        }
+        const appId = actor._safeAppId();
+        if (appId && (!targetAppId || appId === targetAppId)) {
+          refreshAppIds.add(appId);
+        }
+      }
+      for (const appId of refreshAppIds) {
+        void fetchDeclaredPermissions(appId);
+      }
+    }
+  }
+  applyEvoVisibilityToActors(service, eventName, message.body);
   for (const actor of gLiveActors) {
     // A document that is going away can throw here. That must not cost the
     // others the signal, or escape into _onInputReady, which would take it
@@ -730,14 +954,22 @@ const BRIDGE_CAPABILITIES = {
     getStorageInfo: null,
   },
   // Connection state and addresses. getStatus carries the Wi-Fi SSID, which
-  // says where the device is.
+  // says where the device is. network:read covers the readings;
+  // network:manage (privileged: join an access point, repoint DNS) the rest.
+  // An app declaring legacy `network` is normalised to network:read by Nova.
   network: {
-    getStatus: "network",
-    getType: "network",
-    getInterfaces: "network",
-    getIPAddress: "network",
-    getGateway: "network",
-    getDNS: "network",
+    getStatus: "network:read",
+    getType: "network:read",
+    getInterfaces: "network:read",
+    getIPAddress: "network:read",
+    getGateway: "network:read",
+    getDNS: "network:read",
+    scanWifi: "network:read",
+    connectWifi: "network:manage",
+    disconnectWifi: "network:manage",
+    setInterfaceEnabled: "network:manage",
+    setDNS: "network:manage",
+    setHostname: "network:manage",
   },
   // Every app reads pyxis.theme as it starts (the SDK's AppShell), so
   // reading is open. That is only safe because writing is privileged: the
@@ -761,6 +993,49 @@ const BRIDGE_CAPABILITIES = {
     getLocation: null,
     setTimezone: "settings:write",
   },
+  // The lock screen's half of the session (echo/src/services/session.rs).
+  // Echo owns the decision: it checks the password, rate-limits wrong ones and
+  // tells Evo, and Evo, not the page, draws nothing but the lock page while
+  // locked. Asking to lock or to try a password is the shell's alone
+  // (windows:manage, held by the shell's ids), so no app can lock the user out
+  // or guess their password; reading the state needs nothing, like a clock.
+  // Settings' Users & Lock section locks and logs out too, so those two take
+  // settings:write (privileged, as windows:manage is) rather than the shell's
+  // own capability. Unlocking stays the shell's.
+  session: {
+    lock: "settings:write",
+    unlock: "windows:manage",
+    switchUser: "settings:write",
+    getState: null,
+    logout: "settings:write",
+  },
+  // Users: their names and looks, and changing a password. Settings' Users
+  // section and the lock page use it; settings:write, like the other things
+  // that change the device. A wrong current password counts against the same
+  // limit as a wrong unlock.
+  accounts: {
+    list: "settings:write",
+    create: "settings:write",
+    delete: "settings:write",
+    setPassword: "settings:write",
+    setProfile: "settings:write",
+  },
+  // Privileged access requests & in-memory grants (`org.geckoOS.privilege`).
+  // Any app may ask for privilege, check its state, or drop its grant, while
+  // authenticating (submitting the user's password) and dismissing prompts stay
+  // behind windows:manage so only the shell's overlay prompt can unlock.
+  privilege: {
+    Request: null,
+    request: null,
+    Authenticate: "windows:manage",
+    authenticate: "windows:manage",
+    Dismiss: "windows:manage",
+    dismiss: "windows:manage",
+    Revoke: null,
+    revoke: null,
+    GetState: null,
+    getState: null,
+  },
   // Raising a notification is an app's own business. Reading or
   // dismissing the centre is the shell's: `list` returns every app's
   // notifications, text included, so it is privileged
@@ -778,6 +1053,11 @@ const BRIDGE_CAPABILITIES = {
     setMute: "audio",
     listOutputs: "audio",
     setDefaultOutput: "audio",
+    getInputVolume: "audio",
+    setInputVolume: "audio",
+    setInputMute: "audio",
+    listInputs: "audio",
+    setDefaultInput: "audio",
   },
   sound: {
     play: "audio",
@@ -791,6 +1071,12 @@ const BRIDGE_CAPABILITIES = {
     Focus: "appManager:manage",
     List: "appManager:manage",
     GetInfo: "appManager:manage",
+    // An installed app's own icon, read from its webroot by Nova (a third-party
+    // pyxis:// origin can't load another's image). Whoever may list the apps
+    // may draw them.
+    GetAppIcon: "appManager:manage",
+    GetPermissions: "settings:write",
+    SetPermission: "settings:write",
     Install: "appManager:install",
     Uninstall: "appManager:install",
     Reload: "appManager:install",
@@ -859,6 +1145,17 @@ const BRIDGE_CAPABILITIES = {
     // Where each running app's dock icon is, so a window minimizes into it
     // and restores out of it. The shell's dock reports it.
     SetMinimizeTargets: "windows:manage",
+    // Each app's name, accent and icon, for its title bar (looked up by the
+    // window's trusted app id). The shell's app list sends it; an app could
+    // otherwise rename or recolour every other app's windows.
+    SetAppIdentity: "windows:manage",
+    // The lock screen (evo/src/shell/lock.rs). Locking is the shell's to ask
+    // for, and so are the idle time and where the unlock's Clear focuses from.
+    // Unlocking is not here and never will be: only echo-daemon's verified
+    // LockChanged unlocks Evo. GetLockState is echo-cli only.
+    Lock: "windows:manage",
+    SetIdleLock: "windows:manage",
+    SetLockOrigin: "windows:manage",
     GetOverlayState: "windows:manage",
     // A picture of each window, for the overview's and the switcher's cards.
     // What an app draws is its own business: only the shell may see others'.
@@ -868,6 +1165,8 @@ const BRIDGE_CAPABILITIES = {
     // reveals nothing about any app, so it needs nothing.
     SetAnimationSettings: "settings:write",
     GetAnimationState: null,
+    GetOutputs: null,
+    SetOutputConfig: "settings:write",
   },
 };
 
@@ -914,6 +1213,8 @@ const BRIDGE_SIGNALS = {
   audio: {
     VolumeChanged: "audio",
     OutputChanged: "audio",
+    InputVolumeChanged: "audio",
+    InputChanged: "audio",
   },
   // One per key a set/delete/clear/reset changed: {key, value, previous,
   // exists}. The Settings app and the shell are different origins, so a
@@ -925,6 +1226,17 @@ const BRIDGE_SIGNALS = {
   // time.getClock, which tells any app the same.
   time: {
     TimezoneChanged: null,
+  },
+  // The lock changed ({locked, seq, mac}) or a try failed ({attempts_left,
+  // retry_at_ms}). Says when the user is away, so windows:manage, like the
+  // window signals.
+  session: {
+    LockChanged: "windows:manage",
+    UnlockFailed: "windows:manage",
+  },
+  privilege: {
+    PrivilegeRequested: "windows:manage",
+    PrivilegeChanged: null,
   },
   terminal: {
     TerminalOpened: "terminal",
@@ -947,6 +1259,7 @@ const BRIDGE_SIGNALS = {
     AppLaunched: "appManager:manage",
     AppSuspended: "appManager:manage",
     AppResumed: "appManager:manage",
+    PermissionsChanged: "settings:write",
   },
   installer: {
     InstallStarted: "appManager:install",
@@ -980,6 +1293,7 @@ const BRIDGE_SIGNALS = {
     WorkspaceChanged: "windows:manage",
     WorkspaceCreated: "windows:manage",
     WorkspaceDeleted: "windows:manage",
+    OutputsChanged: "settings:write",
   },
 };
 
@@ -1131,8 +1445,35 @@ export class PyxisBridgeParent extends JSWindowActorParent {
     if (service === "notification" && method === "show") {
       params = { ...params, appId };
     }
+    if (service === "privilege") {
+      const obj = params && typeof params === "object" ? params : {};
+      if (method === "Request" || method === "request") {
+        params = { ...obj, appId };
+      } else if (
+        method === "GetState" ||
+        method === "getState" ||
+        method === "Revoke" ||
+        method === "revoke"
+      ) {
+        params = obj.appId === undefined ? { ...obj, appId } : obj;
+      }
+    }
 
     return this._echoRequest(service, method, params, appId);
+  }
+
+  async _hasPrivilegeGrant(appId) {
+    try {
+      const state = await this._echoRequest(
+        "privilege",
+        "GetState",
+        { appId },
+        appId
+      );
+      return Boolean(state && state.granted);
+    } catch {
+      return false;
+    }
   }
 
   // Stamps `scope` on a filesystem call (FILESYSTEM_SCOPES): another app's
@@ -1177,11 +1518,15 @@ export class PyxisBridgeParent extends JSWindowActorParent {
         );
       }
       if (capability === "filesystem:write") {
-        throw capabilityDenied(
-          `app '${appId}' called ${call} on an absolute path, and outside the home files are read-only`
-        );
+        const granted = await this._hasPrivilegeGrant(appId);
+        if (!granted) {
+          throw capabilityDenied(
+            `app '${appId}' called ${call} on an absolute path, and outside the home files are read-only`
+          );
+        }
       }
       scope = "system";
+      return { ...fields, scope, appId };
     } else {
       scope = declared.includes(FILESYSTEM_SCOPES.user) ? "user" : `app:${appId}`;
     }
@@ -1232,9 +1577,9 @@ export class PyxisBridgeParent extends JSWindowActorParent {
   // Called by dispatchSignalToSubscribers() (this file, above) for every
   // signal that arrives. The subscription was checked when it was made; the
   // capability is checked again here, against the permissions Nova last
-  // gave for this app. So a subscription kept while those were unknown
-  // delivers nothing until they are known, and no signal reaches content on
-  // the strength of the subscription alone.
+  // gave for this app. If the cache is missing (e.g. initial lookup failed
+  // or RegistryChanged/PermissionsChanged just invalidated it), re-fetch
+  // asynchronously before deciding rather than dropping the signal.
   forwardEventToContent(service, eventName, data) {
     if (!this._subscriptions.has(`${service}:${eventName}`)) {
       return;
@@ -1245,17 +1590,57 @@ export class PyxisBridgeParent extends JSWindowActorParent {
     }
     if (capability !== null) {
       const appId = this._appIdForThisActor();
+      if (!gPermissionsCache.has(appId)) {
+        void this._forwardEventAfterResolve(
+          appId,
+          capability,
+          service,
+          eventName,
+          data
+        );
+        return;
+      }
       const held = gPermissionsCache.get(appId);
-      if (!held?.includes(capability)) {
-        if (held) {
+      if (!held.includes(capability)) {
+        logDenial(
+          `app '${appId}' did not declare '${capability}' (required to receive ${service}.${eventName})`
+        );
+        return;
+      }
+    }
+    this.sendAsyncMessage("PyxisBridge:Event", { service, eventName, data });
+  }
+
+  async _forwardEventAfterResolve(
+    appId,
+    capability,
+    service,
+    eventName,
+    data
+  ) {
+    try {
+      const held = await this._getDeclaredPermissions(appId);
+      if (
+        this._destroyed ||
+        !this._subscriptions.has(`${service}:${eventName}`)
+      ) {
+        return;
+      }
+      if (!held.includes(capability)) {
+        if (gPermissionsCache.has(appId)) {
           logDenial(
             `app '${appId}' did not declare '${capability}' (required to receive ${service}.${eventName})`
           );
         }
         return;
       }
+      this.sendAsyncMessage("PyxisBridge:Event", { service, eventName, data });
+    } catch (e) {
+      console.error(
+        `[PyxisBridge] could not deliver ${service}.${eventName}:`,
+        e
+      );
     }
-    this.sendAsyncMessage("PyxisBridge:Event", { service, eventName, data });
   }
 
   // --- App identity ---
@@ -1273,6 +1658,46 @@ export class PyxisBridgeParent extends JSWindowActorParent {
     return uri.host; // the app-id
   }
 
+  _safeAppId() {
+    try {
+      return this._appIdForThisActor();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Toggle compositor-driven background throttling for non-shell app documents
+   * when Evo minimizes, restores, focuses, or session-locks their window.
+   */
+  setCompositorVisible(visible, reason = "") {
+    const appId = this._safeAppId();
+    if (
+      !appId ||
+      appId === "system" ||
+      appId === "bloom" ||
+      appId === "bloom-overlay"
+    ) {
+      return false;
+    }
+    const next = Boolean(visible);
+    this._compositorVisible = next;
+    this._compositorVisibilityReason = String(reason || "");
+    try {
+      const topBc = this.browsingContext?.top;
+      const browser = topBc?.embedderElement || null;
+      if (browser && "docShellIsActive" in browser) {
+        browser.docShellIsActive = next;
+      }
+      if (topBc && "isActive" in topBc) {
+        topBc.isActive = next;
+      }
+    } catch (e) {
+      tracingLog("setCompositorVisible failed for", appId, e);
+    }
+    return true;
+  }
+
   // --- Capability allow-list ---
   //
   // The capability an app must hold to call `service.method`: a string
@@ -1286,33 +1711,13 @@ export class PyxisBridgeParent extends JSWindowActorParent {
   // Resolves an app-id's declared permissions[] from Nova's registry (now a
   // real in-process service inside echo-daemon, see
   // echo/src/services/nova.rs — `org.geckoOS.nova` -> `GetInfo`, per
-  // nova-runtime-host-plan.md §5). Cached per app-id for the lifetime of
-  // this process to avoid a round-trip on every single bridge call — Nova
-  // re-broadcasts `RegistryChanged`/`AppUpdated` signals on install/
-  // uninstall/reload, but this actor doesn't currently subscribe to them,
-  // so the cache is intentionally short-lived (cleared whenever a lookup
-  // errors, e.g. Echo not yet up) rather than permanent. On any failure to
-  // reach Nova (not installed, Echo down), fail closed: an empty array
-  // denies every capability-gated call rather than silently allowing them —
-  // matching the original deliberately-conservative placeholder this
-  // replaces.
-  async _getDeclaredPermissions(appId) {
-    if (gPermissionsCache.has(appId)) {
-      return gPermissionsCache.get(appId);
-    }
-    try {
-      const connection = getEchoConnection();
-      const info = await connection.callMethod("nova", "GetInfo", { appId });
-      const perms = Array.isArray(info?.permissions) ? info.permissions : [];
-      gPermissionsCache.set(appId, perms);
-      return perms;
-    } catch (e) {
-      console.error(
-        `[PyxisBridge] failed to resolve permissions for '${appId}' from ` +
-          `Nova, denying all capability-gated calls: ${e}`
-      );
-      return [];
-    }
+  // nova-runtime-host-plan.md §5). Cached per app-id and invalidated/refreshed
+  // via `nova.RegistryChanged` / `nova.PermissionsChanged` signals in
+  // dispatchSignalToSubscribers(). On any failure to reach Nova (not
+  // installed, Echo down), fail closed without caching: an empty array denies
+  // every capability-gated call rather than silently allowing them.
+  _getDeclaredPermissions(appId) {
+    return fetchDeclaredPermissions(appId);
   }
 
   // --- Echo transport ---
@@ -1325,6 +1730,14 @@ export class PyxisBridgeParent extends JSWindowActorParent {
   // exactly like the capability-denial path above already does.
   async _echoRequest(service, method, params, _appId) {
     const connection = getEchoConnection();
-    return connection.callMethod(service, method, params ?? {});
+    const result = await connection.callMethod(service, method, params ?? {});
+    if (service === "evo" && method === "ListWindows" && Array.isArray(result?.windows)) {
+      for (const win of result.windows) {
+        if (win?.window_id !== undefined && typeof win?.app_id === "string") {
+          gWindowIdToAppId.set(Number(win.window_id), win.app_id);
+        }
+      }
+    }
+    return result;
   }
 }

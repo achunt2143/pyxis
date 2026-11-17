@@ -1,0 +1,36 @@
+Vela's new tab is the profile's `pyxis.newtab.url` pref when set (added
+2026-11-16). Firefox removed its new-tab pref in 41; the remaining override is
+AboutNewTab.newTabURL, which only extensions set, and the browser profile runs
+with extensions off. Nova writes the pref (and browser.startup.homepage) into
+the browser window's profile only, pointing at the start page the browser app
+ships (pyxis-experience packages/apps/browser/public/start/). An unset pref
+leaves Firefox's own about:newtab. browser.js's isInitialPage compares against
+the same URL, so the address bar stays empty on it.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/modules/AboutNewTab.sys.mjs b/browser/modules/AboutNewTab.sys.mjs
+index d35c0c0b3fa9..1a27881487f9 100644
+--- a/browser/modules/AboutNewTab.sys.mjs
++++ b/browser/modules/AboutNewTab.sys.mjs
+@@ -76,6 +76,15 @@ export const AboutNewTab = {
+ 
+     // More initialization happens here
+     this.toggleActivityStream(true);
++
++    // PYXIS: Vela's new tab is the profile's `pyxis.newtab.url` when set (Nova
++    // writes it for the browser window: Vela's own start page). Firefox has
++    // no pref for this since 41; the override setter is what extensions use,
++    // and the browser profile runs with extensions off.
++    const pyxisNewTab = Services.prefs.getStringPref("pyxis.newtab.url", "");
++    if (pyxisNewTab) {
++      this.newTabURL = pyxisNewTab;
++    }
+     this.initialized = true;
+ 
+     Services.obs.addObserver(this, BROWSER_READY_NOTIFICATION);

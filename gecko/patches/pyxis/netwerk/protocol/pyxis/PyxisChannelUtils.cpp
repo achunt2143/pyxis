@@ -96,10 +96,16 @@ nsresult PyxisChannelUtils::ResolveAndConfinePath(
   nsAutoCString candidateNormalized;
   candidate->GetNativePath(candidateNormalized);
 
-  if (!StringBeginsWith(candidateNormalized, webrootNormalized)) {
+  const bool withinWebroot =
+      !webrootNormalized.IsEmpty() &&
+      StringBeginsWith(candidateNormalized, webrootNormalized) &&
+      (candidateNormalized.Length() == webrootNormalized.Length() ||
+       webrootNormalized.Last() == '/' ||
+       candidateNormalized.CharAt(webrootNormalized.Length()) == '/');
+  if (!withinWebroot) {
     // Normalization resolved the candidate outside the webroot (via ".."
-    // segments, a symlink escape, or similar) — deny, don't attempt to
-    // "fix up" the path.
+    // segments, a symlink escape, or sibling-prefix match like
+    // "<webroot>_other") — deny, don't attempt to "fix up" the path.
     return NS_ERROR_FILE_ACCESS_DENIED;
   }
 

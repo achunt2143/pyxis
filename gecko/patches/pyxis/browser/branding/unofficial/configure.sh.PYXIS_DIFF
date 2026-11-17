@@ -1,0 +1,19 @@
+Set MOZ_APP_DISPLAYNAME="Pyxis Vela" so the unofficial branding target builds and identifies as Pyxis Vela instead of Nightly.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/branding/unofficial/configure.sh b/browser/branding/unofficial/configure.sh
+index edd3bd3e86e5..127019a7ca08 100644
+--- a/browser/branding/unofficial/configure.sh
++++ b/browser/branding/unofficial/configure.sh
+@@ -2,4 +2,4 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-MOZ_APP_DISPLAYNAME=Nightly
++MOZ_APP_DISPLAYNAME="Pyxis Vela"

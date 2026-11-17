@@ -50,6 +50,12 @@ decides at widget creation) and browser.tabs.allow_transparent_browser;
 geckoOS-boot sets both for the shell. Verified on device 2026-09-27: the
 desktop shows through the overlay, and the overlay's drawing sits above a
 maximized app.
+UPDATE (2026-11-16): app windows disable every <key> in mainKeyset, so the
+browser's own shortcuts (Ctrl+N, Ctrl+T, Ctrl+W, Ctrl+L, Ctrl+F, Ctrl+Q, ...)
+reach the app's page instead. Many are `reserved`, which a page can't
+preventDefault: Ctrl+N in Notes opened a full Firefox window inside the app.
+editMenuKeys (copy/paste/undo) is untouched. The external browser window has no
+pyxisApp key and keeps them all.
 
 ════════════════════════════════════════════════════════════════════════
 The unified diff below is generated from the checkout and is applied with
@@ -59,34 +65,20 @@ git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
 ════════════════════════════════════════════════════════════════════════
 
 diff --git a/browser/base/content/browser-init.js b/browser/base/content/browser-init.js
-index c32b781be079..bff5d7d7167d 100644
+index c32b781be079..1706a13b20d1 100644
 --- a/browser/base/content/browser-init.js
 +++ b/browser/base/content/browser-init.js
-@@ -101,6 +101,23 @@ var gBrowserInit = {
+@@ -101,6 +101,9 @@ var gBrowserInit = {
        );
        toolbarMenubar.setAttribute("data-l10n-attrs", "toolbarname");
      }
-+    // PYXIS-DIAG (temporary, 2026-08-17): the decisive probe for alpha2 #10.
-+    // This logs unconditionally -- BEFORE the `window.arguments[1]` guard --
-+    // so a window that arrives with no arguments at all is distinguishable
-+    // from one whose arguments are present but the wrong shape. Those two
-+    // cases have completely different fixes. Remove once #10 is closed.
-+    try {
-+      let a = window.arguments;
-+      console.error(
-+        `PYXIS-DIAG browser-init: arguments=${a ? a.length : "none"} ` +
-+          `[1]=${a && a[1] ? String(a[1]) : "undefined"} ` +
-+          `isBag=${!!(a && a[1] && a[1] instanceof Ci.nsIWritablePropertyBag2)} ` +
-+          `hasPyxisApp=${!!(a && a[1] && a[1] instanceof Ci.nsIWritablePropertyBag2 && a[1].hasKey("pyxisApp"))}`
-+      );
-+    } catch (e) {
-+      console.error(`PYXIS-DIAG browser-init: probe threw: ${e}`);
-+    }
++
++    let hasPyxisApp = false;
 +
      // If opening a Taskbar Tab window, add an attribute to the top-level element
      // to inform window styling.
      if (window.arguments && window.arguments[1]) {
-@@ -114,6 +131,73 @@ var gBrowserInit = {
+@@ -114,6 +117,96 @@ var gBrowserInit = {
            extraOptions.getPropertyAsAString("taskbartab")
          );
        }
@@ -112,9 +104,22 @@ index c32b781be079..bff5d7d7167d 100644
 +        extraOptions instanceof Ci.nsIWritablePropertyBag2 &&
 +        extraOptions.hasKey("pyxisApp")
 +      ) {
++        hasPyxisApp = true;
 +        let appId = extraOptions.getPropertyAsAString("pyxisApp");
 +        let root = window.document.documentElement;
 +        root.setAttribute("pyxisapp", appId);
++        // An app window is the app, not a browser: hand it the browser's own
++        // shortcuts. mainKeyset's keys (Ctrl+N new window, Ctrl+T, Ctrl+W,
++        // Ctrl+L, Ctrl+F, Ctrl+Q, ...) are many of them `reserved`, so a page
++        // can't preventDefault them: Ctrl+N in Notes opened a full Firefox
++        // window inside the app. A disabled <key> is skipped outright, reserve
++        // check included (XULKeySetGlobalKeyListener::CanHandle), so the event
++        // goes to the page. Disabled rather than removed, since startup code
++        // looks some of them up by id. editMenuKeys (copy, paste, undo, select
++        // all) is a separate keyset and stays.
++        for (let key of window.document.querySelectorAll("#mainKeyset > key")) {
++          key.setAttribute("disabled", "true");
++        }
 +        // "windowclass"/"windowname" are read by
 +        // AppWindow::SyncAttributesToWidget() via plain
 +        // GetAttribute(u"windowclass"_ns, ...) / GetAttribute(u"windowname"_ns,
@@ -157,10 +162,20 @@ index c32b781be079..bff5d7d7167d 100644
 +        root.setAttribute("windowclass", windowClass);
 +        root.setAttribute("windowname", windowClass);
 +      }
++    }
++
++    if (!hasPyxisApp) {
++      let envWindowClass = Services.env.get("PYXIS_WINDOW_CLASS")?.trim();
++      if (envWindowClass) {
++        let root = window.document.documentElement;
++        root.setAttribute("windowclass", envWindowClass);
++        root.setAttribute("windowname", envWindowClass);
++        window.pyxisSetWindowClass?.(envWindowClass);
++      }
      }
  
      // Run menubar initialization first, to avoid CustomTitlebar code picking
-@@ -524,6 +608,77 @@ var gBrowserInit = {
+@@ -524,6 +617,77 @@ var gBrowserInit = {
        }
      }
  

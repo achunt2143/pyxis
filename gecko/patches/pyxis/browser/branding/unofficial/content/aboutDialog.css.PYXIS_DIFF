@@ -1,0 +1,30 @@
+Update About dialog container and footer background colors to Vela's deep ocean palette (#081d28 and rgba(3, 105, 161, 0.28)).
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/branding/unofficial/content/aboutDialog.css b/browser/branding/unofficial/content/aboutDialog.css
+index 6c66cf20eca4..4757064252cd 100644
+--- a/browser/branding/unofficial/content/aboutDialog.css
++++ b/browser/branding/unofficial/content/aboutDialog.css
+@@ -3,7 +3,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #aboutDialogContainer {
+-  background-color: #130829;
++  background-color: #081d28;
+   color: #fff;
+   color-scheme: dark;
+ }
+@@ -15,6 +15,6 @@
+ }
+ 
+ #bottomBox {
+-  background-color: hsla(235, 43%, 10%, 0.5);
++  background-color: rgba(3, 105, 161, 0.28);
+   padding: 15px 10px 15px;
+ }

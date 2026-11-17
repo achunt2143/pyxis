@@ -1,0 +1,48 @@
+Replace Nightly default16.png (16x16) with 4x-supersampled Vela waterdrop badge.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/branding/unofficial/default16.png b/browser/branding/unofficial/default16.png
+index 0c5a7cdb57508567820c3a30d561e799d68dd755..4ba2a1dbb2d6974b7489324e33f3e75ea1ebd601 100644
+GIT binary patch
+delta 836
+zcmV-K1H1h71=<FXBYy)SNkl<Zc$_tmOKV(Z0EVCM`_9anTQZYmrsh(#mJzinLCwMz
+z6v2g{C|F!&VWHB63hs)Ff(+Az3&}<ZZrtcXiod{(6)F}Kk;bf2gHuy-Y0{*b+c|U2
+z`ED*oA9$B9Jnt)7-pjTSuJzk+Hf@xbvTov?v%(qxgE0^iv47d0r>c5XgC0>D5CMC~
+z(XRsF>hI~wD4$<F8k%`;9C(Mf4r?vmSssl-o-O>%PE=t(E~0GAWTiwg?SB+pzZ)%V
+zjr>;+VqZ)9L#w=%!a0O<NE}g`(Jbun>HJN;dGH#4j^?=64{c&+RNbe~$jGauV=Zg(
+z$zvCIr<8M|D1V&Dv=J+3i{h;XB|dMiiM9Lhh}#EGiLYNDiRDHhy0I0~n@pNi8=Yp}
+zSu3p3IBUULLg9I-o}+!S&S#w){J8%lyTb`C|4`(O`Yk48N}PEiwY9<+BeKk(wMJOO
+zag_4j*)p##lqm$B8yBA-?+nT%bWQ}JJ)$C0G6T|BgMZfJvNe{+amI7i93L!JIf@O|
+zIL<ZlTxyo-4pX#|eDd=pdWob&f;7gWGeeeXMv2C1!}XUN6avY{VT_Uz4_rQ9B`+*i
+zYm^!woWU83w8oHWjnRgKLBf^A8q23bqRjJry@>N3yrVf4GFuX)+1M0o!I|*{qc#0F
+zr51SJUw@n;u}}#G^-_RTAb?`1XcWK=6Qs8YtHBupW59bz6U~PgPV@9+j!w@oNDPx9
+z<b}pN&*`Z$Z#Jjdeb{HOJA_IRBtD3Tkv}=?d4F)oR>$#uAtkk*R68b$IfTm5sFu0c
+zjd`Ux$7av*)A|m1CA>*v6`ZRiL2)h=_X~A*XMZmhclNg_D8Y0dN(xFYVX*fPQ9NQ4
+z4VkG<up|{{=FW@h+L`qr+}+sd|FPNisi;j_Z3Tc-9Cl9_bWa!z21LUFW5oEpe5hXh
+zYrXsNmA7vRfEV7qx)P^)_0e&6UPuWZq*6$wQ2%9&2k$vGGrd>J%WJ=U_vKB|YPDp$
+z-92{KzF3>xJ{T@<b+#`!K@R8e&H;}9aYz;#Gk52v!rR}jwjZ`yE%`4>!N!mQ9@$y|
+O0000<MNUMnLSTYZ5|WSr
+
+delta 734
+zcmV<40wMj{2K5DyBYy(CNkl<ZcmZN$Km(SCE(ZXrCQE?Jia3h@My@|yckfujT@u>S
+zj%KXm7V(Uw-GUVyzK**;y*hJehF7p7<u9ilFU1{BaJtUiL~4(aVM{CbO`6%qPaQeu
+zZT^FQ0xo*_qlra4I+x>{`$%GiMouB0mdM^Ad|)`Xq^W&O5q};$dGwscKLMA#@W~Nl
+z#amTKj{K2~=!}A4gv=7MZA+54MC+bdY^*jx1M`jY{*03+&RIwR|7-tT{~Jfz#Q;4M
+z1R)_$FjBBwO<4B>2nOYA+D@=qr$-#}IRJ6xeed4fgyOkwt@!icE_@KocBd?MrQibq
+zA`_4s3RSU9u74?7&p=p)X?vZfbT{emSBN4d9a)+@rj<bJAd%o9NC76Ij1p>@QZ%0J
+zzb_Fx!i7?{TtuW%E@n7u2wKp_5<0iB2Q5GVK_a_|FpH^8ibLUgb&(czPvjG99FtT%
+zvftQ)?jhRjLg{ECpmD_7<BEtr(zr|$>TtT&WeMvJw|}!hO2y8fTRI)nMv5Q=U2l;i
+zg%2QAK&=g`@Ypy)S01UY1uUvuqB=+1I*xs@V*8@QiGVkbXzf4?1b`1DrD6Mb3q;2^
+zIu>%vi2ii3USqQn(gOtce=}n;OZa1)GIxP~pa?PS`n6=|FC|P2QNflj()@AL&Yx@g
+z4%z`>Tz?Q%4M}APQn1fTc58wCWsOsY*f@xQ;L){tTmamB!)u?-W`CT%s!QTSXQAZ)
+z(R=ztQBQKB<qBymc!5hjcG{y8^Y+^hUv{wu$g=#F9n;;f2Evi*n~#a3gZM##a0OXg
+zqD;UR8t0aTsv;icTf(^O{#T}ZZu@Z3w%v2H#aA!aHpbDb7`r*P?F#Y)Squ@GL}vPJ
+zM%i_zp1JCuGW`#C-t_)Om090WH|4|;PPf)fyp{`>$FHHp<8Qot%@+T`Uk|HZaPg-c
+QmH+?%07*qoM6N<$f=2dWZvX%Q
+

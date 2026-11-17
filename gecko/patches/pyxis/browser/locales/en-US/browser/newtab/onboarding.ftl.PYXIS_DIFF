@@ -1,0 +1,31 @@
+Rebrand onboarding gratitude screen attribution strings from the Mozilla Foundation to Pyxis.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/locales/en-US/browser/newtab/onboarding.ftl b/browser/locales/en-US/browser/newtab/onboarding.ftl
+index 5842d34a7819..7e613a0cda13 100644
+--- a/browser/locales/en-US/browser/newtab/onboarding.ftl
++++ b/browser/locales/en-US/browser/newtab/onboarding.ftl
+@@ -266,7 +266,7 @@ mr2022-onboarding-privacy-segmentation-button-secondary-label = Show detailed in
+ ## MR2022 Multistage Gratitude screen strings
+ 
+ mr2022-onboarding-gratitude-title = You’re helping us build a better web
+-mr2022-onboarding-gratitude-subtitle = Thank you for using { -brand-short-name }, backed by the Mozilla Foundation. With your support, we’re working to make the internet more open, accessible, and better for everyone.
++mr2022-onboarding-gratitude-subtitle = Thank you for using { -brand-short-name }, backed by Pyxis. With your support, we’re working to make the internet more open, accessible, and better for everyone.
+ mr2022-onboarding-gratitude-primary-button-label = See what’s new
+ mr2022-onboarding-gratitude-secondary-button-label = Start browsing
+ 
+@@ -322,7 +322,7 @@ onboarding-mobile-download-security-and-privacy-subtitle = When you’re synced
+ 
+ # Gratitude screen
+ onboarding-gratitude-security-and-privacy-title = { -brand-short-name } has your back
+-onboarding-gratitude-security-and-privacy-subtitle = Thank you for using { -brand-short-name }, backed by the Mozilla Foundation. With your support, we’re working to make the internet safer and more accessible for everyone.
++onboarding-gratitude-security-and-privacy-subtitle = Thank you for using { -brand-short-name }, backed by Pyxis. With your support, we’re working to make the internet safer and more accessible for everyone.
+ 
+ # Sign up or Sign in screen
+ onboarding-sign-up-title = Sync your data across devices

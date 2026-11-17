@@ -1,0 +1,22 @@
+Rebrand the privileged content process label shown in task manager and about:processes from Mozilla to Pyxis.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/toolkit/locales/en-US/toolkit/global/processTypes.ftl b/toolkit/locales/en-US/toolkit/global/processTypes.ftl
+index 317d7d12d70d..e7f98cb77289 100644
+--- a/toolkit/locales/en-US/toolkit/global/processTypes.ftl
++++ b/toolkit/locales/en-US/toolkit/global/processTypes.ftl
+@@ -14,7 +14,7 @@ process-type-privilegedabout = Privileged About
+ 
+ # process used to run privileged mozilla pages,
+ # such as accounts.firefox.com
+-process-type-privilegedmozilla = Privileged Mozilla Content
++process-type-privilegedmozilla = Privileged Pyxis Content
+ 
+ process-type-extension = Extension
+ 

@@ -1,0 +1,58 @@
+Rebrand default starter bookmark folder headings and link labels from Mozilla, Firefox, and Nightly to Pyxis and Vela equivalents.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/locales/en-US/browser/profile/default-bookmarks.ftl b/browser/locales/en-US/browser/profile/default-bookmarks.ftl
+index 5523466f30f0..a85b148cf2e4 100644
+--- a/browser/locales/en-US/browser/profile/default-bookmarks.ftl
++++ b/browser/locales/en-US/browser/profile/default-bookmarks.ftl
+@@ -10,13 +10,13 @@ default-bookmarks-title = Bookmarks
+ default-bookmarks-heading = Bookmarks
+ 
+ # Firefox links folder name
+-default-bookmarks-firefox-heading = Mozilla Firefox
++default-bookmarks-firefox-heading = Pyxis Vela
+ 
+ # link title for https://www.mozilla.org/firefox/help/
+ default-bookmarks-firefox-get-help = Get Help
+ 
+ # link title for https://www.mozilla.org/firefox/customize/
+-default-bookmarks-firefox-customize = Customize Firefox
++default-bookmarks-firefox-customize = Customize Vela
+ 
+ # link title for https://www.mozilla.org/contribute/
+ default-bookmarks-firefox-community = Get Involved
+@@ -25,22 +25,22 @@ default-bookmarks-firefox-community = Get Involved
+ default-bookmarks-firefox-about = About Us
+ 
+ # Firefox Nightly links folder name
+-default-bookmarks-nightly-heading = Firefox Nightly Resources
++default-bookmarks-nightly-heading = Vela Resources
+ 
+ # Nightly builds only, link title for https://blog.nightly.mozilla.org/
+-default-bookmarks-nightly-blog = Firefox Nightly blog
++default-bookmarks-nightly-blog = Vela Blog
+ 
+ # Nightly builds only, link title for https://bugzilla.mozilla.org/
+-default-bookmarks-bugzilla = Mozilla Bug Tracker
++default-bookmarks-bugzilla = Pyxis Bug Tracker
+ 
+ # Nightly builds only, link title for https://developer.mozilla.org/
+-default-bookmarks-mdn = Mozilla Developer Network
++default-bookmarks-mdn = Web Developer Network
+ 
+ # Nightly builds only, link title for https://addons.mozilla.org/firefox/addon/nightly-tester-tools/
+-default-bookmarks-nightly-tester-tools = Nightly Tester Tools
++default-bookmarks-nightly-tester-tools = Vela Tester Tools
+ 
+ # Nightly builds only, link title for about:crashes
+ default-bookmarks-crashes = All your crashes
+ 
+ # Nightly builds only, link title for https://planet.mozilla.org/
+-default-bookmarks-planet = Planet Mozilla
++default-bookmarks-planet = Planet Pyxis

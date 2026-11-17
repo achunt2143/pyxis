@@ -20,12 +20,10 @@ pub mod window;
 pub use gecko::{compose_launch, ComposedLaunch, DisplayMode, LaunchEnvironment, WebAppLaunchSpec};
 pub use window::{Window, WindowConfig, WindowState};
 
-use anyhow::Result;
-use std::sync::Arc;
 use tracing::info;
 
 /// Initialize Gecko window manager
-pub async fn initialize(wayland_socket: &str) {
+pub async fn initialize(_wayland_socket: &str) {
     info!("Initializing Gecko Window Manager");
 
     // let wayland = WaylandClient::new(0,0);

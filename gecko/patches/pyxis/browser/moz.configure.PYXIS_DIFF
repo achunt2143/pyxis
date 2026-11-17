@@ -1,0 +1,23 @@
+Imply MOZ_APP_VENDOR=Pyxis and MOZ_APP_BASENAME=Vela in browser configure defaults so generated application metadata (application.ini, XRE sAppData, and GTK application name) reports Pyxis Vela instead of Mozilla Firefox.
+
+════════════════════════════════════════════════════════════════════════
+The unified diff below is generated from the checkout and is applied with
+  git apply gecko/patches/pyxis/<path>.PYXIS_DIFF
+(or `patch -p1 <`). Everything above this line is rationale, not content;
+git apply ignores it. Regenerate with scripts/regen-gecko-patches.sh.
+════════════════════════════════════════════════════════════════════════
+
+diff --git a/browser/moz.configure b/browser/moz.configure
+index e8b401a7dfb2..c92b5c91594e 100644
+--- a/browser/moz.configure
++++ b/browser/moz.configure
+@@ -13,7 +13,8 @@ imply_option("MOZ_NORMANDY", True)
+ imply_option("MOZ_PROFILE_MIGRATOR", True)
+ 
+ 
+-imply_option("MOZ_APP_VENDOR", "Mozilla")
++imply_option("MOZ_APP_VENDOR", "Pyxis")
++imply_option("MOZ_APP_BASENAME", "Vela")
+ imply_option("MOZ_APP_ID", "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}")
+ # Include the DevTools client, not just the server (which is the default)
+ imply_option("MOZ_DEVTOOLS", "all")
