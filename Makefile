@@ -139,6 +139,7 @@ system: stage2-rust-release
 # ============================================================================
 
 PYXIS_REPO   ?= ../pyxis-experience
+PYXIS_NPM_CI ?= 0
 
 # REAL BUG, found via a real report (2026-07-07): `build-release`'s
 # dependency chain (stage1 install-deps stage2-rust-release build-kernel
@@ -165,10 +166,21 @@ PYXIS_REPO   ?= ../pyxis-experience
 # defined in pyxis-experience/package.json) runs
 # `npm run build --workspaces --if-present` first, then the root build --
 # use that instead so every staged app is actually produced.
+# Reuse an existing node_modules tree by default so offline/locally-synced
+# packages (e.g. remochi / @duyojs/duyo) and running dev servers are not wiped
+# by `npm ci`. Pass PYXIS_NPM_CI=1 to force a clean `npm ci` when deps change.
 pyxis-build:
-	@echo "$(YELLOW)Building Pyxis desktop shell + apps from $(PYXIS_REPO)...$(NC)"
-	cd $(PYXIS_REPO) && npm ci && npm run build:all
-	@echo "[✓] Pyxis shell + apps built at $(PYXIS_REPO)/dist and packages/apps/*/dist"
+	@if [ ! -d "$(PYXIS_REPO)" ]; then \
+		echo "$(YELLOW)⚠ $(PYXIS_REPO) not found -- skipping Pyxis web build (create-rootfs.sh will reuse existing rootfs apps if present).$(NC)"; \
+	elif [ "$(PYXIS_NPM_CI)" = "1" ] || [ ! -d "$(PYXIS_REPO)/node_modules" ]; then \
+		echo "$(YELLOW)Installing deps & building Pyxis desktop shell + apps from $(PYXIS_REPO)...$(NC)"; \
+		cd $(PYXIS_REPO) && npm ci && npm run build:all; \
+		echo "[✓] Pyxis shell + apps built at $(PYXIS_REPO)/dist and packages/apps/*/dist"; \
+	else \
+		echo "$(YELLOW)Building Pyxis desktop shell + apps from $(PYXIS_REPO) (reusing existing node_modules; pass PYXIS_NPM_CI=1 to run npm ci)...$(NC)"; \
+		cd $(PYXIS_REPO) && npm run build:all; \
+		echo "[✓] Pyxis shell + apps built at $(PYXIS_REPO)/dist and packages/apps/*/dist"; \
+	fi
 
 pyxis-install: pyxis-build
 
@@ -259,8 +271,7 @@ gecko-build: gecko-patches-check
 		echo "$(YELLOW)  create-rootfs.sh will reuse an existing vela if present, else skip it.$(NC)"; \
 		echo "$(YELLOW)  Set up the checkout per gecko/BUILD_RUNBOOK.md (clone + ./mach bootstrap).$(NC)"; \
 	fi
-
-build-rootfs: pyxis-build gecko-build
+build-rootfs: gecko-build pyxis-build
 	@echo "$(YELLOW)Building root fs...$(NC)"
 	$(RUN_SCRIPT) scripts/create-rootfs.sh --kernel-prebuilt
 	@echo "$(GREEN)✓ Root fs build complete$(NC)"
