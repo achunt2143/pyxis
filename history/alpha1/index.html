@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pyxis alpha 1</title>
+<meta name="description" content="Pyxis alpha 1: the first boot from power-on to a working app.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lato:ital,wght@0,300;0,400;0,700;1,400;1,700&display=swap">
+<style>
+/* Layout: a long guided walk in six chapters; each feature is a text column beside its screenshot, framed in Pyxis's waterdrop corner (16 4 16 16). */
+:root {
+  --paper: #f5f3f6;
+  --card: #ffffff;
+  --ink: #26222b;
+  --quiet: #6b6473;
+  --line: #e1dce5;
+  --chip: #ebe7ee;
+  --red: #e23d3d;      /* the spinner's red, deepened for text */
+  --blue: #2a7ea6;     /* the spinner's blue, deepened for text */
+  --yellow: #c98a00;   /* the spinner's yellow, deepened for text */
+  --red-fill: #ff4a4a;
+  --blue-fill: #69cdff;
+  --yellow-fill: #ffb80d;
+  --shadow: 0 1px 2px rgba(38,34,43,.06), 0 10px 30px rgba(38,34,43,.10);
+  --display: 'Lato', 'Helvetica Neue', Arial, sans-serif;
+  --body: 'Lato', 'Helvetica Neue', Arial, sans-serif;
+  --drop: 16px 4px 16px 16px;
+  --drop-sm: 10px 3px 10px 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #141218; --card: #1e1b23; --ink: #ece9e3; --quiet: #a59fae; --line: #2f2b36; --chip: #26232c;
+    --red: #ff7a7a; --blue: #7fd3ff; --yellow: #ffc845;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 12px 32px rgba(0,0,0,.35);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #141218; --card: #1e1b23; --ink: #ece9e3; --quiet: #a59fae; --line: #2f2b36; --chip: #26232c;
+  --red: #ff7a7a; --blue: #7fd3ff; --yellow: #ffc845;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 12px 32px rgba(0,0,0,.35);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font-family: var(--body); font-size: 17px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1120px; margin: 0 auto; }
+h1, h2, h3 { text-wrap: balance; margin: 0; }
+p { margin: 0; }
+a { color: var(--blue); }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+
+/* ---------- top ---------- */
+header.top { padding-block: 56px 28px; display: grid; gap: 28px; }
+.brand { display: flex; align-items: center; gap: 14px; color: var(--quiet); font-size: 13px; letter-spacing: .32em; text-transform: uppercase; }
+.brand .shapes { display: inline-flex; gap: 6px; }
+h1 { font-family: var(--display); font-weight: 300; font-size: clamp(56px, 11vw, 120px); letter-spacing: .28em; line-height: 1; margin-right: -.28em; }
+.lede { font-size: clamp(19px, 2.3vw, 23px); max-width: 40ch; color: var(--ink); }
+.lede em { font-style: italic; font-weight: 700; }
+.hero-shot { margin-top: 8px; }
+
+nav.chapters { display: flex; flex-wrap: wrap; gap: 8px; padding-block: 8px 0; }
+nav.chapters a {
+  display: inline-flex; align-items: center; gap: 8px; text-decoration: none; color: var(--ink);
+  background: var(--chip); padding: 7px 14px 7px 11px; border-radius: var(--drop-sm); font-size: 14px;
+}
+nav.chapters a:hover { background: var(--line); }
+
+/* ---------- shots ---------- */
+.shot {
+  display: block; width: 100%; padding: 0; border: 0; background: none; cursor: zoom-in;
+  border-radius: var(--drop); overflow: hidden; box-shadow: var(--shadow); line-height: 0;
+}
+.shot img { width: 100%; height: auto; display: block; }
+.shot.strip { border-radius: var(--drop-sm); }
+figure { margin: 0; display: grid; gap: 10px; min-width: 0; }
+figcaption { font-size: 14px; color: var(--quiet); line-height: 1.45; }
+
+/* ---------- chapters ---------- */
+section.chapter { padding-block: 72px 8px; border-top: 1px solid var(--line); margin-top: 56px; }
+.chapter-head { display: grid; gap: 12px; margin-bottom: 40px; max-width: 62ch; }
+.eyebrow { display: flex; align-items: center; gap: 10px; font-size: 13px; letter-spacing: .28em; text-transform: uppercase; color: var(--quiet); }
+h2 { font-family: var(--display); font-weight: 300; font-size: clamp(34px, 5vw, 52px); letter-spacing: .18em; text-transform: uppercase; line-height: 1.1; }
+.chapter-head p { color: var(--quiet); font-size: 18px; }
+
+.feature { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 40px; align-items: start; padding-block: 36px; }
+.feature + .feature { border-top: 1px dashed var(--line); }
+.feature.flip > .text { order: 2; }
+.feature.wide { grid-template-columns: 1fr; }
+.feature .text { display: grid; gap: 14px; min-width: 0; }
+h3 { font-weight: 700; font-size: 24px; line-height: 1.25; }
+.def { font-size: 18px; }
+.def em { font-style: italic; font-weight: 700; }
+ul.can { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+ul.can li { position: relative; padding-left: 22px; }
+ul.can li::before {
+  content: ""; position: absolute; left: 2px; top: .62em; width: 8px; height: 8px;
+  border-radius: 4px 1px 4px 4px; background: var(--blue-fill);
+}
+.label { font-size: 12px; letter-spacing: .22em; text-transform: uppercase; color: var(--quiet); }
+kbd {
+  font-family: var(--body); font-size: 13px; font-weight: 700; color: var(--ink);
+  background: var(--card); border: 1px solid var(--line); border-bottom-width: 2px;
+  padding: 1px 7px; border-radius: 5px; white-space: nowrap;
+}
+
+.trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.duo { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.quad { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px 22px; }
+.stack { display: grid; gap: 18px; }
+.tag { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding: 2px 8px; border-radius: var(--drop-sm); background: var(--chip); color: var(--ink); }
+
+/* running-light legend */
+.lights { display: grid; gap: 10px; margin-top: 4px; }
+.light { display: grid; grid-template-columns: 44px 1fr; align-items: center; gap: 12px; font-size: 15px; }
+.light i { display: block; height: 3px; border-radius: 2px; background: var(--blue-fill); }
+.light .short { width: 18px; margin-left: 13px; }
+.light .long { width: 34px; margin-left: 5px; }
+.light .faint { width: 18px; margin-left: 13px; opacity: .35; }
+.light .red { width: 18px; margin-left: 13px; background: var(--red-fill); }
+.light .pulse { width: 18px; margin-left: 13px; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+
+/* motion names */
+.motion figure h4 { margin: 0; font-size: 18px; font-weight: 700; display: flex; align-items: baseline; gap: 10px; }
+.motion figure h4 span { font-weight: 400; color: var(--quiet); font-size: 14px; }
+
+/* apps grid */
+.apps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 40px 28px; }
+.app { display: grid; gap: 12px; min-width: 0; }
+.app-head { display: flex; align-items: center; gap: 12px; }
+.app-icon { width: 36px; height: 36px; border-radius: 10px 3px 10px 10px; display: grid; place-items: center; color: #fff; flex: none; }
+.app-icon svg { width: 20px; height: 20px; }
+.app h3 { font-size: 21px; }
+.app p { color: var(--quiet); font-size: 16px; }
+
+/* security rooms */
+.rooms { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 18px; border-radius: var(--drop); background: var(--card); box-shadow: var(--shadow); }
+.room { border: 1.5px solid var(--line); border-radius: var(--drop-sm); padding: 12px 10px; display: grid; gap: 6px; justify-items: start; min-width: 0; }
+.room b { font-size: 14px; }
+.room small { font-size: 12px; color: var(--quiet); line-height: 1.35; }
+.room .dot { width: 10px; height: 10px; border-radius: 5px 1px 5px 5px; }
+.rooms .gate { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: var(--drop-sm); background: var(--chip); font-size: 14px; }
+.rooms .gate svg { flex: none; }
+.promises { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 28px; margin-top: 28px; }
+.promise { display: grid; gap: 4px; }
+.promise b { font-size: 16px; }
+.promise span { color: var(--quiet); font-size: 15px; }
+
+/* shortcuts */
+.keys { width: 100%; border-collapse: collapse; font-size: 16px; }
+.keys td { padding: 11px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.keys td:first-child { width: 42%; white-space: nowrap; }
+.keys tr:last-child td { border-bottom: 0; }
+.keys-wrap { overflow-x: auto; background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 6px 16px; }
+
+/* sound */
+.sound-card { background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 22px; display: grid; gap: 16px; }
+.wave { display: flex; align-items: center; gap: 3px; height: 40px; }
+.wave i { flex: 1; background: var(--blue-fill); border-radius: 2px; opacity: .8; }
+.sound-list { display: flex; flex-wrap: wrap; gap: 8px; }
+
+footer { padding-block: 64px 72px; color: var(--quiet); font-size: 14px; border-top: 1px solid var(--line); margin-top: 72px; display: grid; gap: 6px; }
+
+/* lightbox */
+dialog#zoom { padding: 0; border: 0; background: transparent; max-width: min(1400px, 96vw); width: 96vw; }
+dialog#zoom::backdrop { background: rgba(10, 8, 14, .82); }
+dialog#zoom img { width: 100%; height: auto; display: block; border-radius: var(--drop); }
+dialog#zoom p { color: #ece9e3; font-size: 15px; padding-top: 10px; text-align: center; }
+
+@media (max-width: 860px) {
+  .feature, .feature.flip { grid-template-columns: 1fr; gap: 22px; }
+  .feature.flip > .text { order: 0; }
+  .trio { grid-template-columns: 1fr; }
+  .apps, .quad, .promises { grid-template-columns: 1fr; }
+  .rooms { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .duo { grid-template-columns: 1fr; }
+  h1 { letter-spacing: .18em; margin-right: -.18em; }
+}
+@media (prefers-reduced-motion: reduce) { .light .pulse { animation: none; } }
+
+/* history additions */
+.pager { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.pager a { text-decoration: none; display: grid; gap: 2px; padding: 14px 18px; background: var(--card);
+  border-radius: var(--drop); box-shadow: var(--shadow); min-width: 0; color: var(--ink); }
+.pager a small { color: var(--quiet); font-size: 13px; letter-spacing: .18em; text-transform: uppercase; }
+.pager a:hover { background: var(--chip); }
+.pager .next { margin-left: auto; text-align: right; }
+.crumb { font-size: 14px; } .crumb a { text-decoration: none; }
+.note { background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 18px 22px; color: var(--quiet); font-size: 15px; }
+.note b { color: var(--ink); }
+ul.not li::before { background: var(--red-fill); }
+ul.came li::before { background: var(--yellow-fill); }
+/* timeline */
+.timeline { display: grid; gap: 0; }
+.rel { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 32px; padding-block: 44px; border-top: 1px solid var(--line); }
+.rel .when { display: grid; gap: 4px; align-content: start; }
+.rel .when b { font-family: var(--display); font-weight: 300; font-size: 40px; letter-spacing: .12em; line-height: 1; }
+.rel .when span { color: var(--quiet); font-size: 14px; }
+.rel .body { display: grid; grid-template-columns: minmax(0, 6fr) minmax(0, 5fr); gap: 28px; align-items: start; }
+.rel .body .text { display: grid; gap: 12px; }
+.rel h2 { font-size: clamp(24px, 3vw, 30px); letter-spacing: .12em; }
+.rel .links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.rel .links a { display: inline-flex; text-decoration: none; color: var(--ink); background: var(--chip); padding: 6px 13px; border-radius: var(--drop-sm); font-size: 14px; }
+.rel .links a:hover { background: var(--line); }
+@media (max-width: 860px) {
+  .rel { grid-template-columns: 1fr; gap: 14px; }
+  .rel .body { grid-template-columns: 1fr; }
+}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="tri" viewBox="0 0 14 14"><path d="M1.5 2.5h11L7 12z" /></symbol>
+    <symbol id="sq" viewBox="0 0 14 14"><rect x="2" y="2" width="10" height="10" rx="1.5" /></symbol>
+    <symbol id="ci" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.2" /></symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+
+<header class="top">
+  <p class="crumb"><a href="../../">Pyxis docs</a> &rsaquo; <a href="../">Release history</a></p>
+  <div class="brand">
+    <span class="shapes" aria-hidden="true"><svg width="14" height="14" fill="var(--yellow-fill)"><use href="#tri"/></svg><svg width="14" height="14" fill="var(--blue-fill)"><use href="#sq"/></svg><svg width="14" height="14" fill="var(--red-fill)"><use href="#ci"/></svg></span>
+    Alpha 1 &middot; July 2026
+  </div>
+  <h1>ALPHA 1</h1>
+  <p class="lede">The first time Pyxis ran from power-on to a <em>working</em> app. One app, one window, and every layer of the system underneath it real.</p>
+  <figure class="hero-shot">
+    <button class="shot" type="button"><img src="shots/boot-terminal.webp" alt="Alpha 1 after boot: the Terminal fills the screen in a window drawn by Evo, titled pyxis://terminal, under a Nightly security notice" width="1280" height="800"></button><figcaption>What alpha 1 boots to: the Terminal, full screen, in a window Evo draws. Every screenshot on this page was taken by booting the alpha 1 disk image.</figcaption>
+  </figure>
+  <nav class="chapters" aria-label="Sections"><a href="#did"><svg width="12" height="12" fill="var(--yellow-fill)"><use href="#tri"/></svg>What it did</a><a href="#not"><svg width="12" height="12" fill="var(--blue-fill)"><use href="#sq"/></svg>Not yet</a><a href="#next"><svg width="12" height="12" fill="var(--red-fill)"><use href="#ci"/></svg>What came next</a><a href="../../releases/alpha1/"><svg width="12" height="12" fill="var(--yellow-fill)"><use href="#tri"/></svg>Release notes</a></nav>
+  <p class="note"><b>About these pictures.</b> The alpha 1 image starts only the Terminal. The Bloom shots further down come from the same image, with Bloom started by hand over the serial console, to show what the shell looked like at the time.</p>
+</header>
+
+<section class="chapter" id="did">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--yellow-fill)"><use href="#tri"/></svg>What it did</div>
+    <h2>Boot to an app</h2>
+    <p>Alpha 1 proved the architecture end to end: kernel, services, compositor, message bus, web engine and app, all Pyxis's own.</p>
+  </div>
+  <div class="feature">
+    <div class="text">
+      <h3>A real terminal</h3>
+      <p class="def">The one app that worked end to end. What you type runs on the system and the output comes back <em>over the bus</em>, through the same bridge every later app would use.</p>
+      <ul class="can"><li>It runs inside Vela, Pyxis's own build of the Gecko engine, at the address <code>pyxis://terminal</code>.</li><li>The window around it, with its title and three buttons, is drawn by Evo, Pyxis's compositor.</li><li>Restore it down and there is nothing behind it but Evo's plain background: no desktop yet.</li></ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/terminal-at-work.webp" alt="The alpha 1 Terminal after running uname -a and ls /: a 7.0.1-geckoOS kernel and the root directory" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+  <div class="feature flip">
+    <div class="text">
+      <h3>Nothing behind it</h3>
+      <p class="def">Alpha 1 boots straight into the Terminal. The desktop shell existed, but did not start at boot yet.</p>
+      <ul class="can"><li>Evo composites windows on the real kernel and draws their frames itself.</li><li>Echo, the message bus, carries calls and signals between every process.</li></ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/bare-evo.webp" alt="The Terminal restored down, with Evo&#x27;s plain lavender background behind it and no desktop" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+  <div class="feature wide">
+    <div class="text">
+      <h3>The shell, waiting in the wings</h3>
+      <p class="def">Bloom, the desktop shell, ships in the image. Started by hand, it shows the shape the desktop would take: a top bar, a launcher rail, a dock. But its windows are drawn <em>inside the shell's own page</em>, and their contents are pretend.</p>
+      <ul class="can"><li>The battery reads 50% and the Wi-Fi reads off, on a machine with no battery and a working network.</li><li>Files shows placeholder folders, not what is on disk.</li><li>Quick settings offers Dark Mode, Notifications and Auto-brightness.</li></ul>
+    </div>
+    <div class="duo"><figure><button class="shot" type="button"><img src="shots/shell.webp" alt="The alpha 1 Bloom shell, launched by hand: a top bar, a launcher rail, and Terminal and Notes windows drawn inside the page" loading="lazy" width="1280" height="800"></button><figcaption>Bloom, launched by hand from the serial console.</figcaption></figure><figure><button class="shot" type="button"><img src="shots/shell-files.webp" alt="Alpha 1&#x27;s File Manager inside Bloom, showing placeholder folders: Documents, Downloads, Pictures, Music and README.md" loading="lazy" width="1280" height="800"></button><figcaption>Files, with placeholder folders.</figcaption></figure></div>
+  </div>
+  <div class="feature flip">
+    <div class="text">
+      <h3>Seven apps, by name</h3>
+      <p class="def">The app list names Browser, Contacts, File Manager, Notes, Settings, Terminal and Tasks. Only the Terminal does real work.</p>
+      <ul class="can"><li>Vela gives every app its own <code>pyxis://</code> origin, a real secure context of its own.</li><li>A bridge compiled into Vela gives apps the <code>window.geckoOS</code> API for files, apps, power and events.</li></ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/shell-apps.webp" alt="Alpha 1&#x27;s app list: Browser, Contacts, File Manager, Notes, Settings, Terminal and Tasks" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+</section>
+
+<section class="chapter" id="not">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--blue-fill)"><use href="#sq"/></svg>Not yet</div>
+    <h2>What it couldn't do</h2>
+    <p>Written down at release, so the next alpha knew where to start.</p>
+  </div>
+  <ul class="can not"><li>Every app except the Terminal used made-up data.</li><li>The desktop shell didn't start at boot.</li><li>Any program on the bus could call any service: there was no permission model.</li><li>There was no way to install an app. Nova, the app host, was still a design.</li><li>Windows couldn't be minimized.</li><li>The engine still called itself Nightly and showed Firefox's security notice.</li></ul>
+</section>
+
+<section class="chapter" id="next">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--red-fill)"><use href="#ci"/></svg>What came next</div>
+    <h2>Alpha 2: a desktop</h2>
+  </div>
+  <ul class="can came"><li>The shell started at boot, and apps opened as real windows of their own.</li><li>Nova and the installer service arrived, and Vroom became the Pyxis app toolkit.</li></ul>
+</section>
+
+<footer>
+  <nav class="pager" aria-label="Other releases"><a class="next" href="../alpha2/"><small>Later &rarr;</small>Alpha 2</a></nav>
+  <span style="margin-top:28px">Pyxis alpha 1 &middot; July 2026. Booted from pyxis-alpha1.img.</span>
+</footer>
+
+</div>
+
+<dialog id="zoom" aria-label="Enlarged screenshot">
+  <img id="zoom-img" alt="">
+  <p id="zoom-cap"></p>
+</dialog>
+<script>
+(function () {
+  var dlg = document.getElementById('zoom'), img = document.getElementById('zoom-img'), cap = document.getElementById('zoom-cap');
+  document.querySelectorAll('button.shot').forEach(function (b) {
+    var i = b.querySelector('img');
+    b.setAttribute('aria-label', 'Enlarge: ' + i.alt);
+    b.addEventListener('click', function () {
+      img.src = i.src; img.alt = i.alt; cap.textContent = i.alt;
+      if (dlg.showModal) dlg.showModal();
+    });
+  });
+  dlg.addEventListener('click', function () { dlg.close(); });
+})();
+</script>

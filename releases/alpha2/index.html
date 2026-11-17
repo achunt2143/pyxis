@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pyxis alpha 2</title>
+<meta name="description" content="Pyxis release notes.">
+<style>
+:root{--bg:#fafbfc;--fg:#1c2230;--mut:#5b6577;--line:#dde2ea;--code:#eef1f6;--acc:#2f6fed}
+@media(prefers-color-scheme:dark){:root{--bg:#0e121b;--fg:#e4e8f0;--mut:#98a2b5;--line:#262d3b;--code:#171d29;--acc:#7aa5ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 80px}
+h1,h2,h3,h4{line-height:1.25;margin:2em 0 .6em}h1{margin-top:0;font-size:2.1rem}
+h2{border-bottom:1px solid var(--line);padding-bottom:.3em}
+a{color:var(--acc)}hr{border:0;border-top:1px solid var(--line);margin:2em 0}
+code{background:var(--code);padding:.12em .35em;border-radius:5px;font-size:.88em}
+pre{background:var(--code);padding:14px;border-radius:8px;overflow-x:auto}pre code{background:none;padding:0}
+table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:var(--code)}blockquote{margin:1em 0;padding:0 1em;border-left:3px solid var(--line);color:var(--mut)}
+</style></head><body><main>
+<p><a href="../../">&larr; Pyxis docs</a> &middot; <a href="../../history/alpha2/">Tour of alpha 2</a> &middot; <a href="../../history/">Release history</a></p>
+<div class="markdown-heading"><h1 class="heading-element">Pyxis alpha 2</h1><a id="user-content-pyxis-alpha-2" class="anchor" aria-label="Permalink: Pyxis alpha 2" href="#pyxis-alpha-2"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p><em>Released 27 July 2026.</em></p>
+<p>Alpha 2 is the first Pyxis that boots to a desktop. The Bloom shell starts on its own, apps open as real windows that Evo composites, and the browser is Vela. Underneath, the pieces for installing apps arrived: Nova, the app host, and Vroom, the toolkit that builds Pyxis app packages. It shipped after a full on-device test pass, with the bugs that pass found written down and carried into alpha 3.</p>
+<div class="markdown-heading"><h2 class="heading-element">Highlights</h2><a id="user-content-highlights" class="anchor" aria-label="Permalink: Highlights" href="#highlights"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>
+<strong>A desktop at boot.</strong> The machine starts into the Bloom shell: a top bar with search, a dock and a wallpaper.</li>
+<li>
+<strong>Apps are real windows.</strong> Each app opens in its own window that Evo draws and frames, not inside the shell's page.</li>
+<li>
+<strong>The shell stays behind your apps.</strong> Evo keeps the desktop on the bottom layer, so app windows can't disappear beneath it.</li>
+<li>
+<strong>Vela is the browser.</strong> Clicking Browser opens the web straight away in Pyxis's own engine.</li>
+<li>
+<strong>Settings are saved.</strong> Settings survive a restart.</li>
+<li>
+<strong>Eight apps.</strong> The new App Installer joins Terminal, Browser, Files, Notes, Contacts, Tasks and Settings.</li>
+<li>
+<strong>The groundwork for installing apps.</strong> Nova knows every app, launches it and can install or remove it; Vroom builds <code>.ipk</code> packages for web and native apps.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">What changed since alpha 1</h2><a id="user-content-what-changed-since-alpha-1" class="anchor" aria-label="Permalink: What changed since alpha 1" href="#what-changed-since-alpha-1"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>The dock launches apps, and shows a small light under the ones that are running.</li>
+<li>Windows have a title bar drawn by Evo, with the app's name and minimize, maximize and close buttons.</li>
+<li>Minimize works, and the dock keeps a minimized app's icon.</li>
+<li>Opening an app gives one clean window. The first launch is no longer a plain browser window.</li>
+<li>The quick settings panel opens from the gear in the top bar.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Under the hood</h2><a id="user-content-under-the-hood" class="anchor" aria-label="Permalink: Under the hood" href="#under-the-hood"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>
+<strong>Nova</strong>, the app host, is built: it reads each app's manifest, gives every app its own <code>pyxis://</code> origin, composes its launch, installs and removes apps with an integrity check, and allows one copy of each app at a time.</li>
+<li>
+<strong>The installer service</strong> handles <code>.ipk</code> packages through opkg.</li>
+<li>
+<strong>Vroom</strong> became the Pyxis SDK and PDK: <code>pyxis</code>, <code>pyxis-sdk</code> and <code>pyxis-pdk</code> commands that build, package and install apps. (Its old life as a performance monitor with made-up numbers was deleted.)</li>
+<li>Settings are stored in one file in <code>/var/lib/pyxis</code>, whoever is logged in.</li>
+<li>The changes Pyxis makes to Gecko now live in the repository as a patch series, with a script to regenerate and check it.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Known issues</h2><a id="user-content-known-issues" class="anchor" aria-label="Permalink: Known issues" href="#known-issues"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>Restoring a maximized window closes the app.</li>
+<li>Clicking a minimized app's dock icon does not bring it back.</li>
+<li>Files shows a fixed set of folders instead of what is really on disk.</li>
+<li>Windows can't be resized.</li>
+<li>Apps still show Firefox's toolbar for the first seconds after they open, and new windows open partly off screen.</li>
+<li>The top bar and quick settings show made-up values: 50% battery, no network, and every switch reads Off.</li>
+<li>The App Installer can't install anything: the image has no package manager yet.</li>
+<li>Any program connected to the bus can still call any service.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Trying it</h2><a id="user-content-trying-it" class="anchor" aria-label="Permalink: Trying it" href="#trying-it"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p>Pyxis alpha 2 boots as a disk image in QEMU. The reference VM has 2 GB of memory and 4 CPUs.</p>
+
+</main></body></html>

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pyxis alpha 4</title>
+<meta name="description" content="Pyxis release notes.">
+<style>
+:root{--bg:#fafbfc;--fg:#1c2230;--mut:#5b6577;--line:#dde2ea;--code:#eef1f6;--acc:#2f6fed}
+@media(prefers-color-scheme:dark){:root{--bg:#0e121b;--fg:#e4e8f0;--mut:#98a2b5;--line:#262d3b;--code:#171d29;--acc:#7aa5ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 80px}
+h1,h2,h3,h4{line-height:1.25;margin:2em 0 .6em}h1{margin-top:0;font-size:2.1rem}
+h2{border-bottom:1px solid var(--line);padding-bottom:.3em}
+a{color:var(--acc)}hr{border:0;border-top:1px solid var(--line);margin:2em 0}
+code{background:var(--code);padding:.12em .35em;border-radius:5px;font-size:.88em}
+pre{background:var(--code);padding:14px;border-radius:8px;overflow-x:auto}pre code{background:none;padding:0}
+table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:var(--code)}blockquote{margin:1em 0;padding:0 1em;border-left:3px solid var(--line);color:var(--mut)}
+</style></head><body><main>
+<p><a href="../../">&larr; Pyxis docs</a> &middot; <a href="../../history/alpha4/">Tour of alpha 4</a> &middot; <a href="../../history/">Release history</a></p>
+<div class="markdown-heading"><h1 class="heading-element">Pyxis alpha 4</h1><a id="user-content-pyxis-alpha-4" class="anchor" aria-label="Permalink: Pyxis alpha 4" href="#pyxis-alpha-4"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p><em>Released 25 September 2026.</em></p>
+<p>Alpha 3 made Pyxis stop lying. Alpha 4 makes it useful. Its goal was "all my apps working": an app built with the Pyxis SDK, by someone who isn't Pyxis, installs through the App Installer, appears on the desktop with no change to Pyxis, opens in its own window, and uninstalls cleanly. Along the way, the window bugs that had followed Pyxis since alpha 2 were closed, and testing became real.</p>
+<div class="markdown-heading"><h2 class="heading-element">Highlights</h2><a id="user-content-highlights" class="anchor" aria-label="Permalink: Highlights" href="#highlights"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>
+<strong>Install an app and it shows up.</strong> A package built with <code>pyxis-sdk</code> installs through the App Installer and appears in the launcher, drawer, search and dock straight away. Remove it and it disappears.</li>
+<li>
+<strong>No more fixed app list.</strong> The desktop reads Nova's live registry of apps, so the eight built-in apps and anything you install are all on equal footing.</li>
+<li>
+<strong>Apps stay apps.</strong> An app opened a second time no longer comes back as a regular Firefox window with a toolbar.</li>
+<li>
+<strong>Maximize, then restore.</strong> Restoring a maximized window no longer closes the app.</li>
+<li>
+<strong>Restore from the dock.</strong> Click a minimized app's dock icon and it comes back.</li>
+<li>
+<strong>Windows close properly.</strong> The close button asks the app to close, and a closed window is really gone.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">What changed since alpha 3</h2><a id="user-content-what-changed-since-alpha-3" class="anchor" aria-label="Permalink: What changed since alpha 3" href="#what-changed-since-alpha-3"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>An app with no built-in entry still appears, drawn with its own icon from its package, or a plain glyph when it has none.</li>
+<li>The app drawer tells you whether it is still loading, can't reach the registry, or simply has no matches.</li>
+<li>Minimizing an app marks it as in the background, and focusing it from the dock brings it back.</li>
+<li>Firefox's sandbox notice no longer stacks a new bar in every app window.</li>
+<li>The reference virtual machine now has 4 GB of memory: the eight built-in apps and the shell don't all fit in 2 GB.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Under the hood</h2><a id="user-content-under-the-hood" class="anchor" aria-label="Permalink: Under the hood" href="#under-the-hood"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>Each install runs <code>opkg install</code> and then refreshes Nova's registry. Nova refuses to uninstall a packaged app itself and points to <code>opkg remove</code>, because opkg owns the files.</li>
+<li>Evo removes destroyed windows (before, the count climbed with every launch), its close request is real, and maximize and unmaximize can be asked for over the bus.</li>
+<li>Evo's window actions refuse a missing or malformed window id instead of answering success, and its error replies carry the real reason.</li>
+<li>The cause of apps turning back into Firefox windows was Firefox's session restore rewriting the window's chrome two seconds after it opened. App windows are now exempt.</li>
+<li>Shift was sending signals to process ids that weren't real kernel processes. It now refuses to signal anything it didn't start.</li>
+<li>The bridge between apps and the system refuses a call that needs a capability the app's manifest didn't declare.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">How it was checked</h2><a id="user-content-how-it-was-checked" class="anchor" aria-label="Permalink: How it was checked" href="#how-it-was-checked"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p>A new test harness boots the image headless and drives it over the serial console, and its assertions fail the run when something is wrong. Four suites passed on the release image: the package-to-uninstall flow, all eight apps launching and round-tripping through minimize and focus, the system service, and the regression guard for apps turning into Firefox windows. Bloom gained its first automated tests, which check the shell's picture of Nova against Nova's own source.</p>
+<div class="markdown-heading"><h2 class="heading-element">Known issues</h2><a id="user-content-known-issues" class="anchor" aria-label="Permalink: Known issues" href="#known-issues"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>Windows can't be resized by dragging their edges or corners yet.</li>
+<li>Shift's process layer is still simulated underneath real bookkeeping.</li>
+<li>The kernel lacks user namespaces, so the web engine's content sandbox is weaker than intended.</li>
+<li>There is no install-time permission prompt, and no way to see or revoke what an app was granted.</li>
+<li>There is no sound.</li>
+<li>A minimized app keeps all of its memory.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Trying it</h2><a id="user-content-trying-it" class="anchor" aria-label="Permalink: Trying it" href="#trying-it"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p>Pyxis alpha 4 boots as a disk image in QEMU. Give the VM 4 GB of memory.</p>
+
+</main></body></html>

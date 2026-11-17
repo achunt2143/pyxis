@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pyxis alpha 1</title>
+<meta name="description" content="Pyxis release notes.">
+<style>
+:root{--bg:#fafbfc;--fg:#1c2230;--mut:#5b6577;--line:#dde2ea;--code:#eef1f6;--acc:#2f6fed}
+@media(prefers-color-scheme:dark){:root{--bg:#0e121b;--fg:#e4e8f0;--mut:#98a2b5;--line:#262d3b;--code:#171d29;--acc:#7aa5ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 80px}
+h1,h2,h3,h4{line-height:1.25;margin:2em 0 .6em}h1{margin-top:0;font-size:2.1rem}
+h2{border-bottom:1px solid var(--line);padding-bottom:.3em}
+a{color:var(--acc)}hr{border:0;border-top:1px solid var(--line);margin:2em 0}
+code{background:var(--code);padding:.12em .35em;border-radius:5px;font-size:.88em}
+pre{background:var(--code);padding:14px;border-radius:8px;overflow-x:auto}pre code{background:none;padding:0}
+table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:var(--code)}blockquote{margin:1em 0;padding:0 1em;border-left:3px solid var(--line);color:var(--mut)}
+</style></head><body><main>
+<p><a href="../../">&larr; Pyxis docs</a> &middot; <a href="../../history/alpha1/">Tour of alpha 1</a> &middot; <a href="../../history/">Release history</a></p>
+<div class="markdown-heading"><h1 class="heading-element">Pyxis alpha 1</h1><a id="user-content-pyxis-alpha-1" class="anchor" aria-label="Permalink: Pyxis alpha 1" href="#pyxis-alpha-1"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p><em>Released 7 July 2026.</em></p>
+<p>Alpha 1 is the first time Pyxis ran from power-on to a working app. The machine boots its own kernel, starts the Pyxis services, brings up the Evo compositor, and opens one real app: the Terminal, running inside Pyxis's own build of the Gecko web engine and talking to the system over the Echo message bus. It is not yet a usable desktop. It is the proof that the whole architecture holds together end to end.</p>
+<div class="markdown-heading"><h2 class="heading-element">Highlights</h2><a id="user-content-highlights" class="anchor" aria-label="Permalink: Highlights" href="#highlights"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>
+<strong>It boots.</strong> The image starts on a virtual machine, brings up every Pyxis service, and lands in a working app with no help.</li>
+<li>
+<strong>One real app.</strong> The Terminal is live end to end. What you type runs on the system, and the output comes back through the bus.</li>
+<li>
+<strong>Pyxis's own compositor.</strong> Evo draws every window, including its title bar and the minimize, maximize and close buttons.</li>
+<li>
+<strong>Pyxis's own web engine.</strong> Vela, a from-source build of Gecko, opens apps from <code>pyxis://</code> addresses in a chromeless window, each app at its own secure origin.</li>
+<li>
+<strong>One message bus.</strong> Services, apps and the compositor all talk over Echo. Signals now reach other programs, not only the process that sent them.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">What you see</h2><a id="user-content-what-you-see" class="anchor" aria-label="Permalink: What you see" href="#what-you-see"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>The machine boots straight into the Terminal, filling the screen. Restore it down and Evo's plain background is behind it.</li>
+<li>The desktop shell, Bloom, ships in the image but does not start at boot yet. Started by hand, it shows a top bar, a launcher rail on the left, a dock, an app list and a quick settings menu.</li>
+<li>Bloom's windows are drawn inside the shell page itself, and everything in them except the Terminal is simulated: the files, the battery level and the network state are placeholders.</li>
+<li>The app list names Browser, Contacts, File Manager, Notes, Settings, Terminal and Tasks. Only the Terminal does real work.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Under the hood</h2><a id="user-content-under-the-hood" class="anchor" aria-label="Permalink: Under the hood" href="#under-the-hood"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>
+<strong>Evo</strong>, the Wayland compositor, composites windows on the real kernel and draws window frames itself.</li>
+<li>
+<strong>Echo</strong>, the message bus, routes calls between services and now broadcasts signals to every connected program.</li>
+<li>
+<strong>Synergy</strong>, the bridge between web pages and the system, gives apps a <code>window.geckoOS</code> API for files, apps, power and events.</li>
+<li>
+<strong>Vela</strong> carries three Pyxis additions compiled into Gecko: the <code>pyxis://</code> address scheme, the built-in bridge, and a kiosk mode that opens one window per app.</li>
+<li>
+<strong>Rockhopper</strong> and <strong>Shift</strong> start at boot, register on the bus and supervise the other services.</li>
+<li>The retired <code>gaia</code> shell and <code>gonk</code> prototype were removed.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Known issues</h2><a id="user-content-known-issues" class="anchor" aria-label="Permalink: Known issues" href="#known-issues"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>Only the Terminal works. Every other app surface uses made-up data.</li>
+<li>Any program connected to the bus can call any service. There is no permission model yet.</li>
+<li>There is no way to install apps. Nova, the app host, is still a design.</li>
+<li>Windows cannot be minimized, and Evo does not read the display's scale.</li>
+<li>Shift tries to register on the bus before the bus is ready and logs a warning at boot.</li>
+<li>The browser engine still calls itself Nightly and shows Firefox's security notice.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Trying it</h2><a id="user-content-trying-it" class="anchor" aria-label="Permalink: Trying it" href="#trying-it"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p>Pyxis alpha 1 boots as a disk image in QEMU. The reference VM has 2 GB of memory and 4 CPUs.</p>
+
+</main></body></html>

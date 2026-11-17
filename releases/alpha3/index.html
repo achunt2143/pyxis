@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pyxis alpha 3</title>
+<meta name="description" content="Pyxis release notes.">
+<style>
+:root{--bg:#fafbfc;--fg:#1c2230;--mut:#5b6577;--line:#dde2ea;--code:#eef1f6;--acc:#2f6fed}
+@media(prefers-color-scheme:dark){:root{--bg:#0e121b;--fg:#e4e8f0;--mut:#98a2b5;--line:#262d3b;--code:#171d29;--acc:#7aa5ff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 80px}
+h1,h2,h3,h4{line-height:1.25;margin:2em 0 .6em}h1{margin-top:0;font-size:2.1rem}
+h2{border-bottom:1px solid var(--line);padding-bottom:.3em}
+a{color:var(--acc)}hr{border:0;border-top:1px solid var(--line);margin:2em 0}
+code{background:var(--code);padding:.12em .35em;border-radius:5px;font-size:.88em}
+pre{background:var(--code);padding:14px;border-radius:8px;overflow-x:auto}pre code{background:none;padding:0}
+table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:var(--code)}blockquote{margin:1em 0;padding:0 1em;border-left:3px solid var(--line);color:var(--mut)}
+</style></head><body><main>
+<p><a href="../../">&larr; Pyxis docs</a> &middot; <a href="../../history/alpha3/">Tour of alpha 3</a> &middot; <a href="../../history/">Release history</a></p>
+<div class="markdown-heading"><h1 class="heading-element">Pyxis alpha 3</h1><a id="user-content-pyxis-alpha-3" class="anchor" aria-label="Permalink: Pyxis alpha 3" href="#pyxis-alpha-3"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p><em>Released 20 September 2026.</em></p>
+<p>Alpha 3's rule was "nothing lies to the user." Alpha 2 looked finished in places where it wasn't: the battery read 50% on a machine with no battery, the network read disconnected on a working connection, Files showed folders that weren't there, and the App Installer had no package manager to call. Alpha 3 makes each of those either real or honest about what it can't do, and makes the boot itself reliable.</p>
+<div class="markdown-heading"><h2 class="heading-element">Highlights</h2><a id="user-content-highlights" class="anchor" aria-label="Permalink: Highlights" href="#highlights"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>
+<strong>Honest status.</strong> The top bar's clock ticks. The network indicator reads the kernel, so a wired connection shows as connected. A machine with no battery says so instead of showing a made-up number.</li>
+<li>
+<strong>Quick settings that work.</strong> Switches that did nothing were removed. Dark Mode and "Show percentage in top bar" really change things now.</li>
+<li>
+<strong>Files shows your files.</strong> Folders list what is really on disk, one unreadable entry no longer blanks the whole folder, and images preview inline.</li>
+<li>
+<strong>A real package manager.</strong> opkg ships in the image for the first time, so the App Installer has something to install with.</li>
+<li>
+<strong>The App Installer on the desktop.</strong> It is in the app list, with a four-step flow: choose a package, review it, install, done.</li>
+<li>
+<strong>Desktop search.</strong> Type in the top bar and matching apps appear. Press Enter to open one.</li>
+<li>
+<strong>Power works.</strong> Shut down powers the machine off and Restart restarts it.</li>
+<li>
+<strong>The services survive boot.</strong> A bug killed the background services moments after startup. Each now runs in its own session, so an unattended boot brings up everything.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">What changed since alpha 2</h2><a id="user-content-what-changed-since-alpha-2" class="anchor" aria-label="Permalink: What changed since alpha 2" href="#what-changed-since-alpha-2"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>The top bar shows real Wi-Fi or wired status and the time, ticking on the minute.</li>
+<li>Quick settings lists Notifications, Dark Mode, the network's status and its interface name, and the battery.</li>
+<li>Terminal, Files, Notes, Contacts, Tasks, Settings, Browser and App Installer were each built out further on the remochi component library.</li>
+<li>Evo draws app title bars with the triangle, square and circle controls that later became the Pyxis window controls.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Under the hood</h2><a id="user-content-under-the-hood" class="anchor" aria-label="Permalink: Under the hood" href="#under-the-hood"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>The boot script starts each daemon in its own session, with no terminal. Before, they shared the boot script's process group and died when it finished. This also explained several alpha 2 reports that looked like bus bugs.</li>
+<li>opkg 0.10.0 is built from a pinned, checksum-verified source tarball during the image build, because Debian packages no opkg at all.</li>
+<li>The network service reads <code>/proc/net/route</code> and <code>/sys/class/net</code> directly instead of calling a tool that wasn't in the image.</li>
+<li>Reading files gained a binary-safe mode with a size cap, which is what lets Files preview images.</li>
+<li>Evo now binds an app's window to its session through the daemon. Apps launch in their own process group, so a browser that restarts itself isn't orphaned.</li>
+<li>On-device checks became a repeatable process: the image boots in QEMU and a script drives it over the serial console.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Known issues</h2><a id="user-content-known-issues" class="anchor" aria-label="Permalink: Known issues" href="#known-issues"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<ul>
+<li>The launcher, dock and search still use a fixed list of apps. An app installed from a package doesn't appear on the desktop yet.</li>
+<li>Clicking a minimized app's dock icon does not bring it back.</li>
+<li>Restoring a maximized window down closes the app.</li>
+<li>Windows can't be resized.</li>
+<li>An app can open as a regular Firefox window, toolbar and all, instead of a clean app window.</li>
+<li>Sleep isn't supported in the VM and says so.</li>
+<li>There is no sound.</li>
+<li>Shift reports made-up process information over the bus.</li>
+</ul>
+<div class="markdown-heading"><h2 class="heading-element">Trying it</h2><a id="user-content-trying-it" class="anchor" aria-label="Permalink: Trying it" href="#trying-it"><span aria-hidden="true" class="octicon octicon-link"></span></a></div>
+<p>Pyxis alpha 3 boots as a disk image in QEMU. The reference VM has 2 GB of memory and 4 CPUs.</p>
+
+</main></body></html>

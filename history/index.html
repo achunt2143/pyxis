@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pyxis release history</title>
+<meta name="description" content="Every Pyxis alpha, from the first boot to a desktop of its own.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lato:ital,wght@0,300;0,400;0,700;1,400;1,700&display=swap">
+<style>
+/* Layout: a long guided walk in six chapters; each feature is a text column beside its screenshot, framed in Pyxis's waterdrop corner (16 4 16 16). */
+:root {
+  --paper: #f5f3f6;
+  --card: #ffffff;
+  --ink: #26222b;
+  --quiet: #6b6473;
+  --line: #e1dce5;
+  --chip: #ebe7ee;
+  --red: #e23d3d;      /* the spinner's red, deepened for text */
+  --blue: #2a7ea6;     /* the spinner's blue, deepened for text */
+  --yellow: #c98a00;   /* the spinner's yellow, deepened for text */
+  --red-fill: #ff4a4a;
+  --blue-fill: #69cdff;
+  --yellow-fill: #ffb80d;
+  --shadow: 0 1px 2px rgba(38,34,43,.06), 0 10px 30px rgba(38,34,43,.10);
+  --display: 'Lato', 'Helvetica Neue', Arial, sans-serif;
+  --body: 'Lato', 'Helvetica Neue', Arial, sans-serif;
+  --drop: 16px 4px 16px 16px;
+  --drop-sm: 10px 3px 10px 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #141218; --card: #1e1b23; --ink: #ece9e3; --quiet: #a59fae; --line: #2f2b36; --chip: #26232c;
+    --red: #ff7a7a; --blue: #7fd3ff; --yellow: #ffc845;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 12px 32px rgba(0,0,0,.35);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #141218; --card: #1e1b23; --ink: #ece9e3; --quiet: #a59fae; --line: #2f2b36; --chip: #26232c;
+  --red: #ff7a7a; --blue: #7fd3ff; --yellow: #ffc845;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 12px 32px rgba(0,0,0,.35);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font-family: var(--body); font-size: 17px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1120px; margin: 0 auto; }
+h1, h2, h3 { text-wrap: balance; margin: 0; }
+p { margin: 0; }
+a { color: var(--blue); }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+
+/* ---------- top ---------- */
+header.top { padding-block: 56px 28px; display: grid; gap: 28px; }
+.brand { display: flex; align-items: center; gap: 14px; color: var(--quiet); font-size: 13px; letter-spacing: .32em; text-transform: uppercase; }
+.brand .shapes { display: inline-flex; gap: 6px; }
+h1 { font-family: var(--display); font-weight: 300; font-size: clamp(56px, 11vw, 120px); letter-spacing: .28em; line-height: 1; margin-right: -.28em; }
+.lede { font-size: clamp(19px, 2.3vw, 23px); max-width: 40ch; color: var(--ink); }
+.lede em { font-style: italic; font-weight: 700; }
+.hero-shot { margin-top: 8px; }
+
+nav.chapters { display: flex; flex-wrap: wrap; gap: 8px; padding-block: 8px 0; }
+nav.chapters a {
+  display: inline-flex; align-items: center; gap: 8px; text-decoration: none; color: var(--ink);
+  background: var(--chip); padding: 7px 14px 7px 11px; border-radius: var(--drop-sm); font-size: 14px;
+}
+nav.chapters a:hover { background: var(--line); }
+
+/* ---------- shots ---------- */
+.shot {
+  display: block; width: 100%; padding: 0; border: 0; background: none; cursor: zoom-in;
+  border-radius: var(--drop); overflow: hidden; box-shadow: var(--shadow); line-height: 0;
+}
+.shot img { width: 100%; height: auto; display: block; }
+.shot.strip { border-radius: var(--drop-sm); }
+figure { margin: 0; display: grid; gap: 10px; min-width: 0; }
+figcaption { font-size: 14px; color: var(--quiet); line-height: 1.45; }
+
+/* ---------- chapters ---------- */
+section.chapter { padding-block: 72px 8px; border-top: 1px solid var(--line); margin-top: 56px; }
+.chapter-head { display: grid; gap: 12px; margin-bottom: 40px; max-width: 62ch; }
+.eyebrow { display: flex; align-items: center; gap: 10px; font-size: 13px; letter-spacing: .28em; text-transform: uppercase; color: var(--quiet); }
+h2 { font-family: var(--display); font-weight: 300; font-size: clamp(34px, 5vw, 52px); letter-spacing: .18em; text-transform: uppercase; line-height: 1.1; }
+.chapter-head p { color: var(--quiet); font-size: 18px; }
+
+.feature { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 40px; align-items: start; padding-block: 36px; }
+.feature + .feature { border-top: 1px dashed var(--line); }
+.feature.flip > .text { order: 2; }
+.feature.wide { grid-template-columns: 1fr; }
+.feature .text { display: grid; gap: 14px; min-width: 0; }
+h3 { font-weight: 700; font-size: 24px; line-height: 1.25; }
+.def { font-size: 18px; }
+.def em { font-style: italic; font-weight: 700; }
+ul.can { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+ul.can li { position: relative; padding-left: 22px; }
+ul.can li::before {
+  content: ""; position: absolute; left: 2px; top: .62em; width: 8px; height: 8px;
+  border-radius: 4px 1px 4px 4px; background: var(--blue-fill);
+}
+.label { font-size: 12px; letter-spacing: .22em; text-transform: uppercase; color: var(--quiet); }
+kbd {
+  font-family: var(--body); font-size: 13px; font-weight: 700; color: var(--ink);
+  background: var(--card); border: 1px solid var(--line); border-bottom-width: 2px;
+  padding: 1px 7px; border-radius: 5px; white-space: nowrap;
+}
+
+.trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.duo { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.quad { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px 22px; }
+.stack { display: grid; gap: 18px; }
+.tag { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding: 2px 8px; border-radius: var(--drop-sm); background: var(--chip); color: var(--ink); }
+
+/* running-light legend */
+.lights { display: grid; gap: 10px; margin-top: 4px; }
+.light { display: grid; grid-template-columns: 44px 1fr; align-items: center; gap: 12px; font-size: 15px; }
+.light i { display: block; height: 3px; border-radius: 2px; background: var(--blue-fill); }
+.light .short { width: 18px; margin-left: 13px; }
+.light .long { width: 34px; margin-left: 5px; }
+.light .faint { width: 18px; margin-left: 13px; opacity: .35; }
+.light .red { width: 18px; margin-left: 13px; background: var(--red-fill); }
+.light .pulse { width: 18px; margin-left: 13px; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+
+/* motion names */
+.motion figure h4 { margin: 0; font-size: 18px; font-weight: 700; display: flex; align-items: baseline; gap: 10px; }
+.motion figure h4 span { font-weight: 400; color: var(--quiet); font-size: 14px; }
+
+/* apps grid */
+.apps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 40px 28px; }
+.app { display: grid; gap: 12px; min-width: 0; }
+.app-head { display: flex; align-items: center; gap: 12px; }
+.app-icon { width: 36px; height: 36px; border-radius: 10px 3px 10px 10px; display: grid; place-items: center; color: #fff; flex: none; }
+.app-icon svg { width: 20px; height: 20px; }
+.app h3 { font-size: 21px; }
+.app p { color: var(--quiet); font-size: 16px; }
+
+/* security rooms */
+.rooms { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 18px; border-radius: var(--drop); background: var(--card); box-shadow: var(--shadow); }
+.room { border: 1.5px solid var(--line); border-radius: var(--drop-sm); padding: 12px 10px; display: grid; gap: 6px; justify-items: start; min-width: 0; }
+.room b { font-size: 14px; }
+.room small { font-size: 12px; color: var(--quiet); line-height: 1.35; }
+.room .dot { width: 10px; height: 10px; border-radius: 5px 1px 5px 5px; }
+.rooms .gate { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: var(--drop-sm); background: var(--chip); font-size: 14px; }
+.rooms .gate svg { flex: none; }
+.promises { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 28px; margin-top: 28px; }
+.promise { display: grid; gap: 4px; }
+.promise b { font-size: 16px; }
+.promise span { color: var(--quiet); font-size: 15px; }
+
+/* shortcuts */
+.keys { width: 100%; border-collapse: collapse; font-size: 16px; }
+.keys td { padding: 11px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.keys td:first-child { width: 42%; white-space: nowrap; }
+.keys tr:last-child td { border-bottom: 0; }
+.keys-wrap { overflow-x: auto; background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 6px 16px; }
+
+/* sound */
+.sound-card { background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 22px; display: grid; gap: 16px; }
+.wave { display: flex; align-items: center; gap: 3px; height: 40px; }
+.wave i { flex: 1; background: var(--blue-fill); border-radius: 2px; opacity: .8; }
+.sound-list { display: flex; flex-wrap: wrap; gap: 8px; }
+
+footer { padding-block: 64px 72px; color: var(--quiet); font-size: 14px; border-top: 1px solid var(--line); margin-top: 72px; display: grid; gap: 6px; }
+
+/* lightbox */
+dialog#zoom { padding: 0; border: 0; background: transparent; max-width: min(1400px, 96vw); width: 96vw; }
+dialog#zoom::backdrop { background: rgba(10, 8, 14, .82); }
+dialog#zoom img { width: 100%; height: auto; display: block; border-radius: var(--drop); }
+dialog#zoom p { color: #ece9e3; font-size: 15px; padding-top: 10px; text-align: center; }
+
+@media (max-width: 860px) {
+  .feature, .feature.flip { grid-template-columns: 1fr; gap: 22px; }
+  .feature.flip > .text { order: 0; }
+  .trio { grid-template-columns: 1fr; }
+  .apps, .quad, .promises { grid-template-columns: 1fr; }
+  .rooms { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .duo { grid-template-columns: 1fr; }
+  h1 { letter-spacing: .18em; margin-right: -.18em; }
+}
+@media (prefers-reduced-motion: reduce) { .light .pulse { animation: none; } }
+
+/* history additions */
+.pager { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.pager a { text-decoration: none; display: grid; gap: 2px; padding: 14px 18px; background: var(--card);
+  border-radius: var(--drop); box-shadow: var(--shadow); min-width: 0; color: var(--ink); }
+.pager a small { color: var(--quiet); font-size: 13px; letter-spacing: .18em; text-transform: uppercase; }
+.pager a:hover { background: var(--chip); }
+.pager .next { margin-left: auto; text-align: right; }
+.crumb { font-size: 14px; } .crumb a { text-decoration: none; }
+.note { background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 18px 22px; color: var(--quiet); font-size: 15px; }
+.note b { color: var(--ink); }
+ul.not li::before { background: var(--red-fill); }
+ul.came li::before { background: var(--yellow-fill); }
+/* timeline */
+.timeline { display: grid; gap: 0; }
+.rel { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 32px; padding-block: 44px; border-top: 1px solid var(--line); }
+.rel .when { display: grid; gap: 4px; align-content: start; }
+.rel .when b { font-family: var(--display); font-weight: 300; font-size: 40px; letter-spacing: .12em; line-height: 1; }
+.rel .when span { color: var(--quiet); font-size: 14px; }
+.rel .body { display: grid; grid-template-columns: minmax(0, 6fr) minmax(0, 5fr); gap: 28px; align-items: start; }
+.rel .body .text { display: grid; gap: 12px; }
+.rel h2 { font-size: clamp(24px, 3vw, 30px); letter-spacing: .12em; }
+.rel .links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.rel .links a { display: inline-flex; text-decoration: none; color: var(--ink); background: var(--chip); padding: 6px 13px; border-radius: var(--drop-sm); font-size: 14px; }
+.rel .links a:hover { background: var(--line); }
+@media (max-width: 860px) {
+  .rel { grid-template-columns: 1fr; gap: 14px; }
+  .rel .body { grid-template-columns: 1fr; }
+}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="tri" viewBox="0 0 14 14"><path d="M1.5 2.5h11L7 12z" /></symbol>
+    <symbol id="sq" viewBox="0 0 14 14"><rect x="2" y="2" width="10" height="10" rx="1.5" /></symbol>
+    <symbol id="ci" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.2" /></symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+
+<header class="top">
+  <p class="crumb"><a href="../">Pyxis docs</a></p>
+  <div class="brand">
+    <span class="shapes" aria-hidden="true"><svg width="14" height="14" fill="var(--yellow-fill)"><use href="#tri"/></svg><svg width="14" height="14" fill="var(--blue-fill)"><use href="#sq"/></svg><svg width="14" height="14" fill="var(--red-fill)"><use href="#ci"/></svg></span>
+    Release history
+  </div>
+  <h1>PYXIS</h1>
+  <p class="lede">Five alphas, from a kernel that could start one terminal to a desktop with <em>its own</em> light, shape and motion. The screenshots were taken by booting each release's own disk image again, in November 2026.</p>
+</header>
+
+<section class="timeline">
+  <article class="rel" id="alpha5">
+    <div class="when"><b>&alpha;5</b><span>November 2026</span></div>
+    <div class="body">
+      <div class="text">
+        <h2>A desktop that behaves like light</h2>
+        <p class="def">Pyxis's own look and motion: the Daylight wallpaper, frosted waterdrop windows, Lumen motion, a lock screen, and every app in its own sandbox.</p>
+        <ul class="can"><li>Cards and Alt+Tab, notifications and sound.</li><li>One password dialog for every root action.</li></ul>
+        <div class="links"><a href="../feature-guide/">Feature guide</a><a href="../releases/alpha5/">Release notes</a><a href="../identity/">Identity</a></div>
+      </div>
+      <figure><button class="shot" type="button"><img src="../feature-guide/shots/tour-windows-depth.webp" alt="Alpha 5: Notes in front of another window, with frosted title bars" loading="lazy" width="1280" height="800"></button></figure>
+    </div>
+  </article>
+  <article class="rel" id="alpha4">
+    <div class="when"><b>&alpha;4</b><span>September 2026</span></div>
+    <div class="body">
+      <div class="text">
+        <h2>All my apps working</h2>
+        <p class="def">An app built with the Pyxis SDK installs, appears on the desktop with no code change, launches and uninstalls.</p>
+        <ul class="can"><li>The app list comes from Nova's live registry.</li><li>Maximize and restore, and restore from the dock, finally work.</li></ul>
+        <div class="links"><a href="alpha4/">Tour</a><a href="../releases/alpha4/">Release notes</a></div>
+      </div>
+      <figure><button class="shot" type="button"><img src="alpha4/shots/drawer-hello.webp" alt="Alpha 4: the installed Hello Pyxis in the app drawer" loading="lazy" width="1280" height="800"></button></figure>
+    </div>
+  </article>
+  <article class="rel" id="alpha3">
+    <div class="when"><b>&alpha;3</b><span>September 2026</span></div>
+    <div class="body">
+      <div class="text">
+        <h2>Nothing lies to the user</h2>
+        <p class="def">Every faked number became real or honest. opkg arrives, Files shows your files, and the services survive boot.</p>
+        <ul class="can"><li>Real network and battery status.</li><li>Desktop search and the App Installer.</li></ul>
+        <div class="links"><a href="alpha3/">Tour</a><a href="../releases/alpha3/">Release notes</a></div>
+      </div>
+      <figure><button class="shot" type="button"><img src="alpha3/shots/quick.webp" alt="Alpha 3: honest quick settings" loading="lazy" width="1280" height="800"></button></figure>
+    </div>
+  </article>
+  <article class="rel" id="alpha2">
+    <div class="when"><b>&alpha;2</b><span>July 2026</span></div>
+    <div class="body">
+      <div class="text">
+        <h2>A desktop</h2>
+        <p class="def">The shell starts at boot and apps open as real windows. Nova and Vroom lay the groundwork for installing apps.</p>
+        <ul class="can"><li>Vela becomes the browser, and settings are saved.</li><li>Several values on screen were still made up.</li></ul>
+        <div class="links"><a href="alpha2/">Tour</a><a href="../releases/alpha2/">Release notes</a></div>
+      </div>
+      <figure><button class="shot" type="button"><img src="alpha2/shots/desktop.webp" alt="Alpha 2: the desktop at boot" loading="lazy" width="1280" height="800"></button></figure>
+    </div>
+  </article>
+  <article class="rel" id="alpha1">
+    <div class="when"><b>&alpha;1</b><span>July 2026</span></div>
+    <div class="body">
+      <div class="text">
+        <h2>Boot to an app</h2>
+        <p class="def">The first boot from power-on to a working app: the Terminal, running in Pyxis's own engine and compositor.</p>
+        <ul class="can"><li>Evo composites, Echo carries every call, Vela serves <code>pyxis://</code> apps.</li><li>The shell existed but didn't start at boot.</li></ul>
+        <div class="links"><a href="alpha1/">Tour</a><a href="../releases/alpha1/">Release notes</a></div>
+      </div>
+      <figure><button class="shot" type="button"><img src="alpha1/shots/boot-terminal.webp" alt="Alpha 1: the Terminal, full screen" loading="lazy" width="1280" height="800"></button></figure>
+    </div>
+  </article>
+</section>
+
+<footer>
+  <span>Screenshots at 1280 &times; 800, from each release's image booted in QEMU.</span>
+</footer>
+
+</div>
+
+<dialog id="zoom" aria-label="Enlarged screenshot">
+  <img id="zoom-img" alt="">
+  <p id="zoom-cap"></p>
+</dialog>
+<script>
+(function () {
+  var dlg = document.getElementById('zoom'), img = document.getElementById('zoom-img'), cap = document.getElementById('zoom-cap');
+  document.querySelectorAll('button.shot').forEach(function (b) {
+    var i = b.querySelector('img');
+    b.setAttribute('aria-label', 'Enlarge: ' + i.alt);
+    b.addEventListener('click', function () {
+      img.src = i.src; img.alt = i.alt; cap.textContent = i.alt;
+      if (dlg.showModal) dlg.showModal();
+    });
+  });
+  dlg.addEventListener('click', function () { dlg.close(); });
+})();
+</script>
