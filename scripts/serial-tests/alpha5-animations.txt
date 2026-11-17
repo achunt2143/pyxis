@@ -64,6 +64,12 @@ wait_active() { i=0; while [ $i -lt $1 ]; do read _ _ _ _ A _ <<< "$(st)"; [ "$A
 # Wait until nothing is animating.
 wait_idle() { i=0; while [ $i -lt $1 ]; do read _ _ _ _ A _ <<< "$(st)"; [ "$A" = 0 ] && return 0; sleep 1; i=$((i + 1)); done; return 1; }
 
+# This run is over an hour with no real input: Evo's idle lock (Bloom's
+# pyxis.lock.after, 10 min by default) would lock it part way, and a locked
+# screen draws only the lock page, so every later frame count stays still.
+echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.lock.after","value":null}' | grep -c success
+echo-cli call org.geckoOS.evo SetIdleLock --interface org.geckoOS.evo --args '{"seconds":0}' | grep -c '"ok"'
+
 echo "=== settings: the IPC contract ==="
 #!must SETTINGS-OK
 echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args '{"mode":"full","scale":1}' | grep -q '"mode": "full"' && echo SETTINGS-OK || echo SETTINGS-FAILED
@@ -811,7 +817,11 @@ setanim '{"mode":"full","scale":1}' | grep -q 1
 #!must DEPTH-ON
 setdepth true | grep -q 1 && echo DEPTH-ON || echo DEPTH-REFUSED
 read WT WB <<< "$(wa)"; [ "$WT" != 0 ] || setwa 44 76
-for A in files notes tasks settings; do rm -f /var/lib/pyxis/profiles/$A/xulstore.json /var/lib/pyxis/profiles/$A/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'sessionId|Error'; sleep 15; done
+# One line per app: four launches and their waits outrun the harness's 60 s per command.
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'; sleep 15
+rm -f /var/lib/pyxis/profiles/notes/xulstore.json /var/lib/pyxis/profiles/notes/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'; sleep 15
+rm -f /var/lib/pyxis/profiles/tasks/xulstore.json /var/lib/pyxis/profiles/tasks/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"tasks"}' | grep -E 'sessionId|Error'; sleep 15
+rm -f /var/lib/pyxis/profiles/settings/xulstore.json /var/lib/pyxis/profiles/settings/sessionstore.jsonlz4; echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"settings"}' | grep -E 'sessionId|Error'; sleep 15
 sleep 3
 wait_idle 20
 for A in files notes tasks settings; do winact UnmaximizeWindow $(wid $A) | grep -q 1; done
@@ -854,7 +864,10 @@ sleep 2
 #!shot depth-rest
 LX=$((NX + NW / 2)); LY=$((NY + 12))
 #!pointer down $LX $LY
-LX2=$((LX + 40)); LY2=$((LY + 30))
+# Left only: Notes is as tall as the work area and its right edge is the
+# screen's, so the move clamp (the frame stays wholly in the work area) leaves
+# it room to go left and nowhere else.
+LX2=$((LX - 40)); LY2=$LY
 #!pointer move $LX2 $LY2
 sleep 1
 read MX MY MW MH _ <<< "$(geom notes)"; echo "held: $MX,$MY ${MW}x$MH (was $NX,$NY)"
@@ -862,7 +875,7 @@ read MX MY MW MH _ <<< "$(geom notes)"; echo "held: $MX,$MY ${MW}x$MH (was $NX,$
 #!pointer up
 sleep 2
 #!must LIFT-FOLLOWS-POINTER
-test "$MX" = $((NX + 40)) -a "$MY" = $((NY + 30)) && echo LIFT-FOLLOWS-POINTER || echo "LIFT-MOVED-WRONG $MX,$MY (want $((NX + 40)),$((NY + 30)))"
+test "$MX" = $((NX - 40)) -a "$MY" = "$NY" && echo LIFT-FOLLOWS-POINTER || echo "LIFT-MOVED-WRONG $MX,$MY (want $((NX - 40)),$NY)"
 #!shot depth-settled
 
 # --- maximized: square, no shadow.

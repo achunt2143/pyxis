@@ -53,7 +53,10 @@ AX=$((CX + 131)); AY=$((CY + 147)); echo "appearance $AX,$AY"
 sleep 2
 
 echo "=== a wallpaper picked in Settings reaches the shell, live ==="
-WX=$((CX + 628)); WY=$((CY + 300)); echo "sunset thumbnail $WX,$WY"
+# Measured on device with the Settings app that has the "Launch bar" group
+# (2026-11-12) above the wallpapers: on an image whose Settings predates it,
+# Sunset sat 130 px higher (+628, +300).
+WX=$((CX + 636)); WY=$((CY + 430)); echo "sunset thumbnail $WX,$WY"
 #!pointer click $WX $WY
 #!must SETTINGS-WROTE
 waitset pyxis.wallpaper sunset 10 SETTINGS-WROTE
@@ -87,12 +90,15 @@ sleep 2
 # remochi 0.4's Prelude font sets text a few px taller on the device than in a
 # desktop browser (the box is 273-307 below the content's top in Chrome,
 # 281-314 on the device), and 280 was one pixel above it on the device.
-QX=$((CX + 762)); QY=$((CY + 297)); echo "search $QX,$QY"
+# Since 2026-11-15 the box is a remochi Input (taller), under the current
+# zone's line: 304-338 below the content's top on the device, the first
+# result's row 351-402 (shot settings-live-datetime).
+QX=$((CX + 762)); QY=$((CY + 322)); echo "search $QX,$QY"
 #!pointer click $QX $QY
 sleep 1
 #!type Tokyo
 sleep 2
-OX=$((CX + 767)); OY=$((CY + 346)); echo "first result $OX,$OY"
+OX=$((CX + 767)); OY=$((CY + 376)); echo "first result $OX,$OY"
 #!pointer click $OX $OY
 sleep 4
 #!must Asia/Tokyo

@@ -1,0 +1,474 @@
+# Tour screenshots: one clean shot of every user-facing feature, for the
+# non-technical feature guide. Nothing here is a test: the few `#!must` lines
+# only guard a wait that could otherwise fail silently. Each shot is preceded
+# by a printed state line, and every shot is named tour-<feature>
+# (target/serial-shots/tour-*.png). LOOK at them: a capture succeeding says
+# nothing about whether the screen is right.
+#
+# On an image built after 2026-11-12 nothing needs pushing, except the app
+# dists and the dev marker the root dialog needs (the unsigned acceptance
+# package is installed through the installer). Full command line, on a dev
+# image with everything current:
+#
+#   : > /tmp/allow-unsigned-packages   # on the host
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/echo-cli:/usr/bin/echo-cli \
+#     --push gecko/patches/pyxis/toolkit/actors/PyxisBridgeParent.sys.mjs:/usr/lib/pyxis-gecko/actors/PyxisBridgeParent.sys.mjs \
+#     --push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot \
+#     --push ../pyxis-experience/packages/apps/files/dist:/usr/share/geckoOS/apps/files/webroot \
+#     --push ../pyxis-experience/packages/apps/notes/dist:/usr/share/geckoOS/apps/notes/webroot \
+#     --push ../pyxis-experience/packages/apps/contacts/dist:/usr/share/geckoOS/apps/contacts/webroot \
+#     --push ../pyxis-experience/packages/apps/tasks/dist:/usr/share/geckoOS/apps/tasks/webroot \
+#     --push ../pyxis-experience/packages/apps/settings/dist:/usr/share/geckoOS/apps/settings/webroot \
+#     --push ../pyxis-experience/packages/apps/browser/dist:/usr/share/geckoOS/apps/browser/webroot \
+#     --push ../pyxis-experience/packages/apps/terminal/dist:/usr/share/geckoOS/apps/terminal/webroot \
+#     --push ../pyxis-experience/packages/apps/installer/dist:/usr/share/geckoOS/apps/installer/webroot \
+#     --push /tmp/allow-unsigned-packages:/etc/pyxis/allow-unsigned-packages \
+#     --script scripts/serial-tests/tour-screenshots.txt
+#
+# (An image rebuilt after all of that lands needs none of the --push lines but
+# the marker. Bloom's title-bar names and the lock page need the vela whose
+# bridge has SetAppIdentity and session.*; on an older vela the bars show the
+# client's own title and the lock page is drawn by the stand-in described at
+# the shots.)
+#
+# What is not here, and why:
+#   * Nothing skipped. Two things are approximations to look at:
+#     - the documents of Notes, Contacts and Tasks are seeded through the
+#       filesystem service (scope app:<id>), so each app has real content.
+#     - tour-power-dialog reaches Shut Down by Shift+Tab (the panel traps Tab,
+#       so Shift+Tab from the first control lands on the last, Shut Down) and
+#       Enter, since the button's position moves with the panel's height.
+#   * The geckouser password is set for the lock and root-dialog shots and is
+#     left set at the end (the lock is then not press-to-enter on this boot).
+#
+# Run time is long (about an hour): idle lock is turned off at the start.
+
+evo() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "$a"; }
+ostate() { evo GetOverlayState | tr -d ' \n'; }
+orects() { ostate | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done; }
+geom() { evo ListWindows | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id|focused)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"], v["focused"]; exit } on = 0 }'; }
+wid() { evo ListWindows | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"window_id":/ { gsub(/[",:]/, ""); print $2; exit }'; }
+winact() { echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "{\"window_id\":$2}" | grep -c '"success": true'; }
+sset() { echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args "{\"key\":\"$1\",\"value\":$2}" | grep -c '"success": true'; }
+fscall() { echo-cli call org.geckoOS.filesystem "$1" --interface org.geckoOS.filesystem --args "$2" 2>&1; }
+setanim() { echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args "$1" | grep -c '"mode"'; }
+act() { evo GetAnimationState | tr -d ' \n' | grep -o '"active":[0-9]*' | head -1 | cut -d: -f2; }
+wait_idle() { local i=0; while [ $i -lt $1 ]; do [ "$(act)" = 0 ] && return 0; sleep 1; i=$((i + 1)); done; echo "STILL-ANIMATING"; return 1; }
+blstate() { evo GetLumenState | tr -d ' \n'; }
+lfr() { blstate | grep -o '"frames":{[^}]*}' | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
+lpr() { blstate | grep -o '"last_progress":{[^}]*}' | grep -o "\"$1\":[0-9.eE+-]*" | cut -d: -f2; }
+# wlp EFFECT FRAMES-BEFORE TENTHS THRESHOLD: wait until EFFECT has drawn a frame beyond the count and reached the progress.
+wlp() { local i=0; while [ $i -lt $3 ]; do if [ "$(lfr $1)" -gt "$2" ] && awk -v p="$(lpr $1)" -v w="$4" 'BEGIN { exit !(p + 0 >= w) }'; then echo "$1-REACHED $4 at $(lpr $1)"; return 0; fi; sleep 0.1; i=$((i + 1)); done; echo "$1-MISSED $4 at $(lpr $1)"; return 1; }
+bgone() { local i=0; while [ $i -lt 60 ]; do pgrep -f "profiles/$1( |$)" > /dev/null || return 0; sleep 0.5; i=$((i + 1)); done; echo "STILL-RUNNING $1"; return 1; }
+bbound() { echo-cli call org.geckoOS.appHost ListRunningApps --interface org.geckoOS.appHost --args '{}' | tr -d ' \n' | grep -o "\"appId\":\"$1\"[^}]*" | grep -q '"surfaces":\[[0-9]'; }
+bmapped() { local i=0; while [ $i -lt 80 ]; do [ -n "$(wid $1)" ] && bbound $1 && return 0; sleep 0.5; i=$((i + 1)); done; echo "NOT-MAPPED $1"; return 1; }
+blaunch() { echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$1\"}" | grep -E 'sessionId|Error'; }
+# lstart: a first run (profile state cleared, so it opens maximized); lopen: launch as it is; lretry: launch again only if the first never mapped.
+lstart() { rm -f /var/lib/pyxis/profiles/$1/xulstore.json /var/lib/pyxis/profiles/$1/sessionstore.jsonlz4; blaunch $1; bmapped $1 && echo "UP $1"; }
+lopen() { blaunch $1; bmapped $1 && echo "UP $1"; }
+lretry() { if [ -n "$(wid $1)" ] && bbound $1; then echo "ALREADY-UP $1"; else echo "RETRY $1"; echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args "{\"appId\":\"$1\"}" > /dev/null 2>&1; bgone $1; blaunch $1; bmapped $1 && echo "UP $1"; fi; }
+# flt: float a window (unmaximize); cwin: close it by its own X (its floating place is remembered) and wait for it to be gone.
+flt() { winact UnmaximizeWindow $(wid $1) > /dev/null; sleep 3; echo "$1 floats at: $(geom $1)"; }
+cwin() { winact CloseWindow $(wid $1) > /dev/null; bgone $1; sleep 2; }
+# seed APP STORE JSON: write a document into the app's own storage, as the app would have saved it.
+seed() { local esc; esc=$(printf '%s' "$3" | sed 's/\\/\\\\/g; s/"/\\"/g'); fscall writeFile "{\"path\":\"~/$2.json\",\"content\":\"$esc\",\"scope\":\"app:$1\"}" | grep -E 'success|rror' | head -2; }
+clear_notes() { for NID in $(echo-cli call org.geckoOS.notification list --interface org.geckoOS.notification --args '{}' | grep -o '"id": "[^"]*"' | cut -d'"' -f4); do echo-cli call org.geckoOS.notification close --interface org.geckoOS.notification --args "{\"notificationId\":\"$NID\"}" | grep -c '"success": true'; done; }
+# Lock and root-dialog helpers (from alpha5-lock.txt and alpha5-root-dialog.txt).
+lst() { evo GetLockState | tr -d ' \n'; }
+lf() { lst | sed 's/"frames":{[^}]*}//' | grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2 | tr -d '"'; }
+lwait() { local i=0; while [ $i -lt $3 ]; do [ "$(lf $1)" = "$2" ] && { echo "LOCK-$1=$2"; return 0; }; sleep 0.1; i=$((i + 1)); done; echo "LOCK-$1-NOT-$2 ($(lst))"; return 1; }
+unlock() { echo-cli call org.geckoOS.session unlock --interface org.geckoOS.session --args "{\"password\":\"$1\"}" | tr -d ' \n'; }
+priv() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.privilege "$1" --interface org.geckoOS.privilege --args "$a"; }
+asgeck() { su -s /bin/sh geckouser -c "XDG_RUNTIME_DIR=/run/user/1000 $1"; }
+bg_install() { rm -f "$1"; ( asgeck "echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args '{\"packagePath\":\"$PKG\"}'"; echo "EXIT=$?" ) > "$1" 2>&1 & }
+waitfor() { local i=0; while [ $i -lt $3 ]; do grep -qF -- "$2" "$1" 2>/dev/null && return 0; sleep 0.5; i=$((i + 1)); done; return 1; }
+rid() { tr -d ' \n' < "$1" | grep -o '"requestId":"[^"]*"' | tail -1 | cut -d'"' -f4; }
+start_watch() { rm -f "$1"; echo-cli watch --signal PrivilegeRequested --seconds 40 > "$1" 2>&1 & sleep 1; }
+PASS='Tr0ub4dor-tour-shots'
+
+echo "=== set up: the shell is up, nothing locks or moves on its own ==="
+sleep 25
+#!must pyxis-overlay
+pgrep -a vela | grep -o -- '--pyxis-overlay [^ ]*' | head -1
+sset pyxis.lock.after null; evo SetIdleLock '{"seconds":0}' | grep -c '"ok"'
+sset pyxis.theme '"light"'; sset pyxis.wallpaper '"daylight"'; sset pyxis.launchBar.position '"bottom"'; sset pyxis.wallpaper.motion '"still"'; sset pyxis.wallpaper.pinnedTime null
+setanim '{"mode":"full","scale":1}'
+clear_notes
+echo "overlay rects: $(orects | tr '\n' ';')"
+
+echo "=== 1. the desktop through the day (Daylight pinned) ==="
+sset pyxis.wallpaper.pinnedTime 750; sleep 5
+echo "STATE desktop-day pinned 12:30, no windows: $(geom bloom | cut -d' ' -f1-4)"
+#!shot tour-desktop-day
+sset pyxis.wallpaper.pinnedTime 1140; sleep 5
+echo "STATE desktop-dusk pinned 19:00"
+#!shot tour-desktop-dusk
+sset pyxis.wallpaper.pinnedTime 1380; sleep 5
+echo "STATE desktop-night pinned 23:00"
+#!shot tour-desktop-night
+
+echo "=== 2. the status strip and the launch bar, in golden evening light ==="
+sset pyxis.wallpaper.pinnedTime 1050; sleep 5
+echo "STATE strip: 1280x36 at the top; bar: 1280x64 at the bottom"
+#!shot tour-status-strip -g "0,0 1280x36"
+#!shot tour-launch-bar -g "0,736 1280x64"
+sset pyxis.wallpaper.pinnedTime null; sleep 3
+
+echo "=== 3. app drawer, search, quick settings ==="
+read DX DY DW DH <<< "$(orects | awk '$2 == 736 && $3 == 1280 { print; exit }')"; AX=$((DX + 36)); AY=$((DY + DH / 2)); echo "bar $DX,$DY ${DW}x$DH, Apps button $AX,$AY"
+#!pointer click $AX $AY
+sleep 3
+echo "STATE drawer open (overlay rects: $(orects | tr '\n' ';'))"
+#!shot tour-app-drawer
+#!key esc
+sleep 2
+#!pointer click 100 22
+sleep 2
+#!type no
+sleep 3
+echo "STATE search open, typed 'no'"
+#!shot tour-search
+#!key esc
+sleep 2
+#!pointer click 1220 18
+sleep 3
+echo "STATE quick settings open"
+#!shot tour-quick-settings
+#!pointer click 300 300
+sleep 2
+
+echo "=== 4. notifications: a toast, then the centre ==="
+echo-cli call org.geckoOS.notification show --interface org.geckoOS.notification --args '{"title":"Backup finished","body":"Documents and Photos were backed up to the external drive.","timeout":0}' | grep -c success
+echo-cli call org.geckoOS.notification show --interface org.geckoOS.notification --args '{"title":"Standup in 10 min","body":"Room 4, or join from the calendar.","timeout":0}' | grep -c success
+sleep 3
+echo "STATE toast stack at the bottom right (rects: $(orects | tr '\n' ';'))"
+#!shot tour-notification-toast
+CNTX=$((DX + DW - 27)); CNTY=$((DY + DH / 2)); echo "dashboard count $CNTX,$CNTY"
+#!pointer click $CNTX $CNTY
+sleep 3
+echo "STATE notification centre open"
+#!shot tour-notification-centre
+#!pointer click 300 300
+sleep 2
+clear_notes
+sleep 2
+
+echo "=== 5a. documents for Notes, Contacts and Tasks, through each app's own storage ==="
+NOW=$(date +%s)000
+seed notes notes '{"notes":[{"id":"n1","title":"Weekend plans","body":"Hike up to the ridge on Saturday morning.\nPack lunch, a map and plenty of water.\nDinner with Maya on Sunday, her place at 7.","category":"Personal","pinned":true,"updatedAt":'"$NOW"'},{"id":"n2","title":"Project ideas","body":"A small garden planner that works offline.\nA recipe box with a shopping list that builds itself.","category":"Ideas","updatedAt":'"$((NOW - 3600000))"'},{"id":"n3","title":"Meeting notes","body":"Agree the schedule for the next release.\nReview open questions on the budget.","category":"Work","updatedAt":'"$((NOW - 86400000))"'},{"id":"n4","title":"Groceries","body":"Bread, olive oil, lemons, oats, coffee.","category":"General","updatedAt":'"$((NOW - 172800000))"'}]}'
+seed contacts contacts '{"contacts":[{"id":"c1","name":"Maya Chen","email":"maya.chen@example.com","phone":"+1 555 0134","starred":true,"category":"Personal","company":"Chen Studio","jobTitle":"Designer","notes":"Dinner on Sunday.","updatedAt":'"$NOW"'},{"id":"c2","name":"Oliver Grant","email":"oliver@example.com","phone":"+1 555 0172","category":"Work","company":"Northwind","jobTitle":"Project Lead","notes":"","updatedAt":'"$NOW"'},{"id":"c3","name":"Priya Nair","email":"priya.nair@example.com","phone":"+1 555 0108","starred":true,"category":"Family","notes":"","updatedAt":'"$NOW"'},{"id":"c4","name":"Samuel Ortiz","email":"sam.ortiz@example.com","phone":"+1 555 0199","category":"Other","notes":"","updatedAt":'"$NOW"'},{"id":"c5","name":"Aiko Tanaka","email":"aiko@example.com","phone":"+81 90 5550 1122","category":"Work","company":"Hoshi Labs","notes":"","updatedAt":'"$NOW"'}]}'
+TODAY=$(date +%F); TOMORROW=$(date -d tomorrow +%F)
+seed tasks tasks '{"tasks":[{"id":"t1","text":"Send the report to Oliver","done":false,"priority":"high","dueDate":"'"$TODAY"'","category":"work","createdAt":'"$NOW"'},{"id":"t2","text":"Call the dentist","done":false,"priority":"medium","dueDate":"'"$TOMORROW"'","category":"personal","createdAt":'"$((NOW - 1000))"'},{"id":"t3","text":"Buy lemons and coffee","done":false,"priority":"low","category":"shopping","createdAt":'"$((NOW - 2000))"'},{"id":"t4","text":"Renew the library card","done":true,"category":"personal","createdAt":'"$((NOW - 3000))"'}]}'
+ls -la /var/lib/pyxis/data/notes /var/lib/pyxis/data/contacts /var/lib/pyxis/data/tasks 2>&1 | head -12
+
+echo "=== 5b. Files ==="
+lstart files
+lretry files
+flt files
+echo "STATE files floating, focused: $(geom files)"
+#!shot tour-app-files
+cwin files
+
+echo "=== 5c. Notes ==="
+lstart notes
+lretry notes
+flt notes
+echo "STATE notes floating with four notes: $(geom notes)"
+#!shot tour-app-notes
+cwin notes
+
+echo "=== 5d. Contacts ==="
+lstart contacts
+lretry contacts
+flt contacts
+echo "STATE contacts floating: $(geom contacts)"
+#!shot tour-app-contacts
+cwin contacts
+
+echo "=== 5e. Tasks ==="
+lstart tasks
+lretry tasks
+flt tasks
+# The seeded tasks are the content. (Not Ctrl+N: vela takes it as Firefox's
+# New Window and opens a browser window inside the app.)
+sleep 2
+echo "STATE tasks floating, seeded tasks: $(geom tasks)"
+#!shot tour-app-tasks
+cwin tasks
+
+echo "=== 5f. Settings: Appearance, Date and Time, Users and Lock, System ==="
+lstart settings
+lretry settings
+sleep 3
+read SX SY SW SH SID _ <<< "$(geom settings)"; CX=$SX; CY=$((SY + 32)); echo "settings (maximized on a first run): $SX,$SY ${SW}x$SH id=$SID, content at $CX,$CY"
+# Rail rows are 50 px apart: appearance 147, sound, accessibility, network, datetime 347, users 397, system 447, about 497.
+ROW_APP=$((CY + 147)); ROW_DT=$((CY + 347)); ROW_USERS=$((CY + 397)); ROW_SYS=$((CY + 447)); RX=$((CX + 131))
+#!pointer click $RX $ROW_APP
+sleep 2
+flt settings
+echo "STATE settings floating on Appearance: $(geom settings)"
+#!shot tour-app-settings
+winact MaximizeWindow $(wid settings) > /dev/null; sleep 4
+#!pointer click $RX $ROW_DT
+sleep 2
+flt settings
+echo "STATE settings floating on Date and Time"
+#!shot tour-settings-datetime
+winact MaximizeWindow $(wid settings) > /dev/null; sleep 4
+#!pointer click $RX $ROW_USERS
+sleep 2
+flt settings
+echo "STATE settings floating on Users and Lock"
+#!shot tour-settings-users-lock
+winact MaximizeWindow $(wid settings) > /dev/null; sleep 4
+#!pointer click $RX $ROW_SYS
+sleep 2
+flt settings
+echo "STATE settings floating on System"
+#!shot tour-settings-system
+# Back to Appearance, so the app's next open (the motion shot) is its front page.
+winact MaximizeWindow $(wid settings) > /dev/null; sleep 4
+#!pointer click $RX $ROW_APP
+sleep 2
+flt settings
+cwin settings
+
+echo "=== 5g. Browser ==="
+lstart browser
+lretry browser
+flt browser
+echo "STATE browser floating: $(geom browser)"
+#!shot tour-app-browser
+cwin browser
+
+echo "=== 5h. Terminal ==="
+lstart terminal
+lretry terminal
+flt terminal
+read TX TY TW TH TID _ <<< "$(geom terminal)"; TCX=$((TX + TW / 2)); TCY=$((TY + TH / 2)); echo "terminal $TX,$TY ${TW}x$TH, click $TCX,$TCY"
+#!pointer click $TCX $TCY
+sleep 1
+#!type uname -a
+#!key ret
+sleep 2
+#!type ls /usr/share/geckoOS/apps
+#!key ret
+sleep 2
+echo "STATE terminal floating, two commands run"
+#!shot tour-app-terminal
+cwin terminal
+
+echo "=== 5i. App Installer ==="
+lstart installer
+lretry installer
+flt installer
+echo "STATE installer floating: $(geom installer)"
+#!shot tour-app-installer
+cwin installer
+
+echo "=== 6. the title bar close up, and two windows overlapping ==="
+lopen files
+lretry files
+flt files
+lopen notes
+lretry notes
+flt notes
+read FX FY FW FH FID _ <<< "$(geom files)"; read NX NY NW NH NID _ <<< "$(geom notes)"; echo "files $FX,$FY ${FW}x$FH; notes $NX,$NY ${NW}x$NH"
+# Slide the two apart so both frames and the shadows show; the later drag leaves Notes focused.
+FDX=$((FX + FW / 2)); FDY=$((FY + 12)); FDE=$((FDX - 100)); NDX=$((NX + NW / 2)); NDY=$((NY + 12)); NDE=$((NDX + 100)); echo "drag files $FDX,$FDY -> $FDE; notes $NDX,$NDY -> $NDE"
+#!pointer drag $FDX $FDY $FDE $FDY
+sleep 2
+#!pointer drag $NDX $NDY $NDE $NDY
+sleep 2
+read FX FY FW FH FID _ <<< "$(geom files)"; read NX NY NW NH NID NFOC <<< "$(geom notes)"; echo "files $FX,$FY ${FW}x$FH; notes $NX,$NY ${NW}x$NH focused=$NFOC"
+echo "STATE title bar of the focused Notes window (icon, name, three spinner controls)"
+#!shot tour-title-bar -g "$NX,$NY ${NW}x32" -s 2
+echo "STATE two overlapping windows, Notes focused (larger shadow), Files behind"
+#!shot tour-windows-depth
+
+echo "=== 7. maximized: under the strip, above the bar ==="
+winact MaximizeWindow $NID > /dev/null
+sleep 4
+echo "STATE notes maximized: $(geom notes)"
+#!shot tour-maximized
+winact UnmaximizeWindow $NID > /dev/null
+sleep 4
+
+echo "=== 8. cards overview and Alt+Tab, with four apps ==="
+lopen tasks
+lretry tasks
+flt tasks
+lopen contacts
+lretry contacts
+flt contacts
+sleep 3
+echo "apps: files $(wid files) notes $(wid notes) tasks $(wid tasks) contacts $(wid contacts)"
+#!key meta_l tab
+sleep 4
+echo "STATE cards overview open (Super+Tab)"
+#!shot tour-cards-overview
+#!key esc
+sleep 3
+#!keydown alt
+#!key tab
+sleep 1
+echo "STATE Alt+Tab switcher shown while Alt is held: $(evo GetSwitcherState | tr -d ' \n' | grep -o '"shown":[a-z]*')"
+#!shot tour-alt-tab
+#!keyup alt
+sleep 3
+
+echo "=== 9. motion, in slow motion ==="
+echo "--- open (Bloom), Settings launched at scale 60, caught at about 40%, still soft and glowing (by 55% it is already sharp) ---"
+setanim '{"mode":"full","scale":60}'
+F0=$(lfr bloom); echo "bloom frames before: $F0"
+blaunch settings
+#!must bloom-REACHED
+wlp bloom $F0 450 0.40
+echo "STATE a window opening: soft, tinted toward its accent, rounded wide, glow beneath"
+#!shot tour-motion-open
+wait_idle 40
+setanim '{"mode":"full","scale":1}'
+sleep 2
+lretry settings
+flt settings
+# Droplet's progress is front-loaded (read off the spring): by 50% it is already
+# a small orb landing in the icon, and at a third nearly so. About a sixth in it is
+# mid-arc, rounding, tinted and glowing.
+echo "--- minimize (Droplet), Files into the launch bar, at about 18% ---"
+setanim '{"mode":"full","scale":13}'
+# Files in front first: a ghost keeps its z-slot, so behind Settings the orb is hidden.
+winact FocusWindow $(wid files) > /dev/null
+sleep 2
+F0=$(lfr droplet); echo "droplet frames before: $F0"
+winact MinimizeWindow $(wid files) > /dev/null
+#!must droplet-REACHED
+wlp droplet $F0 300 0.18
+echo "STATE a window shrinking to an orb in its app's colour on its way to the bar"
+#!shot tour-motion-minimize
+wait_idle 40
+setanim '{"mode":"full","scale":1}'
+winact RestoreWindow $(wid files) > /dev/null
+sleep 3
+wait_idle 20
+echo "--- close (Evaporate), Notes at about 60%, the burn well under way ---"
+setanim '{"mode":"full","scale":60}'
+F0=$(lfr evaporate); echo "evaporate frames before: $F0"
+# Notes in front first, or it burns away behind Files.
+winact FocusWindow $(wid notes) > /dev/null
+sleep 2
+winact CloseWindow $(wid notes) > /dev/null
+#!must evaporate-REACHED
+wlp evaporate $F0 300 0.60
+echo "STATE a window dissolving from its close button with a glowing edge"
+#!shot tour-motion-close
+wait_idle 40
+setanim '{"mode":"full","scale":1}'
+bgone notes
+echo "--- show desktop (Recede), Super+D at scale 30, about 62% ---"
+echo "windows open: files $(wid files) tasks $(wid tasks) contacts $(wid contacts) settings $(wid settings)"
+setanim '{"mode":"full","scale":30}'
+F0=$(lfr recede); echo "recede frames before: $F0"
+#!key meta_l d
+#!must recede-REACHED
+wlp recede $F0 300 0.62
+echo "STATE every window receding: shrinking, soft and fading, front-most first"
+#!shot tour-motion-show-desktop
+wait_idle 40
+setanim '{"mode":"full","scale":1}'
+sleep 1
+# A second Super+D brings back exactly that set.
+#!key meta_l d
+sleep 4
+wait_idle 20
+echo "windows back: files $(geom files | cut -d' ' -f1-4); settings $(geom settings | cut -d' ' -f1-4)"
+cwin tasks
+cwin contacts
+cwin settings
+lopen notes
+lretry notes
+flt notes
+echo "left open for the next shots: files, notes"
+
+echo "=== 10. the launch bar as a left rail ==="
+sset pyxis.launchBar.position '"left"'
+sleep 5
+echo "STATE rail: $(orects | awk '$1 == 0 && $2 == 36 { print "rail rect " $0 }' | head -1); files now $(geom files | cut -d' ' -f1-4)"
+#!shot tour-left-rail
+sset pyxis.launchBar.position '"bottom"'
+sleep 5
+
+echo "=== 11. the dark theme ==="
+sset pyxis.theme '"dark"'
+sleep 5
+echo "STATE dark theme with Files and Notes open"
+#!shot tour-dark-theme
+sset pyxis.theme '"light"'
+sleep 4
+
+echo "=== 12. the lock screen ==="
+# A password, so the lock page asks for one (set once; the root dialog below uses it too).
+#!must "ok": true
+echo-cli call org.geckoOS.accounts setPassword --interface org.geckoOS.accounts --args "{\"user\":\"geckouser\",\"current\":\"\",\"new\":\"$PASS\"}" | grep '"ok"'
+cwin files
+cwin notes
+sleep 2
+#!key meta_l l
+#!must LOCK-locked=true
+lwait locked true 50
+sleep 9
+echo "STATE lock page at rest (locked=$(lf locked), veil=$(lf veil), keyboard on overlay: $(ostate | grep -o '"keyboard":[a-z]*'))"
+#!shot tour-lock-screen
+# Wake the page and type, so the password field shows its dots (the first key may only wake it).
+#!pointer move 640 400
+sleep 1
+#!type hunter2x
+sleep 2
+echo "STATE lock page with characters typed (locked=$(lf locked))"
+#!shot tour-lock-typing
+#!must "ok":true
+unlock "$PASS"
+#!must LOCK-locked=false
+lwait locked false 100
+sleep 6
+echo "unlocked: $(lst | grep -o '"locked":[a-z]*')"
+
+echo "=== 13. the root-access dialog ==="
+HDIR=/var/lib/pyxis/incoming
+PKG=$(ls $HDIR/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+#!must allow-unsigned-packages
+ls /etc/pyxis/allow-unsigned-packages 2>&1
+opkg list-installed | grep -q com.pyxis.hello && echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo cleaned
+start_watch /root/pr.log
+bg_install /root/install1.log
+waitfor /root/pr.log 'package.install' 40 && echo REQUESTED || echo NOT-REQUESTED
+sleep 3
+R1=$(rid /root/pr.log); echo "R1=$R1"
+echo "STATE root dialog asking for the password to install a package"
+#!shot tour-root-dialog
+priv Dismiss "{\"requestId\":\"$R1\"}" | grep '"ok"'
+waitfor /root/install1.log 'EXIT=' 40 && echo INSTALL-FINISHED || echo INSTALL-STILL-HELD
+sleep 2
+rm -f /root/pr.log /root/install1.log
+
+echo "=== 14. the Shut Down confirmation ==="
+#!pointer click 1220 18
+sleep 3
+# The panel traps Tab, so Shift+Tab from its first control lands on its last: Shut Down.
+#!key shift tab
+sleep 1
+#!key ret
+sleep 3
+echo "STATE shut down confirmation dialog"
+#!shot tour-power-dialog
+#!key esc
+sleep 2
+#!key esc
+sleep 2
+
+echo "=== put things back ==="
+sset pyxis.wallpaper.pinnedTime null; sset pyxis.wallpaper.motion '"flow"'; sset pyxis.theme '"light"'; sset pyxis.launchBar.position '"bottom"'
+setanim '{"mode":"full","scale":1}'
+echo "lock: $(lst | grep -o '"locked":[a-z]*'); leftover windows: $(evo ListWindows | grep -c '"window_id"')"

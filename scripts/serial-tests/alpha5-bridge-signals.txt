@@ -89,7 +89,10 @@ echo "=== the centre has it without listing again (NotificationShown, to the des
 # signals, so the notification is in it only if the desktop heard it.
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'success|Error'
 sleep 3
-#!pointer click 1021 22
+# The centre opens from the launch bar's dashboard: its count, 27 px in from
+# the bar's right end (the Bell left the top bar with the identity work).
+read DX DY DW DH <<< "$(echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done | awk '$2 > 600 && $3 > 100 && $4 > 40 { print; exit }')"; CNTX=$((DX + DW - 27)); CNTY=$((DY + DH / 2)); echo "dashboard count $CNTX,$CNTY"
+#!pointer click $CNTX $CNTY
 sleep 3
 #!shot signals-centre
 #!pointer click 640 600
@@ -97,7 +100,8 @@ sleep 2
 
 echo "=== quick settings follows a volume change made elsewhere (audio VolumeChanged) ==="
 V0=$(echo-cli call org.geckoOS.audio getVolume --interface org.geckoOS.audio --args '{}' | grep -o '"volume": [0-9]*' | grep -o '[0-9]*$'); echo "volume was $V0"
-#!pointer click 1061 22
+# Quick settings opens from the status strip's right-hand cluster.
+#!pointer click 1220 18
 sleep 3
 #!must "volume": 25
 echo-cli call org.geckoOS.audio setVolume --interface org.geckoOS.audio --args '{"volume":25}' | grep '"volume"'
@@ -141,8 +145,10 @@ echo "=== the shell and the built-ins were refused nothing ==="
 # patch refuses Bloom (SetWorkArea, SetOverlayFocus, GetOverlayState,
 # OverlayFocusChanged, SwitcherChanged, ShortcutTriggered). alpha5-shell-layering reports that
 # one cause, as BRIDGE-OK; repeating it here would fail every suite on it.
+# Likewise SetAppIdentity (the identity work), reported by alpha5-identity as
+# IDENTITY-STAND-IN.
 #!must-not capability denied
-grep -a "capability denied" /var/log/vela.log | grep -v "SetWorkArea\|SetOverlayFocus\|GetOverlayState\|OverlayFocusChanged\|SwitcherChanged\|ShortcutTriggered" | head -5
+grep -a "capability denied" /var/log/vela.log | grep -v "SetWorkArea\|SetOverlayFocus\|GetOverlayState\|OverlayFocusChanged\|SwitcherChanged\|ShortcutTriggered\|SetAppIdentity" | head -5
 #!must-not capability denied
 grep -a "capability denied" /var/log/echo.log | grep -v "app 'com.pyxis.hello'" | head -5
 # Nor did delivery fail, or a permission lookup (which would hold a

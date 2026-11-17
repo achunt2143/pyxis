@@ -28,7 +28,11 @@ PKG=$(ls /var/lib/pyxis/incoming/com.pyxis.hello_*.ipk 2>/dev/null | head -1); e
 echo "$PKG"
 #!must-not com.pyxis.hello
 opkg list-installed
-#!must bloom
+# The built-ins are listed; the shell's own entries (bloom, bloom-overlay) are
+# not: List feeds the launcher, and the shell is not an app to launch.
+#!must "id": "files"
+echo-cli call org.geckoOS.nova List --interface org.geckoOS.nova --args '{}' | grep -o '"id": "[^"]*"' | sort
+#!must-not bloom
 echo-cli call org.geckoOS.nova List --interface org.geckoOS.nova --args '{}' | grep -o '"id": "[^"]*"' | sort
 
 # ---------- discovery, before installing ----------
@@ -60,11 +64,15 @@ echo-cli call org.geckoOS.nova GetInfo --interface org.geckoOS.nova --args '{"ap
 
 # ---------- the derived artefacts Nova owns ----------
 # Nova launches an app through pyxis-wlctx, which drops to the app user itself
-# (--uid 1001); there is no setpriv in the launch any more.
+# (--uid <the app's own uid, 10000 up, from /var/lib/pyxis/uids.json); there is
+# no setpriv in the launch any more.
 #!must pyxis-wlctx
 #!must "--uid"
 #!must "video,render"
 cat /var/lib/pyxis/nova/native/com.pyxis.hello/manifest.json 2>&1
+# The uid in the manifest is the app's own (allocated, never 1001 or the shell's).
+#!must MANIFEST-UID-PER-APP
+MU=$(tr -d ' \n' < /var/lib/pyxis/nova/native/com.pyxis.hello/manifest.json | sed -n 's/.*"--uid","\([0-9]*\)".*/\1/p'); [ -n "$MU" ] && [ "$MU" -ge 10000 ] && echo MANIFEST-UID-PER-APP || echo "MANIFEST-UID-BAD '$MU'"
 #!must com.pyxis.hello
 grep com.pyxis.hello /run/pyxis/nova/origins.map 2>&1
 

@@ -78,6 +78,20 @@ test "$X" -ge 0 -a "$Y" -ge "$WT" -a $((X + W)) -le 1280 -a $((Y + H)) -le $((80
 #!must ON-SCR
 test $((X + W + 8)) -le 1280 -a $((Y + H + 8)) -le 800 && echo ON-SCR || echo OFF-SCR
 
+echo "=== make room: the bands must be clear of the strip and the bar ==="
+# Fitted, the window is exactly as tall as the work area (700 of 800, under
+# the 36 px strip and above the 64 px bar), so its top and bottom bands sit
+# under Bloom's strip and bar, which take those clicks, and the move clamp
+# leaves it no room to go down. Wider insets for this suite only give it room
+# (Evo shrinks and moves the window to fit); they are put back at the end.
+read WT0 WB0 <<< "$(wa)"
+#!must "success": true
+echo-cli call org.geckoOS.evo SetWorkArea --interface org.geckoOS.evo --args '{"top":60,"bottom":110}' | grep '"success"'
+sleep 3
+read X Y W H ID <<< "$(geom files)"; echo "with room: x=$X y=$Y w=$W h=$H"
+#!must BANDS-CLEAR
+test $((Y - 4)) -ge 36 -a $((Y + H + 4)) -lt 736 && echo BANDS-CLEAR || echo "BANDS-UNDER-SHELL y=$Y h=$H"
+
 echo "=== control: the same drag, started inside the frame, is the client's ==="
 IX=$((X + W - 30)); IY=$((Y + H - 30)); IEX=$((IX - 100)); IEY=$((IY - 80)); echo "inside=$IX,$IY -> $IEX,$IEY"
 #!pointer drag $IX $IY $IEX $IEY
@@ -129,4 +143,5 @@ echo "=== Evo's own record of the grab ==="
 grep -a 'SSD resize band press' /var/log/evo.log | tail -2
 
 echo "=== clean up ==="
+echo-cli call org.geckoOS.evo SetWorkArea --interface org.geckoOS.evo --args "{\"top\":$WT0,\"bottom\":$WB0}" | grep -c success
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'

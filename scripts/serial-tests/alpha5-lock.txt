@@ -1,0 +1,311 @@
+# Alpha 5, lock lane LE/LT: the lock screen, Evo's half, end to end.
+#
+# On an image built after 2026-11-12 with the lock lanes (bash
+# scripts/rebuild-and-verify.sh) nothing needs pushing:
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-lock.txt
+#
+# On an OLDER image, push what it lacks (evo has the lock, echo-daemon the
+# session and accounts services and the key file, echo-cli the `emit` this
+# uses to forge a signal, Bloom's dist the lock page):
+#
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/echo-cli:/usr/bin/echo-cli \
+#     --push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot \
+#     --script scripts/serial-tests/alpha5-lock.txt
+#
+# docs/internal/pyxis-glass-and-lock-plan.md, part 2. Evo owns what is secret:
+# while locked it draws only the overlay (Bloom's lock page) over black, sends
+# all input there or nowhere, and unlocks only on Echo's `LockChanged` with a
+# mac it can verify. This suite drives Evo and Echo with echo-cli, so it does
+# not need Bloom's lock page to work: the page's own states are Bloom's.
+#
+# The Bloom lock UI needs a vela with the session bridge entries
+# (session.*, evo Lock/SetIdleLock/SetLockOrigin in PyxisBridgeParent) for
+# Bloom to call `session.*` itself. On an older vela those calls are refused
+# (logged once in /var/log/vela.log) and this suite is unaffected: it calls
+# `session.*` with echo-cli throughout, the way the identity suites stand in
+# for SetAppIdentity. What does need the page is the look of `lock-rest`.
+#
+# Slow motion is used for the two shots mid-animation: EVO_ANIMATION_SCALE via
+# SetAnimationSettings, so the 600 ms Veil and the 900 ms Clear are shot at
+# about a third of the way through.
+#
+# LOOK at target/serial-shots/lock-*.png:
+#   lock-before   Files floating, the desktop, for comparison
+#   lock-veil     the Veil caught part-way: Files blurred, grey, half faded
+#                 beneath the lock page's fade-in, over black (the wallpaper is
+#                 NOT drawn: only the overlay and the windows' ghosts)
+#   lock-rest     the lock page alone: no window, no wallpaper of the desktop
+#   lock-black    the overlay's vela killed while locked: the screen is black
+#   lock-restarted the restarted shell's overlay, locked (the lock page again)
+#   lock-clear    the Clear caught part-way: the desktop and Files coming into
+#                 focus (blurred, 104%) about the field; the lock layer's
+#                 circular hole is Bloom's, the soft windows are Evo's
+#   lock-after    the desktop again, sharp, Files where it was
+#
+# Printed: the Veil and Clear frame counts, the fps while locked and the
+# refusal counts. Fails if the password appears in any log.
+
+evo() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "$a"; }
+lst() { evo GetLockState | tr -d ' \n'; }
+# A top-level boolean or scalar of GetLockState (the frames object removed first).
+lf() { lst | sed 's/"frames":{[^}]*}//' | grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2 | tr -d '"'; }
+# One of GetLockState's frame counts.
+lfr() { lst | grep -o '"frames":{[^}]*}' | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
+# Wait (up to $3 * 0.1 s) for GetLockState's field $1 to equal $2.
+lwait() { i=0; while [ $i -lt $3 ]; do [ "$(lf $1)" = "$2" ] && { echo "LOCK-$1=$2"; return 0; }; sleep 0.1; i=$((i + 1)); done; echo "LOCK-$1-NOT-$2 ($(lst))"; return 1; }
+sstate() { echo-cli call org.geckoOS.session getState --interface org.geckoOS.session --args '{}' | tr -d ' \n'; }
+sflag() { sstate | grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2 | tr -d '"'; }
+unlock() { echo-cli call org.geckoOS.session unlock --interface org.geckoOS.session --args "{\"password\":\"$1\"}" | tr -d ' \n'; }
+ostate() { evo GetOverlayState | tr -d ' \n'; }
+geom() { evo ListWindows | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+focused() { evo ListWindows | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(focused|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["focused"]; exit } on = 0 }'; }
+fps() { evo GetRenderingStatus | awk '/"fps"/ { gsub(/[",:]/, ""); print $2 }'; }
+# Lumen's last progress for effect $1, and a wait for it to reach $2.
+lp() { evo GetLumenState | tr -d ' \n' | grep -o '"last_progress":{[^}]*}' | grep -o "\"$1\":[0-9.e-]*" | cut -d: -f2; }
+wait_lp() { i=0; while [ $i -lt $3 ]; do awk -v p="$(lp $1)" -v w="$2" 'BEGIN { exit !(p >= w) }' && { echo "$1-REACHED $2 at $(lp $1)"; return 0; }; sleep 0.1; i=$((i + 1)); done; echo "$1-MISSED $2 at $(lp $1)"; return 1; }
+# The animation counters of kind $1: started and completed.
+astat() { evo GetAnimationState | tr -d ' \n' | grep -o "\"$1\":[0-9]*" | cut -d: -f2 | tr '\n' ' '; }
+anim() { evo SetAnimationSettings "$1" | grep -c '"ok": true'; }
+PASS='Tr0ub4dor-lock-suite'
+WRONG1='definitely-not-it-1'
+
+echo "=== a password, and Files open ==="
+#!must "ok": true
+echo-cli call org.geckoOS.accounts setPassword --interface org.geckoOS.accounts --args "{\"user\":\"geckouser\",\"current\":\"\",\"new\":\"$PASS\"}" | grep '"ok"'
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 20
+#!must FILES-UP
+test -n "$(geom files)" && echo FILES-UP || echo FILES-NOT-UP
+read FX FY FW FH FID <<< "$(geom files)"; echo "files $FID $FX,$FY ${FW}x$FH"
+evo UnmaximizeWindow "{\"window_id\":$FID}" | grep -c success; sleep 3
+read FX FY FW FH FID <<< "$(geom files)"; echo "files $FID $FX,$FY ${FW}x$FH"
+FCX=$((FX + FW / 2)); FCY=$((FY + FH / 2)); echo "files centre $FCX,$FCY"
+evo FocusWindow "{\"window_id\":$FID}" | grep -c success; sleep 1
+#!must STATE-SHAPE
+S=$(lst); ok=1; for K in '"locked":' '"overlay":' '"last_seq":' '"idle_lock_after":' '"idle_seconds":' '"veil":' '"clear":' '"frames":{' '"refused_macs":'; do echo "$S" | grep -q "$K" || ok=0; done; test $ok = 1 && echo STATE-SHAPE || echo "SHAPE=$S"
+#!must UNLOCKED-AT-START
+test "$(lf locked)" = false && echo UNLOCKED-AT-START || echo "STATE=$(lst)"
+#!must OVERLAY-SEEN
+test "$(lf overlay)" = true && echo OVERLAY-SEEN || echo "OVERLAY=$(lf overlay)"
+#!must-not uniform
+#!shot lock-before
+
+echo "=== Super+L locks: Evo at once, Echo agrees ==="
+# Slow motion, so the Veil is caught part-way (6 s at x10).
+#!must 1
+anim '{"scale":10}'
+#!key meta_l l
+#!must LOCK-locked=true
+lwait locked true 30
+#!must ECHO-LOCKED
+test "$(sflag locked)" = true && echo ECHO-LOCKED || echo "ECHO=$(sstate)"
+#!must veil-REACHED
+wait_lp veil 0.3 100
+#!must-not uniform
+#!shot lock-veil
+#!must VEIL-FRAMES
+test "$(lfr veil)" -ge 1 && echo VEIL-FRAMES || echo "VEIL-FRAMES=$(lfr veil) lumen=$(evo GetLumenState | tr -d ' \n' | grep -o '"program":"[a-z]*"')"
+echo "veil running: $(lf veil) frames: $(lfr veil)"
+# Back to normal speed once it has been seen; the Veil in flight ends on its own.
+anim '{"scale":1}' > /dev/null
+sleep 8
+#!must VEIL-DONE
+test "$(lf veil)" = false && echo VEIL-DONE || echo "VEIL-STILL=$(lst)"
+#!shot lock-rest
+echo "overlay: $(ostate)"
+#!must OVERLAY-HAS-THE-KEYBOARD
+ostate | grep -q '"keyboard":true' && echo OVERLAY-HAS-THE-KEYBOARD || echo "KEYBOARD=$(ostate)"
+#!must NO-APP-FOCUSED
+test "$(focused files)" = false && echo NO-APP-FOCUSED || echo "FILES-FOCUSED"
+#!must PHASE-LOCKED
+test "$(lf phase)" = locked && echo PHASE-LOCKED || echo "PHASE=$(lf phase)"
+
+echo "=== while locked: a click on Files reaches nothing, shortcuts and thumbnails are off ==="
+#!pointer click $FCX $FCY
+sleep 1
+#!must FILES-STILL-UNFOCUSED
+test "$(focused files)" = false && echo FILES-STILL-UNFOCUSED || echo "FILES-GOT-FOCUS"
+TBX=$((FX + 40)); TBY=$((FY + 12)); echo "title bar $TBX,$TBY"
+#!pointer click $TBX $TBY
+sleep 1
+#!must STILL-LOCKED-AFTER-CLICKS
+test "$(lf locked)" = true -a "$(focused files)" = false && echo STILL-LOCKED-AFTER-CLICKS || echo "CLICKS-LEAKED $(lst)"
+V0=$(astat veil)
+#!key meta_l l
+sleep 1
+#!must SUPER-L-IS-A-NO-OP
+test "$(astat veil)" = "$V0" && echo SUPER-L-IS-A-NO-OP || echo "SECOND-VEIL $V0 -> $(astat veil)"
+#!key alt tab
+sleep 1
+#!must NO-SWITCHER
+evo GetSwitcherState | tr -d ' \n' | grep -q '"active":false' && echo NO-SWITCHER || echo "SWITCHER-RAN"
+#!key meta_l tab
+#!key meta_l d
+#!key meta_l q
+sleep 1
+#!must FILES-SURVIVED-THE-SHORTCUTS
+test -n "$(geom files)" && test "$(lf locked)" = true && echo FILES-SURVIVED-THE-SHORTCUTS || echo "SHORTCUT-EFFECT $(lst)"
+# A VT switch key: Evo must still be here and still locked afterwards.
+#!key ctrl alt f2
+sleep 2
+#!must STILL-HERE
+test "$(lf locked)" = true && echo STILL-HERE || echo "GONE $(lst)"
+#!must THUMBNAILS-EMPTY
+evo GetWindowThumbnails '{"max_width":200,"max_height":150}' | tr -d ' \n' | grep -q '"thumbnails":\[\]' && echo THUMBNAILS-EMPTY || echo "THUMBNAILS: $(evo GetWindowThumbnails '{"max_width":200,"max_height":150}' | head -c 200)"
+echo "fps while locked: $(fps)"
+
+echo "=== a wrong password is refused and counted, and the sixth try waits ==="
+#!must "wrong"
+unlock "$WRONG1" | grep -o '"reason":"wrong"'
+unlock "$WRONG1-b" > /dev/null; unlock "$WRONG1-c" > /dev/null; unlock "$WRONG1-d" > /dev/null
+#!must "attempts_left":0
+unlock "$WRONG1-e" | grep -o '"attempts_left":0'
+#!must "reason":"wait"
+unlock "$WRONG1-f" | grep -o '"reason":"wait"'
+#!must STILL-LOCKED-AFTER-WRONG
+test "$(lf locked)" = true -a "$(sflag locked)" = true && echo STILL-LOCKED-AFTER-WRONG || echo "UNLOCKED-BY-WRONG $(lst)"
+
+echo "=== a forged LockChanged is refused: Evo stays locked and counts it ==="
+R0=$(lf refused_macs); echo "refused before: $R0"
+ZERO=$(printf '0%.0s' $(seq 1 64))
+echo-cli emit org.geckoOS.session LockChanged --data "{\"locked\":false,\"seq\":99999999999999,\"mac\":\"$ZERO\"}" | tail -1
+sleep 2
+#!must FORGERY-COUNTED
+test "$(lf refused_macs)" -gt "$R0" && echo FORGERY-COUNTED || echo "NOT-COUNTED $R0 -> $(lf refused_macs)"
+#!must STILL-LOCKED-AFTER-FORGERY
+test "$(lf locked)" = true && echo STILL-LOCKED-AFTER-FORGERY || echo "UNLOCKED-BY-FORGERY $(lst)"
+# And one with no mac at all, and a lock signal (which is always welcome).
+echo-cli emit org.geckoOS.session LockChanged --data '{"locked":false,"seq":99999999999998}' | tail -1
+sleep 1
+#!must STILL-LOCKED-NO-MAC
+test "$(lf locked)" = true && echo STILL-LOCKED-NO-MAC || echo "UNLOCKED-NO-MAC $(lst)"
+echo "refused now: $(lf refused_macs)"
+
+echo "=== the overlay dies while locked: still locked, and black ==="
+pkill -9 -f "profiles/bloom( |$)"; echo killed
+sleep 3
+#!must STILL-LOCKED-WITHOUT-OVERLAY
+test "$(lf locked)" = true && echo STILL-LOCKED-WITHOUT-OVERLAY || echo "UNLOCKED-BY-DEATH $(lst)"
+#!must NO-OVERLAY
+test "$(lf overlay)" = false && echo NO-OVERLAY || echo "OVERLAY-STILL=$(lf overlay)"
+#!must uniform
+#!shot lock-black
+#!pointer click $FCX $FCY
+sleep 1
+#!must FILES-UNTOUCHED-IN-THE-DARK
+test "$(focused files)" = false && echo FILES-UNTOUCHED-IN-THE-DARK || echo "FILES-FOCUSED-IN-THE-DARK"
+# geckoOS-boot supervises the shell's vela (supervise_daemon), so a new
+# overlay should come up. On the 11-09 image it did not within 50 s (a probe on
+# 2026-11-12 saw no window at all for a minute after the kill): that is the
+# shell's supervision, not the lock, so it is printed here, not asserted. What
+# is asserted is Evo's half: still locked, whether or not a shell returns.
+echo "waiting for the supervised shell to restart..."
+lwait overlay true 500
+sleep 5
+#!must RESTARTED-STILL-LOCKED
+test "$(lf locked)" = true && test "$(sflag locked)" = true && echo RESTARTED-STILL-LOCKED || echo "RESTARTED-STATE $(lst) $(sstate)"
+echo "shell back: $(lf overlay); overlay state: $(ostate)"
+#!shot lock-restarted
+
+echo "=== the right password unlocks: Clear, then the desktop ==="
+# The wait from the sixth try is 30 s (it doubles with each further wrong one).
+sleep 32
+# Where the Clear focuses from: bottom centre, about where a field sits.
+#!must "ok": true
+evo SetLockOrigin '{"x":640,"y":560}' | grep '"ok"'
+#!must 1
+anim '{"scale":20}'
+#!must "ok":true
+unlock "$PASS"
+#!must clear-REACHED
+wait_lp clear 0.3 200
+#!must-not uniform
+#!shot lock-clear
+#!must CLEAR-FRAMES
+test "$(lfr clear)" -ge 1 && echo CLEAR-FRAMES || echo "CLEAR-FRAMES=$(lfr clear) lumen=$(evo GetLumenState | tr -d ' \n' | grep -o '"bloom_program":"[a-z]*"')"
+#!must LOCK-locked=false
+lwait locked false 20
+#!must ECHO-UNLOCKED
+test "$(sflag locked)" = false && echo ECHO-UNLOCKED || echo "ECHO=$(sstate)"
+#!must LAST-SEQ-MOVED
+test "$(lf last_seq)" -gt 0 && echo LAST-SEQ-MOVED || echo "LAST-SEQ=$(lf last_seq)"
+anim '{"scale":1}' > /dev/null
+sleep 20
+#!must CLEAR-DONE
+test "$(lf clear)" = false && echo CLEAR-DONE || echo "CLEAR-STILL=$(lst)"
+#!shot lock-after
+#!must COUNTERS-BALANCED
+A=$(evo GetAnimationState | tr -d ' \n'); echo "$A" | grep -q '"active":0' && echo COUNTERS-BALANCED || echo "ACTIVE=$A"
+echo "veil: $(astat veil) clear: $(astat clear)"
+#!must FILES-BACK
+test -n "$(geom files)" && echo FILES-BACK || echo FILES-GONE
+#!must KEYBOARD-HANDED-BACK
+test "$(focused files)" = true && echo KEYBOARD-HANDED-BACK || echo "FOCUS: files=$(focused files)"
+#!must THUMBNAILS-BACK
+evo GetWindowThumbnails '{"max_width":200,"max_height":150}' | tr -d ' \n' | grep -q '"window_id"' && echo THUMBNAILS-BACK || echo "THUMBNAILS-STILL-EMPTY"
+
+echo "=== reduced and off: a fade, then instant, and the counters balance ==="
+#!must 1
+anim '{"mode":"reduced"}'
+#!key meta_l l
+sleep 2
+#!must LOCKED-REDUCED
+test "$(lf locked)" = true && echo LOCKED-REDUCED || echo "NOT-LOCKED $(lst)"
+#!must "ok":true
+unlock "$PASS"
+sleep 3
+#!must UNLOCKED-REDUCED
+test "$(lf locked)" = false && echo UNLOCKED-REDUCED || echo "STILL-LOCKED $(lst)"
+#!must 1
+anim '{"mode":"off"}'
+#!key meta_l l
+sleep 1
+#!must LOCKED-OFF
+test "$(lf locked)" = true && echo LOCKED-OFF || echo "NOT-LOCKED $(lst)"
+#!must VEIL-INSTANT
+test "$(lf veil)" = false && echo VEIL-INSTANT || echo "VEIL-RUNNING"
+#!must "ok":true
+unlock "$PASS"
+sleep 2
+#!must UNLOCKED-OFF
+test "$(lf locked)" = false && echo UNLOCKED-OFF || echo "STILL-LOCKED $(lst)"
+#!must CLEAR-INSTANT
+test "$(lf clear)" = false && echo CLEAR-INSTANT || echo "CLEAR-RUNNING"
+anim '{"mode":"full","scale":1}' > /dev/null
+sleep 3
+#!must COUNTERS-BALANCED-AGAIN
+A=$(evo GetAnimationState | tr -d ' \n'); echo "$A" | grep -q '"active":0' && echo COUNTERS-BALANCED-AGAIN || echo "ACTIVE=$A"
+
+echo "=== idle lock: five seconds with no input ==="
+#!must "ok": true
+evo SetIdleLock '{"seconds":5}' | grep '"ok"'
+#!must IDLE-SET
+test "$(lf idle_lock_after)" = 5 && echo IDLE-SET || echo "IDLE=$(lf idle_lock_after)"
+sleep 9
+#!must IDLE-LOCKED
+test "$(lf locked)" = true && echo IDLE-LOCKED || echo "NOT-IDLE-LOCKED $(lst)"
+#!must IDLE-TOLD-ECHO
+test "$(sflag locked)" = true && echo IDLE-TOLD-ECHO || echo "ECHO=$(sstate)"
+evo SetIdleLock '{"seconds":0}' | grep -c '"ok"'
+#!must "ok":true
+unlock "$PASS"
+sleep 3
+#!must UNLOCKED-AFTER-IDLE
+test "$(lf locked)" = false && echo UNLOCKED-AFTER-IDLE || echo "STILL-LOCKED $(lst)"
+#!must EVO-LOCK-METHOD
+evo Lock | grep -q '"ok": true' && sleep 2 && test "$(lf locked)" = true && echo EVO-LOCK-METHOD || echo "EVO-LOCK-FAILED $(lst)"
+#!must "ok":true
+unlock "$PASS"
+sleep 3
+
+echo "=== the password is in no log ==="
+#!must NOT-LOGGED
+grep -a -l -e "$PASS" -e "$WRONG1" /var/log/*.log 2>/dev/null && echo LOGGED || echo NOT-LOGGED
+echo "refused macs in all: $(lf refused_macs); last seq: $(lf last_seq)"
+echo "final: $(lst)"

@@ -62,9 +62,10 @@ echo "=== the shell is the overlay's: the bar and the dock are in its input regi
 pgrep -a vela | grep -o -- '--pyxis-overlay [^ ]*' | head -1
 sleep 5
 echo "region: $(orects | tr '\n' ';')"
-# The bar spans the screen at the top; the dock floats at the bottom.
+# The status strip spans the screen at the top (36 px); the launch bar is
+# flush with the bottom edge, full width (64 px).
 #!must BAR-IN-REGION
-orects | awk '$1 == 0 && $2 == 0 && $3 == 1280 && $4 >= 40 && $4 <= 60 { found = 1 } END { print found ? "BAR-IN-REGION" : "NO-BAR-RECT" }'
+orects | awk '$1 == 0 && $2 == 0 && $3 == 1280 && $4 >= 30 && $4 <= 60 { found = 1 } END { print found ? "BAR-IN-REGION" : "NO-BAR-RECT" }'
 #!must DOCK-IN-REGION
 orects | awk '$2 > 600 && $3 > 100 && $4 > 40 { found = 1 } END { print found ? "DOCK-IN-REGION" : "NO-DOCK-RECT" }'
 #!must NO-PANEL-YET
@@ -76,12 +77,12 @@ read WT WB <<< "$(wa)"; echo "work area: top=$WT bottom=$WB"
 #!must BRIDGE-OK
 test "$WT" -gt 0 && echo BRIDGE-OK || echo "BRIDGE-OLD-VELA: SetWorkArea was refused (see /var/log/vela.log); standing in"
 # On a vela without the patch, say what Bloom would have said: the bar's
-# height, and the dock's height plus its margin and gap.
-if [ "$WT" = 0 ]; then evo SetWorkArea "{\"top\":44,\"bottom\":$((800 - DY + 6))}" | grep -c success; fi
+# height, and the launch bar's (flush, so the screen below its top).
+if [ "$WT" = 0 ]; then evo SetWorkArea "{\"top\":36,\"bottom\":$((800 - DY))}" | grep -c success; fi
 sleep 1
 read WT WB <<< "$(wa)"; echo "work area now: top=$WT bottom=$WB"
 #!must WORK-AREA-SET
-test "$WT" -ge 40 -a "$WB" -ge 60 && echo WORK-AREA-SET || echo "WORK-AREA-MISSING top=$WT bottom=$WB"
+test "$WT" -ge 30 -a "$WB" -ge 60 && echo WORK-AREA-SET || echo "WORK-AREA-MISSING top=$WT bottom=$WB"
 
 echo "=== a maximized app starts below the bar and ends above the dock ==="
 # Only a first-run window opens maximized (see alpha5-resize.txt).
@@ -144,8 +145,8 @@ test "$(fullscreen_rects)" = 0 && echo PANEL-CLOSED || echo PANEL-STILL-OPEN
 test "$NFOC" = true && echo NEW-APP-HAS-KEYBOARD || echo "NEW-APP-UNFOCUSED"
 
 echo "=== the dock takes a click, and the drawer opens over the apps ==="
-# The first dock button is the app drawer: 12 px of padding and a border,
-# then a 46 px button.
+# The launch bar's first button is Apps (the drawer): 16 px of padding, then
+# a 40 px tile.
 CX=$((DX + 36)); CY=$((DY + DH / 2)); echo "drawer button $CX,$CY"
 #!pointer click $CX $CY
 sleep 2

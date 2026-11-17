@@ -1,0 +1,183 @@
+# Alpha 5, visual identity: the shell's new look on device (lanes T, B, N, C;
+# lane E's window chrome has its own suite, alpha5-identity-evo.txt).
+#
+# On an image built after 2026-11-12 (bash scripts/rebuild-and-verify.sh; see
+# docs/internal/next-image-checklist.md) nothing needs pushing:
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-identity.txt
+#
+# On an OLDER image (the 11-09 one), push what that image lacks:
+#
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/echo-cli:/usr/bin/echo-cli \
+#     --push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot \
+#     --push scripts/serial-tests/identity-icons/notes.png:/usr/share/pyxis-test/notes.png \
+#     --script scripts/serial-tests/alpha5-identity.txt
+#
+# docs/internal/pyxis-visual-identity-plan.md. The status strip is drawn on the
+# wallpaper (36 px, no background, ink from the Daylight palette), the launch
+# bar is flush with the bottom edge (64 px, full width) with the notification
+# dashboard at its right end, notifications rise from there, and panels and
+# cards wear the waterdrop corner (16 4 16 16, top-right sharp).
+#
+# The image's zone is UTC (no place), so Daylight runs its fixed day: the
+# pinned times below are night, dawn, midday and dusk on that day.
+#
+# Needs a vela rebuilt with SetAppIdentity in the bridge for Bloom to name the
+# title bars itself; on an older one the call is refused (logged once in
+# vela.log) and this suite stands in with echo-cli (IDENTITY-STAND-IN).
+#
+# LOOK at target/serial-shots/identity-shell-*.png:
+#   -night/-dawn/-midday/-dusk  the strip's ink and the bar's material follow
+#                               the wallpaper (light ink at night, dark by day)
+#   -desktop      two floating windows with waterdrop frames, a toast rising
+#                 from the bottom right, a chip and the count on the dashboard
+#   -centre       the notification centre opening upward from the dashboard
+#   -quick        quick settings from the strip's right-hand cluster
+#   -drawer       APPLICATIONS, waterdrop icons
+#   -cards        the overview: waterdrop cards, accent title strips
+#   -rail         the launch bar as a left rail, windows kept off it
+
+evo() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "$a"; }
+ostate() { evo GetOverlayState | tr -d ' \n'; }
+orects() { ostate | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done; }
+wa() { local w t b; w=$(ostate | grep -o '"workArea":{[^}]*}'); t=$(echo "$w" | grep -o '"top":[0-9]*' | cut -d: -f2); b=$(echo "$w" | grep -o '"bottom":[0-9]*' | cut -d: -f2); echo "${t:-0} ${b:-0}"; }
+fullscreen_rects() { orects | grep -c '^0 0 1280 800$'; }
+geom() { evo ListWindows | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+sset() { echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args "{\"key\":\"$1\",\"value\":$2}" | grep -c '"success": true'; }
+
+echo "=== the shell's edges: a 36 px strip and a 64 px launch bar ==="
+sleep 20
+#!must pyxis-overlay
+pgrep -a vela | grep -o -- '--pyxis-overlay [^ ]*' | head -1
+echo "region: $(orects | tr '\n' ';')"
+#!must STRIP-IN-REGION
+orects | awk '$1 == 0 && $2 == 0 && $3 == 1280 && $4 == 36 { f = 1 } END { print f ? "STRIP-IN-REGION" : "NO-STRIP-RECT" }'
+#!must BAR-IN-REGION
+orects | awk '$1 == 0 && $2 == 736 && $3 == 1280 && $4 == 64 { f = 1 } END { print f ? "BAR-IN-REGION" : "NO-BAR-RECT" }'
+#!must WORK-AREA 36 64
+read WT WB <<< "$(wa)"; echo "WORK-AREA $WT $WB"
+
+echo "=== the shell follows the day (nothing open) ==="
+sset pyxis.wallpaper.motion '"still"' > /dev/null
+#!must 1
+sset pyxis.wallpaper.pinnedTime 1380
+sleep 4
+#!must-not uniform
+#!shot identity-shell-night
+sset pyxis.wallpaper.pinnedTime 390 > /dev/null; sleep 4
+#!must-not uniform
+#!shot identity-shell-dawn
+sset pyxis.wallpaper.pinnedTime 720 > /dev/null; sleep 4
+#!must-not uniform
+#!shot identity-shell-midday
+sset pyxis.wallpaper.pinnedTime 1110 > /dev/null; sleep 4
+#!must-not uniform
+#!shot identity-shell-dusk
+sset pyxis.wallpaper.pinnedTime 1050 > /dev/null; sset pyxis.wallpaper.motion '"flow"' > /dev/null; echo golden-evening
+
+echo "=== two floating windows, named in their title bars ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4 /var/lib/pyxis/profiles/notes/xulstore.json /var/lib/pyxis/profiles/notes/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 15
+# Launch's reply can come back empty while Files is still starting, though
+# Notes starts: judge by its window instead.
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+sleep 18
+#!must NOTES-UP
+test -n "$(geom notes)" && echo NOTES-UP || echo NOTES-NOT-UP
+read FX FY FW FH FID <<< "$(geom files)"; read NX NY NW NH NID <<< "$(geom notes)"; echo "files $FID $FX,$FY ${FW}x$FH; notes $NID $NX,$NY ${NW}x$NH"
+evo UnmaximizeWindow "{\"window_id\":$FID}" | grep -c success; sleep 3
+evo UnmaximizeWindow "{\"window_id\":$NID}" | grep -c success; sleep 3
+# Bloom sends the identity table itself on a vela that allows it; otherwise
+# stand in with what it would have sent for Notes (and Files without an icon).
+if grep -a "capability denied" /var/log/vela.log | grep -q SetAppIdentity; then echo "IDENTITY-STAND-IN (vela without SetAppIdentity)"; ICON="data:image/png;base64,$(base64 -w0 /usr/share/pyxis-test/notes.png)"; evo SetAppIdentity "{\"apps\":[{\"app_id\":\"notes\",\"name\":\"Notes\",\"accent\":\"#eab308\",\"icon\":\"$ICON\"},{\"app_id\":\"files\",\"name\":\"File Manager\",\"accent\":\"#d97706\"}],\"dark\":false}" | grep -c '"ok": true'; else echo IDENTITY-FROM-BLOOM; fi
+sleep 2
+#!must "title_label": "Notes"
+evo ListWindows | grep -o '"title_label": "Notes[^"]*"' | head -1
+# Bloom's name for Files is "File Manager" (registry and manifest); the
+# client's own title follows it when it adds anything.
+#!must "title_label": "File Manager
+evo ListWindows | grep -o '"title_label": "File Manager[^"]*"' | head -1
+#!must "success": true
+echo-cli call org.geckoOS.notification show --interface org.geckoOS.notification --args '{"title":"Standup in 10 min","body":"Launch bar offsets for bridge-deny","timeout":0}' | grep success
+sleep 3
+echo "region: $(orects | tr '\n' ';')"
+# The toast stack rises from the bar's right end: 340 wide, its right edge
+# 12 px in, its bottom 8 px above the bar.
+#!must TOAST-BOTTOM-RIGHT
+orects | awk '$3 == 340 { if ($1 + $3 == 1268 && $2 + $4 == 728) f = 1; else bad = $0 } END { print f ? "TOAST-BOTTOM-RIGHT" : "TOAST-ELSEWHERE " bad }'
+#!must-not uniform
+#!shot identity-shell-desktop
+
+echo "=== the dashboard's count opens the centre, upward ==="
+read DX DY DW DH <<< "$(orects | awk '$2 == 736 && $3 == 1280 { print; exit }')"; CNTX=$((DX + DW - 27)); CNTY=$((DY + DH / 2)); echo "count $CNTX,$CNTY"
+#!pointer click $CNTX $CNTY
+sleep 3
+#!must CENTRE-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo CENTRE-OPEN || echo "CENTRE-NOT-OPEN region: $(orects | tr '\n' ';')"
+#!must-not uniform
+#!shot identity-shell-centre
+#!pointer click 300 300
+sleep 2
+
+echo "=== quick settings from the strip ==="
+#!pointer click 1220 18
+sleep 3
+#!must QUICK-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo QUICK-OPEN || echo "QUICK-NOT-OPEN"
+#!must-not uniform
+#!shot identity-shell-quick
+#!pointer click 300 300
+sleep 2
+
+echo "=== the drawer (Apps, the bar's first button) ==="
+AX=$((DX + 36)); AY=$((DY + DH / 2)); echo "apps button $AX,$AY"
+#!pointer click $AX $AY
+sleep 3
+#!must DRAWER-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo DRAWER-OPEN || echo "DRAWER-NOT-OPEN"
+#!must-not uniform
+#!shot identity-shell-drawer
+#!key esc
+sleep 2
+
+echo "=== cards (Super+Tab) ==="
+sleep 2
+#!key meta_l tab
+sleep 3
+#!must CARDS-OPEN
+test "$(fullscreen_rects)" -ge 1 && echo CARDS-OPEN || echo "CARDS-NOT-OPEN"
+#!must-not uniform
+#!shot identity-shell-cards
+#!key esc
+sleep 2
+
+echo "=== the launch bar as a left rail (pyxis.launchBar.position) ==="
+#!must 1
+sset pyxis.launchBar.position '"left"'
+sleep 4
+echo "region: $(orects | tr '\n' ';')"
+#!must RAIL-IN-REGION
+orects | awk '$1 == 0 && $2 == 36 && $3 == 64 && $4 == 764 { f = 1 } END { print f ? "RAIL-IN-REGION" : "NO-RAIL-RECT" }'
+#!must "left":64
+ostate | grep -o '"workArea":{[^}]*}' | grep -o '"left":[0-9]*'
+# Evo re-fits open windows off the rail.
+read FX FY FW FH FID <<< "$(geom files)"; echo "files now $FX,$FY ${FW}x$FH"
+#!must OFF-RAIL
+test "$FX" -ge 64 && echo OFF-RAIL || echo "UNDER-RAIL x=$FX"
+#!must-not uniform
+#!shot identity-shell-rail
+#!must 1
+sset pyxis.launchBar.position '"bottom"'
+sleep 4
+#!must BAR-BACK
+orects | awk '$1 == 0 && $2 == 736 && $3 == 1280 && $4 == 64 { f = 1 } END { print f ? "BAR-BACK" : "NO-BAR-RECT" }'
+
+echo "=== put things back; nothing refused but what the old vela lacks ==="
+sset pyxis.wallpaper.pinnedTime null > /dev/null; echo unpinned
+#!must-not capability denied
+grep -a "capability denied" /var/log/vela.log | grep -v SetAppIdentity | head -5

@@ -25,8 +25,9 @@ geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo -
 # ("0 0" while Bloom has reported none): a maximized frame starts below the
 # first and ends above the second (see alpha5-shell-layering.txt).
 wa() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | awk '/"top"/ { gsub(/[",:]/, ""); t = $2 } /"bottom"/ { gsub(/[",:]/, ""); b = $2 } END { print t + 0, b + 0 }'; }
-# One "x y w h" line per rect of the overlay's input region: the bar, the dock
-# and, while there is one, the toast stack (340 wide).
+# One "x y w h" line per rect of the overlay's input region: the status strip,
+# the launch bar and, while there is one, the toast stack (340 wide, rising
+# from the bar's right end).
 orects() { echo-cli call org.geckoOS.evo GetOverlayState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' | grep -o '"rects":\[[^]]*\]' | grep -o '{[^{}]*}' | while read -r r; do f() { echo "$r" | grep -o "\"$1\":-\?[0-9]*" | cut -d: -f2; }; echo "$(f x) $(f y) $(f width) $(f height)"; done; }
 toast_rects() { orects | awk '$3 == 340 { n++ } END { print "toast-rects=" n + 0 }'; }
 notes() { echo "notifications=$(echo-cli call org.geckoOS.notification list --interface org.geckoOS.notification --args '{}' | grep -c '"title"')"; }
@@ -74,9 +75,11 @@ read FX FY FW FH FID FFOC <<< "$(geom files)"; [ "$FFOC" = true ] && echo files-
 echo "=== the toast's X, over the app, dismisses it ==="
 #!must notifications=1
 notes
-# The X sits at the stack's top-right: the stack is 340 wide at right 16,
-# top 62, and the button is inside 12 px of padding.
-#!pointer click 1245 82
+# The toast stack rises from the launch bar's right end (12 px from the right,
+# 8 px above the bar); the X sits 8 px in from the toast's top-right corner,
+# a 21 px button. Placed from the stack's own rect.
+read TX TY TW TH <<< "$(orects | awk '$3 == 340 { print; exit }')"; XX=$((TX + TW - 19)); XY=$((TY + 19)); echo "toast $TX,$TY ${TW}x$TH; X at $XX,$XY"
+#!pointer click $XX $XY
 sleep 2
 #!must notifications=0
 notes
@@ -87,7 +90,8 @@ toast_rects
 echo "=== where the toast was, clicks reach the app again ==="
 echo-cli call org.geckoOS.evo FocusWindow --interface org.geckoOS.evo --args "{\"window_id\":$BID}" | grep -c success
 sleep 1
-#!pointer click 1100 100
+PX=$((TX + 60)); PY=$((TY + TH / 2)); echo "where the toast was: $PX,$PY"
+#!pointer click $PX $PY
 sleep 2
 #!must files-focused
 read FX FY FW FH FID FFOC <<< "$(geom files)"; [ "$FFOC" = true ] && echo files-focused || echo "files focused=$FFOC"

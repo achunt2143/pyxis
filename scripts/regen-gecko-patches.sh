@@ -58,7 +58,7 @@ for rel in "${MODIFIED[@]}"; do
   fi
 
   { sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmpdir/prose"; echo; echo "$SEP"; echo;
-    git diff -- "$rel"; } > "$tmpdir/new"
+    git diff --binary -- "$rel"; } > "$tmpdir/new"
 
   if [ "$CHECK_ONLY" = 1 ]; then
     if ! diff -q "$tmpdir/new" "$out" >/dev/null 2>&1; then

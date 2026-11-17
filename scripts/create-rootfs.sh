@@ -25,6 +25,16 @@ OPKG_URL_BASE="${OPKG_URL_BASE:-https://downloads.yoctoproject.org/releases/opkg
 GECKO_PREBUILT=${GECKO_PREBUILT:-0}
 KERNEL_PREBUILT=${KERNEL_PREBUILT:-0}
 FORCE_REBUILD=${FORCE_REBUILD:-0}
+# Opt-in gate for staging the developer pyxis:// smoketest app ("Pyxis Smoketest"
+# / app-id "testapp"). Kept off by default so it does not leak into the user
+# AppDrawer; set PYXIS_INCLUDE_TESTAPP=1 when building a smoketest image.
+PYXIS_INCLUDE_TESTAPP=${PYXIS_INCLUDE_TESTAPP:-0}
+
+# PYXIS_DEV_IMAGE=1 (the default for now) leaves a passwordless root bash on
+# tty1 and ttyS0; scripts/serial-test.py drives the device through the serial
+# one. Release images must be built with PYXIS_DEV_IMAGE=0, which puts a login
+# prompt on both consoles instead.
+PYXIS_DEV_IMAGE=${PYXIS_DEV_IMAGE:-1}
 # Which staged pyxis:// app vela launches into at boot. Both "terminal" and
 # "bloom" are always staged (stage_terminal_app / stage_bloom_app run
 # unconditionally below) -- this only picks which one the boot script
@@ -303,7 +313,7 @@ apt install -y --no-install-recommends \
   ncurses-base ncurses-term bash-completion \
   file less procps psmisc util-linux kmod udev nano \
   iproute2 iputils-ping netbase ifupdown \
-  mount passwd login \
+  mount passwd login sudo \
   libdrm2 libgbm1 libinput10 libxkbcommon0 libwayland-client0 libwayland-server0 \
   libwayland-egl1 libwayland-cursor0 \
   wayland-protocols libegl1 libgles2 mesa-utils libgl1-mesa-dri \
@@ -317,7 +327,8 @@ apt install -y --no-install-recommends \
   libpci3 fontconfig fonts-dejavu-core \
   openssl curl wget \
   grim \
-  pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils alsa-utils
+  pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils alsa-utils \
+  nftables
 
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
@@ -370,9 +381,9 @@ stage_opkg() {
     # .ipk files (installer.rs validates a path and hands it to `opkg
     # install`), so the network half of opkg is dead weight:
     #   WITH_CURL=OFF          no remote feeds -> no libcurl, no TLS stack
-    #   WITH_GPGME=OFF         signature checking is an alpha6 roadmap item;
-    #                          turning it on now would demand a keyring the
-    #                          project doesn't have yet
+    #   WITH_GPGME=OFF         opkg's own check covers feed indexes only, never
+    #                          a local .ipk; the installer verifies a detached
+    #                          signature (package_sig.rs) before opkg runs
     #   USE_SOLVER_LIBSOLV=OFF the built-in solver is enough for self-contained
     #                          bundled apps and drops the libsolv dependency
     #   WITH_XZ=ON             kept (upstream default): Vroom emits gzip today,
@@ -381,6 +392,20 @@ stage_opkg() {
     #
     # Build deps are purged afterwards so they don't ship in the image; only
     # the runtime libs (libarchive, liblzma) stay behind.
+
+    # Package trust. Release images ship the publisher's public key(s) in
+    # /etc/pyxis/keys as <keyId>.pub (PEM); the directory is empty here. The
+    # installer refuses unsigned packages unless the marker below exists, and
+    # the marker is made only for dev images (the on-device suites install an
+    # unsigned acceptance package). A release rebuild on a reused rootfs
+    # removes a marker left by an earlier dev build.
+    sudo install -d -m 0755 -o root -g root "${ROOTFS_DIR}/etc/pyxis" "${ROOTFS_DIR}/etc/pyxis/keys"
+    if [[ "${PYXIS_DEV_IMAGE}" == "1" ]]; then
+        sudo touch "${ROOTFS_DIR}/etc/pyxis/allow-unsigned-packages"
+        sudo chmod 0644 "${ROOTFS_DIR}/etc/pyxis/allow-unsigned-packages"
+    else
+        sudo rm -f "${ROOTFS_DIR}/etc/pyxis/allow-unsigned-packages"
+    fi
 
     if sudo test -x "${ROOTFS_DIR}/usr/bin/opkg" && [[ "${FORCE_REBUILD}" != "1" ]]; then
         log_info "opkg already present in rootfs, skipping build (pass --force to rebuild)"
@@ -496,6 +521,10 @@ stage_rootfs_dirs() {
     sudo mkdir -p "${ROOTFS_DIR}/var/run"
     sudo mkdir -p "${ROOTFS_DIR}/var/tmp"
     sudo mkdir -p "${ROOTFS_DIR}/var/lib/wayland"
+    # Profiles for the lock screen and Settings (display name, accent, avatar),
+    # one JSON file per user, written by echo's accounts service as root.
+    sudo mkdir -p "${ROOTFS_DIR}/var/lib/pyxis/accounts"
+    sudo chmod 755 "${ROOTFS_DIR}/var/lib/pyxis/accounts"
 
     sudo mkdir -p "${ROOTFS_DIR}/run/user/1000"
 
@@ -525,7 +554,7 @@ sysfs     /sys           sysfs     nosuid,noexec,nodev  0 0
 devtmpfs  /dev           devtmpfs  mode=0755,nosuid     0 0
 devpts    /dev/pts       devpts    gid=5,mode=620       0 0
 tmpfs     /run           tmpfs     nosuid,nodev,mode=755 0 0
-tmpfs     /tmp           tmpfs     mode=1777            0 0
+tmpfs     /tmp           tmpfs     nosuid,nodev,mode=1777 0 0
 tmpfs     /dev/shm       tmpfs     nosuid,nodev         0 0
 cgroup2   /sys/fs/cgroup cgroup2   nosuid,noexec,nodev  0 0
 EOF
@@ -584,6 +613,14 @@ geckouser:*:20000:0:99999:7:::
 pyxisapp:*:20000:0:99999:7:::
 EOF
     sudo chmod 640 "${ROOTFS_DIR}/etc/shadow"
+
+    sudo mkdir -p "${ROOTFS_DIR}/etc/sudoers.d"
+    sudo chmod 750 "${ROOTFS_DIR}/etc/sudoers.d"
+    write_rootfs_file "${ROOTFS_DIR}/etc/sudoers.d/pyxis" <<'EOF'
+# Pyxis privileged access rules.
+geckouser ALL=(ALL:ALL) ALL
+EOF
+    sudo chmod 0440 "${ROOTFS_DIR}/etc/sudoers.d/pyxis"
 
     write_rootfs_file "${ROOTFS_DIR}/etc/os-release" <<'EOF'
 NAME="GeckoOS"
@@ -714,14 +751,73 @@ stage_services() {
     # (filesystem/device setup left over after the initramfs's switch_root);
     # geckoOS-boot (::wait) starts the system daemons in dependency order and
     # must return before init proceeds to the respawn entries below.
-    write_rootfs_file "${ROOTFS_DIR}/etc/inittab" <<'EOF'
+    local tty1_line ttyS0_line
+    if [[ "$PYXIS_DEV_IMAGE" == "1" ]]; then
+        tty1_line='tty1::respawn:/bin/bash'
+        ttyS0_line='ttyS0::respawn:/bin/bash'
+        log_info "PYXIS_DEV_IMAGE=1: DEV image, passwordless root shell on tty1 and ttyS0"
+    else
+        tty1_line='tty1::respawn:/sbin/getty 38400 tty1'
+        ttyS0_line='ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100'
+        log_info "PYXIS_DEV_IMAGE=0: RELEASE image, login prompt on tty1 and ttyS0"
+    fi
+    {
+        cat <<'EOF'
 ::sysinit:/etc/init.d/rcS
 ::wait:/usr/sbin/geckoOS-boot
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/bin/sync
-tty1::respawn:/bin/bash
-ttyS0::respawn:/bin/bash
 EOF
+        printf '%s\n%s\n' "$tty1_line" "$ttyS0_line"
+    } | write_rootfs_file "${ROOTFS_DIR}/etc/inittab"
+
+    # Kernel hardening, applied by rcS (BusyBox init does not read sysctl.d).
+    # Not set on purpose: kernel.unprivileged_userns_clone, because vela's
+    # content sandbox needs user namespaces.
+    write_rootfs_file "${ROOTFS_DIR}/etc/sysctl.d/90-pyxis-hardening.conf" <<'EOF'
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+kernel.yama.ptrace_scope=1
+kernel.unprivileged_bpf_disabled=1
+net.core.bpf_jit_harden=2
+fs.protected_symlinks=1
+fs.protected_hardlinks=1
+fs.protected_fifos=2
+fs.protected_regular=2
+fs.suid_dumpable=0
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.tcp_syncookies=1
+EOF
+
+    # Default-drop inbound firewall, applied by rcS before networking comes up.
+    write_rootfs_file "${ROOTFS_DIR}/etc/nftables.conf" <<'EOF'
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, nd-router-solicit } accept
+        icmpv6 type echo-request limit rate 5/second accept
+        icmp type echo-request limit rate 5/second accept
+        udp sport 67 udp dport 68 accept
+        udp sport 547 udp dport 546 accept
+    }
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+EOF
+    sudo chmod 644 "${ROOTFS_DIR}/etc/nftables.conf"
 
     write_rootfs_file "${ROOTFS_DIR}/etc/init.d/rcS" <<'EOF'
 #!/bin/sh
@@ -740,8 +836,38 @@ mount -t devpts devpts /dev/pts -o gid=5,mode=620 -n 2>/dev/null || true
 # mkdir above.
 mount -t tmpfs tmpfs /dev/shm -o mode=1777,nosuid,nodev -n 2>/dev/null || true
 mount -t tmpfs tmpfs /run -o mode=755,size=128M -n 2>/dev/null || true
-mount -t tmpfs tmpfs /tmp -o mode=1777,size=512M -n 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp -o mode=1777,size=512M,nosuid,nodev -n 2>/dev/null || true
 mount -t cgroup2 cgroup2 /sys/fs/cgroup -n 2>/dev/null || true
+
+# Kernel hardening from /etc/sysctl.d (BusyBox init does not read it). Each
+# failure is logged and ignored: a key the kernel lacks (Yama before the new
+# kernel) must not stop the boot.
+for conf in /etc/sysctl.d/*.conf; do
+    [ -f "$conf" ] || continue
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; esac
+        key=${line%%=*}
+        val=${line#*=}
+        path=/proc/sys/$(echo "$key" | tr . /)
+        if echo "$val" > "$path" 2>/dev/null; then
+            echo "rcS: sysctl $key=$val"
+        else
+            echo "rcS: sysctl $key=$val failed (ignored)"
+        fi
+    done < "$conf"
+done
+
+# Default-drop inbound firewall. Never fatal: a missing nft or a kernel
+# without nftables is logged and the boot carries on.
+if [ -x /usr/sbin/nft ] && [ -f /etc/nftables.conf ]; then
+    if /usr/sbin/nft -f /etc/nftables.conf 2>/run/nft.err; then
+        echo "rcS: firewall: active (default-drop inbound)"
+    else
+        echo "rcS: firewall: INACTIVE (nft failed: $(head -n 1 /run/nft.err 2>/dev/null))"
+    fi
+else
+    echo "rcS: firewall: INACTIVE (nft or /etc/nftables.conf missing)"
+fi
 
 # Must come after the /run and /tmp tmpfs mounts above -- creating these
 # first would just get hidden underneath the fresh (empty) tmpfs once it's
@@ -970,7 +1096,8 @@ supervise_daemon() {
                         sleep 0.5
                         i=$((i + 1))
                     done
-                    chown 1000:1000 "$chown_sock" 2>/dev/null
+                    chmod 755 "$(dirname "$chown_sock")" 2>/dev/null
+                    chown 1000:1000 "$(dirname "$chown_sock")" "$chown_sock" 2>/dev/null
                 ) &
             fi
         done
@@ -1046,6 +1173,14 @@ sleep 1
 supervise_daemon echo - "${XDG_RUNTIME_DIR}/geckoOS/echo.sock" /usr/bin/env PYXIS_SHELL_APPS=@@BOOT_APP@@ /usr/bin/echo-daemon
 if wait_for_socket "${XDG_RUNTIME_DIR}/geckoOS/echo.sock" 20; then
     echo "[boot] echo socket ready"
+    # Echo runs as root (required by accounts, installer, and scoped
+    # filesystem drops) and creates ${XDG_RUNTIME_DIR}/geckoOS and echo.sock
+    # root-owned. Hand both over to geckouser (and keep the dir 0755 so apps
+    # can traverse it via their runtime link) immediately upon socket creation
+    # rather than gating it behind Evo's WAYLAND_DISPLAY below.
+    chmod 755 "${XDG_RUNTIME_DIR}/geckoOS" 2>/dev/null || true
+    chown 1000:1000 "${XDG_RUNTIME_DIR}/geckoOS" 2>/dev/null || true
+    chown 1000:1000 "${XDG_RUNTIME_DIR}/geckoOS/echo.sock" 2>/dev/null || true
 else
     echo "[boot] WARN: echo socket not seen after 10s, continuing anyway"
 fi
@@ -1099,15 +1234,12 @@ if wait_for_socket "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" 40; then
     # That's exactly the "Failed to connect ... Permission denied" a real
     # boot showed once the socket-name desync (wayland-1 vs wayland-0) was
     # fixed and the socket finally EXISTED. Hand the socket to geckouser so
-    # the unprivileged app can connect. Also hand over echo's socket + dir
-    # (created root:root by echo-daemon) so the window.geckoOS bridge can
-    # reach Echo later when app JS actually calls a service -- not needed
-    # for the bare index.html render, but cheap to do here and avoids the
-    # identical permission problem surfacing on the first bridge call.
+    # the unprivileged shell can connect. (Echo's socket + dir were already
+    # handed over right after echo.sock appeared above.)
     #
     # This is the pragmatic bring-up fix, not the final architecture: the
-    # "proper" model runs the whole session (evo, echo, ...) as geckouser
-    # with only seatd/udevd as root, so every session socket is
+    # "proper" model runs the compositor/session as geckouser with only
+    # seatd/udevd/privileged services as root, so session sockets are
     # geckouser-owned from creation. That's a larger refactor (seatd video-
     # group membership, echo/shift root-need audit) deferred until the
     # smoke test passes.
@@ -1117,11 +1249,6 @@ if wait_for_socket "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" 40; then
     # makes for them.
     chown 1000:1000 "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" 2>/dev/null || true
     chmod 600 "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" 2>/dev/null || true
-    # Echo's dir must be traversable by apps (their bridge connects to
-    # echo.sock through a link in their own runtime dir).
-    chmod 755 "${XDG_RUNTIME_DIR}/geckoOS" 2>/dev/null || true
-    chown 1000:1000 "${XDG_RUNTIME_DIR}/geckoOS" 2>/dev/null || true
-    chown 1000:1000 "${XDG_RUNTIME_DIR}/geckoOS/echo.sock" 2>/dev/null || true
 else
     echo "[boot] WARN: evo wayland socket not seen after 20s, continuing anyway"
 fi
@@ -1451,7 +1578,9 @@ else
     echo "[boot] SKIP vela: binary (${VELA_BIN}) or @@BOOT_APP@@ app not staged"
 fi
 
-start_daemon rockhopper /usr/bin/rockhopper-daemon
+if [ "${PYXIS_ENABLE_ROCKHOPPER:-0}" = "1" ]; then
+    start_daemon rockhopper /usr/bin/rockhopper-daemon
+fi
 
 # The boot sound, once the shell is on its way. It goes through echo's
 # sound service, the one path every system sound takes (see sound.rs). In the
@@ -1497,13 +1626,25 @@ stage_binaries() {
         pyxis-wlprobe
     )
 
+    # rebuild-and-verify.sh reads this list (between "local bins=(" and the
+    # closing paren) to check every binary is built before it asks for root;
+    # keep one name per line.
+    local missing=()
     for bin in "${bins[@]}"; do
         if [[ -f "${PROJECT_ROOT}/target/release/${bin}" ]]; then
             sudo cp "${PROJECT_ROOT}/target/release/${bin}" "${ROOTFS_DIR}/usr/bin/${bin}"
             sudo chmod 755 "${ROOTFS_DIR}/usr/bin/${bin}"
             log_success "Installed ${bin}"
+        else
+            missing+=("${bin}")
         fi
     done
+    # Not fatal (a partial tree still boots), but said out loud: a missing
+    # pyxis-wlctx, say, means no app launches, and the image keeps whatever
+    # copy an earlier build left in the reused rootfs.
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Not built, NOT staged (run cargo build --release): ${missing[*]}"
+    fi
 }
 
 stage_gecko() {
@@ -1595,6 +1736,16 @@ stage_pyxis_smoketest_app() {
     # (re)generates origins.map from whatever it actually discovered.
     local src="${PROJECT_ROOT}/target/pyxis-test-app/webroot"
     local app_dir="${ROOTFS_DIR}/usr/share/geckoOS/apps/testapp"
+
+    if [[ "${PYXIS_INCLUDE_TESTAPP}" != "1" ]]; then
+        if sudo test -d "$app_dir"; then
+            sudo rm -rf "$app_dir"
+            log_info "Removed previously staged smoketest app (set PYXIS_INCLUDE_TESTAPP=1 to include it)"
+        else
+            log_info "Skipping smoketest app (PYXIS_INCLUDE_TESTAPP=${PYXIS_INCLUDE_TESTAPP}; set PYXIS_INCLUDE_TESTAPP=1 to include it)"
+        fi
+        return
+    fi
 
     if [[ ! -d "$src" ]]; then
         log_info "No smoketest app at ${src}, skipping (see BUILD_RUNBOOK.md for how it was created)"
@@ -1805,7 +1956,7 @@ stage_browser_app() {
     log_section "Stage 8e: standalone Browser app"
     # Reads the connection state (network) and opens pages in a separate
     # vela window through nova.OpenExternalBrowser (browser).
-    _stage_pyxis_app "browser" "Browser" "system" '"browser","network"' "windowed"
+    _stage_pyxis_app "browser" "Vela" "system" '"browser","network"' "windowed"
 }
 
 stage_files_app() {
@@ -1880,6 +2031,28 @@ stage_system_sounds() {
     sudo cp "${PROJECT_ROOT}/system-sounds/"* "${ROOTFS_DIR}/usr/share/sounds/pyxis/"
     sudo chmod 644 "${ROOTFS_DIR}/usr/share/sounds/pyxis/"*
     log_success "System sounds: $(ls "${ROOTFS_DIR}/usr/share/sounds/pyxis" | tr '\n' ' ')"
+}
+
+stage_test_fixtures() {
+    log_section "Stage 9c: On-device test fixtures"
+
+    # Files only the serial suites read (scripts/serial-tests/), at a fixed
+    # path so a suite needs no --push on a rebuilt image. Nothing in the
+    # system uses them. Today: the two waterdrop icons alpha5-identity and
+    # alpha5-identity-evo hand Evo through SetAppIdentity.
+    local src="${PROJECT_ROOT}/scripts/serial-tests/identity-icons"
+    local dest="${ROOTFS_DIR}/usr/share/pyxis-test"
+
+    if [[ ! -d "$src" ]]; then
+        log_info "No test fixtures at ${src}, skipping"
+        return
+    fi
+    sudo mkdir -p "$dest"
+    sudo chmod 755 "$dest"
+    sudo rm -f "${dest}/"*.png
+    sudo cp "${src}/"*.png "${dest}/"
+    sudo chmod 644 "${dest}/"*.png
+    log_success "Test fixtures in /usr/share/pyxis-test: $(ls "$dest" | tr '\n' ' ')"
 }
 
 stage_boot_assets() {
@@ -1981,6 +2154,9 @@ stage_permissions() {
         sudo chown -R 1001:1001 "${ROOTFS_DIR}/home/pyxisapp"
         sudo chmod 700 "${ROOTFS_DIR}/home/pyxisapp"
     fi
+    if [[ -f "${ROOTFS_DIR}/etc/sudoers.d/pyxis" ]]; then
+        sudo chmod 0440 "${ROOTFS_DIR}/etc/sudoers.d/pyxis"
+    fi
 
     log_success "Permissions finalized"
 }
@@ -2018,6 +2194,7 @@ main() {
     stage_installer_app
     stage_boot_assets
     stage_system_sounds
+    stage_test_fixtures
     stage_userspace_apps
     stage_permissions
 

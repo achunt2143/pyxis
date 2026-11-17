@@ -41,8 +41,14 @@ cpu() { a=$(ticks); sleep $1; b=$(ticks); awk -v a=$a -v b=$b -v s=$1 'BEGIN { p
 
 echo "=== the desktop draws Daylight, flowing, through WebGL ==="
 sleep 20
+# What Evo lists before anything is launched (only the shell should be there):
+# a stray full-screen window here pauses the wallpaper for the whole run.
+echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | grep -o '"\(app_id\|width\|height\|title_label\)": [^,]*' | paste -sd' '
 #!must STATE-flowing
 waitst flowing 40
+# The desktop's first lines: the window store's app ids (store=) say what it
+# counted if the state above is wrong.
+grep -a "PYXIS-WALLPAPER state=\|PYXIS-WALLPAPER-EXPOSURE" /var/log/vela.log | head -6
 #!must backend=webgl
 st
 #!must WALLPAPER-DAYLIGHT
@@ -164,5 +170,7 @@ waitst flowing 20
 
 echo "=== nothing refused on the way ==="
 #!must-not capability denied
-grep -a "capability denied" /var/log/vela.log | grep -i "settings\|time\|evo" | head -5
+# SetAppIdentity is new in this vela's bridge (the identity work): an older
+# vela refuses it, which alpha5-identity reports as IDENTITY-STAND-IN.
+grep -a "capability denied" /var/log/vela.log | grep -i "settings\|time\|evo" | grep -v SetAppIdentity | head -5
 grep -a "PYXIS-WALLPAPER" /var/log/vela.log | tail -12

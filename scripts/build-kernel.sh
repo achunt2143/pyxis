@@ -51,6 +51,15 @@ force_kconfig() {
     fi
   }
 
+  ensure_n() {
+    local sym="$1"
+    if grep -q "^${sym}=" "$cfg"; then
+      sed -i "s/^${sym}=.*/# ${sym} is not set/" "$cfg"
+    elif ! grep -q "^# ${sym} is not set" "$cfg"; then
+      echo "# ${sym} is not set" >> "$cfg"
+    fi
+  }
+
   # -----------------------------------------------------------------------
   # Block / storage
   # -----------------------------------------------------------------------
@@ -226,6 +235,55 @@ force_kconfig() {
   # -----------------------------------------------------------------------
   ensure_y CONFIG_NAMESPACES
   ensure_y CONFIG_USER_NS
+
+  # -----------------------------------------------------------------------
+  # Kernel hardening. These are hardening options matching Ubuntu's defaults.
+  # SECURITY comes first: the lockdown, Landlock, Yama and dmesg options
+  # depend on it, and olddefconfig would drop them otherwise.
+  # CONFIG_LSM in .config already lists landlock, lockdown and yama.
+  # No AppArmor: there are no profiles to load.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_SECURITY
+  ensure_y CONFIG_SECURITY_YAMA
+  ensure_y CONFIG_SECURITY_LANDLOCK
+  ensure_y CONFIG_SECURITY_LOCKDOWN_LSM
+  ensure_y CONFIG_SECURITY_LOCKDOWN_LSM_EARLY
+  ensure_y CONFIG_HARDENED_USERCOPY
+  ensure_y CONFIG_FORTIFY_SOURCE
+  ensure_y CONFIG_SLAB_FREELIST_HARDENED
+  ensure_y CONFIG_SLAB_FREELIST_RANDOM
+  ensure_y CONFIG_INIT_ON_ALLOC_DEFAULT_ON
+  ensure_y CONFIG_IO_STRICT_DEVMEM
+  ensure_y CONFIG_BPF_UNPRIV_DEFAULT_OFF
+  ensure_y CONFIG_SECURITY_DMESG_RESTRICT
+  # Lockdown does nothing unless told a mode, and nothing here writes a kernel
+  # command line, so integrity mode is chosen at build time (no /dev/mem
+  # writes, no unsigned kexec, no raw port access from root).
+  ensure_n CONFIG_LOCK_DOWN_KERNEL_FORCE_NONE
+  ensure_y CONFIG_LOCK_DOWN_KERNEL_FORCE_INTEGRITY
+  # kexec would let a root process replace the running kernel without a
+  # firmware reboot, so it is off.
+  ensure_n CONFIG_KEXEC
+
+  # -----------------------------------------------------------------------
+  # Firewall: nftables with connection tracking, for a default-drop inbound
+  # ruleset (/etc/nftables.conf, applied by rcS). NFT_LIMIT is the rate limit
+  # on ping. NETFILTER_ADVANCED gates most of the rest.
+  # -----------------------------------------------------------------------
+  ensure_y CONFIG_NETFILTER
+  ensure_y CONFIG_NETFILTER_ADVANCED
+  ensure_y CONFIG_NF_CONNTRACK
+  ensure_y CONFIG_NF_TABLES
+  ensure_y CONFIG_NF_TABLES_INET
+  ensure_y CONFIG_NF_TABLES_IPV4
+  ensure_y CONFIG_NF_TABLES_IPV6
+  ensure_y CONFIG_NFT_CT
+  ensure_y CONFIG_NFT_LIMIT
+  ensure_y CONFIG_NFT_REJECT
+  ensure_y CONFIG_NFT_REJECT_INET
+  ensure_y CONFIG_NF_REJECT_IPV4
+  ensure_y CONFIG_NF_REJECT_IPV6
+  ensure_y CONFIG_NFT_LOG
 }
 
 main() {

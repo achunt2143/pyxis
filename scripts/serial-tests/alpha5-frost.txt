@@ -1,0 +1,235 @@
+# Alpha 5, glass lane F1: the frosted title bar (tiers F0 and F1).
+#
+# This image has none of it yet, so push what it lacks. Evo and echo-cli are
+# the new binaries (SetFrost and GetFrostState are echo-cli only, no bridge
+# entry); Bloom's dist is the new shell, which sends `material` with
+# SetAppIdentity (a vela without that bridge entry is stood in for below, as
+# alpha5-identity does):
+#
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-cli:/usr/bin/echo-cli \
+#     --push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot \
+#     --push scripts/serial-tests/identity-icons/notes.png:/usr/share/pyxis-test/notes.png \
+#     --script scripts/serial-tests/alpha5-frost.txt
+#
+# docs/internal/pyxis-glass-and-lock-plan.md, part 1. Every title bar is glass:
+# the desktop (Bloom's wallpaper) is captured at a quarter of its size when it
+# commits, at most four times a second, blurred and veiled for the theme into
+# one texture, and each bar draws the crop of it under itself (tier F1), with
+# grain, a rim of white along its top and the app's accent as its seam. With
+# nothing to frost (SetFrost off, no GL, a failed shader) the bar is one flat
+# colour, Bloom's material veiled for the theme, with the same rim and seam
+# (tier F0). The lightness is held in a band per theme, so the ink never has
+# to choose: dark `#2a2620` on the light bar, light `#ece9e3` on the dark one.
+#
+# F2 (frost over other windows) is not built: a bar over another window shows
+# the wallpaper, not that window.
+#
+# The image's zone is UTC (no place), so Daylight runs its fixed day: the
+# pinned times below are night, dawn, midday and dusk on that day.
+#
+# LOOK at target/serial-shots/frost-*.png:
+#   frost-light-night/-dawn/-midday/-dusk
+#                  Notes and Files floating; each title bar is the wallpaper
+#                  behind it, blurred and lightened toward warm white, the
+#                  colour of the sky carrying faintly (never shouting), a hair
+#                  of grain, a bright rim along the top edge, a thin gold (Notes)
+#                  or amber (Files) line along the bottom. Files is inactive: its
+#                  bar has almost no colour and its seam is faint.
+#   frost-dark-night/-dawn/-midday/-dusk
+#                  the same in the dark theme: indigo glass, light ink, a faint
+#                  rim. Ink must read over every one.
+#   frost-flat-light/-dark
+#                  SetFrost off: the F0 bar, one colour (here Bloom's material, a
+#                  sand and an indigo, veiled), the rim and seam kept.
+#   frost-maximized  Notes maximized: a square bar over the strip's wallpaper.
+#
+# Printed: the fps over a flowing wallpaper with frost on and off, how many
+# times the field was rebuilt in five seconds (at most four a second), and how
+# long an update takes.
+
+evo() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.evo "$1" --interface org.geckoOS.evo --args "$a"; }
+fstate() { evo GetFrostState | tr -d ' \n'; }
+# The tier ("f0" or "f1") of window id $1, and the field's rebuild count.
+ftier() { fstate | grep -o "\"$1\":\"f[01]\"" | head -1 | cut -d'"' -f4; }
+fupdates() { fstate | grep -o '"f1":[0-9]*' | head -1 | cut -d: -f2; }
+fps() { evo GetRenderingStatus | awk '/"fps"/ { gsub(/[",:]/, ""); print $2 }'; }
+sset() { echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args "{\"key\":\"$1\",\"value\":$2}" | grep -c '"success": true'; }
+geom() { evo ListWindows | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
+# What Bloom would have sent, for a vela whose bridge refuses SetAppIdentity.
+# $1 is the theme, $2 the material.
+ident() { ICON="data:image/png;base64,$(base64 -w0 /usr/share/pyxis-test/notes.png)"; evo SetAppIdentity "{\"apps\":[{\"app_id\":\"notes\",\"name\":\"Notes\",\"accent\":\"#eab308\",\"icon\":\"$ICON\"},{\"app_id\":\"files\",\"name\":\"Files\",\"accent\":\"#d97706\"}],\"dark\":$1,\"material\":$2}" | grep -c '"ok": true'; }
+# Pin the wallpaper to minute $1 (named $2), wait, and say whether the field followed.
+pin() { local u0 u1; u0=$(fupdates); sset pyxis.wallpaper.pinnedTime "$1" > /dev/null; sleep 4; u1=$(fupdates); test "$u1" -gt "$u0" && echo "FOLLOWED-OK $2 ($u0 -> $u1)" || echo "NOT-FOLLOWED $2 ($u0 -> $u1)"; }
+MAT='{"light":"#e6d6b8","dark":"#1c2040"}'
+
+echo "=== the switch and the state, before any window ==="
+#!must "ok": true
+evo SetFrost '{"mode":"wallpaper"}'
+#!must MODE-WALLPAPER
+fstate | grep -q '"mode":"wallpaper"' && echo MODE-WALLPAPER || echo "MODE=$(fstate)"
+#!must BAD-MODE-REFUSED
+evo SetFrost '{"mode":"frosty"}' 2>&1 | grep -qi 'mode must be' && echo BAD-MODE-REFUSED || echo BAD-MODE-ACCEPTED
+#!must STATE-SHAPE
+S=$(fstate); ok=1; for K in '"tiers":{' '"updates":{"f1":[0-9]*}' '"last_ms":' '"over_budget":' '"program":"'; do echo "$S" | grep -q "$K" || ok=0; done; test $ok = 1 && echo STATE-SHAPE || echo "SHAPE=$S"
+sset pyxis.wallpaper.motion '"still"' > /dev/null
+sset pyxis.wallpaper.pinnedTime 390 > /dev/null
+sleep 4
+
+echo "=== two floating windows ==="
+rm -f /var/lib/pyxis/profiles/files/xulstore.json /var/lib/pyxis/profiles/files/sessionstore.jsonlz4 /var/lib/pyxis/profiles/notes/xulstore.json /var/lib/pyxis/profiles/notes/sessionstore.jsonlz4; echo first-run
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'
+sleep 15
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+sleep 18
+#!must NOTES-UP
+test -n "$(geom notes)" && echo NOTES-UP || echo NOTES-NOT-UP
+read FX FY FW FH FID <<< "$(geom files)"; read NX NY NW NH NID <<< "$(geom notes)"; echo "files $FID $FX,$FY ${FW}x$FH; notes $NID $NX,$NY ${NW}x$NH"
+evo UnmaximizeWindow "{\"window_id\":$FID}" | grep -c success; sleep 3
+evo UnmaximizeWindow "{\"window_id\":$NID}" | grep -c success; sleep 3
+# Notes has the keyboard, Files is behind it and inactive.
+evo FocusWindow "{\"window_id\":$NID}" | grep -c success; sleep 1
+OLD_VELA=0; if grep -a "capability denied" /var/log/vela.log 2>/dev/null | grep -q SetAppIdentity; then OLD_VELA=1; fi
+ident false "$MAT" > /dev/null; sleep 2
+echo "old vela: $OLD_VELA"
+
+echo "=== F1: the shader compiled, a capture was taken, the windows are frosted ==="
+#!must PROGRAM-COMPILED
+fstate | grep -q '"program":"compiled"' && echo PROGRAM-COMPILED || echo "PROGRAM=$(fstate)"
+#!must NOTES-F1
+test "$(ftier $NID)" = f1 && echo NOTES-F1 || echo "NOTES-TIER=$(ftier $NID) state=$(fstate)"
+#!must FILES-F1
+test "$(ftier $FID)" = f1 && echo FILES-F1 || echo "FILES-TIER=$(ftier $FID)"
+#!must FIELD-BUILT
+test "$(fupdates)" -ge 1 && echo FIELD-BUILT || echo "UPDATES=$(fupdates)"
+echo "state: $(fstate)"
+# An update over 10 ms (frost.rs BUDGET_MS) happens while apps start and the
+# VM is busy; one in ten is the limit.
+#!must WITHIN-BUDGET
+OB=$(fstate | grep -o '"over_budget":[0-9]*' | cut -d: -f2); UP=$(fupdates); test $((OB * 10)) -le "$UP" && echo "WITHIN-BUDGET ($OB of $UP over)" || echo "OVER-BUDGET $(fstate)"
+
+echo "=== the light bar over the day ==="
+#!must FOLLOWED-OK
+pin 1380 night
+#!must-not uniform
+#!shot frost-light-night
+echo shot
+#!must FOLLOWED-OK
+pin 390 dawn
+#!must-not uniform
+#!shot frost-light-dawn
+echo shot
+#!must FOLLOWED-OK
+pin 720 midday
+#!must-not uniform
+#!shot frost-light-midday
+echo shot
+#!must FOLLOWED-OK
+pin 1110 dusk
+#!must-not uniform
+#!shot frost-light-dusk
+echo shot
+#!must NOTES-STILL-F1
+test "$(ftier $NID)" = f1 && echo NOTES-STILL-F1 || echo "NOTES-TIER=$(ftier $NID)"
+
+echo "=== the dark bar over the day ==="
+sset pyxis.theme '"dark"' > /dev/null
+if [ "$OLD_VELA" = 1 ]; then ident true "$MAT" > /dev/null; fi
+sleep 3
+#!must FOLLOWED-OK
+pin 1380 night
+#!must-not uniform
+#!shot frost-dark-night
+echo shot
+#!must FOLLOWED-OK
+pin 390 dawn
+#!must-not uniform
+#!shot frost-dark-dawn
+echo shot
+#!must FOLLOWED-OK
+pin 720 midday
+#!must-not uniform
+#!shot frost-dark-midday
+echo shot
+#!must FOLLOWED-OK
+pin 1110 dusk
+#!must-not uniform
+#!shot frost-dark-dusk
+echo shot
+#!must DARK-STILL-F1
+test "$(ftier $NID)" = f1 && echo DARK-STILL-F1 || echo "NOTES-TIER=$(ftier $NID)"
+
+echo "=== SetFrost off: the flat bar, Bloom's material veiled ==="
+#!must "mode": "off"
+evo SetFrost '{"mode":"off"}'
+sleep 2
+#!must NOTES-F0
+test "$(ftier $NID)" = f0 && echo NOTES-F0 || echo "NOTES-TIER=$(ftier $NID)"
+#!must FILES-F0
+test "$(ftier $FID)" = f0 && echo FILES-F0 || echo "FILES-TIER=$(ftier $FID)"
+#!must-not uniform
+#!shot frost-flat-dark
+echo shot
+sset pyxis.theme '"light"' > /dev/null
+if [ "$OLD_VELA" = 1 ]; then ident false "$MAT" > /dev/null; fi
+sleep 3
+#!must-not uniform
+#!shot frost-flat-light
+echo shot
+# No more field is built while it is off.
+U0=$(fupdates); sset pyxis.wallpaper.pinnedTime 720 > /dev/null; sleep 3; U1=$(fupdates)
+#!must NO-UPDATES-WHILE-OFF
+test "$U1" = "$U0" && echo NO-UPDATES-WHILE-OFF || echo "UPDATES-WHILE-OFF $U0 -> $U1"
+#!must "mode": "wallpaper"
+evo SetFrost '{"mode":"wallpaper"}'
+sleep 3
+#!must NOTES-BACK-ON-F1
+test "$(ftier $NID)" = f1 && echo NOTES-BACK-ON-F1 || echo "NOTES-TIER=$(ftier $NID)"
+
+echo "=== maximized: a square bar over the strip's wallpaper ==="
+evo MaximizeWindow "{\"window_id\":$NID}" | grep -c success; sleep 3
+#!must-not uniform
+#!shot frost-maximized
+echo shot
+#!must MAXIMIZED-F1
+test "$(ftier $NID)" = f1 && echo MAXIMIZED-F1 || echo "NOTES-TIER=$(ftier $NID)"
+evo UnmaximizeWindow "{\"window_id\":$NID}" | grep -c success; sleep 3
+
+echo "=== a flowing wallpaper: fps with frost on and off, and the cap on updates ==="
+sset pyxis.wallpaper.pinnedTime null > /dev/null
+sset pyxis.wallpaper.motion '"flow"' > /dev/null
+sleep 6
+echo "fps frost ON : $(fps) $(sleep 1; fps) $(sleep 1; fps) $(sleep 1; fps)"
+U0=$(fupdates); sleep 5; U1=$(fupdates)
+echo "frost updates in 5 s: $((U1 - U0)) ($(fstate | grep -o '"last_ms":[0-9.e-]*'), $(fstate | grep -o '"over_budget":[0-9]*'))"
+#!must UPDATES-CAPPED
+test "$((U1 - U0))" -le 22 && echo UPDATES-CAPPED || echo "TOO-MANY $((U1 - U0))"
+#!must "ok": true
+evo SetFrost '{"mode":"off"}'
+sleep 3
+echo "fps frost OFF: $(fps) $(sleep 1; fps) $(sleep 1; fps) $(sleep 1; fps)"
+evo SetFrost '{"mode":"wallpaper"}' | grep -c '"ok": true'
+sleep 3
+echo "fps frost ON : $(fps) $(sleep 1; fps) $(sleep 1; fps) $(sleep 1; fps)"
+
+echo "=== a still wallpaper and nothing moving: no updates, no damage ==="
+sset pyxis.wallpaper.motion '"still"' > /dev/null
+sset pyxis.wallpaper.pinnedTime 720 > /dev/null
+sleep 6
+U0=$(fupdates); sleep 6; U1=$(fupdates)
+#!must F1-QUIET
+test "$U1" = "$U0" && echo "F1-QUIET ($U0)" || echo "F1-BUSY $U0 -> $U1"
+# And it wakes when the wallpaper does.
+sset pyxis.wallpaper.pinnedTime 1110 > /dev/null; sleep 3
+#!must F1-WAKES
+test "$(fupdates)" -gt "$U1" && echo F1-WAKES || echo "F1-ASLEEP $(fupdates)"
+
+echo "=== tidy up ==="
+sset pyxis.wallpaper.pinnedTime null > /dev/null
+sset pyxis.wallpaper.motion '"flow"' > /dev/null
+sset pyxis.theme '"light"' > /dev/null
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'success|Error'
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'success|Error'
+echo done

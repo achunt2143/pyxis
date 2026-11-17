@@ -11,7 +11,12 @@ setanim() { echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.g
 mst() { echo-cli call org.geckoOS.evo GetAnimationState --interface org.geckoOS.evo --args '{}' | tr -d ' \n' ; echo; }
 act() { mst | grep -o '"active":[0-9]*'; }
 sleep 25
-for A in files notes tasks settings; do echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args "{\"appId\":\"$A\"}" | grep -E 'sessionId|Error'; sleep 15; done
+# One line per app: a launch and its wait together run past the harness's
+# 60 s per-command limit when all four share a line.
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"files"}' | grep -E 'sessionId|Error'; sleep 15
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'; sleep 15
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"tasks"}' | grep -E 'sessionId|Error'; sleep 15
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"settings"}' | grep -E 'sessionId|Error'; sleep 15
 echo-cli call org.geckoOS.evo SetLumen --interface org.geckoOS.evo --args '{"enabled":false}' | grep -c enabled
 setanim '{"mode":"full","scale":10}'
 for A in files notes tasks settings; do winact MinimizeWindow $(wid $A); done

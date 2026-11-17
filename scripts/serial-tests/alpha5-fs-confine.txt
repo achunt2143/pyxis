@@ -43,6 +43,7 @@
 # Not `D`: the harness's #!shot sets D in this same shell.
 HELLO_DATA=/var/lib/pyxis/data/com.pyxis.hello
 fsproof() { cat $HELLO_DATA/proof-*.txt 2>/dev/null; }
+app_uid() { sed -n "s/.*\"$1\": *\([0-9]*\).*/\1/p" /var/lib/pyxis/uids.json; }
 fscall() { echo-cli call org.geckoOS.filesystem "$1" --interface org.geckoOS.filesystem --args "$2" 2>&1; }
 # x y width height window_id of an app's window (alpha5-resize.txt's helper).
 geom() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk -v app="$1" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && /"(x|y|width|height|window_id)":/ { gsub(/[",:]/, ""); v[$1] = $2 } /}/ { if (on) { print v["x"], v["y"], v["width"], v["height"], v["window_id"]; exit } on = 0 }'; }
@@ -139,10 +140,13 @@ fsproof | grep '^fs-ok own='
 fsproof | grep '^fs-ok scope-named='
 #!must fs storage mount=/
 fsproof | grep '^fs storage'
-#!must 1001 1001 700
-stat -c '%u %g %a' $HELLO_DATA
-#!must 1001 1001
-stat -c '%u %g' $HELLO_DATA/nested/deep/a.txt
+HU=$(app_uid com.pyxis.hello); echo "hello's own uid: $HU"
+#!must HELLO-UID-ALLOCATED
+[ -n "$HU" ] && [ "$HU" -ge 10000 ] && echo HELLO-UID-ALLOCATED || echo "HELLO-UID-BAD '$HU'"
+#!must HELLO-DATA-OWNED-BY-ITS-UID 700
+echo "HELLO-DATA-OWNED-BY-ITS-UID $(stat -c '%u %g %a' $HELLO_DATA | awk -v u=$HU '$1 == u && $2 == u { print $3 }')"
+#!must NESTED-OWNED-BY-ITS-UID
+[ "$(stat -c '%u %g' $HELLO_DATA/nested/deep/a.txt)" = "$HU $HU" ] && echo NESTED-OWNED-BY-ITS-UID || echo "NESTED-WRONG-OWNER $(stat -c '%u %g' $HELLO_DATA/nested/deep/a.txt)"
 #!must PROOF-HERE
 ls $HELLO_DATA/proof-*.txt > /dev/null 2>&1 && echo PROOF-HERE || echo NO-PROOF
 #!must-not pyxis-hello-proof
@@ -195,8 +199,8 @@ sleep 3
 # the app's own storage.
 #!must NOTE-SAVED
 grep -q '"notes": \[' /var/lib/pyxis/data/notes/notes.json 2>/dev/null && grep -q '"id"' /var/lib/pyxis/data/notes/notes.json && echo NOTE-SAVED || ls -la /var/lib/pyxis/data/notes
-#!must 1001 1001
-stat -c '%u %g' /var/lib/pyxis/data/notes/notes.json
+#!must NOTES-OWNED-BY-ITS-UID
+NU=$(app_uid notes); [ -n "$NU" ] && [ "$NU" -ge 10000 ] && [ "$(stat -c '%u %g' /var/lib/pyxis/data/notes/notes.json)" = "$NU $NU" ] && echo NOTES-OWNED-BY-ITS-UID || echo "NOTES-WRONG-OWNER uid=$NU $(stat -c '%u %g' /var/lib/pyxis/data/notes/notes.json)"
 #!must-not capability denied: app 'notes'
 grep -a "capability denied: app 'notes'" /var/log/echo.log | head -3
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'success|Error'
@@ -246,7 +250,7 @@ sleep 5
 rm -f /tmp/pyxis-fs-canary; echo cleaned
 
 echo "=== uninstalling a tarball app, while it runs, deletes its data and profile ==="
-UT=/tmp/pyxis-usertest; rm -rf $UT $UT.tar; mkdir -p $UT/webroot && echo '<!doctype html><title>usertest</title><p>usertest</p>' > $UT/webroot/index.html && printf '{"id":"com.pyxis.usertest","name":"User Test","version":"0.1.0","entry":"index.html","permissions":["filesystem:read","filesystem:write"]}' > $UT/manifest.webapp && tar -cf $UT.tar -C $UT . && echo built
+UT=/var/lib/pyxis/incoming/pyxis-usertest; rm -rf $UT $UT.tar; mkdir -p $UT/webroot && echo '<!doctype html><title>usertest</title><p>usertest</p>' > $UT/webroot/index.html && printf '{"id":"com.pyxis.usertest","name":"User Test","version":"0.1.0","entry":"index.html","permissions":["filesystem:read","filesystem:write"]}' > $UT/manifest.webapp && tar -cf $UT.tar -C $UT . && echo built
 #!must "appId": "com.pyxis.usertest"
 echo-cli call org.geckoOS.nova Install --interface org.geckoOS.nova --args "{\"packagePath\":\"$UT.tar\"}" | grep -E '"appId"|Error'
 #!must "success": true

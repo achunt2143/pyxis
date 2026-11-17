@@ -1,0 +1,192 @@
+# Alpha 5, hardening wave 3 (W3-E): one root-access dialog for every root action.
+#
+# Echo holds a call that would act as root (installer.Install/Remove,
+# nova.Install/Uninstall, network.* setters, accounts.create/delete) until the
+# shell's dialog is answered: privilege.Authenticate {requestId, password}
+# approves, privilege.Dismiss {requestId} denies (the held call then fails with
+# {"reason":"denied",...}). Root callers (echo-cli as root, Evo) are never held;
+# the shell's uid 1000 (geckouser) is. docs/internal/pyxis-hardening-plan.md,
+# "Wave 3". This suite plays the shell with `su geckouser` + echo-cli and
+# answers the dialog as root, so it does not need Bloom's dialog to work; only
+# the `root-dialog-install` shot needs it (look at target/serial-shots/).
+#
+# Needs a DEV image (the unsigned acceptance package is installed through the
+# installer; /etc/pyxis/allow-unsigned-packages must exist, the build makes it
+# only for PYXIS_DEV_IMAGE=1) or that marker made by hand.
+#
+# On an image built after the wave-3 build nothing needs pushing:
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-root-dialog.txt
+#
+# On an OLDER image push what it lacks: echo-daemon (actions + the hold),
+# echo-cli (`watch`), the bridge file (held-call timeouts), Bloom's dist (the
+# dialog) and the dev marker (--push of an empty file):
+#
+#   : > /tmp/allow-unsigned-packages   # on the host
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/echo-daemon:/usr/bin/echo-daemon \
+#     --push target/release/echo-cli:/usr/bin/echo-cli \
+#     --push gecko/patches/pyxis/toolkit/actors/PyxisBridgeParent.sys.mjs:/usr/lib/pyxis-gecko/actors/PyxisBridgeParent.sys.mjs \
+#     --push ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot \
+#     --push /tmp/allow-unsigned-packages:/etc/pyxis/allow-unsigned-packages \
+#     --script scripts/serial-tests/alpha5-root-dialog.txt
+#
+# The 120 s timeout is not waited out: a held call is seen pending in
+# privilege.GetState with its action set, then dismissed.
+#
+# Markers: REQUESTED, DENIED-OK, NOT-INSTALLED-AFTER-DENY, INSTALLED-AFTER-APPROVAL,
+# REMOVED-AFTER-APPROVAL, ROOT-NOT-HELD, ROOT-REMOVED, HOSTNAME-HELD,
+# HOSTNAME-SET, CACHED-NO-PROMPT, PENDING-LISTED, PENDING-DISMISSED.
+
+PASS='Tr0ub4dor-root-dialog'
+HDIR=/var/lib/pyxis/incoming
+priv() { local a="${2-}"; [ -n "$a" ] || a='{}'; echo-cli call org.geckoOS.privilege "$1" --interface org.geckoOS.privilege --args "$a"; }
+# Run a command line as the shell's user.
+asgeck() { su -s /bin/sh geckouser -c "XDG_RUNTIME_DIR=/run/user/1000 $1"; }
+# Start installer.Install as geckouser in the background; its output and EXIT= go to $1.
+bg_install() { rm -f "$1"; ( asgeck "echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args '{\"packagePath\":\"$PKG\"}'"; echo "EXIT=$?" ) > "$1" 2>&1 & }
+# Wait (up to $3 * 0.5 s) for file $1 to contain fixed text $2.
+waitfor() { i=0; while [ $i -lt $3 ]; do grep -qF -- "$2" "$1" 2>/dev/null && return 0; sleep 0.5; i=$((i + 1)); done; return 1; }
+# The last requestId in a watch log.
+rid() { tr -d ' \n' < "$1" | grep -o '"requestId":"[^"]*"' | tail -1 | cut -d'"' -f4; }
+# Start a watch for PrivilegeRequested into $1.
+start_watch() { rm -f "$1"; echo-cli watch --signal PrivilegeRequested --seconds 40 > "$1" 2>&1 & sleep 1; }
+nreq() { tr -d ' \n' < "$1" 2>/dev/null | grep -o '"action":"[^"]*"' | wc -l; }
+
+echo "=== preconditions ==="
+#!must echo-daemon
+pgrep -a echo-daemon | head -1
+#!must allow-unsigned-packages
+ls -la /etc/pyxis/allow-unsigned-packages 2>&1; echo "marker rc=$?"
+PKG=$(ls $HDIR/com.pyxis.hello_*.ipk 2>/dev/null | head -1); echo "PKG=$PKG"
+#!must .ipk
+echo "$PKG"
+ls -la "$PKG" $HDIR
+# The shell's user can read the package.
+#!must PKG-READABLE
+su -s /bin/sh geckouser -c "[ -r $PKG ]" && echo PKG-READABLE || echo PKG-UNREADABLE
+# A clean start: root is not held, so this just removes a leftover.
+opkg list-installed | grep -q com.pyxis.hello && echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' > /dev/null 2>&1; echo cleaned
+#!must-not com.pyxis.hello
+opkg list-installed
+ORIGHOST=$(cat /etc/hostname); echo "ORIGHOST=$ORIGHOST"
+
+echo "=== 1. a password for geckouser (root: no current password needed the first time) ==="
+#!must "ok": true
+echo-cli call org.geckoOS.accounts setPassword --interface org.geckoOS.accounts --args "{\"user\":\"geckouser\",\"current\":\"\",\"new\":\"$PASS\"}" | grep '"ok"'
+
+echo "=== 2. dismiss: the shell's install is held, then denied ==="
+start_watch /root/pr.log
+bg_install /root/install1.log
+waitfor /root/pr.log 'package.install' 40 && echo REQUESTED || echo NOT-REQUESTED
+tr -d ' \n' < /root/pr.log | grep -o '"action":"package.install"' | head -1
+# Nothing is installed while it is held.
+#!must-not com.pyxis.hello
+opkg list-installed
+R1=$(rid /root/pr.log); echo "R1=$R1"
+#!must PRIVILEGE-REQUEST-FIELDS
+tr -d ' \n' < /root/pr.log | grep -q '"action":"package.install"' && tr -d ' \n' < /root/pr.log | grep -q '"requestId"' && echo PRIVILEGE-REQUEST-FIELDS || echo PRIVILEGE-REQUEST-FIELDS-MISSING
+# The shell's overlay draws the dialog now; LOOK at target/serial-shots/root-dialog-install.png.
+#!shot root-dialog-install
+#!must "ok": true
+priv Dismiss "{\"requestId\":\"$R1\"}" | grep '"ok"'
+waitfor /root/install1.log 'EXIT=' 40 && echo INSTALL1-FINISHED || echo INSTALL1-STILL-HELD
+cat /root/install1.log
+#!must DENIED-OK
+grep -q denied /root/install1.log && echo DENIED-OK || echo DENIED-MISSING
+#!must NOT-INSTALLED-AFTER-DENY
+opkg list-installed | grep -q com.pyxis.hello && echo STILL-INSTALLED || echo NOT-INSTALLED-AFTER-DENY
+
+echo "=== 3. approve: the same install, answered with the password ==="
+start_watch /root/pr2.log
+bg_install /root/install2.log
+waitfor /root/pr2.log 'package.install' 40 && echo REQUESTED || echo NOT-REQUESTED
+R2=$(rid /root/pr2.log); echo "R2=$R2"
+#!must NEW-REQUEST-ID
+[ -n "$R2" ] && [ "$R2" != "$R1" ] && echo NEW-REQUEST-ID || echo "SAME-OR-EMPTY-REQUEST-ID '$R2' '$R1'"
+priv Authenticate "{\"requestId\":\"$R2\",\"password\":\"$PASS\"}" > /root/auth2.log 2>&1; cat /root/auth2.log
+waitfor /root/install2.log 'EXIT=' 90 && echo INSTALL2-FINISHED || echo INSTALL2-STILL-HELD
+cat /root/install2.log
+#!must launchable
+#!must EXIT=0
+cat /root/install2.log
+#!must INSTALLED-AFTER-APPROVAL
+opkg list-installed | grep -q com.pyxis.hello && echo INSTALLED-AFTER-APPROVAL || echo NOT-INSTALLED-AFTER-APPROVAL
+#!must-not Tr0ub4dor
+cat /root/pr.log /root/pr2.log /root/install2.log /var/log/echo.log 2>/dev/null
+
+# Remove it the same way: the shell is held, then approved.
+start_watch /root/pr3.log
+rm -f /root/remove3.log
+( asgeck "echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{\"package\":\"com.pyxis.hello\"}'"; echo "EXIT=$?" ) > /root/remove3.log 2>&1 &
+waitfor /root/pr3.log 'package.remove' 40 && echo REQUESTED-REMOVE || echo NOT-REQUESTED-REMOVE
+R3=$(rid /root/pr3.log); echo "R3=$R3"
+priv Authenticate "{\"requestId\":\"$R3\",\"password\":\"$PASS\"}" > /dev/null 2>&1
+waitfor /root/remove3.log 'EXIT=' 90 && echo REMOVE3-FINISHED || echo REMOVE3-STILL-HELD
+cat /root/remove3.log
+#!must REMOVED-AFTER-APPROVAL
+opkg list-installed | grep -q com.pyxis.hello && echo STILL-INSTALLED || echo REMOVED-AFTER-APPROVAL
+
+echo "=== 4. root is not held ==="
+start_watch /root/pr4.log
+#!must launchable
+echo-cli call org.geckoOS.installer Install --interface org.geckoOS.installer --args "{\"packagePath\":\"$PKG\"}"
+sleep 2
+#!must ROOT-NOT-HELD
+[ "$(nreq /root/pr4.log)" = "0" ] && echo ROOT-NOT-HELD || { echo ROOT-WAS-HELD; cat /root/pr4.log; }
+#!must com.pyxis.hello
+opkg list-installed
+# And a root Remove asks nothing either.
+#!must removed
+echo-cli call org.geckoOS.installer Remove --interface org.geckoOS.installer --args '{"package":"com.pyxis.hello"}' | grep -io 'removed' | head -1 | tr 'A-Z' 'a-z'
+#!must ROOT-REMOVED
+opkg list-installed | grep -q com.pyxis.hello && echo STILL-INSTALLED || echo ROOT-REMOVED
+sleep 1
+#!must ROOT-NOT-HELD
+[ "$(nreq /root/pr4.log)" = "0" ] && echo ROOT-NOT-HELD || { echo ROOT-WAS-HELD; cat /root/pr4.log; }
+
+echo "=== 5. network.manage: asked once, then cached for 300 s ==="
+start_watch /root/pr5.log
+rm -f /root/host1.log
+( asgeck "echo-cli call org.geckoOS.network setHostname --interface org.geckoOS.network --args '{\"hostname\":\"pyxis-test\"}'"; echo "EXIT=$?" ) > /root/host1.log 2>&1 &
+waitfor /root/pr5.log 'network.manage' 40 && echo HOSTNAME-HELD || echo HOSTNAME-NOT-HELD
+tr -d ' \n' < /root/pr5.log | grep -o '"hostname":"[^"]*"' | head -1
+R5=$(rid /root/pr5.log); echo "R5=$R5"
+priv Authenticate "{\"requestId\":\"$R5\",\"password\":\"$PASS\"}" > /dev/null 2>&1
+waitfor /root/host1.log 'EXIT=' 60 && echo HOST1-FINISHED || echo HOST1-STILL-HELD
+cat /root/host1.log
+#!must HOSTNAME-SET
+[ "$(cat /etc/hostname)" = "pyxis-test" ] && echo HOSTNAME-SET || echo "HOSTNAME-NOT-SET $(cat /etc/hostname)"
+# A second call within 300 s: no new request, and it completes.
+start_watch /root/pr6.log
+rm -f /root/host2.log
+( asgeck "echo-cli call org.geckoOS.network setHostname --interface org.geckoOS.network --args '{\"hostname\":\"pyxis-test\"}'"; echo "EXIT=$?" ) > /root/host2.log 2>&1 &
+waitfor /root/host2.log 'EXIT=' 40 && echo HOST2-FINISHED || echo HOST2-STILL-HELD
+cat /root/host2.log
+#!must CACHED-NO-PROMPT
+[ "$(nreq /root/pr6.log)" = "0" ] && grep -q 'EXIT=0' /root/host2.log && echo CACHED-NO-PROMPT || { echo PROMPTED-AGAIN; cat /root/pr6.log; }
+# Restore the original hostname as root (not held).
+#!must "success": true
+echo-cli call org.geckoOS.network setHostname --interface org.geckoOS.network --args "{\"hostname\":\"$ORIGHOST\"}" | grep '"success"'
+#!must HOSTNAME-RESTORED
+[ "$(cat /etc/hostname)" = "$ORIGHOST" ] && echo HOSTNAME-RESTORED || echo "HOSTNAME-NOT-RESTORED $(cat /etc/hostname)"
+
+echo "=== 6. a held call is pending in GetState with its action; dismiss it (the 120 s timeout is not waited out) ==="
+start_watch /root/pr7.log
+bg_install /root/install7.log
+waitfor /root/pr7.log 'package.install' 40 && echo REQUESTED || echo NOT-REQUESTED
+R7=$(rid /root/pr7.log); echo "R7=$R7"
+priv GetState '{}' | tr -d ' \n' > /root/state7.log
+grep -o '"pending":\[.*\],"auditLog"' /root/state7.log | head -c 600; echo
+#!must PENDING-LISTED
+grep -o '"pending":\[[^]]*' /root/state7.log | grep -q "\"requestId\":\"$R7\"" && grep -o '"pending":\[[^]]*' /root/state7.log | grep -q '"action":"package.install"' && echo PENDING-LISTED || echo PENDING-NOT-LISTED
+priv Dismiss "{\"requestId\":\"$R7\"}" > /dev/null 2>&1
+waitfor /root/install7.log 'EXIT=' 40 && echo INSTALL7-FINISHED || echo INSTALL7-STILL-HELD
+cat /root/install7.log
+#!must PENDING-DISMISSED
+priv GetState '{}' | tr -d ' \n' | grep -o '"pending":\[[^]]*' | grep -q "$R7" && echo STILL-PENDING || echo PENDING-DISMISSED
+#!must-not com.pyxis.hello
+opkg list-installed
+
+echo "=== cleanup ==="
+rm -f /root/pr*.log /root/install*.log /root/remove3.log /root/host*.log /root/auth2.log /root/state7.log; echo done

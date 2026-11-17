@@ -108,11 +108,12 @@ echo "=== Bloom's notification centre lists it (notification.list, notifications
 echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"com.pyxis.hello"}' | grep -E 'success|Error'
 sleep 3
 L0=$(routed 'org.geckoOS.notification (list)'); echo "list calls so far: $L0"
-# The Bell is the first button of the bar's right-hand cluster: Bell, Settings
-# gear, Wi-Fi, the battery pill, then the clock.
-read BX BY BW BH <<< "$(barbox)"; echo "bar: $BX,$BY ${BW}x$BH"
-BELLX=$((BX + BW - 240)); BARY=$((BY + BH / 2)); echo "bell $BELLX,$BARY"
-#!pointer click $BELLX $BARY
+# The centre opens from the launch bar's dashboard: its count, 27 px in from
+# the bar's right end, there while a notification is stored (hello-pyxis has
+# raised one). The Bell left the top bar with the identity work.
+read DX DY DW DH <<< "$(dockbox)"; echo "launch bar: $DX,$DY ${DW}x$DH"
+CNTX=$((DX + DW - 27)); CNTY=$((DY + DH / 2)); echo "dashboard count $CNTX,$CNTY"
+#!pointer click $CNTX $CNTY
 sleep 3
 #!shot bridge-centre
 #!must LIST-CALLED
@@ -124,20 +125,20 @@ echo "=== Bloom moves the volume (audio.setVolume, audio) ==="
 #!must "volume": 40
 echo-cli call org.geckoOS.audio setVolume --interface org.geckoOS.audio --args '{"volume":40}' | grep '"volume"'
 V0=$(routed 'org.geckoOS.audio (setVolume)'); echo "setVolume calls so far: $V0"
-# The Settings gear opens quick settings, a panel anchored 14 px from the
-# right edge and 8 px under the bar. Inside it nothing can be read from the
+# The status strip's right-hand cluster (Wi-Fi, volume, battery) opens quick
+# settings, a panel anchored 14 px from the right edge and 8 px under the strip. Inside it nothing can be read from the
 # guest (the panel is one rectangle to Evo), so its controls are placed from
 # those two anchors: LOOK at target/serial-shots/bridge-volume.png and
 # bridge-dnd.png if a layout change makes the checks below fail.
 read BX BY BW BH <<< "$(barbox)"
-GEARX=$((BX + BW - 204)); BARY=$((BY + BH / 2)); echo "gear $GEARX,$BARY"
-#!pointer click $GEARX $BARY
+QSX=$((BX + BW - 60)); BARY=$((BY + BH / 2)); echo "status cluster $QSX,$BARY"
+#!pointer click $QSX $BARY
 sleep 3
 PANELT=$((BY + BH + 8)); PANELR=$((BX + BW - 14))
-# The volume row is the first slider, 156 px down; its track runs from 301 to
-# 73 px left of the panel's edge. The drag must start on the thumb, which is at
+# The volume slider's line is 295 px down; its track runs from 318 to 62 px
+# left of the panel's edge. The drag must start on the thumb, which is at
 # 40 % (set just above) of the track.
-SLY=$((PANELT + 156)); SLX0=$((PANELR - 210)); SLX1=$((PANELR - 73)); echo "volume slider thumb $SLX0 -> $SLX1 at $SLY"
+SLY=$((PANELT + 295)); SLX0=$((PANELR - 216)); SLX1=$((PANELR - 62)); echo "volume slider thumb $SLX0 -> $SLX1 at $SLY"
 #!pointer drag $SLX0 $SLY $SLX1 $SLY
 sleep 3
 #!shot bridge-volume
@@ -151,9 +152,9 @@ v=$(setpriv --reuid=1000 --regid=1000 --clear-groups env XDG_RUNTIME_DIR=/run/us
 echo "=== and a setting (settings.set, settings:write) ==="
 #!must "success": true
 echo-cli call org.geckoOS.settings set --interface org.geckoOS.settings --args '{"key":"pyxis.dnd","value":false}' | grep success
-# Do Not Disturb is the second toggle under Wi-Fi: the switch at the panel's
-# right, 447 px below its top.
-DNDX=$((PANELR - 61)); DNDY=$((PANELT + 447)); echo "DND switch $DNDX,$DNDY"
+# Do Not Disturb is a toggle tile; its switch sits 56 px in from the panel's
+# right, 88 px below its top.
+DNDX=$((PANELR - 56)); DNDY=$((PANELT + 88)); echo "DND switch $DNDX,$DNDY"
 #!pointer click $DNDX $DNDY
 sleep 3
 #!shot bridge-dnd
@@ -165,10 +166,13 @@ sleep 2
 
 echo "=== Bloom launches an app (nova.Launch, appManager:manage) ==="
 N0=$(routed 'org.geckoOS.nova (Launch)'); echo "launches so far: $N0"
-# Files is the fifth button of the dock (drawer, overview, then the pinned
-# apps: Terminal, Browser, Files, Notes), 54 px apart after a separator.
-read DX DY DW DH <<< "$(dockbox)"; echo "dock: $DX,$DY ${DW}x$DH"
-FILESX=$((DX + 265)); FILESY=$((DY + DH / 2)); echo "files button $FILESX,$FILESY"
+# The launch bar centres its app icons on the screen, 40 px tiles 52 px apart:
+# the four pinned ones (Terminal, Browser, Files, Notes) span 196 px, and each
+# running unpinned app adds a separator and an icon (13 + 52 px). Nothing
+# unpinned runs here (hello-pyxis was closed), so Files, the third, is at
+# DX + DW/2 - 98 + 124.
+read DX DY DW DH <<< "$(dockbox)"; echo "launch bar: $DX,$DY ${DW}x$DH"
+FILESX=$((DX + DW / 2 + 26)); FILESY=$((DY + DH / 2)); echo "files button $FILESX,$FILESY"
 #!pointer click $FILESX $FILESY
 sleep 18
 #!must LAUNCHED-BY-BLOOM
@@ -188,8 +192,10 @@ echo "=== the shell and the built-ins were refused nothing ==="
 # patch refuses Bloom (SetWorkArea, SetOverlayFocus, GetOverlayState,
 # OverlayFocusChanged, SwitcherChanged, ShortcutTriggered). alpha5-shell-layering reports that
 # one cause, as BRIDGE-OK; repeating it here would fail every suite on it.
+# Likewise SetAppIdentity (the identity work), reported by alpha5-identity as
+# IDENTITY-STAND-IN.
 #!must-not capability denied
-grep -a "capability denied" /var/log/vela.log | grep -v "SetWorkArea\|SetOverlayFocus\|GetOverlayState\|OverlayFocusChanged\|SwitcherChanged\|ShortcutTriggered" | head -5
+grep -a "capability denied" /var/log/vela.log | grep -v "SetWorkArea\|SetOverlayFocus\|GetOverlayState\|OverlayFocusChanged\|SwitcherChanged\|ShortcutTriggered\|SetAppIdentity" | head -5
 #!must-not capability denied
 grep -a "capability denied" /var/log/echo.log | grep -v "app 'com.pyxis.hello'" | head -5
 

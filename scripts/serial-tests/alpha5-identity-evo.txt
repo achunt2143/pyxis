@@ -1,0 +1,149 @@
+# Alpha 5, visual identity lane E: Evo's window chrome.
+#
+# On an image built after 2026-11-12 (bash scripts/rebuild-and-verify.sh; see
+# docs/internal/next-image-checklist.md) nothing needs pushing: the image has
+# evo, echo-cli, pyxis-wlprobe and the two icons in /usr/share/pyxis-test.
+#
+#   scripts/serial-test.py --memory 4096 --script scripts/serial-tests/alpha5-identity-evo.txt
+#
+# On an OLDER image (the 11-09 one), push what that image lacks:
+#
+#   scripts/serial-test.py --memory 4096 \
+#     --push target/release/evo:/usr/bin/evo \
+#     --push target/release/echo-cli:/usr/bin/echo-cli \
+#     --push target/release/pyxis-wlprobe:/usr/bin/pyxis-wlprobe \
+#     --push scripts/serial-tests/identity-icons/notes.png:/usr/share/pyxis-test/notes.png \
+#     --push scripts/serial-tests/identity-icons/probe.png:/usr/share/pyxis-test/probe.png \
+#     --script scripts/serial-tests/alpha5-identity-evo.txt
+#
+# docs/internal/pyxis-visual-identity-plan.md, lane E. The title bar is a
+# waterdrop (16 4 16 16: the top-right corner sharp), square when maximized.
+# Its controls are the remochi spinner's shapes in the spinner's colours, 14 px
+# in 32 px targets, outlines when the window is inactive, and the spinner
+# itself when the app stops answering xdg_wm_base.ping. It shows the app's icon
+# and name from SetAppIdentity, looked up by the window's trusted app id, then
+# the client's title only when it adds anything, on glass tinted with the
+# app's accent. Bloom sends the table once vela is rebuilt (SetAppIdentity is a
+# new bridge entry); echo-cli stands in for it here.
+#
+# LOOK at target/serial-shots/identity-*.png:
+#   identity-focused     Notes alone, focused (it opens maximized, so square):
+#                        yellow-tinted bar, the waterdrop icon and "Notes"
+#                        (bold), the three controls 14 px in their colours
+#                        with thin dark outlines.
+#   identity-floating    Notes unmaximized and focused: the frame's top-right
+#                        corner nearly square (4 px), the other three round.
+#   identity-busy        the probe window (purple tint, "Busy Probe ·
+#                        pyxis-wlprobe") focused and busy: its three slots
+#                        each a different spinner shape. Notes behind it,
+#                        inactive: its controls as outlines in the quiet ink.
+#   identity-busy-late   the same a moment on: the shapes have moved round.
+#   identity-busy-off    animations off: the probe's slots are static outlines
+#                        in each shape's own dark colour.
+#   identity-recovered   the probe answered again: its controls back to the
+#                        filled shapes.
+#   identity-maximized   Notes maximized again: square corners, no shadow.
+#   identity-dark        the dark bar (dark material, light ink).
+#   identity-plain       no identities: the client's own title as before.
+
+export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0
+# Mirrors Nova's launch: root, dropping to the app user inside pyxis-wlctx, so
+# the window's app id is the security context's.
+asapp() { id=$1; shift; pyxis-wlctx --app-id "$id" --uid 1001 --gid 1001 --groups video,render --runtime-dir /run/user/1001 --host-socket /run/user/1000/wayland-0 -- "$@"; }
+lw() { echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}'; }
+# Field $2 of the first window whose app_id is $1 (echo-cli prints one key a line).
+wf() { lw | awk -v app="$1" -v key="$2" '/"app_id"/ { on = index($0, "\"" app "\"") > 0 } on && index($0, "\"" key "\":") { sub(/^[^:]*: */, ""); sub(/,$/, ""); gsub(/^"|"$/, ""); print; exit } /}/ { on = 0 }'; }
+wid() { wf "$1" window_id; }
+setid() { echo-cli call org.geckoOS.evo SetAppIdentity --interface org.geckoOS.evo --args "$(cat "$1")"; }
+setanim() { echo-cli call org.geckoOS.evo SetAnimationSettings --interface org.geckoOS.evo --args "$1" | grep -c '"mode"'; }
+idle() { i=0; while [ $i -lt 20 ]; do echo-cli call org.geckoOS.evo GetAnimationState --interface org.geckoOS.evo --args '{}' | grep -q '"active": 0' && return 0; sleep 0.5; i=$((i + 1)); done; return 1; }
+
+echo "=== SetAppIdentity: names, accents, icons; a bad icon costs nothing else ==="
+#!must ICONS-PRESENT
+test -s /usr/share/pyxis-test/notes.png && test -s /usr/share/pyxis-test/probe.png && echo ICONS-PRESENT || echo ICONS-MISSING
+N=$(base64 -w0 /usr/share/pyxis-test/notes.png); P=$(base64 -w0 /usr/share/pyxis-test/probe.png); printf '{"apps":[{"app_id":"notes","name":"Notes","accent":"#eab308","icon":"data:image/png;base64,%s"},{"app_id":"busyprobe","name":"Busy Probe","accent":"#7c3aed","icon":"data:image/png;base64,%s"},{"app_id":"badicon","name":"Bad Icon","accent":"nope","icon":"data:image/png;base64,!!!!"}],"dark":false}' "$N" "$P" > /tmp/ident-light.json; sed 's/"dark":false/"dark":true/' /tmp/ident-light.json > /tmp/ident-dark.json; echo '{"apps":[],"dark":false}' > /tmp/ident-none.json; wc -c /tmp/ident-light.json
+#!must "ok": true
+#!must "apps": 3
+#!must "icons": 2
+setid /tmp/ident-light.json
+#!must BAD-BODY-REFUSED
+echo-cli call org.geckoOS.evo SetAppIdentity --interface org.geckoOS.evo --args '{"dark":true}' 2>&1 | grep -qi 'apps must be' && echo BAD-BODY-REFUSED || echo BAD-BODY-ACCEPTED
+#!must ANIM-FULL
+test "$(setanim '{"mode":"full","scale":1}')" -ge 1 && echo ANIM-FULL || echo ANIM-NOT-SET
+
+echo "=== a real app: its name, vela's template stripped ==="
+#!must sessionId
+echo-cli call org.geckoOS.nova Launch --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'sessionId|Error'
+i=0; while [ $i -lt 40 ] && [ -z "$(wid notes)" ]; do sleep 1; i=$((i + 1)); done; sleep 8; idle; echo "notes window $(wid notes) after ${i}s"
+#!must TITLE-LABEL Notes
+echo "TITLE-LABEL $(wf notes title_label)"
+#!must-not pyxis://
+echo "label: $(wf notes title_label)"
+#!must NOTES-NOT-BUSY
+test "$(wf notes busy)" = false && echo NOTES-NOT-BUSY || echo "NOTES-BUSY=$(wf notes busy)"
+#!shot identity-focused
+echo shot
+
+echo "=== busy: a client that stops answering, then answers again ==="
+# Inside the first two seconds the ping (sent as the window took focus) is
+# out but not overdue: not busy yet. ListWindows lags by up to 250 ms.
+#!must BUSY-AT-MAP=false
+rm -f /tmp/probe.log; (asapp busyprobe pyxis-wlprobe window busyprobe 75 --pong-after 14 > /tmp/probe.log 2>&1 &); i=0; while [ $i -lt 40 ] && [ -z "$(wid busyprobe)" ]; do sleep 0.1; i=$((i + 1)); done; echo "BUSY-AT-MAP=$(wf busyprobe busy) after $i polls"; cat /tmp/probe.log
+#!must PROBE-TITLE Busy Probe
+echo "PROBE-TITLE $(wf busyprobe title_label)"
+sleep 4
+#!must BUSY-NOW=true
+echo "BUSY-NOW=$(wf busyprobe busy)"
+#!must PING-IGNORED
+cat /tmp/probe.log
+#!shot identity-busy
+echo shot
+sleep 0.4
+#!shot identity-busy-late
+echo shot
+#!must ANIM-OFF
+test "$(setanim '{"mode":"off"}')" -ge 1 && echo ANIM-OFF || echo ANIM-NOT-SET
+#!shot identity-busy-off
+echo shot
+setanim '{"mode":"full","scale":1}'
+# Notes, behind, still answers: only the silent client is busy.
+#!must NOTES-STILL-ANSWERS
+test "$(wf notes busy)" = false && echo NOTES-STILL-ANSWERS || echo NOTES-BUSY-TOO
+i=0; while [ $i -lt 40 ] && ! grep -q PONG-RESUMED /tmp/probe.log; do sleep 0.5; i=$((i + 1)); done; sleep 1; echo "after pong: busy=$(wf busyprobe busy)"
+#!must PONG-RESUMED
+cat /tmp/probe.log
+#!must BUSY-CLEARED
+test "$(wf busyprobe busy)" = false && echo BUSY-CLEARED || echo "STILL-BUSY=$(wf busyprobe busy)"
+#!shot identity-recovered
+echo shot
+#!must CLOSED-WHILE-BUSY
+rm -f /tmp/probe2.log; (asapp busyprobe pyxis-wlprobe window busyprobe 60 --no-pong > /tmp/probe2.log 2>&1 &); sleep 4; B=$(lw | grep -c '"busy": true'); P2=$(echo-cli call org.geckoOS.evo ListWindows --interface org.geckoOS.evo --args '{}' | awk '/"app_id": "busyprobe"/ { on = 1 } on && /"window_id":/ { gsub(/[",:]/, ""); id = $2 } END { print id }'); echo-cli call org.geckoOS.evo CloseWindow --interface org.geckoOS.evo --args "{\"window_id\":$P2}" | grep -q '"success": true' && echo "busy=$B CLOSED-WHILE-BUSY"
+
+echo "=== maximized: square ==="
+NID=$(wid notes); echo "notes $NID"
+#!must MAXIMIZED
+echo-cli call org.geckoOS.evo MaximizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$NID}" | grep -q '"success": true' && echo MAXIMIZED
+sleep 2; idle
+#!shot identity-maximized
+echo shot
+echo-cli call org.geckoOS.evo UnmaximizeWindow --interface org.geckoOS.evo --args "{\"window_id\":$NID}" | grep -c success; sleep 2; idle
+echo-cli call org.geckoOS.evo FocusWindow --interface org.geckoOS.evo --args "{\"window_id\":$NID}" | grep -c success; sleep 1
+#!shot identity-floating
+echo shot
+
+echo "=== dark, then no identities at all ==="
+#!must "ok": true
+setid /tmp/ident-dark.json
+sleep 1
+#!shot identity-dark
+echo shot
+#!must "apps": 0
+setid /tmp/ident-none.json
+sleep 1
+#!must-not TITLE-STILL-NAMED
+L=$(wf notes title_label); echo "plain label: $L"; test "$L" = Notes && echo TITLE-STILL-NAMED || echo TITLE-PLAIN
+#!shot identity-plain
+echo shot
+setid /tmp/ident-light.json | grep -c ok
+echo-cli call org.geckoOS.nova Close --interface org.geckoOS.nova --args '{"appId":"notes"}' | grep -E 'success|Error'
+echo done
