@@ -33,7 +33,8 @@ use crate::{
 };
 
 use super::{
-    placement::{PreFullscreen, PreFullscreenState},
+    element::{FullscreenOutputName, TileState},
+    placement::{default_restore_frame_rect, PreFullscreen, PreFullscreenState},
     OldGeometry, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge,
     ResizeState, SurfaceData, WindowElement, WindowLayout,
 };
@@ -61,6 +62,10 @@ struct ShellFullscreenedMarker;
 impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
+    }
+
+    fn client_pong(&mut self, client: smithay::wayland::shell::xdg::ShellClient) {
+        self.note_pong(&client);
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
@@ -121,11 +126,13 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             },
         );
 
-        // Set up commit handler for window resize/move updates
+        // Set up post-commit hooks for shell fullscreen discovery and AppHost binding.
+        // (`handle_toplevel_commit` runs inside `CompositorHandler::commit` right after
+        // `Window::on_commit()` refreshes geometry and before `ensure_initial_configure`
+        // clears `ResizeState::WaitingForCommit`.)
         compositor::add_post_commit_hook::<EvoState<BackendData>, _>(
             surface.wl_surface(),
             |state, _, surface| {
-                state.handle_toplevel_commit(surface);
                 // Also (re)check whether this is the shell that needs its
                 // compositor-driven fullscreen -- app_id is often set AFTER the
                 // initial configures, so ack_configure alone can miss it; commits
@@ -384,6 +391,7 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         let known = is_shell
             || wl_output.is_some()
             || !self.space.outputs_for_element(&window).is_empty()
+            || self.is_window_mapped(&window)
             || self.workspace_manager.is_minimized(&window);
         let output = known
             .then(|| self.output_for_fullscreen(&window, wl_output.as_ref()))
@@ -456,8 +464,12 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             // A fullscreen window is bare: no header, and the client gets the
             // whole output.
             window.set_ssd_suppressed(true);
-            self.set_window_layout(&window, WindowLayout::Fullscreen);
         }
+        window.user_data().insert_if_missing(FullscreenOutputName::default);
+        if let Some(slot) = window.user_data().get::<FullscreenOutputName>() {
+            slot.set(Some(output.name()));
+        }
+        self.set_window_layout(&window, WindowLayout::Fullscreen);
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
@@ -466,6 +478,9 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         });
 
         if is_shell {
+            // An earlier request, made before the window was known to be the
+            // shell, may have given it the output to itself.
+            self.clear_exclusive_fullscreen(&window);
             self.place_window(&window, geometry.loc, false);
             trace!("Shell fullscreen (non-exclusive): {:?}", window);
         } else {
@@ -500,6 +515,9 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
             }
             self.clear_exclusive_fullscreen(window);
             window.set_ssd_suppressed(false);
+            if let Some(slot) = window.user_data().get::<FullscreenOutputName>() {
+                slot.set(None);
+            }
         }
 
         surface.with_pending_state(|state| {
@@ -582,9 +600,10 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         // otherwise "restore" to the blind guess it was created at. And not
         // when it is already maximized, where the frame on hand is the
         // maximized one and would overwrite the place worth going back to.
+        let pre_tile = window.user_data().get::<TileState>().and_then(TileState::take);
         if window.placement_pending() || layout == WindowLayout::Maximized {
             // Nothing worth remembering.
-        } else if let Some(old_geo) = self.window_frame(&window) {
+        } else if let Some(old_geo) = pre_tile.map(|t| t.restore_geo).or_else(|| self.window_frame(&window)) {
             window.user_data().insert_if_missing(OldGeometry::default);
             if let Some(saved) = window.user_data().get::<OldGeometry>() {
                 saved.save(old_geo);
@@ -661,49 +680,20 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
         );
 
         window.begin_settling();
+        let fallback_rect = if restored.is_none() {
+            self.work_area_for(&window).map(default_restore_frame_rect)
+        } else {
+            None
+        };
+        let restore_client_size = fallback_rect.map(|r| maximized_client_size(&window, r.size));
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
-            state.size = None;
+            state.size = restore_client_size;
         });
 
-        // `restored == None` is not a corner case here, it is the COMMON one,
-        // and leaving it unhandled is a real defect (observed on-device:
-        // "unmaximize_request: restored_loc=None had_saved_geo=false").
-        //
-        // `OldGeometry` is only ever populated by our own `maximize_request`.
-        // A client that comes up maximized under its own steam -- which
-        // GTK/Gecko does, via the `sizemode="maximized"` path in
-        // browser-init.js's onBeforeInitialXULLayout, without ever sending
-        // xdg_toplevel.set_maximized to us -- was never maximized *by Evo*, so
-        // nothing was saved. The window then restores down with no saved rect.
-        //
-        // Previously that meant skipping `map_element` entirely: the client
-        // was told "unmaximized, pick your own size" while the compositor left
-        // the element mapped at its maximized origin, so the two disagreed
-        // about the window's geometry from that moment on. Place it
-        // deliberately instead -- centred on its output at a conventional
-        // restore size -- so both sides agree on where the window is.
-        let restore_loc = restored.map(|old_geo| old_geo.loc).or_else(|| {
-            let output = self
-                .space
-                .outputs_for_element(&window)
-                .first()
-                .cloned()
-                .or_else(|| self.space.outputs().next().cloned())?;
-            let output_geo = super::work_area::of_output(self.space.output_geometry(&output)?);
-            let size = self
-                .window_frame(&window)
-                .map(|frame| frame.size)
-                .unwrap_or(output_geo.size);
-            // Centre, clamped so the titlebar can never land off-screen.
-            Some(
-                (
-                    output_geo.loc.x + ((output_geo.size.w - size.w) / 2).max(0),
-                    output_geo.loc.y + ((output_geo.size.h - size.h) / 2).max(0),
-                )
-                    .into(),
-            )
-        });
+        let restore_loc = restored
+            .map(|old_geo| old_geo.loc)
+            .or_else(|| fallback_rect.map(|r| r.loc));
 
         tracing::info!(
             "unmaximize_request: mapping to {:?} (synthesized={})",
@@ -742,6 +732,11 @@ impl<BackendData: Backend> XdgShellHandler for EvoState<BackendData> {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        // A popup grab takes the keyboard and the pointer: not while the
+        // screen is locked (shell/lock.rs).
+        if super::lock::input_locked() {
+            return;
+        }
         let seat: Seat<EvoState<BackendData>> = Seat::from_resource(&seat).unwrap();
         let kind = PopupKind::Xdg(surface);
         if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
@@ -858,40 +853,48 @@ impl<BackendData: Backend> EvoState<BackendData> {
         serial: Serial,
         edges: ResizeEdge,
     ) {
-
         if let Some(touch) = seat.get_touch() {
             if touch.has_grab(serial) {
-                let start_data = touch.grab_start_data().unwrap();
-
+                let Some(start_data) = touch.grab_start_data() else {
+                    warn!("XDG touch resize request: missing grab_start_data");
+                    return;
+                };
                 let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
                     return;
                 };
-
-                if start_data.focus.is_none()
-                    || !start_data
-                        .focus
-                        .as_ref()
-                        .unwrap()
-                        .0
-                        .same_client_as(&surface.wl_surface().id())
+                if !start_data
+                    .focus
+                    .as_ref()
+                    .is_some_and(|(focus, _)| focus.same_client_as(&surface.wl_surface().id()))
                 {
                     return;
                 }
                 let geometry = window.geometry();
-                let loc = self.space.element_location(&window).unwrap();
+                let Some(loc) = self.space.element_location(&window) else {
+                    warn!("XDG touch resize request: window has no location in space");
+                    return;
+                };
+                if let Some(tile) = window.user_data().get::<TileState>() {
+                    tile.take();
+                }
+                if self
+                    .workspace_manager
+                    .state(&window)
+                    .is_some_and(|s| s.layout == WindowLayout::Tiled)
+                {
+                    self.set_window_layout(&window, WindowLayout::Floating);
+                }
                 let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
                 with_states(surface.wl_surface(), move |states| {
-                    states
-                        .data_map
-                        .get::<RefCell<SurfaceData>>()
-                        .unwrap()
-                        .borrow_mut()
-                        .resize_state = ResizeState::Resizing(ResizeData {
-                        edges,
-                        initial_window_location,
-                        initial_window_size,
-                    });
+                    states.data_map.insert_if_missing(RefCell::<SurfaceData>::default);
+                    if let Some(surface_data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                        surface_data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
+                            edges,
+                            initial_window_location,
+                            initial_window_size,
+                        });
+                    }
                 });
 
                 let grab = TouchResizeSurfaceGrab {
@@ -908,13 +911,16 @@ impl<BackendData: Backend> EvoState<BackendData> {
             }
         }
 
-        let pointer = seat.get_pointer().unwrap();
-
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
         if !pointer.has_grab(serial) {
             return;
         }
-
-        let start_data = pointer.grab_start_data().unwrap();
+        let Some(start_data) = pointer.grab_start_data() else {
+            warn!("XDG pointer resize request: missing grab_start_data");
+            return;
+        };
 
         // Not unwrap(): the SSD path gets here from an idle callback, and the
         // window can close between the press and the callback.
@@ -922,13 +928,10 @@ impl<BackendData: Backend> EvoState<BackendData> {
             return;
         };
 
-        if start_data.focus.is_none()
-            || !start_data
-                .focus
-                .as_ref()
-                .unwrap()
-                .0
-                .same_client_as(&surface.wl_surface().id())
+        if !start_data
+            .focus
+            .as_ref()
+            .is_some_and(|(focus, _)| focus.same_client_as(&surface.wl_surface().id()))
         {
             return;
         }
@@ -937,19 +940,27 @@ impl<BackendData: Backend> EvoState<BackendData> {
         let Some(loc) = self.space.element_location(&window) else {
             return;
         };
+        if let Some(tile) = window.user_data().get::<TileState>() {
+            tile.take();
+        }
+        if self
+            .workspace_manager
+            .state(&window)
+            .is_some_and(|s| s.layout == WindowLayout::Tiled)
+        {
+            self.set_window_layout(&window, WindowLayout::Floating);
+        }
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
         with_states(surface.wl_surface(), move |states| {
-            states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut()
-                .resize_state = ResizeState::Resizing(ResizeData {
-                edges,
-                initial_window_location,
-                initial_window_size,
-            });
+            states.data_map.insert_if_missing(RefCell::<SurfaceData>::default);
+            if let Some(surface_data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                surface_data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
+                    edges,
+                    initial_window_location,
+                    initial_window_size,
+                });
+            }
         });
 
         let grab = PointerResizeSurfaceGrab {
@@ -964,52 +975,41 @@ impl<BackendData: Backend> EvoState<BackendData> {
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }
 
-
     pub fn move_request_xdg(
         &mut self,
         surface: &ToplevelSurface,
         seat: &Seat<Self>,
         serial: Serial,
     ) {
+        let is_maximized = surface
+            .with_pending_state(|state| state.states.contains(xdg_toplevel::State::Maximized));
+
         if let Some(touch) = seat.get_touch() {
             if touch.has_grab(serial) {
-                let start_data = touch.grab_start_data().unwrap();
-
+                let Some(start_data) = touch.grab_start_data() else {
+                    warn!("XDG touch move request: missing grab_start_data");
+                    return;
+                };
                 let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
                     return;
                 };
-
-                if start_data.focus.is_none()
-                    || !start_data
-                        .focus
-                        .as_ref()
-                        .unwrap()
-                        .0
-                        .same_client_as(&surface.wl_surface().id())
+                if !start_data
+                    .focus
+                    .as_ref()
+                    .is_some_and(|(focus, _)| focus.same_client_as(&surface.wl_surface().id()))
                 {
                     return;
                 }
-
-                let mut initial_window_location = self.space.element_location(&window).unwrap();
-
-                let changed = surface.with_pending_state(|state| {
-                    if state.states.unset(xdg_toplevel::State::Maximized) {
-                        state.size = None;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if changed {
-                    surface.send_configure();
-                    initial_window_location = start_data.location.to_i32_round();
-                    self.set_window_layout(&window, WindowLayout::Floating);
-                }
+                let Some(initial_window_location) = self.space.element_location(&window) else {
+                    warn!("XDG touch move request: window has no location in space");
+                    return;
+                };
 
                 let grab = TouchMoveSurfaceGrab {
                     start_data,
                     window,
                     initial_window_location,
+                    pending_unmaximize: is_maximized,
                 };
 
                 touch.set_grab(self, grab, serial);
@@ -1017,50 +1017,37 @@ impl<BackendData: Backend> EvoState<BackendData> {
             }
         }
 
-        let pointer = seat.get_pointer().unwrap();
-
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
         if !pointer.has_grab(serial) {
             return;
         }
-
-        let start_data = pointer.grab_start_data().unwrap();
+        let Some(start_data) = pointer.grab_start_data() else {
+            warn!("XDG pointer move request: missing grab_start_data");
+            return;
+        };
 
         let Some(window) = self.window_for_surface(surface.wl_surface().clone()) else {
             return;
         };
-
-        if start_data.focus.is_none()
-            || !start_data
-                .focus
-                .as_ref()
-                .unwrap()
-                .0
-                .same_client_as(&surface.wl_surface().id())
+        if !start_data
+            .focus
+            .as_ref()
+            .is_some_and(|(focus, _)| focus.same_client_as(&surface.wl_surface().id()))
         {
             return;
         }
-
-        let mut initial_window_location = self.space.element_location(&window).unwrap();
-
-        let changed = surface.with_pending_state(|state| {
-            if state.states.unset(xdg_toplevel::State::Maximized) {
-                state.size = None;
-                true
-            } else {
-                false
-            }
-        });
-        if changed {
-            surface.send_configure();
-            let pos = pointer.current_location();
-            initial_window_location = (pos.x as i32, pos.y as i32).into();
-            self.set_window_layout(&window, WindowLayout::Floating);
-        }
+        let Some(initial_window_location) = self.space.element_location(&window) else {
+            warn!("XDG pointer move request: window has no location in space");
+            return;
+        };
 
         let grab = PointerMoveSurfaceGrab {
             start_data,
             window,
             initial_window_location,
+            pending_unmaximize: is_maximized,
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);
@@ -1132,34 +1119,37 @@ impl<BackendData: Backend> EvoState<BackendData> {
         let mut window_loc = self.space.element_location(&window)?;
         let geometry = window.geometry();
 
-        let new_loc: Point<Option<i32>, Logical> =
-            with_states(window.wl_surface().as_deref()?, |states| {
-                let data = states
-                    .data_map
-                    .get::<RefCell<SurfaceData>>()?
-                    .borrow_mut();
+        let result = with_states(window.wl_surface().as_deref()?, |states| {
+            let data = states
+                .data_map
+                .get::<RefCell<SurfaceData>>()?
+                .borrow();
 
-                if let ResizeState::Resizing(resize_data) = data.resize_state {
-                    let edges = resize_data.edges;
-                    let loc = resize_data.initial_window_location;
-                    let size = resize_data.initial_window_size;
+            let (resize_data, is_final) = match data.resize_state {
+                ResizeState::Resizing(resize_data) => (resize_data, false),
+                ResizeState::WaitingForFinalAck(resize_data, _) => (resize_data, false),
+                ResizeState::WaitingForCommit(resize_data) => (resize_data, true),
+                ResizeState::NotResizing => return None,
+            };
 
-                    edges.intersects(ResizeEdge::TOP_LEFT).then(|| {
-                        let new_x = edges
-                            .intersects(ResizeEdge::LEFT)
-                            .then_some(loc.x + (size.w - geometry.size.w));
+            let edges = resize_data.edges;
+            let loc = resize_data.initial_window_location;
+            let size = resize_data.initial_window_size;
 
-                        let new_y = edges
-                            .intersects(ResizeEdge::TOP)
-                            .then_some(loc.y + (size.h - geometry.size.h));
+            edges.intersects(ResizeEdge::TOP_LEFT).then(|| {
+                let new_x = edges
+                    .intersects(ResizeEdge::LEFT)
+                    .then_some(loc.x + (size.w - geometry.size.w));
 
-                        (new_x, new_y).into()
-                    })
-                } else {
-                    None
-                }
-            })?;
+                let new_y = edges
+                    .intersects(ResizeEdge::TOP)
+                    .then_some(loc.y + (size.h - geometry.size.h));
 
+                (Point::<Option<i32>, Logical>::from((new_x, new_y)), is_final)
+            })
+        })?;
+
+        let (new_loc, is_final) = result;
         if let Some(new_x) = new_loc.x {
             window_loc.x = new_x;
         }
@@ -1169,6 +1159,9 @@ impl<BackendData: Backend> EvoState<BackendData> {
 
         if new_loc.x.is_some() || new_loc.y.is_some() {
             self.place_window(&window, window_loc, false);
+            if is_final {
+                self.window_moved(&window);
+            }
         }
 
         Some(())

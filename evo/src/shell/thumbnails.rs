@@ -371,6 +371,15 @@ impl<BackendData: Backend> EvoState<BackendData> {
         if requests.is_empty() {
             return;
         }
+        // A picture of an app window is a picture of the user's work: none
+        // while the screen is locked, however the request got here (it may
+        // have been queued just before the lock).
+        if super::lock::input_locked() {
+            for request in requests {
+                let _ = request.reply.send(Vec::new());
+            }
+            return;
+        }
         let alive: std::collections::HashSet<u32> = self.windows_by_id.keys().copied().collect();
         with_cache(|c| c.retain(|id| alive.contains(&id)));
         for request in requests {

@@ -17,7 +17,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -42,6 +42,19 @@ pub struct WindowInfo {
     pub y: i32,
     pub focused: bool,
     pub visible: bool,
+    #[serde(default)]
+    pub minimized: bool,
+    #[serde(default)]
+    pub maximized: bool,
+    #[serde(default)]
+    pub fullscreen: bool,
+    /// The app has stopped answering pings (shell/busy.rs).
+    #[serde(default)]
+    pub busy: bool,
+    /// What the title bar shows: the app's name, then the document's title
+    /// (shell/identity.rs), or the client's title with no identity.
+    #[serde(default)]
+    pub title_label: String,
 }
 
 /// Rendering status exposed via IPC
@@ -83,6 +96,292 @@ pub enum WindowAction {
     /// Bloom's `SetOverlayFocus` (`window_id` is 0): give the overlay the
     /// keyboard, or take it back.
     OverlayKeyboard(bool),
+    /// Re-apply `OUTPUT_CONFIGS` to mapped Smithay outputs on the compositor thread.
+    ApplyOutputConfigs,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputModeInfo {
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputConfigInfo {
+    pub name: String,
+    pub description: String,
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+    pub scale: f64,
+    pub x: i32,
+    pub y: i32,
+    pub modes: Vec<OutputModeInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputConfigRequest {
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+    pub scale: f64,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<&OutputConfigInfo> for OutputConfigRequest {
+    fn from(info: &OutputConfigInfo) -> Self {
+        Self {
+            name: info.name.clone(),
+            width: info.width,
+            height: info.height,
+            refresh_mhz: info.refresh_mhz,
+            scale: info.scale,
+            x: info.x,
+            y: info.y,
+        }
+    }
+}
+
+fn displays_file_path() -> PathBuf {
+    if let Ok(file) = std::env::var("PYXIS_DISPLAYS_FILE") {
+        let trimmed = file.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(dir) = std::env::var("PYXIS_SETTINGS_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("displays.json");
+        }
+    }
+    PathBuf::from("/var/lib/pyxis/displays.json")
+}
+
+fn load_persisted_output_configs_at(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<String, OutputConfigRequest> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return std::collections::BTreeMap::new();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_persisted_output_config_at(
+    path: &std::path::Path,
+    config: &OutputConfigInfo,
+) -> Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut map = load_persisted_output_configs_at(path);
+    map.insert(config.name.clone(), OutputConfigRequest::from(config));
+    let content = serde_json::to_string_pretty(&map)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("displays.json");
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let write_res = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_res
+}
+
+pub fn load_persisted_output_configs() -> std::collections::BTreeMap<String, OutputConfigRequest> {
+    load_persisted_output_configs_at(&displays_file_path())
+}
+
+pub fn save_persisted_output_config(config: &OutputConfigInfo) -> Result<()> {
+    save_persisted_output_config_at(&displays_file_path(), config)
+}
+
+pub fn apply_persisted_config_to_output(output: &smithay::output::Output) -> Option<(i32, i32)> {
+    let configs = load_persisted_output_configs();
+    let cfg = configs.get(&output.name())?;
+    if cfg.width <= 0 || cfg.height <= 0 || !cfg.scale.is_finite() || !(0.5..=4.0).contains(&cfg.scale) {
+        return None;
+    }
+    let refresh = if cfg.refresh_mhz > 0 { cfg.refresh_mhz } else { 60_000 };
+    let new_mode = Some(smithay::output::Mode {
+        size: (cfg.width, cfg.height).into(),
+        refresh,
+    });
+    let new_scale = Some(smithay::output::Scale::Fractional(cfg.scale));
+    let new_loc = Some((cfg.x, cfg.y).into());
+    output.change_current_state(new_mode, None, new_scale, new_loc);
+    Some((cfg.x, cfg.y))
+}
+
+fn default_outputs() -> Vec<OutputConfigInfo> {
+    vec![OutputConfigInfo {
+        name: "eDP-1".to_string(),
+        description: "Built-in Display".to_string(),
+        width: 1920,
+        height: 1080,
+        refresh_mhz: 60000,
+        scale: 1.0,
+        x: 0,
+        y: 0,
+        modes: vec![
+            OutputModeInfo { width: 1920, height: 1080, refresh_mhz: 60000 },
+            OutputModeInfo { width: 2560, height: 1440, refresh_mhz: 60000 },
+            OutputModeInfo { width: 3840, height: 2160, refresh_mhz: 60000 },
+            OutputModeInfo { width: 1280, height: 720, refresh_mhz: 60000 },
+        ],
+    }]
+}
+
+static OUTPUT_CONFIGS: OnceLock<RwLock<Vec<OutputConfigInfo>>> = OnceLock::new();
+
+fn outputs_store() -> &'static RwLock<Vec<OutputConfigInfo>> {
+    OUTPUT_CONFIGS.get_or_init(|| RwLock::new(default_outputs()))
+}
+
+pub fn get_outputs_snapshot() -> Vec<OutputConfigInfo> {
+    outputs_store().read().clone()
+}
+
+/// Update the output store from the compositor's live space outputs without
+/// overwriting any mode list we already hold for matching connectors.
+/// Returns `true` when the snapshot changed.
+pub fn sync_outputs_from_space(outputs: Vec<OutputConfigInfo>) -> bool {
+    if outputs.is_empty() {
+        return false;
+    }
+    let mut guard = outputs_store().write();
+    if *guard != outputs {
+        *guard = outputs;
+        true
+    } else {
+        false
+    }
+}
+
+pub fn apply_output_config_request(body: &Value) -> std::result::Result<OutputConfigInfo, String> {
+    let mut guard = outputs_store().write();
+    if guard.is_empty() {
+        *guard = default_outputs();
+    }
+    let requested_name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let idx = if let Some(name) = requested_name {
+        guard
+            .iter()
+            .position(|o| o.name == name)
+            .ok_or_else(|| format!("unknown output '{name}'"))?
+    } else {
+        0
+    };
+
+    let scale_req = match body.get("scale") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let s = v
+                .as_f64()
+                .ok_or_else(|| "scale must be a finite number".to_string())?;
+            if !s.is_finite() || !(0.5..=4.0).contains(&s) {
+                return Err("scale must be between 0.5 and 4.0".to_string());
+            }
+            Some(s)
+        }
+    };
+
+    let width_req = match body.get("width") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let w = v
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .filter(|&w| w > 0)
+                .ok_or_else(|| "width must be a positive integer".to_string())?;
+            Some(w)
+        }
+    };
+
+    let height_req = match body.get("height") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let h = v
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .filter(|&h| h > 0)
+                .ok_or_else(|| "height must be a positive integer".to_string())?;
+            Some(h)
+        }
+    };
+
+    let refresh_req = match body.get("refresh_mhz") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let r = v
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .filter(|&r| r > 0)
+                .ok_or_else(|| "refresh_mhz must be a positive integer".to_string())?;
+            Some(r)
+        }
+    };
+
+    let x_req = match body.get("x") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let x = v
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| "x must be an integer".to_string())?;
+            Some(x)
+        }
+    };
+
+    let y_req = match body.get("y") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let y = v
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| "y must be an integer".to_string())?;
+            Some(y)
+        }
+    };
+
+    let target = &mut guard[idx];
+    if let Some(s) = scale_req {
+        target.scale = s;
+    }
+    if let Some(w) = width_req {
+        target.width = w;
+    }
+    if let Some(h) = height_req {
+        target.height = h;
+    }
+    if let Some(r) = refresh_req {
+        target.refresh_mhz = r;
+    }
+    if let Some(x) = x_req {
+        target.x = x;
+    }
+    if let Some(y) = y_req {
+        target.y = y;
+    }
+    let updated = target.clone();
+    drop(guard);
+    let _ = save_persisted_output_config(&updated);
+    Ok(updated)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -413,6 +712,36 @@ impl GeckoEchoService {
     })
 }
 
+    /// Create an isolated in-memory `GeckoEchoService` and signal spy for unit tests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> (Self, TestEchoSpy) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+        let runtime_handle = runtime.handle().clone();
+        let (command_tx, command_rx) = mpsc::channel::<EchoCommand>(128);
+        let service = GeckoEchoService {
+            service_name: "org.geckoOS.evo".to_string(),
+            ready: Arc::new(RwLock::new(false)),
+            toplevels: Arc::new(RwLock::new(Vec::new())),
+            command_tx,
+            runtime_handle,
+            pending_window_actions: Arc::new(RwLock::new(Vec::new())),
+            rebind_requested: Arc::new(AtomicBool::new(false)),
+            frame_count: Arc::new(AtomicU64::new(0)),
+            fps_window_start: Arc::new(RwLock::new(Instant::now())),
+            last_fps: Arc::new(AtomicU32::new(0)),
+        };
+        (
+            service,
+            TestEchoSpy {
+                rx: command_rx,
+                _runtime: runtime,
+            },
+        )
+    }
+
 
     // ========================================================================
     // SYNC PUBLIC API (for use in Evo)
@@ -581,6 +910,23 @@ impl GeckoEchoService {
         )
     }
 
+    /// Tell Echo's session service the screen is locked: `session.lock`, so
+    /// its state and `getState` agree with Evo's (Evo locked itself: Super+L,
+    /// the idle timer, `evo.Lock`, or Echo's own signal after a restart). Not
+    /// waited on; Echo answers with a `LockChanged`, which Evo is already
+    /// locked for. Sent again after a reconnect if the screen is locked.
+    pub fn session_lock_remote(&self) -> Result<()> {
+        self.notify(
+            EchoMessage::method_call(
+                crate::shell::lock::SESSION_IFACE.to_string(),
+                crate::shell::lock::SESSION_IFACE.to_string(),
+                "lock".to_string(),
+                json!({}),
+            ),
+            "session.lock",
+        )
+    }
+
     /// Detach a surface from its AppHost session. See `bind_surface_remote`
     /// for why this must not touch `AppHost::global()`, and why it does not
     /// wait.
@@ -724,6 +1070,17 @@ impl GeckoEchoService {
             }))
     }
 
+    /// Emit `OutputsChanged` whenever outputs are added, removed, or reconfigured.
+    pub fn emit_outputs_changed(&self, outputs: &[OutputConfigInfo]) -> Result<()> {
+        self.emit(
+            "OutputsChanged",
+            json!({
+                "outputs": outputs,
+                "timestamp": now_ms(),
+            }),
+        )
+    }
+
     /// Emit workspace created signal (SYNC)
     pub fn emit_workspace_created(&self, workspace_id: u32, workspace_name: &str) -> Result<()> {
         self.emit("WorkspaceCreated", json!({
@@ -739,6 +1096,13 @@ impl GeckoEchoService {
                 "workspace_id": workspace_id,
                 "timestamp": now_ms()
             }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_window_action_for_test(&self, window_id: u32, action: WindowAction) {
+        self.pending_window_actions
+            .write()
+            .push(PendingWindowAction { window_id, action });
     }
 
     /// Drain and return all pending FocusWindow/MinimizeWindow/RestoreWindow
@@ -917,6 +1281,10 @@ impl GeckoEchoService {
                                 }
                                 continue;
                             }
+                            if msg.header.message_type == "SIGNAL" {
+                                Self::handle_signal(&msg);
+                                continue;
+                            }
                             if let Err(e) = Self::handle_incoming_message(
                                 &mut write_half,
                                 msg,
@@ -962,6 +1330,22 @@ impl GeckoEchoService {
 }
 
 
+    /// A signal off the bus. Echo sends every connection every signal, so
+    /// this is where Evo hears `org.geckoOS.session` `LockChanged`: the one
+    /// way the screen locks from Echo and, with a mac that verifies, unlocks
+    /// (shell/lock.rs). Any other signal is not Evo's business.
+    fn handle_signal(msg: &EchoMessage) {
+        use crate::shell::lock;
+        if msg.header.interface == lock::SESSION_IFACE && msg.header.method == lock::SIGNAL_LOCK_CHANGED {
+            let line = lock::on_lock_changed(&msg.body);
+            if line.contains("refused") || line.contains("ignored") {
+                warn!("{line}");
+            } else {
+                info!("{line}");
+            }
+        }
+    }
+
     /// Handle incoming METHOD_CALL messages from Echo daemon
     async fn handle_incoming_message(
     write_half: &mut OwnedWriteHalf,
@@ -986,22 +1370,7 @@ impl GeckoEchoService {
         let response = match method {
             "ListWindows" => {
                 let windows_list = toplevels.read();
-                let window_list: Vec<Value> = windows_list
-                    .iter()
-                    .map(|w| {
-                        json!({
-                            "window_id": w.window_id,
-                            "app_id": w.app_id,
-                            "width": w.width,
-                            "height": w.height,
-                            "x": w.x,
-                            "y": w.y,
-                            "focused": w.focused,
-                            "visible": w.visible,
-                        })
-                    })
-                    .collect();
-                EchoMessage::method_return(message_id, json!({ "windows": window_list }))
+                EchoMessage::method_return(message_id, format_list_windows_json(&windows_list))
             }
 
             "GetRenderingStatus" => {
@@ -1145,6 +1514,27 @@ impl GeckoEchoService {
                 }
             },
 
+            // The apps' names, accents and icons, for the title bar
+            // (shell/identity.rs): looked up by each window's trusted app id.
+            // Bloom sends the whole table whenever its app list or theme
+            // changes; it replaces the last one. Read when a frame is drawn,
+            // so it is set here, not queued. A bad icon or accent is dropped
+            // from its entry and costs nothing else.
+            "SetAppIdentity" => match crate::shell::identity::parse(&msg.body) {
+                Ok(update) => {
+                    let count = update.apps.len();
+                    let icons = update.apps.values().filter(|a| a.icon.is_some()).count();
+                    let dark = update.dark;
+                    crate::shell::identity::set(update);
+                    info!("App identities: {} app(s), {} icon(s), dark={}", count, icons, dark);
+                    EchoMessage::method_return(message_id, json!({ "ok": true, "apps": count, "icons": icons }))
+                }
+                Err(e) => {
+                    warn!("SetAppIdentity: {}", e);
+                    EchoMessage::method_error(message_id, &e)
+                }
+            },
+
             // The only way the overlay gets the keyboard, or gives it back
             // (shell/overlay.rs). Panels that take typing ask for it while
             // open. `OverlayFocusChanged` reports what actually happened.
@@ -1191,6 +1581,11 @@ impl GeckoEchoService {
             // size, encoded here on a blocking worker, cached per window.
             // A window with nothing drawn yet is left out, so the reply has
             // at most one entry per window asked for.
+            // While the screen is locked there are no pictures of apps to
+            // give, whoever asks (shell/lock.rs).
+            "GetWindowThumbnails" if crate::shell::lock::input_locked() => {
+                EchoMessage::method_return(message_id, json!({ "thumbnails": [] }))
+            }
             "GetWindowThumbnails" => match crate::shell::thumbnails::parse_request(&msg.body) {
                 Ok((ids, bounds)) => {
                     let started = std::time::Instant::now();
@@ -1346,6 +1741,57 @@ impl GeckoEchoService {
                 }),
             ),
 
+            // The title bars' frost (shell/frost.rs): off draws the flat bar
+            // (F0), wallpaper frosts the desktop (F1); `full` is F2's, reserved
+            // and the same as wallpaper for now. For the suites and the fps
+            // comparison; echo-cli only (no bridge entry).
+            "SetFrost" => match msg.body.get("mode").and_then(Value::as_str).and_then(crate::shell::frost::Mode::parse) {
+                Some(mode) => {
+                    crate::shell::frost::set_mode(mode);
+                    EchoMessage::method_return(message_id, json!({ "ok": true, "mode": mode.as_str() }))
+                }
+                None => EchoMessage::method_error(message_id, "mode must be \"off\" or \"wallpaper\""),
+            },
+            "GetFrostState" => EchoMessage::method_return(message_id, crate::shell::frost::state_json()),
+
+            // The lock screen (shell/lock.rs; plan and contracts in
+            // docs/internal/pyxis-glass-and-lock-plan.md). `Lock` locks the
+            // screen now (input at once, the picture on the compositor
+            // thread's next pass) and Evo then tells Echo's session service.
+            // Unlocking is not here: only a verified `LockChanged` from Echo
+            // unlocks, and nothing in this table can.
+            "Lock" => {
+                crate::shell::lock::request_lock(crate::shell::lock::Source::Request);
+                EchoMessage::method_return(message_id, json!({ "ok": true }))
+            }
+            // Lock after this many idle seconds (no key or pointer input);
+            // 0 is never. Bloom sends it from `pyxis.lock.after`.
+            "SetIdleLock" => match crate::shell::lock::parse_idle_seconds(&msg.body) {
+                Ok(seconds) => {
+                    crate::shell::lock::set_idle_lock(seconds);
+                    EchoMessage::method_return(message_id, json!({ "ok": true, "seconds": seconds }))
+                }
+                Err(e) => {
+                    warn!("SetIdleLock: {}", e);
+                    EchoMessage::method_error(message_id, &e)
+                }
+            },
+            // Where the unlock's Clear focuses from: the password field's
+            // centre, output-logical px. Bloom sends it as the field moves.
+            "SetLockOrigin" => match crate::shell::lock::parse_origin(&msg.body) {
+                Ok((x, y)) => {
+                    crate::shell::lock::set_origin(x, y);
+                    EchoMessage::method_return(message_id, json!({ "ok": true, "x": x, "y": y }))
+                }
+                Err(e) => {
+                    warn!("SetLockOrigin: {}", e);
+                    EchoMessage::method_error(message_id, &e)
+                }
+            },
+            // For the suites (echo-cli only, no bridge entry): whether the
+            // screen is locked and what the lock has seen and drawn.
+            "GetLockState" => EchoMessage::method_return(message_id, crate::shell::lock::state_json()),
+
             // Lumen on or off (off, every effect draws its plain fallback:
             // genie-lite for minimize), and whether its program built, how
             // many frames went through each effect, each effect's last
@@ -1454,6 +1900,33 @@ impl GeckoEchoService {
                 message_id,
                 &format!("{method} is not implemented: workspaces are not real yet"),
             ),
+
+            "GetOutputs" => {
+                let outputs = get_outputs_snapshot();
+                EchoMessage::method_return(message_id, json!({ "outputs": outputs }))
+            }
+
+            "SetOutputConfig" => match apply_output_config_request(&msg.body) {
+                Ok(updated) => {
+                    pending_window_actions.write().push(PendingWindowAction {
+                        window_id: 0,
+                        action: WindowAction::ApplyOutputConfigs,
+                    });
+                    let outputs = get_outputs_snapshot();
+                    info!(
+                        "SetOutputConfig: {} {}x{} scale={} ({}, {})",
+                        updated.name, updated.width, updated.height, updated.scale, updated.x, updated.y
+                    );
+                    EchoMessage::method_return(
+                        message_id,
+                        json!({ "ok": true, "output": updated, "outputs": outputs }),
+                    )
+                }
+                Err(e) => {
+                    warn!("SetOutputConfig: {}", e);
+                    EchoMessage::method_error(message_id, &e)
+                }
+            },
 
             _ => {
                 warn!("Unhandled method call: {}", method);
@@ -1676,6 +2149,17 @@ impl GeckoEchoService {
                     }],
                 },
                 MethodDefinition {
+                    name: "SetAppIdentity".to_string(),
+                    input_args: vec![
+                        ArgumentDefinition { name: "apps".to_string(), arg_type: "a(ssss)".to_string() },
+                        ArgumentDefinition { name: "dark".to_string(), arg_type: "b".to_string() },
+                    ],
+                    output_args: vec![ArgumentDefinition {
+                        name: "ok".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
                     name: "SetOverlayFocus".to_string(),
                     input_args: vec![ArgumentDefinition {
                         name: "focused".to_string(),
@@ -1732,6 +2216,62 @@ impl GeckoEchoService {
                         name: "active".to_string(),
                         arg_type: "u".to_string(),
                     }],
+                },
+                MethodDefinition {
+                    name: "GetOutputs".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition {
+                        name: "outputs".to_string(),
+                        arg_type: "a(ssiiidii)".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "SetOutputConfig".to_string(),
+                    input_args: vec![
+                        ArgumentDefinition { name: "name".to_string(), arg_type: "s".to_string() },
+                        ArgumentDefinition { name: "width".to_string(), arg_type: "i".to_string() },
+                        ArgumentDefinition { name: "height".to_string(), arg_type: "i".to_string() },
+                        ArgumentDefinition { name: "scale".to_string(), arg_type: "d".to_string() },
+                        ArgumentDefinition { name: "x".to_string(), arg_type: "i".to_string() },
+                        ArgumentDefinition { name: "y".to_string(), arg_type: "i".to_string() },
+                    ],
+                    output_args: vec![ArgumentDefinition {
+                        name: "ok".to_string(),
+                        arg_type: "b".to_string(),
+                    }],
+                },
+                MethodDefinition {
+                    name: "Lock".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition { name: "ok".to_string(), arg_type: "b".to_string() }],
+                },
+                MethodDefinition {
+                    name: "SetIdleLock".to_string(),
+                    input_args: vec![ArgumentDefinition { name: "seconds".to_string(), arg_type: "u".to_string() }],
+                    output_args: vec![ArgumentDefinition { name: "ok".to_string(), arg_type: "b".to_string() }],
+                },
+                MethodDefinition {
+                    name: "SetLockOrigin".to_string(),
+                    input_args: vec![
+                        ArgumentDefinition { name: "x".to_string(), arg_type: "d".to_string() },
+                        ArgumentDefinition { name: "y".to_string(), arg_type: "d".to_string() },
+                    ],
+                    output_args: vec![ArgumentDefinition { name: "ok".to_string(), arg_type: "b".to_string() }],
+                },
+                MethodDefinition {
+                    name: "GetLockState".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition { name: "locked".to_string(), arg_type: "b".to_string() }],
+                },
+                MethodDefinition {
+                    name: "SetFrost".to_string(),
+                    input_args: vec![ArgumentDefinition { name: "mode".to_string(), arg_type: "s".to_string() }],
+                    output_args: vec![ArgumentDefinition { name: "ok".to_string(), arg_type: "b".to_string() }],
+                },
+                MethodDefinition {
+                    name: "GetFrostState".to_string(),
+                    input_args: vec![],
+                    output_args: vec![ArgumentDefinition { name: "mode".to_string(), arg_type: "s".to_string() }],
                 },
                 MethodDefinition {
                     name: "SetLumen".to_string(),
@@ -2040,6 +2580,13 @@ impl GeckoEchoService {
                         },
                     ],
                 },
+                SignalDefinition {
+                    name: "OutputsChanged".to_string(),
+                    arguments: vec![ArgumentDefinition {
+                        name: "outputs".to_string(),
+                        arg_type: "a(ssiiidii)".to_string(),
+                    }],
+                },
             ],
             properties: vec![],
         }
@@ -2081,6 +2628,50 @@ fn bind_surface_body(app_id: &str, surface_id: u32, pid: Option<u32>) -> Value {
         body["pid"] = json!(pid);
     }
     body
+}
+
+fn format_list_windows_json(windows_list: &[WindowInfo]) -> Value {
+    let window_list: Vec<Value> = windows_list
+        .iter()
+        .map(|w| {
+            json!({
+                "window_id": w.window_id,
+                "app_id": w.app_id,
+                "width": w.width,
+                "height": w.height,
+                "x": w.x,
+                "y": w.y,
+                "focused": w.focused,
+                "visible": w.visible,
+                "minimized": w.minimized,
+                "maximized": w.maximized,
+                "fullscreen": w.fullscreen,
+                "busy": w.busy,
+                "title_label": w.title_label,
+            })
+        })
+        .collect();
+    json!({ "windows": window_list })
+}
+
+#[cfg(test)]
+pub(crate) struct TestEchoSpy {
+    rx: mpsc::Receiver<EchoCommand>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+#[cfg(test)]
+impl TestEchoSpy {
+    /// Drain any queued `EmitSignal` commands as `(signal_name, args)` pairs.
+    pub(crate) fn drain_signals(&mut self) -> Vec<(String, Value)> {
+        let mut signals = Vec::new();
+        while let Ok(cmd) = self.rx.try_recv() {
+            if let EchoCommand::EmitSignal { signal_name, args } = cmd {
+                signals.push((signal_name, args));
+            }
+        }
+        signals
+    }
 }
 
 fn now_ms() -> u64 {
@@ -2230,6 +2821,83 @@ mod tests {
         assert_eq!(again["body"]["name"], "org.geckoOS.evo");
     }
 
+    /// The broker hears `LockChanged` off the bus: a lock locks, a forged
+    /// unlock is refused and counted, and the real one is queued for the
+    /// compositor thread's tick. The wiring between the socket and the lock's
+    /// state machine, which the state machine's own tests can't see.
+    // The guard serializes tests that touch the process-wide lock; this test
+    // runs on one thread, so holding it across awaits cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn broker_feeds_lock_changed_to_the_lock() {
+        use crate::shell::lock;
+        let _g = lock::GLOBAL_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        lock::test_reset();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("session.key");
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        std::fs::write(&key_file, key.iter().map(|b| format!("{b:02x}")).collect::<String>()).unwrap();
+        std::env::set_var("PYXIS_SESSION_KEY", &key_file);
+
+        let path = dir.path().join("echo.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (_command_tx, command_rx) = mpsc::channel(8);
+        tokio::spawn(GeckoEchoService::echo_broker_loop(
+            command_rx,
+            path.clone(),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let (mut daemon, _) = listener.accept().await.unwrap();
+        read_frame(&mut daemon).await;
+        write_frame(&mut daemon, &frame("METHOD_RETURN", json!({}))).await;
+
+        let signal = |body: Value| {
+            let mut f = frame(
+                "SIGNAL",
+                json!({ "interface": "org.geckoOS.session", "method": "LockChanged" }),
+            );
+            f["body"] = body;
+            f
+        };
+        async fn until(what: &str, mut done: impl FnMut() -> bool) {
+            for _ in 0..200 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("never happened: {what}");
+        }
+        let refused = || lock::state_json()["refused_macs"].as_u64().unwrap();
+
+        write_frame(&mut daemon, &signal(json!({ "locked": true, "seq": 10, "mac": "" }))).await;
+        until("locked", lock::input_locked).await;
+        lock::tick();
+
+        write_frame(&mut daemon, &signal(json!({ "locked": false, "seq": 99, "mac": "00".repeat(32) }))).await;
+        until("the forgery counted", || refused() == 1).await;
+        assert!(lock::input_locked(), "a forged unlock leaves it locked");
+
+        // Another interface's LockChanged is nobody's business.
+        let mut other = frame("SIGNAL", json!({ "interface": "org.geckoOS.other", "method": "LockChanged" }));
+        other["body"] = json!({ "locked": false, "seq": 100, "mac": "00" });
+        write_frame(&mut daemon, &other).await;
+
+        let good = lock::mac_for(&key, false, 100);
+        write_frame(&mut daemon, &signal(json!({ "locked": false, "seq": 100, "mac": good }))).await;
+        until("the unlock is queued", || lock::state_json()["last_seq"] == 100).await;
+        assert_eq!(refused(), 1, "the other interface's signal was not counted");
+        assert!(lock::tick().begin_unlock.is_some(), "the next compositor pass opens it");
+        assert!(!lock::input_locked());
+        lock::test_reset();
+    }
+
     /// A frame that arrives in pieces, with a signal of Evo's sent while it
     /// is half read. Reading inside the broker's `select!` lost the half that
     /// was read when the signal won, so the next "length" came from the middle
@@ -2322,11 +2990,86 @@ mod tests {
             y: 50,
             focused: true,
             visible: true,
+            minimized: false,
+            maximized: true,
+            fullscreen: false,
+            busy: true,
+            title_label: "Notes · Groceries".to_string(),
         };
 
         let json = serde_json::to_string(&window).unwrap();
         let deserialized: WindowInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.window_id, window.window_id);
         assert_eq!(deserialized.app_id, window.app_id);
+        assert!(!deserialized.minimized);
+        assert!(deserialized.maximized);
+        assert!(!deserialized.fullscreen);
+
+        let list_payload = format_list_windows_json(&[window]);
+        let item = &list_payload["windows"][0];
+        assert_eq!(item["minimized"], false);
+        assert_eq!(item["maximized"], true);
+        assert_eq!(item["fullscreen"], false);
+    }
+
+    #[test]
+    fn output_config_get_and_update_validates_fields() {
+        let initial = get_outputs_snapshot();
+        assert!(!initial.is_empty());
+        let name = initial[0].name.clone();
+
+        // Reject out-of-range scale.
+        assert!(apply_output_config_request(&json!({ "name": name, "scale": 9.0 })).is_err());
+
+        // Apply valid resolution, scale, and arrangement.
+        let updated = apply_output_config_request(&json!({
+            "name": name,
+            "width": 2560,
+            "height": 1440,
+            "scale": 1.5,
+            "x": 1920,
+            "y": 0
+        }))
+        .unwrap();
+        assert_eq!(updated.width, 2560);
+        assert_eq!(updated.height, 1440);
+        assert!((updated.scale - 1.5).abs() < f64::EPSILON);
+        assert_eq!(updated.x, 1920);
+        assert_eq!(updated.y, 0);
+
+        // Restore defaults so parallel tests see clean values.
+        let _ = apply_output_config_request(&json!({
+            "name": updated.name,
+            "width": 1920,
+            "height": 1080,
+            "scale": 1.0,
+            "x": 0,
+            "y": 0
+        }));
+    }
+
+    #[test]
+    fn persisted_output_config_round_trips_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("displays.json");
+        let cfg = OutputConfigInfo {
+            name: "eDP-1".to_string(),
+            description: "Built-in Display".to_string(),
+            width: 2560,
+            height: 1440,
+            refresh_mhz: 60000,
+            scale: 1.5,
+            x: 1920,
+            y: 120,
+            modes: vec![],
+        };
+        save_persisted_output_config_at(&file, &cfg).unwrap();
+        let loaded = load_persisted_output_configs_at(&file);
+        let saved = loaded.get("eDP-1").expect("eDP-1 persisted");
+        assert_eq!(saved.width, 2560);
+        assert_eq!(saved.height, 1440);
+        assert!((saved.scale - 1.5).abs() < f64::EPSILON);
+        assert_eq!(saved.x, 1920);
+        assert_eq!(saved.y, 120);
     }
 }

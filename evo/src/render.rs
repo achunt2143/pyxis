@@ -38,7 +38,7 @@ use crate::{
         transform::{wrap_all, Transformed},
     },
     drawing::{PointerRenderElement, CLEAR_COLOR, CLEAR_COLOR_FULLSCREEN},
-    shell::{FullscreenSurface, WindowElement, WindowRenderElement},
+    shell::{self, FullscreenSurface, WindowElement, WindowRenderElement},
 };
 
 smithay::backend::renderer::element::render_elements! {
@@ -265,6 +265,10 @@ where
         let frame = Rectangle::new(location, window.geometry().size);
         let render_origin = location - window.geometry().loc - output_geo.loc;
         let physical_origin = render_origin.to_physical_precise_round(scale);
+        // Where the frame sits on the output: the bar's frost is a crop of the
+        // desktop at that place, in whatever coordinates it is later drawn
+        // (a pose, a snapshot).
+        window.set_frost_anchor(physical_origin + SpaceElement::geometry(&window.0).loc.to_physical_precise_round(scale));
         let pose = window.animation_transform(now, frame);
         // Another kind of animation has the window (open, minimize): it wins,
         // and the geometry transition is moot.
@@ -415,6 +419,12 @@ where
     // counter open.
     geometry::sweep(anim::now());
 
+    // The screen is locked: nothing but the lock page is drawn, whatever else
+    // is in the Space (shell/lock.rs).
+    if shell::lock::drawing_locked() {
+        return locked_elements(output, space, custom_elements, renderer);
+    }
+
     // A window entering or leaving fullscreen goes through the normal path
     // (which draws the whole stack, the overlay above it) until its
     // transition ends, then hands over to the exclusive one.
@@ -424,9 +434,38 @@ where
         .and_then(|f| f.get())
         .filter(|w| !w.geometry_animating())
     {
-        let scale = output.current_scale().fractional_scale().into();
+        let output_scale = output.current_scale().fractional_scale();
+        let scale = Scale::from(output_scale);
         let window_render_elements: Vec<WindowRenderElement<R>> =
             AsRenderElements::<R>::render_elements(&window, renderer, (0, 0).into(), scale, 1.0);
+
+        // Render `wlr-layer-shell` `Layer::Overlay` surfaces above the fullscreen
+        // window (and the Pyxis shell overlay below), so lock overlays, OSDs,
+        // and external layer-shell popups stay visible over fullscreen video.
+        let layer_overlay_elements: Vec<OutputRenderElements<R, WindowRenderElement<R>>> = {
+            let layer_map = layer_map_for_output(output);
+            layer_map
+                .layers_on(Layer::Overlay)
+                .rev()
+                .filter_map(|surface| {
+                    layer_map
+                        .layer_geometry(surface)
+                        .map(|geo| (geo.loc, surface))
+                })
+                .flat_map(|(loc, surface)| {
+                    AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                        surface,
+                        renderer,
+                        loc.to_physical_precise_round(output_scale),
+                        scale,
+                        1.0,
+                    )
+                    .into_iter()
+                    .map(|e| OutputRenderElements::Space(SpaceRenderElements::Surface(e)))
+                    .collect::<Vec<_>>()
+                })
+                .collect()
+        };
 
         // The shell overlay (toasts) is still drawn, above the app: Evo's
         // exclusive fullscreen would otherwise hide every notification for as
@@ -449,10 +488,11 @@ where
             })
             .unwrap_or_default();
 
-        // Front to back: pointer, overlay, then the fullscreen window.
+        // Front to back: pointer, wlr-layer-shell Overlay, shell overlay, then fullscreen window.
         let elements = custom_elements
             .into_iter()
             .map(OutputRenderElements::from)
+            .chain(layer_overlay_elements)
             .chain(
                 overlay_render_elements
                     .into_iter()
@@ -480,6 +520,64 @@ where
         (output_render_elements, CLEAR_COLOR)
     }
 }
+
+/// What a locked screen draws, front to back: the cursor, the overlay (Bloom's
+/// lock page) and, for the 600 ms of the Veil, a ghost of each window that was
+/// on screen blurring away, all over solid black.
+///
+/// **This is the fail-closed half of the lock**, and it is deliberately not
+/// built from `stack_elements`: it never walks the Space's app windows, layer
+/// surfaces or popups, so nothing that is added to them later can leak into a
+/// locked frame. The only app pixels are the Veil's ghosts, and every other
+/// kind of ghost (a window closing as the lock began) is dropped here
+/// (`retain_kind`) rather than drawn. The custom elements are filtered to the
+/// pointer: a drag icon is an app's surface. With no overlay window the frame
+/// is the cursor over black, and stays so until one maps.
+fn locked_elements<R>(
+    output: &Output,
+    space: &Space<WindowElement>,
+    custom_elements: impl IntoIterator<Item = CustomRenderElements<R>>,
+    renderer: &mut R,
+) -> (Vec<OutputRenderElements<R, WindowRenderElement<R>>>, Color32F)
+where
+    R: Renderer + ImportAll + ImportMem + GlesAccess,
+    R::TextureId: Clone + Texture + Send + 'static,
+{
+    let scale = output.current_scale().fractional_scale();
+    let output_origin = space.output_geometry(output).map(|g| g.loc).unwrap_or_default();
+
+    let mut elements: Vec<OutputRenderElements<R, WindowRenderElement<R>>> = custom_elements
+        .into_iter()
+        .filter(|e| matches!(e, CustomRenderElements::Pointer(_)))
+        .map(OutputRenderElements::from)
+        .collect();
+
+    // The overlay, positioned as the fullscreen branch positions it.
+    if let Some(overlay) = space.elements().find(|w| w.is_overlay()) {
+        if let Some(location) = space.element_location(overlay) {
+            let location = location - overlay.geometry().loc - output_origin;
+            let drawn: Vec<WindowRenderElement<R>> = AsRenderElements::<R>::render_elements(
+                overlay,
+                renderer,
+                location.to_physical_precise_round(Scale::from(scale)),
+                Scale::from(scale),
+                1.0,
+            );
+            elements.extend(drawn.into_iter().map(|e| OutputRenderElements::Window(Wrap::from(e))));
+        }
+    }
+
+    // The Veil, beneath the overlay: front-most first, no shadows.
+    ghosts::retain_kind(anim::AnimKind::Veil);
+    for ghost in ghosts::draw_all(renderer, output_origin, scale, anim::now()) {
+        elements.extend(ghost.elements.into_iter().map(OutputRenderElements::Ghost));
+    }
+
+    (elements, LOCKED_CLEAR_COLOR)
+}
+
+/// Opaque black: what the locked screen is drawn over.
+const LOCKED_CLEAR_COLOR: Color32F = Color32F::new(0.0, 0.0, 0.0, 1.0);
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_output<'a, 'd, R>(

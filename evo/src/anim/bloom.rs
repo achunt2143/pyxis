@@ -34,7 +34,7 @@ use super::{
     shader::{self, BloomInner, BloomParams, BloomSurface, GlesAccess, GlowElement},
     spec,
 };
-use crate::shell::{ssd::DecorationRenderElement, WindowRenderElement};
+use crate::shell::{identity::Radii, ssd::DecorationRenderElement, WindowRenderElement};
 
 /// A neutral cool white, for an app whose accent Evo has not been told (a
 /// window only now appearing has no picture to take an average from).
@@ -51,16 +51,27 @@ pub struct BloomFx {
     start: Duration,
     duration: Duration,
     accent: [f32; 3],
-    /// The corner radius the window lands on (its frame's, 0 when square).
-    radius_to: f64,
+    /// The corners the window lands on (its frame's, square when maximized).
+    radius_to: Radii,
+    style: Style,
+}
+
+/// Which look the live-surface shader is given: an opening window's, or the
+/// unlock's focus pull (`anim::clear`), which is only the blur.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Style {
+    Open,
+    Clear,
 }
 
 /// Bloom's look at one instant, in logical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BloomLook {
+    /// Which effect this frame counts for (`Bloom`, or `Clear`).
+    pub effect: Effect,
     pub progress: f64,
     pub blur: f64,
-    pub radius: f64,
+    pub radii: Radii,
     pub tint: f64,
     pub glow: f64,
     pub accent: [f32; 3],
@@ -69,12 +80,22 @@ pub struct BloomLook {
 impl BloomFx {
     /// `None` unless Bloom draws in these settings: in reduced mode the open
     /// is opacity only, and off is nothing.
-    pub fn new(settings: &AnimationSettings, now: Duration, accent: [f32; 3], radius_to: f64) -> Option<Self> {
+    pub fn new(settings: &AnimationSettings, now: Duration, accent: [f32; 3], radius_to: Radii) -> Option<Self> {
         if !settings.motion() {
             return None;
         }
         let duration = settings.duration(spec::BLOOM)?;
-        Some(Self { start: now, duration, accent, radius_to })
+        Some(Self { start: now, duration, accent, radius_to, style: Style::Open })
+    }
+
+    /// The unlock's focus pull on a window that keeps its own corners
+    /// (`anim::clear`): `None` in reduced and off, as `new`.
+    pub fn clear(settings: &AnimationSettings, now: Duration, radius_to: Radii) -> Option<Self> {
+        if !settings.motion() {
+            return None;
+        }
+        let duration = settings.duration(spec::CLEAR)?;
+        Some(Self { start: now, duration, accent: NEUTRAL_ACCENT, radius_to, style: Style::Clear })
     }
 
     pub fn progress(&self, now: Duration) -> f64 {
@@ -86,21 +107,42 @@ impl BloomFx {
     }
 
     pub fn look(&self, now: Duration) -> BloomLook {
-        look_at(self.progress(now), self.radius_to, self.accent)
+        match self.style {
+            Style::Open => look_at(self.progress(now), self.radius_to, self.accent),
+            Style::Clear => clear_look_at(self.progress(now), self.radius_to),
+        }
+    }
+}
+
+/// The unlock's look at run progress `p`: the blur of `anim::clear`, the
+/// window's own corners throughout, no tint and no glow.
+pub fn clear_look_at(p: f64, radius_to: Radii) -> BloomLook {
+    let p = p.clamp(0.0, 1.0);
+    BloomLook {
+        effect: Effect::Clear,
+        progress: p,
+        blur: super::clear::blur_at(p),
+        radii: radius_to,
+        tint: 0.0,
+        glow: 0.0,
+        accent: NEUTRAL_ACCENT,
     }
 }
 
 /// Bloom's look at progress `p`. Pure, so the spec's numbers are tested here.
-pub fn look_at(p: f64, radius_to: f64, accent: [f32; 3]) -> BloomLook {
+pub fn look_at(p: f64, radius_to: Radii, accent: [f32; 3]) -> BloomLook {
     let p = p.clamp(0.0, 1.0);
     let rest = 1.0 - p;
     // Cubic out: blur is gone fast, the last of it slowly (a lens settling).
     let pull = rest * rest * rest;
     let tint_rest = (1.0 - p / spec::BLOOM_TINT_FRACTION).max(0.0);
     BloomLook {
+        effect: Effect::Bloom,
         progress: p,
         blur: spec::BLOOM_BLUR_PX * pull,
-        radius: radius_to + (spec::BLOOM_RADIUS_FROM - radius_to) * pull,
+        // Each corner from the wide start to its own: the sharp top-right
+        // corner of the waterdrop has the furthest to go.
+        radii: radius_to.mix(Radii::uniform(spec::BLOOM_RADIUS_FROM), pull),
         tint: spec::BLOOM_TINT * tint_rest * tint_rest,
         glow: spec::BLOOM_GLOW_ALPHA * (std::f64::consts::PI * p).sin().max(0.0),
         accent,
@@ -141,9 +183,9 @@ pub fn blurred_frames() -> u64 {
 
 /// One window drawn through Bloom's shader this frame.
 fn note_frame(look: &BloomLook, blurred: bool) {
-    lumen::count_frame(Effect::Bloom);
-    lumen::record_progress(Effect::Bloom, look.progress);
-    if blurred {
+    lumen::count_frame(look.effect);
+    lumen::record_progress(look.effect, look.progress);
+    if blurred && look.effect == Effect::Bloom {
         BLURRED_FRAMES.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -210,7 +252,7 @@ where
     let px = (scale.x + scale.y) / 2.0;
     let blur = if blur_enabled() && look.blur * px > BLUR_MIN_PX { look.blur * px } else { 0.0 };
     let params = BloomParams {
-        radius: look.radius * px,
+        radii: look.radii.scale(px),
         blur,
         tint: look.tint as f32,
         accent: look.accent,
@@ -241,6 +283,12 @@ where
                     );
                     return Some(WindowRenderElement::Decoration(DecorationRenderElement::Solid(solid)));
                 }
+                // The bar's frost is already soft: it takes the opening
+                // corners and no blur.
+                WindowRenderElement::Frost(f) => {
+                    let r = params.radii;
+                    return Some(WindowRenderElement::Frost(f.with_radii(Radii([r.top_left(), r.top_right(), 0.0, 0.0]))));
+                }
                 other => return Some(other),
             };
             Some(match BloomSurface::new(inner, programs.surface.clone(), scale, frame, params) {
@@ -255,6 +303,10 @@ where
 /// How visible the border's solid edges are at `look`: hidden until the
 /// corners are within a pixel or two of the frame's own, then faded in.
 pub fn border_alpha(look: &BloomLook) -> f32 {
+    // A window coming into focus keeps its corners, so its border is whole.
+    if look.effect == Effect::Clear {
+        return 1.0;
+    }
     // The share of the radius change still to go (the corners' cubic out):
     // the edges show from 8% left (about 2 px over the arcs) and are whole by
     // 2% (half a pixel).
@@ -284,66 +336,104 @@ mod tests {
     use super::*;
     use crate::anim::settings::Mode;
 
+    const W: Radii = Radii::FRAME;
+
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
     #[test]
     fn starts_soft_wide_tinted_and_dark_and_lands_plain() {
-        let start = look_at(0.0, 16.0, NEUTRAL_ACCENT);
+        let start = look_at(0.0, W, NEUTRAL_ACCENT);
         assert_eq!(start.blur, spec::BLOOM_BLUR_PX);
-        assert_eq!(start.radius, spec::BLOOM_RADIUS_FROM);
+        assert_eq!(start.radii, Radii::uniform(spec::BLOOM_RADIUS_FROM));
         assert_eq!(start.tint, spec::BLOOM_TINT);
         assert_eq!(start.glow, 0.0);
-        let end = look_at(1.0, 16.0, NEUTRAL_ACCENT);
-        assert_eq!((end.blur, end.radius, end.tint), (0.0, 16.0, 0.0));
+        let end = look_at(1.0, W, NEUTRAL_ACCENT);
+        assert_eq!((end.blur, end.radii, end.tint), (0.0, W, 0.0));
         assert!(end.glow.abs() < 1e-9);
     }
 
     #[test]
     fn blur_is_a_cubic_out_focus_pull() {
         // Most of the blur goes early: under half is left at a fifth of the way.
-        assert!(look_at(0.2, 16.0, NEUTRAL_ACCENT).blur < spec::BLOOM_BLUR_PX * 0.52);
+        assert!(look_at(0.2, W, NEUTRAL_ACCENT).blur < spec::BLOOM_BLUR_PX * 0.52);
         let mut last = f64::INFINITY;
         for i in 0..=20 {
-            let b = look_at(i as f64 / 20.0, 16.0, NEUTRAL_ACCENT).blur;
+            let b = look_at(i as f64 / 20.0, W, NEUTRAL_ACCENT).blur;
             assert!(b <= last, "blur never comes back");
             last = b;
         }
-        assert!(look_at(0.75, 16.0, NEUTRAL_ACCENT).blur < BLUR_MIN_PX, "sharp by three quarters");
+        assert!(look_at(0.75, W, NEUTRAL_ACCENT).blur < BLUR_MIN_PX, "sharp by three quarters");
     }
 
     #[test]
     fn tint_is_gone_by_half_way_and_glow_peaks_there() {
-        assert_eq!(look_at(0.5, 16.0, NEUTRAL_ACCENT).tint, 0.0);
-        assert!(look_at(0.25, 16.0, NEUTRAL_ACCENT).tint > 0.0);
-        let peak = look_at(0.5, 16.0, NEUTRAL_ACCENT).glow;
+        assert_eq!(look_at(0.5, W, NEUTRAL_ACCENT).tint, 0.0);
+        assert!(look_at(0.25, W, NEUTRAL_ACCENT).tint > 0.0);
+        let peak = look_at(0.5, W, NEUTRAL_ACCENT).glow;
         assert!((peak - spec::BLOOM_GLOW_ALPHA).abs() < 1e-9);
         for p in [0.1, 0.3, 0.7, 0.9] {
-            assert!(look_at(p, 16.0, NEUTRAL_ACCENT).glow < peak);
+            assert!(look_at(p, W, NEUTRAL_ACCENT).glow < peak);
         }
     }
 
     #[test]
     fn corners_land_on_the_frames_radius_even_square() {
-        assert_eq!(look_at(1.0, 0.0, NEUTRAL_ACCENT).radius, 0.0);
-        let mid = look_at(0.3, 0.0, NEUTRAL_ACCENT).radius;
+        assert!(look_at(1.0, Radii::SQUARE, NEUTRAL_ACCENT).radii.is_square());
+        let mid = look_at(0.3, Radii::SQUARE, NEUTRAL_ACCENT).radii.top_left();
         assert!(mid > 0.0 && mid < spec::BLOOM_RADIUS_FROM);
     }
 
     #[test]
+    fn corners_land_on_the_waterdrop_each_its_own() {
+        assert_eq!(look_at(1.0, W, NEUTRAL_ACCENT).radii, Radii([16.0, 4.0, 16.0, 16.0]));
+        let mid = look_at(0.5, W, NEUTRAL_ACCENT).radii;
+        assert!(mid.top_right() < mid.top_left(), "the sharp corner stays the sharpest");
+        assert!(mid.top_left() > 16.0 && mid.top_left() < spec::BLOOM_RADIUS_FROM);
+    }
+
+    #[test]
     fn border_fades_in_only_once_the_corners_have_landed() {
-        assert_eq!(border_alpha(&look_at(0.0, 16.0, NEUTRAL_ACCENT)), 0.0);
-        assert_eq!(border_alpha(&look_at(0.3, 16.0, NEUTRAL_ACCENT)), 0.0);
-        assert_eq!(border_alpha(&look_at(1.0, 16.0, NEUTRAL_ACCENT)), 1.0);
-        let late = border_alpha(&look_at(0.8, 16.0, NEUTRAL_ACCENT));
+        assert_eq!(border_alpha(&look_at(0.0, W, NEUTRAL_ACCENT)), 0.0);
+        assert_eq!(border_alpha(&look_at(0.3, W, NEUTRAL_ACCENT)), 0.0);
+        assert_eq!(border_alpha(&look_at(1.0, W, NEUTRAL_ACCENT)), 1.0);
+        let late = border_alpha(&look_at(0.8, W, NEUTRAL_ACCENT));
         assert!(late > 0.0 && late <= 1.0);
+    }
+
+    #[test]
+    fn clear_is_only_a_blur_on_the_windows_own_corners() {
+        let start = clear_look_at(0.0, W);
+        assert_eq!(start.blur, spec::CLEAR_BLUR_PX);
+        assert_eq!((start.tint, start.glow, start.radii), (0.0, 0.0, W));
+        assert_eq!(start.effect, Effect::Clear);
+        assert_eq!(border_alpha(&start), 1.0, "the border never waits on corners that never change");
+        let done = clear_look_at(0.85, Radii::SQUARE);
+        assert_eq!((done.blur, done.radii), (0.0, Radii::SQUARE));
+        assert!(clear_look_at(0.5, W).blur < clear_look_at(0.25, W).blur);
+    }
+
+    #[test]
+    fn clear_runs_on_its_own_clock_and_only_in_full_motion() {
+        let slow = AnimationSettings { mode: Mode::Full, scale: 10.0 };
+        let fx = BloomFx::clear(&slow, ms(1000), W).unwrap();
+        assert_eq!(fx.progress(ms(1000)), 0.0);
+        assert!((fx.progress(ms(1000) + spec::CLEAR * 5) - 0.5).abs() < 1e-9);
+        assert_eq!(fx.look(ms(1000)).blur, spec::CLEAR_BLUR_PX);
+        for s in [
+            AnimationSettings { mode: Mode::Reduced, scale: 1.0 },
+            AnimationSettings { mode: Mode::Off, scale: 1.0 },
+            AnimationSettings { mode: Mode::Full, scale: 0.0 },
+        ] {
+            assert!(BloomFx::clear(&s, ms(0), W).is_none());
+        }
     }
 
     #[test]
     fn progress_follows_the_scaled_clock() {
         let slow = AnimationSettings { mode: Mode::Full, scale: 10.0 };
-        let fx = BloomFx::new(&slow, ms(1000), NEUTRAL_ACCENT, 16.0).unwrap();
+        let fx = BloomFx::new(&slow, ms(1000), NEUTRAL_ACCENT, W).unwrap();
         assert_eq!(fx.progress(ms(1000)), 0.0);
         assert!((fx.progress(ms(1000) + spec::BLOOM * 5) - 0.5).abs() < 1e-9);
         assert_eq!(fx.progress(ms(1000) + spec::BLOOM * 20), 1.0);
@@ -363,8 +453,8 @@ mod tests {
         let off = AnimationSettings { mode: Mode::Off, scale: 1.0 };
         let zero = AnimationSettings { mode: Mode::Full, scale: 0.0 };
         for s in [reduced, off, zero] {
-            assert!(BloomFx::new(&s, ms(0), NEUTRAL_ACCENT, 16.0).is_none());
+            assert!(BloomFx::new(&s, ms(0), NEUTRAL_ACCENT, W).is_none());
         }
-        assert!(BloomFx::new(&AnimationSettings::default(), ms(0), NEUTRAL_ACCENT, 16.0).is_some());
+        assert!(BloomFx::new(&AnimationSettings::default(), ms(0), NEUTRAL_ACCENT, W).is_some());
     }
 }

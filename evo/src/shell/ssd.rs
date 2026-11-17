@@ -31,18 +31,25 @@ use tracing::{debug, info, warn};
 use crate::{state::Backend, EvoState};
 use super::{grabs::ResizeEdge, WindowElement};
 
-// === PYXIS DECORATION SHAPE COLORS ===
-// Matches Bloom's window-chrome design language (src/components/DesktopWindow.tsx):
-// red circle (close), blue square (maximize), yellow downward triangle (minimize),
-// on a translucent "glass" title bar with 16px rounded top corners.
-const CLOSE_RGB: [u8; 3] = [0xFF, 0x52, 0x52];
-const CLOSE_HOVER_RGB: [u8; 3] = [0xD3, 0x2F, 0x2F];
-const MAXIMIZE_RGB: [u8; 3] = [0x21, 0x96, 0xF3];
-const MAXIMIZE_HOVER_RGB: [u8; 3] = [0x19, 0x76, 0xD2];
-const MINIMIZE_RGB: [u8; 3] = [0xFF, 0xC1, 0x07];
-const MINIMIZE_HOVER_RGB: [u8; 3] = [0xFF, 0xB3, 0x00];
-const GLASS_RGBA: [u8; 4] = [0xFF, 0xFF, 0xFF, 0x33];
-const GLASS_CORNER_RADIUS: f32 = crate::anim::depth::FRAME_RADIUS as f32;
+// === PYXIS WINDOW CONTROLS ===
+// The remochi spinner's shapes, colours and outlines (shell/identity.rs):
+// circle (close), square (maximize), downward triangle (minimize), right to
+// left, each 14 px centred in its 32 px target. At rest, controls sit as
+// etched monochrome outlines (dark ink when focused, quiet ink when inactive);
+// hover reveals the Mochi spinner colour; a busy window runs the spinner in
+// the three slots (shell/busy.rs).
+use super::identity::{
+    BarColors, Icon, Radii, TitleLabel, SPINNER_BLUE, SPINNER_BLUE_OUTLINE, SPINNER_RED, SPINNER_RED_OUTLINE,
+    SPINNER_YELLOW, SPINNER_YELLOW_OUTLINE,
+};
+use super::busy::{self, Shape};
+
+/// The spinner's outline, and the inactive outline (a little heavier, as it
+/// carries the shape alone).
+const OUTLINE_PX: f32 = 1.2;
+const INACTIVE_OUTLINE_PX: f32 = 1.5;
+/// The frame's corners (the waterdrop), logical px.
+const FRAME_RADII: Radii = crate::anim::depth::FRAME_RADII;
 
 // === WINDOW BORDER (item #8: see overlapping windows) ===
 // A thin outer border, over the drop shadow (`anim::depth`) that gives windows
@@ -54,95 +61,45 @@ const BORDER_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
 /// Straight-alpha byte form of BORDER_COLOR for the rasterized corner arcs
 /// (0.55 * 255 ≈ 140). Black stays premultiply-safe.
 const BORDER_ALPHA_U8: u8 = 140;
-/// Corner-arc buffer size — matches the glass bar's top-corner radius so the
-/// border follows the same rounding.
-const BORDER_CORNER_SIZE: u32 = GLASS_CORNER_RADIUS as u32;
 
-// === TITLE TEXT (item #9: show the app name in the title bar) ===
-const TITLE_RGB: [u8; 3] = [0x1a, 0x1a, 0x1a];
-const TITLE_PX: f32 = 14.0;
+// === TITLE (item #9: show the app name in the title bar) ===
+const TITLE_PX: f32 = 13.0;
 const TITLE_PAD_LEFT: u32 = 10;
 const TITLE_GAP_BEFORE_BUTTONS: u32 = 10;
-/// Font shipped by create-rootfs.sh's `fonts-dejavu-core` package.
+/// Between the icon and the name, and around the dot before the document.
+const ICON_GAP: u32 = 8;
+/// Fonts shipped by create-rootfs.sh's `fonts-dejavu-core` package.
 const DEJAVU_SANS_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+const DEJAVU_SANS_BOLD_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+
+fn load_font(path: &str) -> Option<FontVec> {
+    match std::fs::read(path) {
+        Ok(bytes) => match FontVec::try_from_vec(bytes) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!("SSD: failed to parse title font {}: {}", path, e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("SSD: title font {} unavailable: {}", path, e);
+            None
+        }
+    }
+}
 
 /// The title-bar font, loaded once from the rootfs. `None` (missing/unparseable
 /// font) degrades to a title bar without text rather than failing — Evo must
 /// never panic over a cosmetic decoration.
 fn title_font() -> Option<&'static FontVec> {
     static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
-    FONT.get_or_init(|| match std::fs::read(DEJAVU_SANS_PATH) {
-        Ok(bytes) => match FontVec::try_from_vec(bytes) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                warn!("SSD: failed to parse title font {}: {}", DEJAVU_SANS_PATH, e);
-                None
-            }
-        },
-        Err(e) => {
-            warn!("SSD: title font {} unavailable: {}", DEJAVU_SANS_PATH, e);
-            None
-        }
-    })
-    .as_ref()
+    FONT.get_or_init(|| load_font(DEJAVU_SANS_PATH)).as_ref()
 }
 
-/// Rasterize `text` into a straight-alpha ARGB8888 buffer (matching the glass
-/// bar's convention — see `put_pixel`), left-to-right, clipped to `max_width`
-/// pixels (trailing glyphs are dropped rather than squeezed). Returns
-/// `(width, height, pixels)` or `None` when there's no font or nothing to draw.
-fn rasterize_text(text: &str, max_width: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let text = text.trim();
-    if text.is_empty() || max_width == 0 {
-        return None;
-    }
-    let font = title_font()?;
-    let scale = PxScale::from(TITLE_PX);
-    let scaled = font.as_scaled(scale);
-    let ascent = scaled.ascent();
-    let line_h = (scaled.ascent() - scaled.descent()).ceil().max(1.0) as u32;
-
-    let mut positioned = Vec::new();
-    let mut caret = 0.0f32;
-    let mut prev = None;
-    for c in text.chars() {
-        let gid = font.glyph_id(c);
-        if let Some(p) = prev {
-            caret += scaled.kern(p, gid);
-        }
-        let advance = scaled.h_advance(gid);
-        if !positioned.is_empty() && (caret + advance).ceil() as u32 > max_width {
-            break;
-        }
-        positioned.push(gid.with_scale_and_position(scale, point(caret, ascent)));
-        caret += advance;
-        prev = Some(gid);
-    }
-
-    let width = (caret.ceil() as u32).clamp(1, max_width);
-    let mut buf = vec![0u8; (width * line_h * 4) as usize];
-    for glyph in positioned {
-        if let Some(outline) = font.outline_glyph(glyph) {
-            let bounds = outline.px_bounds();
-            outline.draw(|gx, gy, coverage| {
-                let px = bounds.min.x as i32 + gx as i32;
-                let py = bounds.min.y as i32 + gy as i32;
-                if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < line_h {
-                    let a = (coverage * 255.0).round() as u8;
-                    if a > 0 {
-                        put_pixel(
-                            &mut buf,
-                            width,
-                            px as u32,
-                            py as u32,
-                            [TITLE_RGB[0], TITLE_RGB[1], TITLE_RGB[2], a],
-                        );
-                    }
-                }
-            });
-        }
-    }
-    Some((width, line_h, buf))
+/// The app name's font: bold, or the regular one when bold is missing.
+fn name_font() -> Option<&'static FontVec> {
+    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+    FONT.get_or_init(|| load_font(DEJAVU_SANS_BOLD_PATH)).as_ref().or_else(title_font)
 }
 
 /// Writes one BGRA8888-in-memory pixel (matching `Fourcc::Argb8888`'s byte
@@ -155,84 +112,422 @@ fn put_pixel(buf: &mut [u8], stride: u32, x: u32, y: u32, rgba: [u8; 4]) {
     buf[idx + 3] = rgba[3]; // A
 }
 
-/// Rasterizes a filled circle (transparent outside) into an RGBA buffer.
-fn rasterize_circle(size: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let mut buf = vec![0u8; (size * size * 4) as usize];
-    let center = size as f32 / 2.0;
-    let radius = size as f32 / 2.0 - 2.0;
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 + 0.5 - center;
-            let dy = y as f32 + 0.5 - center;
-            if dx * dx + dy * dy <= radius * radius {
-                put_pixel(&mut buf, size, x, y, [rgb[0], rgb[1], rgb[2], 0xFF]);
-            }
-        }
+/// Lays `rgba` (straight alpha, its alpha times `cover`) over the pixel at
+/// `(x, y)`: source-over, so shapes and text can overlap cleanly.
+fn blend_pixel(buf: &mut [u8], stride: u32, x: u32, y: u32, rgba: [u8; 4], cover: f32) {
+    let sa = rgba[3] as f32 / 255.0 * cover.clamp(0.0, 1.0);
+    if sa <= 0.0 {
+        return;
     }
-    buf
+    let idx = ((y * stride + x) * 4) as usize;
+    let da = buf[idx + 3] as f32 / 255.0;
+    let oa = sa + da * (1.0 - sa);
+    let mix = |s: u8, d: u8| ((s as f32 * sa + d as f32 * da * (1.0 - sa)) / oa).round().clamp(0.0, 255.0) as u8;
+    let (b, g, r) = (buf[idx], buf[idx + 1], buf[idx + 2]);
+    buf[idx] = mix(rgba[2], b);
+    buf[idx + 1] = mix(rgba[1], g);
+    buf[idx + 2] = mix(rgba[0], r);
+    buf[idx + 3] = (oa * 255.0).round() as u8;
 }
 
-/// Rasterizes a downward-pointing equilateral-ish triangle (transparent
-/// outside), matching Bloom's minimize-button glyph orientation.
-fn rasterize_triangle_down(size: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let mut buf = vec![0u8; (size * size * 4) as usize];
-    let margin = size as f32 * 0.22;
-    let top_left = (margin, margin);
-    let top_right = (size as f32 - margin, margin);
-    let apex = (size as f32 / 2.0, size as f32 - margin);
-
-    fn edge(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
-        (p.0 - a.0) * (b.1 - a.1) - (p.1 - a.1) * (b.0 - a.0)
-    }
-
-    for y in 0..size {
-        for x in 0..size {
-            let p = (x as f32 + 0.5, y as f32 + 0.5);
-            let d1 = edge(top_left, top_right, p);
-            let d2 = edge(top_right, apex, p);
-            let d3 = edge(apex, top_left, p);
-            let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-            let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-            if !(has_neg && has_pos) {
-                put_pixel(&mut buf, size, x, y, [rgb[0], rgb[1], rgb[2], 0xFF]);
-            }
+/// Draws `text` into `buf` (`stride`×`height`) from `x`, vertically centred,
+/// stopping before a glyph would cross `max_x` (trailing glyphs are dropped
+/// rather than squeezed). Returns where the caret ended.
+fn draw_text(buf: &mut [u8], stride: u32, height: u32, x: f32, text: &str, font: &FontVec, rgba: [u8; 4], max_x: u32) -> f32 {
+    let scale = PxScale::from(TITLE_PX);
+    let scaled = font.as_scaled(scale);
+    let line_h = scaled.ascent() - scaled.descent();
+    let baseline = ((height as f32 - line_h) / 2.0 + scaled.ascent()).round();
+    let mut caret = x;
+    let mut prev = None;
+    for c in text.chars() {
+        let gid = font.glyph_id(c);
+        if let Some(p) = prev {
+            caret += scaled.kern(p, gid);
         }
+        let advance = scaled.h_advance(gid);
+        if (caret + advance).ceil() as u32 > max_x {
+            break;
+        }
+        if let Some(outline) = font.outline_glyph(gid.with_scale_and_position(scale, point(caret, baseline))) {
+            let bounds = outline.px_bounds();
+            outline.draw(|gx, gy, coverage| {
+                let px = bounds.min.x as i32 + gx as i32;
+                let py = bounds.min.y as i32 + gy as i32;
+                if px >= 0 && py >= 0 && (px as u32) < stride && (py as u32) < height {
+                    blend_pixel(buf, stride, px as u32, py as u32, rgba, coverage);
+                }
+            });
+        }
+        caret += advance;
+        prev = Some(gid);
     }
-    buf
+    caret
 }
 
-/// Rasterizes a translucent "glass" bar with rounded top corners only
-/// (the bottom edge meets the client area, so it stays square).
-fn rasterize_glass_bar(width: u32, height: u32, radius: f32, rgba: [u8; 4]) -> Vec<u8> {
+/// The width `text` takes in `font`, px.
+fn text_width(text: &str, font: &FontVec) -> f32 {
+    let scaled = font.as_scaled(PxScale::from(TITLE_PX));
+    let mut w = 0.0;
+    let mut prev = None;
+    for c in text.chars() {
+        let gid = font.glyph_id(c);
+        if let Some(p) = prev {
+            w += scaled.kern(p, gid);
+        }
+        w += scaled.h_advance(gid);
+        prev = Some(gid);
+    }
+    w
+}
+
+/// What the title bar's label shows, and in what colours.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TitleSource {
+    pub label: TitleLabel,
+    pub icon: Option<std::sync::Arc<Icon>>,
+    pub colors: BarColors,
+}
+
+impl Default for TitleSource {
+    fn default() -> Self {
+        Self {
+            label: TitleLabel::default(),
+            icon: None,
+            colors: super::identity::bar_colors(None, false, super::identity::material(false)),
+        }
+    }
+}
+
+/// Rasterize the label (icon, bold name, quiet document title; or the plain
+/// title) into a straight-alpha buffer `HEADER_BAR_HEIGHT` tall, at most
+/// `max_width` wide. `None` when there is nothing to draw.
+fn rasterize_label(src: &TitleSource, max_width: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if max_width == 0 {
+        return None;
+    }
+    let height = HEADER_BAR_HEIGHT as u32;
+    let ink = src.colors.ink;
+    let quiet = src.colors.quiet;
+    // How wide it will be, so the buffer is no wider than its contents.
+    let (width, plain) = match &src.label.name {
+        Some(name) => {
+            let mut w = 0.0;
+            if src.icon.is_some() {
+                w += (super::identity::ICON_PX + ICON_GAP) as f32;
+            }
+            w += name_font().map_or(0.0, |f| text_width(name, f));
+            if let Some(doc) = &src.label.doc {
+                w += title_font().map_or(0.0, |f| text_width(&format!("  ·  {doc}"), f));
+            }
+            (w, false)
+        }
+        None => {
+            let t = src.label.plain.trim();
+            if t.is_empty() {
+                return None;
+            }
+            (title_font().map_or(0.0, |f| text_width(t, f)), true)
+        }
+    };
+    let width = (width.ceil() as u32).clamp(1, max_width);
     let mut buf = vec![0u8; (width * height * 4) as usize];
-    let r = radius.min(width as f32 / 2.0).min(height as f32);
+    if plain {
+        let font = title_font()?;
+        draw_text(&mut buf, width, height, 0.0, src.label.plain.trim(), font, ink, width);
+        return Some((width, height, buf));
+    }
+    let mut x = 0.0;
+    if let Some(icon) = &src.icon {
+        let top = (height - icon.size) / 2;
+        for iy in 0..icon.size {
+            for ix in 0..icon.size {
+                if ix >= width {
+                    break;
+                }
+                let i = ((iy * icon.size + ix) * 4) as usize;
+                let px = [icon.rgba[i], icon.rgba[i + 1], icon.rgba[i + 2], icon.rgba[i + 3]];
+                blend_pixel(&mut buf, width, ix, top + iy, px, 1.0);
+            }
+        }
+        x += (icon.size + ICON_GAP) as f32;
+    }
+    if let (Some(name), Some(font)) = (&src.label.name, name_font()) {
+        x = draw_text(&mut buf, width, height, x, name, font, ink, width);
+    }
+    if let (Some(doc), Some(font)) = (&src.label.doc, title_font()) {
+        draw_text(&mut buf, width, height, x, &format!("  ·  {doc}"), font, quiet, width);
+    }
+    Some((width, height, buf))
+}
+
+// === The controls ===
+
+/// One shape drawn into a control's 32 px target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Layer {
+    shape: Shape,
+    fill: Option<[u8; 3]>,
+    stroke: [u8; 4],
+    stroke_px: f32,
+    scale: f32,
+    /// Degrees; negative is anticlockwise.
+    turn: f32,
+    alpha: f32,
+}
+
+fn fill_of(shape: Shape) -> [u8; 3] {
+    match shape {
+        Shape::Circle => SPINNER_RED,
+        Shape::Square => SPINNER_BLUE,
+        Shape::Triangle => SPINNER_YELLOW,
+    }
+}
+
+fn outline_of(shape: Shape) -> [u8; 4] {
+    let c = match shape {
+        Shape::Circle => SPINNER_RED_OUTLINE,
+        Shape::Square => SPINNER_BLUE_OUTLINE,
+        Shape::Triangle => SPINNER_YELLOW_OUTLINE,
+    };
+    [c[0], c[1], c[2], 0xff]
+}
+
+/// The control in slot `slot`: 0 minimize (left), 1 maximize, 2 close.
+fn slot_shape(slot: usize) -> Shape {
+    match slot {
+        0 => Shape::Triangle,
+        1 => Shape::Square,
+        _ => Shape::Circle,
+    }
+}
+
+/// How a control looks this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ControlState {
+    /// 0 inactive .. 1 focused (the focus crossfade).
+    focus: f32,
+    hover: bool,
+    busy: bool,
+    mode: crate::anim::Mode,
+    /// The spinner's phase, 0..1.
+    phase: f64,
+    /// The title's quiet ink, for inactive outlines.
+    quiet: [u8; 4],
+}
+
+/// The shapes slot `slot` draws in `state`. A hovered slot always shows its
+/// own control, so what you are about to press is never mid-morph.
+fn control_layers(slot: usize, state: &ControlState) -> Vec<Layer> {
+    let own = slot_shape(slot);
+    let filled = |shape: Shape, fill: [u8; 3], alpha: f32| Layer {
+        shape,
+        fill: Some(fill),
+        stroke: outline_of(shape),
+        stroke_px: OUTLINE_PX,
+        scale: 1.0,
+        turn: 0.0,
+        alpha,
+    };
+    let outlined = |shape: Shape, stroke: [u8; 4], alpha: f32| Layer {
+        shape,
+        fill: None,
+        stroke,
+        stroke_px: INACTIVE_OUTLINE_PX,
+        scale: 1.0,
+        turn: 0.0,
+        alpha,
+    };
+    if state.busy && !state.hover {
+        return vec![match state.mode {
+            crate::anim::Mode::Full => {
+                let m = busy::morph(slot, state.phase);
+                Layer {
+                    scale: m.scale as f32,
+                    turn: m.turn as f32,
+                    ..filled(m.shape, fill_of(m.shape), m.alpha as f32)
+                }
+            }
+            // Reduced: each slot blinks its own colour in place.
+            crate::anim::Mode::Reduced if busy::blink_on(slot, state.phase) => filled(own, fill_of(own), 1.0),
+            // Off (and reduced between blinks): the shapes' own outlines,
+            // which an inactive window (quiet ink) never shows.
+            _ => outlined(own, outline_of(own), 1.0),
+        }];
+    }
+    if state.hover {
+        return vec![filled(own, fill_of(own), 1.0)];
+    }
+    let f = state.focus.clamp(0.0, 1.0);
+    let active_stroke = [state.quiet[0], state.quiet[1], state.quiet[2], 0xd8];
+    let mut layers = Vec::with_capacity(2);
+    if f < 0.99 {
+        layers.push(outlined(own, state.quiet, 1.0 - f));
+    }
+    if f > 0.01 {
+        layers.push(outlined(own, active_stroke, f));
+    }
+    layers
+}
+
+/// Signed distance from `p` to `shape` in a 32 px target, px, negative
+/// inside. The mockup's geometry: a 14 px circle and rounded square centred
+/// in the target, a 14 px wide downward triangle.
+fn shape_sdf(shape: Shape, p: (f32, f32)) -> f32 {
+    match shape {
+        Shape::Circle => ((p.0 - 16.0).powi(2) + (p.1 - 16.0).powi(2)).sqrt() - 7.0,
+        Shape::Square => {
+            let r = 1.5;
+            let qx = (p.0 - 16.0).abs() - (7.0 - r);
+            let qy = (p.1 - 16.0).abs() - (7.0 - r);
+            (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r
+        }
+        Shape::Triangle => triangle_sdf(p, (9.0, 11.5), (23.0, 11.5), (16.0, 23.0)),
+    }
+}
+
+/// The point a shape turns and scales about: the centre of its box.
+fn shape_center(shape: Shape) -> (f32, f32) {
+    match shape {
+        Shape::Triangle => (16.0, 17.25),
+        _ => (16.0, 16.0),
+    }
+}
+
+/// Exact signed distance to a triangle (Inigo Quilez's `sdTriangle`).
+fn triangle_sdf(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    let sub = |u: (f32, f32), v: (f32, f32)| (u.0 - v.0, u.1 - v.1);
+    let dot = |u: (f32, f32), v: (f32, f32)| u.0 * v.0 + u.1 * v.1;
+    let (e0, e1, e2) = (sub(b, a), sub(c, b), sub(a, c));
+    let (v0, v1, v2) = (sub(p, a), sub(p, b), sub(p, c));
+    let seg = |v: (f32, f32), e: (f32, f32)| {
+        let t = (dot(v, e) / dot(e, e)).clamp(0.0, 1.0);
+        (v.0 - e.0 * t, v.1 - e.1 * t)
+    };
+    let (pq0, pq1, pq2) = (seg(v0, e0), seg(v1, e1), seg(v2, e2));
+    let s = (e0.0 * e2.1 - e0.1 * e2.0).signum();
+    let cand = |pq: (f32, f32), v: (f32, f32), e: (f32, f32)| (dot(pq, pq), s * (v.0 * e.1 - v.1 * e.0));
+    let (a0, b0) = cand(pq0, v0, e0);
+    let (a1, b1) = cand(pq1, v1, e1);
+    let (a2, b2) = cand(pq2, v2, e2);
+    let d = a0.min(a1).min(a2);
+    let side = b0.min(b1).min(b2);
+    -d.sqrt() * side.signum()
+}
+
+/// Rasterize a control's layers into a `BUTTON_WIDTH`² straight-alpha buffer.
+fn rasterize_control(layers: &[Layer]) -> Vec<u8> {
+    let size = BUTTON_WIDTH;
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    for layer in layers {
+        if layer.alpha <= 0.0 {
+            continue;
+        }
+        let c = shape_center(layer.shape);
+        let (sin, cos) = (-layer.turn.to_radians()).sin_cos();
+        let scale = layer.scale.max(0.05);
+        for y in 0..size {
+            for x in 0..size {
+                // Into the shape's own frame: unturn, unscale about its centre.
+                let (dx, dy) = (x as f32 + 0.5 - c.0, y as f32 + 0.5 - c.1);
+                let (rx, ry) = (dx * cos - dy * sin, dx * sin + dy * cos);
+                let p = (c.0 + rx / scale, c.1 + ry / scale);
+                let d = shape_sdf(layer.shape, p) * scale;
+                if let Some(fill) = layer.fill {
+                    let cover = (0.5 - d).clamp(0.0, 1.0);
+                    blend_pixel(&mut buf, size, x, y, [fill[0], fill[1], fill[2], 0xff], cover * layer.alpha);
+                }
+                let half = layer.stroke_px * scale.max(0.6) / 2.0;
+                let cover = (half + 0.5 - d.abs()).clamp(0.0, 1.0);
+                blend_pixel(&mut buf, size, x, y, layer.stroke, cover * layer.alpha);
+            }
+        }
+    }
+    buf
+}
+
+// === The frame ===
+
+/// Rasterizes a "glass" bar with its top corners rounded at `top_left` and
+/// `top_right` (the bottom edge meets the client area, so it stays square),
+/// with an anti-aliased edge.
+fn rasterize_glass_bar(width: u32, height: u32, top_left: f32, top_right: f32, rgba: [u8; 4]) -> Vec<u8> {
+    let mut buf = vec![0u8; (width * height * 4) as usize];
+    let limit = (width as f32 / 2.0).min(height as f32);
+    let (tl, tr) = (top_left.min(limit), top_right.min(limit));
     for y in 0..height {
         for x in 0..width {
             let xf = x as f32 + 0.5;
             let yf = y as f32 + 0.5;
-            let mut inside = true;
-            if yf < r {
-                if xf < r {
-                    let (dx, dy) = (r - xf, r - yf);
-                    inside = dx * dx + dy * dy <= r * r;
-                } else if xf > width as f32 - r {
-                    let (dx, dy) = (xf - (width as f32 - r), r - yf);
-                    inside = dx * dx + dy * dy <= r * r;
-                }
-            }
-            if inside {
-                put_pixel(&mut buf, width, x, y, rgba);
+            let corner = |cx: f32, cy: f32, r: f32| {
+                let d = ((xf - cx).powi(2) + (yf - cy).powi(2)).sqrt();
+                (r - d + 0.5).clamp(0.0, 1.0)
+            };
+            let cover = if yf < tl && xf < tl {
+                corner(tl, tl, tl)
+            } else if yf < tr && xf > width as f32 - tr {
+                corner(width as f32 - tr, tr, tr)
+            } else {
+                1.0
+            };
+            if cover > 0.0 {
+                blend_pixel(&mut buf, width, x, y, rgba, cover);
             }
         }
     }
     buf
 }
 
-/// Rasterize a ~1px rounded-corner arc (transparent everywhere else) at the
-/// glass bar's corner radius, so the window border follows the rounding rather
-/// than squaring off the top corners. `center` is the arc's center of curvature
-/// within the `size`×`size` buffer (top-left corner: `(radius, radius)`;
-/// top-right: `(0, radius)`).
+/// What the flat bar (F0) was last drawn from; it is redrawn when any of it
+/// changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FlatKey {
+    width: u32,
+    shape: Radii,
+    glass: [u8; 4],
+    glass_inactive: [u8; 4],
+    accent: [u8; 3],
+    dark: bool,
+    /// The focus level in twentieths: the crossfade is stepped, not smooth.
+    focus: u8,
+}
+
+/// The flat bar: one colour (the glass, mixed from its inactive to its active
+/// level by `focus`), the rim of light along its top and the seam of the
+/// accent along its bottom, in the waterdrop's top corners. This is what a bar
+/// is when there is nothing to frost, so it keeps the frosted bar's edges.
+fn rasterize_flat_bar(key: &FlatKey, height: u32) -> Vec<u8> {
+    let f = key.focus as f32 / 20.0;
+    let mixed = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+    let fill = [
+        mixed(key.glass_inactive[0], key.glass[0]),
+        mixed(key.glass_inactive[1], key.glass[1]),
+        mixed(key.glass_inactive[2], key.glass[2]),
+        mixed(key.glass_inactive[3], key.glass[3]),
+    ];
+    let mut buf = rasterize_glass_bar(key.width, height, key.shape.top_left() as f32, key.shape.top_right() as f32, fill);
+    let seam = super::frost::SEAM_INACTIVE + (super::frost::SEAM - super::frost::SEAM_INACTIVE) * f;
+    let rim = [255, 255, 255, (super::frost::rim_alpha(key.dark) * 255.0).round() as u8];
+    let seam = [key.accent[0], key.accent[1], key.accent[2], (seam * 255.0).round() as u8];
+    for x in 0..key.width {
+        // Corners that are cut leave the edge rows partly or wholly empty.
+        for (y, edge) in [(0, rim), (height - 1, seam)] {
+            let cover = alpha_of(&buf, key.width, x, y) as f32 / fill[3].max(1) as f32;
+            blend_pixel(&mut buf, key.width, x, y, edge, cover.min(1.0));
+        }
+    }
+    buf
+}
+
+fn alpha_of(buf: &[u8], stride: u32, x: u32, y: u32) -> u8 {
+    buf[((y * stride + x) * 4 + 3) as usize]
+}
+
+/// Rasterize a ~1px rounded-corner arc (transparent everywhere else) of
+/// `radius`, so the window border follows the frame's rounding rather than
+/// squaring off its corners. `center` is the arc's center of curvature within
+/// the `size`×`size` buffer (top-left corner: `(radius, radius)`; top-right:
+/// `(0, radius)`).
 fn rasterize_corner(size: u32, radius: f32, center: (f32, f32), rgba: [u8; 4]) -> Vec<u8> {
     let mut buf = vec![0u8; (size * size * 4) as usize];
     // Slightly thicker than the 1px straight edges so the diagonal arc has no
@@ -251,7 +546,40 @@ fn rasterize_corner(size: u32, radius: f32, center: (f32, f32), rgba: [u8; 4]) -
     buf
 }
 
+/// The four border arcs for `radii` (top-left, top-right, bottom-right,
+/// bottom-left), each a buffer its corner's radius square. A square corner
+/// gets an empty 1 px buffer, which is never drawn.
+fn corner_buffers(radii: Radii) -> [MemoryRenderBuffer; 4] {
+    let arc = |r: f64, center: fn(f32) -> (f32, f32)| {
+        let size = r.round().max(1.0) as u32;
+        let r = r as f32;
+        memory_buffer(size, size, rasterize_corner(size, r, center(r), [0, 0, 0, BORDER_ALPHA_U8]))
+    };
+    [
+        arc(radii.top_left(), |r| (r, r)),
+        arc(radii.top_right(), |r| (0.0, r)),
+        arc(radii.bottom_right(), |_| (0.0, 0.0)),
+        arc(radii.bottom_left(), |r| (r, 0.0)),
+    ]
+}
+
+/// Straight alpha (how everything here is rasterized) to premultiplied, which
+/// is what the renderer blends textures as. With binary edges it made no
+/// difference; anti-aliased ones drawn straight showed as a bright fringe.
+fn premultiply(mut pixels: Vec<u8>) -> Vec<u8> {
+    for px in pixels.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a < 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+    pixels
+}
+
 fn memory_buffer(width: u32, height: u32, pixels: Vec<u8>) -> MemoryRenderBuffer {
+    let pixels = premultiply(pixels);
     MemoryRenderBuffer::from_slice(
         &pixels,
         Fourcc::Argb8888,
@@ -281,7 +609,7 @@ impl<R: Renderer> std::fmt::Debug for DecorationRenderElement<R> {
 // Import GeckoOS decorations when feature is enabled
 #[cfg(feature = "decorations")]
 use crate::enhancements::decorations::{
-    ControlButton, Theme, WindowDecoration, ButtonState, WindowGeometry,
+    ControlButton, Theme, WindowDecoration, WindowGeometry,
 };
 
 /// Window decoration state stored in window user data
@@ -309,24 +637,22 @@ pub struct HeaderBar {
     pub close_button_hover: bool,
     pub maximize_button_hover: bool,
     pub minimize_button_hover: bool,  // NEW: Added minimize button support
-    
-    // Rendering buffers -- close/minimize are shaped (circle/triangle) so
-    // they're rasterized textures; maximize is a square, i.e. just a
-    // plain-colored rect, so it stays a SolidColorBuffer.
+
+    // Rendering buffers: the glass, and the three controls (each its whole
+    // 32 px target, the shape drawn centred in it).
     pub background: MemoryRenderBuffer,
     pub close_button: MemoryRenderBuffer,
-    pub maximize_button: SolidColorBuffer,
+    pub maximize_button: MemoryRenderBuffer,
     pub minimize_button: MemoryRenderBuffer,
+    /// What each control (minimize, maximize, close) was last drawn as.
+    drawn_controls: [Option<Vec<Layer>>; 3],
 
     // Full visible window height (header + client), needed to size the side
     // borders (which extend the whole window, unlike the header-only widgets).
     pub window_height: u32,
-    // Rounded top corners (constant arcs); straight edges run between/below them.
-    pub border_corner_tl: MemoryRenderBuffer,
-    pub border_corner_tr: MemoryRenderBuffer,
-    // Rounded bottom corners, to match the client content's clip.
-    pub border_corner_bl: MemoryRenderBuffer,
-    pub border_corner_br: MemoryRenderBuffer,
+    // Rounded corners (arcs at each corner's own radius); straight edges run
+    // between them. Index: top-left, top-right, bottom-right, bottom-left.
+    border_corners: [MemoryRenderBuffer; 4],
     /// Maximized or fullscreen: square corners all round. Set by the caller
     /// before `redraw`, which reshapes the frame when it changes.
     pub square: bool,
@@ -334,127 +660,132 @@ pub struct HeaderBar {
     /// it (depth off, or the shaders failed) the bottom stays square, as it
     /// was before depth, and the border follows.
     pub bottom_round: bool,
-    /// The shape `redraw` last drew, so a change is noticed.
-    shaped_square: bool,
-    shaped_bottom: bool,
-    /// 0 (inactive) ..= 1 (active): how bright the glass, title and buttons are.
+    /// The corners `redraw` last shaped the frame with.
+    shaped: Radii,
+    /// 0 (inactive) ..= 1 (active): how bright the glass and title are, and
+    /// how far the controls have gone from outlines to their colours.
     pub focus: f32,
+    /// The app has stopped answering pings: the controls run the spinner.
+    pub busy: bool,
     pub border_top: SolidColorBuffer,
     pub border_bottom: SolidColorBuffer,
     pub border_left: SolidColorBuffer,
     pub border_right: SolidColorBuffer,
 
-    // Title text (app name). Re-rasterized only when the title or the space
-    // available for it changes.
-    pub title: String,
+    // The label (icon, app name, document title). Re-rasterized only when
+    // what it says or the space available for it changes.
+    pub title: TitleSource,
     pub title_buffer: Option<MemoryRenderBuffer>,
     pub title_px_w: u32,
     pub title_px_h: u32,
+    /// The flat bar's glass (F0) was last drawn from this; `None` while the
+    /// bar is frosted (the `FrostElement` draws it) or before the first draw.
+    drawn_flat: Option<FlatKey>,
+    /// Frost draws the glass (`shell::frost`, F1): the header draws none.
+    /// Set by the caller before `redraw`.
+    pub frosted: bool,
 
     // Theme support
     #[cfg(feature = "decorations")]
     pub theme: Theme,
+    /// Last left-click timestamp and frame-relative location on the titlebar
+    /// drag region, used for double-click maximize/restore detection.
+    last_titlebar_click: Option<(u32, Point<f64, Logical>)>,
 }
 
 // Layout constants
 pub const HEADER_BAR_HEIGHT: i32 = 32;
+pub(crate) const BTN_LEFT: u32 = 0x110;
+pub(crate) const BTN_MIDDLE: u32 = 0x112;
+const DOUBLE_CLICK_MS: u32 = 400;
+const DOUBLE_CLICK_DIST_SQ: f64 = 36.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TitlebarAction {
+    StartResize(ResizeEdge),
+    Close,
+    MaximizeToggle,
+    Minimize,
+    Lower,
+    StartMove,
+}
 const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;
 const BUTTON_WIDTH: u32 = 32;
 
 /// Depth of the invisible band around an SSD frame that starts a resize.
 /// It lies outside the visible window (see `WindowElement::ssd_resize_band`).
 pub const RESIZE_BAND: i32 = 8;
-/// How far a corner's diagonal grab reaches along each edge. The top corners
-/// are rounded at GLASS_CORNER_RADIUS, so this is the band plus that curve.
-const RESIZE_CORNER: i32 = RESIZE_BAND + GLASS_CORNER_RADIUS as i32;
+/// How far a corner's diagonal grab reaches along each edge: the band plus
+/// the frame's largest corner curve.
+const RESIZE_CORNER: i32 = RESIZE_BAND + FRAME_RADII.0[0] as i32;
 /// The smallest frame a resize will make: the three buttons plus a little
 /// title, over a strip of client. Below about three buttons wide, the
 /// button hit-tests' `width - BUTTON_WIDTH * n` had nothing left to mean.
 pub const MIN_FRAME_SIZE: (i32, i32) = (BUTTON_WIDTH as i32 * 3 + 64, HEADER_BAR_HEIGHT + 48);
 
+/// The corners a frame is shaped with: square when it fills its space, the
+/// waterdrop otherwise, its bottom corners square when the client content
+/// isn't clipped to match.
+pub fn frame_shape(square: bool, bottom_round: bool) -> Radii {
+    if square {
+        return Radii::SQUARE;
+    }
+    let mut r = FRAME_RADII;
+    if !bottom_round {
+        r.0[2] = 0.0;
+        r.0[3] = 0.0;
+    }
+    r
+}
+
 impl HeaderBar {
     /// Create a new header bar with default or themed colors
     pub fn new() -> Self {
+        let shaped = frame_shape(false, true);
         Self {
             pointer_loc: None,
             width: 0,
             close_button_hover: false,
             maximize_button_hover: false,
             minimize_button_hover: false,
-            // Fixed 32x32 button size -- rasterize the real (non-hover)
-            // shapes up front; redraw() swaps to hover variants as needed.
+            // Drawn by the first redraw().
             background: memory_buffer(1, 1, vec![0; 4]),
-            close_button: memory_buffer(
-                BUTTON_WIDTH,
-                BUTTON_HEIGHT,
-                rasterize_circle(BUTTON_WIDTH, CLOSE_RGB),
-            ),
-            maximize_button: SolidColorBuffer::default(),
-            minimize_button: memory_buffer(
-                BUTTON_WIDTH,
-                BUTTON_HEIGHT,
-                rasterize_triangle_down(BUTTON_WIDTH, MINIMIZE_RGB),
-            ),
+            close_button: memory_buffer(1, 1, vec![0; 4]),
+            maximize_button: memory_buffer(1, 1, vec![0; 4]),
+            minimize_button: memory_buffer(1, 1, vec![0; 4]),
+            drawn_controls: [None, None, None],
             window_height: 0,
-            border_corner_tl: memory_buffer(
-                BORDER_CORNER_SIZE,
-                BORDER_CORNER_SIZE,
-                rasterize_corner(
-                    BORDER_CORNER_SIZE,
-                    GLASS_CORNER_RADIUS,
-                    (GLASS_CORNER_RADIUS, GLASS_CORNER_RADIUS),
-                    [0, 0, 0, BORDER_ALPHA_U8],
-                ),
-            ),
-            border_corner_tr: memory_buffer(
-                BORDER_CORNER_SIZE,
-                BORDER_CORNER_SIZE,
-                rasterize_corner(
-                    BORDER_CORNER_SIZE,
-                    GLASS_CORNER_RADIUS,
-                    (0.0, GLASS_CORNER_RADIUS),
-                    [0, 0, 0, BORDER_ALPHA_U8],
-                ),
-            ),
-            border_corner_bl: memory_buffer(
-                BORDER_CORNER_SIZE,
-                BORDER_CORNER_SIZE,
-                rasterize_corner(
-                    BORDER_CORNER_SIZE,
-                    GLASS_CORNER_RADIUS,
-                    (GLASS_CORNER_RADIUS, 0.0),
-                    [0, 0, 0, BORDER_ALPHA_U8],
-                ),
-            ),
-            border_corner_br: memory_buffer(
-                BORDER_CORNER_SIZE,
-                BORDER_CORNER_SIZE,
-                rasterize_corner(BORDER_CORNER_SIZE, GLASS_CORNER_RADIUS, (0.0, 0.0), [0, 0, 0, BORDER_ALPHA_U8]),
-            ),
+            border_corners: corner_buffers(shaped),
             square: false,
             bottom_round: true,
-            shaped_square: false,
-            shaped_bottom: true,
+            shaped,
             focus: 1.0,
+            busy: false,
             border_top: SolidColorBuffer::default(),
             border_bottom: SolidColorBuffer::default(),
             border_left: SolidColorBuffer::default(),
             border_right: SolidColorBuffer::default(),
-            title: String::new(),
+            title: TitleSource::default(),
             title_buffer: None,
             title_px_w: 0,
             title_px_h: 0,
+            drawn_flat: None,
+            frosted: false,
             #[cfg(feature = "decorations")]
             theme: Theme::default(),
+            last_titlebar_click: None,
         }
     }
 
-    /// The top and bottom corner radii the frame was last shaped with.
-    fn corner_radii(&self) -> (i32, i32) {
-        let r = GLASS_CORNER_RADIUS as i32;
-        let top = if self.shaped_square { 0 } else { r };
-        let bottom = if self.shaped_square || !self.shaped_bottom { 0 } else { r };
-        (top, bottom)
+    /// The bar's own corners: the frame's two top ones, logical px. The bar's
+    /// bottom meets the client, so it stays square.
+    pub fn bar_radii(&self) -> Radii {
+        Radii([self.shaped.top_left(), self.shaped.top_right(), 0.0, 0.0])
+    }
+
+    /// The corners the frame was last shaped with, whole px.
+    fn corner_px(&self) -> [i32; 4] {
+        self.shaped.0.map(|r| r.round() as i32)
     }
 
     /// Set theme and trigger redraw
@@ -473,6 +804,7 @@ impl HeaderBar {
     /// Clear pointer location
     pub fn pointer_leave(&mut self) {
         self.pointer_loc = None;
+        self.last_titlebar_click = None;
     }
 
     /// The pointer, when it is over the header bar itself. `pointer_loc`
@@ -568,7 +900,92 @@ impl HeaderBar {
         }
     }
     
-    /// Handle click with fallback simple hit testing
+    /// Classify a pointer press at `self.pointer_loc` by button and double-click state.
+    pub(crate) fn resolve_pointer_press(&mut self, button: u32, time: u32) -> Option<TitlebarAction> {
+        if button == BTN_MIDDLE {
+            self.last_titlebar_click = None;
+            return self.header_point().map(|_| TitlebarAction::Lower);
+        }
+        if button != BTN_LEFT {
+            self.last_titlebar_click = None;
+            return None;
+        }
+        if let Some(edges) = self.resize_edge() {
+            self.last_titlebar_click = None;
+            return Some(TitlebarAction::StartResize(edges));
+        }
+        let loc = self.header_point()?;
+        if loc.x >= self.width.saturating_sub(BUTTON_WIDTH) as f64 {
+            self.last_titlebar_click = None;
+            return Some(TitlebarAction::Close);
+        }
+        if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 2) as f64 {
+            self.last_titlebar_click = None;
+            return Some(TitlebarAction::MaximizeToggle);
+        }
+        if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 3) as f64 {
+            self.last_titlebar_click = None;
+            return Some(TitlebarAction::Minimize);
+        }
+        let is_double = self
+            .last_titlebar_click
+            .take()
+            .is_some_and(|(prev_time, prev_loc)| {
+                let dt = time.wrapping_sub(prev_time);
+                let dx = loc.x - prev_loc.x;
+                let dy = loc.y - prev_loc.y;
+                dt <= DOUBLE_CLICK_MS && (dx * dx + dy * dy) <= DOUBLE_CLICK_DIST_SQ
+            });
+        if is_double {
+            Some(TitlebarAction::MaximizeToggle)
+        } else {
+            self.last_titlebar_click = Some((time, loc));
+            Some(TitlebarAction::StartMove)
+        }
+    }
+
+    /// Handle pointer button press on the SSD titlebar/resize band.
+    pub fn clicked_button<B: Backend>(
+        &mut self,
+        seat: &Seat<EvoState<B>>,
+        state: &mut EvoState<B>,
+        window: &WindowElement,
+        serial: Serial,
+        time: u32,
+        button: u32,
+    ) {
+        let Some(action) = self.resolve_pointer_press(button, time) else {
+            return;
+        };
+        match action {
+            TitlebarAction::StartResize(edges) => {
+                info!("SSD resize band press: edges={:?}", edges);
+                self.handle_resize(seat, state, window, serial, edges);
+            }
+            TitlebarAction::Close => {
+                info!("Close button clicked");
+                self.handle_close(window);
+            }
+            TitlebarAction::MaximizeToggle => {
+                info!("Maximize/restore triggered from SSD titlebar");
+                self.handle_maximize(state, window);
+            }
+            TitlebarAction::Minimize => {
+                info!("Minimize button clicked");
+                self.handle_minimize(state, window);
+            }
+            TitlebarAction::Lower => {
+                info!("Middle-click lowering window from SSD titlebar");
+                self.handle_lower(state, window);
+            }
+            TitlebarAction::StartMove => {
+                self.handle_move(seat, state, window, serial);
+            }
+        }
+    }
+
+    /// Handle click with fallback simple hit testing (left button compatibility helper).
+    #[allow(dead_code)]
     pub fn clicked<B: Backend>(
         &mut self,
         seat: &Seat<EvoState<B>>,
@@ -576,53 +993,7 @@ impl HeaderBar {
         window: &WindowElement,
         serial: Serial,
     ) {
-        // The band around the frame first. It is outside the header, so it
-        // never competes with the buttons, but it must win over the header
-        // fallbacks below, which read only `loc.x`.
-        if let Some(edges) = self.resize_edge() {
-            info!("SSD resize band press: edges={:?}", edges);
-            self.handle_resize(seat, state, window, serial, edges);
-            return;
-        }
-        // Diagnostic: which button a titlebar click resolves to, with the
-        // coordinates that decided it. If "maximize closes the app" is really
-        // a hit-test overshoot (the maximize/close buttons sit adjacent at the
-        // screen corner once maximized), this log shows "close" firing when
-        // the user aimed for maximize.
-        info!(
-            "SSD titlebar click: loc_x={:?} width={} (close>={}, max>={}, min>={})",
-            self.pointer_loc.as_ref().map(|l| l.x),
-            self.width,
-            self.width.saturating_sub(BUTTON_WIDTH),
-            self.width.saturating_sub(BUTTON_WIDTH * 2),
-            self.width.saturating_sub(BUTTON_WIDTH * 3),
-        );
-        match self.header_point().as_ref() {
-            // Close button (rightmost)
-            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH) as f64 => {
-                info!("Close button clicked");
-                self.handle_close(window);
-            }
-
-            // Maximize button (second from right)
-            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 2) as f64 => {
-                info!("Maximize button clicked");
-                self.handle_maximize(state, window);
-            }
-
-            // Minimize button (third from right)
-            Some(loc) if loc.x >= self.width.saturating_sub(BUTTON_WIDTH * 3) as f64 => {
-                info!("Minimize button clicked");
-                self.handle_minimize(state, window);
-            }
-
-            // Title bar drag area
-            Some(_) => {
-                self.handle_move(seat, state, window, serial);
-            }
-
-            _ => {}
-        }
+        self.clicked_button(seat, state, window, serial, 0, BTN_LEFT);
     }
     
     /// Handle close button action
@@ -701,6 +1072,12 @@ impl HeaderBar {
         state.handle.insert_idle(move |data| data.minimize_window(&window));
     }
 
+    /// Lower the window to the back of the app stack (middle-click titlebar).
+    fn handle_lower<B: Backend>(&self, state: &mut EvoState<B>, window: &WindowElement) {
+        let window = window.clone();
+        state.handle.insert_idle(move |data| data.lower_window(&window));
+    }
+
     /// Start an interactive resize from a press in the band around the
     /// frame. Deferred to an idle callback for the same reason as
     /// `handle_move` and `handle_maximize`: this runs inside the SSD click's
@@ -718,12 +1095,22 @@ impl HeaderBar {
         serial: Serial,
         edges: ResizeEdge,
     ) {
-        if let WindowSurface::Wayland(w) = window.0.underlying_surface() {
-            let seat = seat.clone();
-            let toplevel = w.clone();
-            state
-                .handle
-                .insert_idle(move |data| data.resize_request_xdg(&toplevel, &seat, serial, edges));
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(w) => {
+                let seat = seat.clone();
+                let toplevel = w.clone();
+                state
+                    .handle
+                    .insert_idle(move |data| data.resize_request_xdg(&toplevel, &seat, serial, edges));
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(w) => {
+                let seat = seat.clone();
+                let surface = w.clone();
+                state
+                    .handle
+                    .insert_idle(move |data| data.resize_request_x11(&surface, &seat, serial, edges));
+            }
         }
     }
 
@@ -796,59 +1183,72 @@ impl HeaderBar {
         }
     }
     
-    /// Redraw header bar with theme support
-    pub fn redraw(&mut self, width: u32, window_height: u32, title: &str) {
+    /// Redraw the header bar: the frame's shape, the label in `title`, and
+    /// the controls (hover, focus, busy).
+    pub fn redraw(&mut self, width: u32, window_height: u32, title: &TitleSource) {
         if width == 0 {
             self.width = 0;
             return;
         }
 
-        let reshaped = self.square != self.shaped_square || self.bottom_round != self.shaped_bottom;
-        let needs_redraw_buttons = width != self.width || reshaped;
-        // A square frame (maximized, fullscreen) has no corner radius.
-        let corner = if self.square { 0.0 } else { GLASS_CORNER_RADIUS };
-        if needs_redraw_buttons {
+        let shape = frame_shape(self.square, self.bottom_round);
+        let reshaped = shape != self.shaped;
+        let resized = width != self.width || reshaped;
+        if resized {
             self.width = width;
-            self.shaped_square = self.square;
-            self.shaped_bottom = self.bottom_round;
-            // Only the glass bar depends on window width -- (re)rasterize it
-            // now rather than on every hover-triggered redraw.
-            self.background = memory_buffer(
+            self.shaped = shape;
+        }
+        // The flat glass depends on the window's width, its colours and its
+        // focus level: (re)rasterize it when one changes rather than on every
+        // hover-triggered redraw. A frosted bar has none: its element draws it.
+        if self.frosted {
+            self.drawn_flat = None;
+        } else {
+            let colors = &title.colors;
+            let key = FlatKey {
                 width,
-                HEADER_BAR_HEIGHT as u32,
-                rasterize_glass_bar(width, HEADER_BAR_HEIGHT as u32, corner, GLASS_RGBA),
-            );
+                shape,
+                glass: colors.glass,
+                glass_inactive: colors.glass_inactive,
+                accent: colors.accent,
+                dark: colors.dark,
+                focus: (self.focus.clamp(0.0, 1.0) * 20.0).round() as u8,
+            };
+            if self.drawn_flat != Some(key) {
+                self.background = memory_buffer(width, HEADER_BAR_HEIGHT as u32, rasterize_flat_bar(&key, HEADER_BAR_HEIGHT as u32));
+                self.drawn_flat = Some(key);
+            }
+        }
+        if reshaped {
+            self.border_corners = corner_buffers(shape);
         }
 
         // === BORDERS === sized to the full window (width x window_height, and
         // the thin side strips down the whole height). Re-created only on a
         // real size change so damage tracking sees stable buffers otherwise.
-        if needs_redraw_buttons || window_height != self.window_height {
+        if resized || window_height != self.window_height {
             self.window_height = window_height;
-            let (rt, rb) = self.corner_radii();
+            let [tl, tr, br, bl] = self.corner_px();
             let w = width as i32;
             let h = window_height.max(1) as i32;
-            // The top and bottom edges run BETWEEN the rounded corners, the
-            // side edges BETWEEN the top and bottom ones. The client content is
-            // clipped to the same radius at its bottom (`anim::shader`), so the
-            // frame reads as one rounded card. A square frame has no radius.
-            self.border_top
-                .update(((w - 2 * rt).max(0), BORDER_THICKNESS), BORDER_COLOR);
-            self.border_bottom
-                .update(((w - 2 * rb).max(0), BORDER_THICKNESS), BORDER_COLOR);
-            self.border_left
-                .update((BORDER_THICKNESS, (h - rt - rb).max(0)), BORDER_COLOR);
-            self.border_right
-                .update((BORDER_THICKNESS, (h - rt - rb).max(0)), BORDER_COLOR);
+            // Each edge runs BETWEEN the corners at its ends. The client
+            // content is clipped to the same radius at its bottom
+            // (`anim::shader`), so the frame reads as one rounded card. A
+            // square frame has no radius.
+            self.border_top.update(((w - tl - tr).max(0), BORDER_THICKNESS), BORDER_COLOR);
+            self.border_bottom.update(((w - bl - br).max(0), BORDER_THICKNESS), BORDER_COLOR);
+            self.border_left.update((BORDER_THICKNESS, (h - tl - bl).max(0)), BORDER_COLOR);
+            self.border_right.update((BORDER_THICKNESS, (h - tr - br).max(0)), BORDER_COLOR);
         }
 
-        // === TITLE === re-rasterize only when the text or the space available
-        // for it (window width minus the three right-hand buttons) changes.
-        if needs_redraw_buttons || title != self.title {
-            self.title = title.to_string();
+        // === TITLE === re-rasterize only when what it says or the space
+        // available for it (window width minus the three right-hand buttons)
+        // changes.
+        if resized || *title != self.title {
+            self.title = title.clone();
             let reserved = BUTTON_WIDTH * 3 + TITLE_PAD_LEFT + TITLE_GAP_BEFORE_BUTTONS;
             let avail = width.saturating_sub(reserved);
-            match rasterize_text(&self.title, avail) {
+            match rasterize_label(&self.title, avail) {
                 Some((tw, th, px)) => {
                     self.title_px_w = tw;
                     self.title_px_h = th;
@@ -862,50 +1262,43 @@ impl HeaderBar {
             }
         }
 
-        // === CLOSE BUTTON (rightmost) ===
-        let close_hovered = self
-            .header_point()
-            .map(|l| l.x >= width.saturating_sub(BUTTON_WIDTH) as f64)
-            .unwrap_or(false);
-        if needs_redraw_buttons || close_hovered != self.close_button_hover {
-            let rgb = if close_hovered { CLOSE_HOVER_RGB } else { CLOSE_RGB };
-            self.close_button = memory_buffer(BUTTON_WIDTH, BUTTON_HEIGHT, rasterize_circle(BUTTON_WIDTH, rgb));
-            self.close_button_hover = close_hovered;
-        }
-
-        // === MAXIMIZE BUTTON (second from right, plain colored square) ===
-        let maximize_hovered = self
-            .header_point()
-            .map(|l| {
-                l.x >= width.saturating_sub(BUTTON_WIDTH * 2) as f64
-                    && l.x <= width.saturating_sub(BUTTON_WIDTH) as f64
+        // === CONTROLS === slot 0 minimize, 1 maximize, 2 close (rightmost).
+        let point = self.header_point();
+        let hovered = |slot: u32| {
+            point.is_some_and(|l| {
+                let right = width.saturating_sub(BUTTON_WIDTH * (2 - slot)) as f64;
+                l.x >= right - BUTTON_WIDTH as f64 && l.x < right
             })
-            .unwrap_or(false);
-        if needs_redraw_buttons || maximize_hovered != self.maximize_button_hover {
-            let rgb = if maximize_hovered { MAXIMIZE_HOVER_RGB } else { MAXIMIZE_RGB };
-            self.maximize_button.update(
-                (BUTTON_WIDTH as i32, BUTTON_HEIGHT as i32),
-                [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0, 1.0],
-            );
-            self.maximize_button_hover = maximize_hovered;
-        }
-
-        // === MINIMIZE BUTTON (third from right) ===
-        let minimize_hovered = self
-            .header_point()
-            .map(|l| {
-                l.x >= width.saturating_sub(BUTTON_WIDTH * 3) as f64
-                    && l.x <= width.saturating_sub(BUTTON_WIDTH * 2) as f64
-            })
-            .unwrap_or(false);
-        if needs_redraw_buttons || minimize_hovered != self.minimize_button_hover {
-            let rgb = if minimize_hovered { MINIMIZE_HOVER_RGB } else { MINIMIZE_RGB };
-            self.minimize_button = memory_buffer(
-                BUTTON_WIDTH,
-                BUTTON_HEIGHT,
-                rasterize_triangle_down(BUTTON_WIDTH, rgb),
-            );
-            self.minimize_button_hover = minimize_hovered;
+        };
+        self.minimize_button_hover = hovered(0);
+        self.maximize_button_hover = hovered(1);
+        self.close_button_hover = hovered(2);
+        let settings = crate::anim::settings();
+        let mode = if settings.enabled() { settings.mode } else { crate::anim::Mode::Off };
+        // The spinner's frames, a few dozen per loop: enough to read as
+        // motion, few enough that a frame is often drawn twice.
+        let phase = (busy::phase(crate::anim::now()) * 48.0).floor() / 48.0;
+        let base = ControlState {
+            focus: (self.focus * 20.0).round() / 20.0,
+            hover: false,
+            busy: self.busy,
+            mode,
+            phase,
+            quiet: self.title.colors.quiet,
+        };
+        let hovers = [self.minimize_button_hover, self.maximize_button_hover, self.close_button_hover];
+        for slot in 0..3 {
+            let layers = control_layers(slot, &ControlState { hover: hovers[slot], ..base });
+            if self.drawn_controls[slot].as_ref() == Some(&layers) {
+                continue;
+            }
+            let buffer = memory_buffer(BUTTON_WIDTH, BUTTON_HEIGHT, rasterize_control(&layers));
+            match slot {
+                0 => self.minimize_button = buffer,
+                1 => self.maximize_button = buffer,
+                _ => self.close_button = buffer,
+            }
+            self.drawn_controls[slot] = Some(layers);
         }
     }
 }
@@ -939,20 +1332,20 @@ where
         // --- Window border (item #8). Pushed first == frontmost (see the
         // reverse-draw note below), so it frames over the client's own edge
         // pixels. The side/bottom borders run the FULL window height, past the
-        // header, which is why the HeaderBar tracks window_height. Rounded top
-        // corners follow the glass bar's radius; straight edges run
-        // between/below them.
+        // header, which is why the HeaderBar tracks window_height. Rounded
+        // corners follow the frame's (the waterdrop); straight edges run
+        // between them.
         let full_h = self.window_height.max(HEADER_BAR_HEIGHT as u32) as i32;
         let w_i = self.width as i32;
-        let (rt, rb) = self.corner_radii();
+        let [tl, tr, br, bl] = self.corner_px();
         // The header's own brightness, dimmed while the window is inactive.
         let dim = crate::anim::depth::HEADER_INACTIVE;
         let head = alpha * (dim + (1.0 - dim) * self.focus.clamp(0.0, 1.0));
         for (buf, off) in [
-            (&self.border_top, Point::<i32, Logical>::from((rt, 0))),
-            (&self.border_bottom, Point::from((rb, full_h - BORDER_THICKNESS))),
-            (&self.border_left, Point::from((0, rt))),
-            (&self.border_right, Point::from((w_i - BORDER_THICKNESS, rt))),
+            (&self.border_top, Point::<i32, Logical>::from((tl, 0))),
+            (&self.border_bottom, Point::from((bl, full_h - BORDER_THICKNESS))),
+            (&self.border_left, Point::from((0, tl))),
+            (&self.border_right, Point::from((w_i - BORDER_THICKNESS, tr))),
         ] {
             elements.push(
                 DecorationRenderElement::from(SolidColorRenderElement::from_buffer(
@@ -965,17 +1358,18 @@ where
                 .into(),
             );
         }
-        // Rounded corners (arcs matching the glass radius), none when square.
-        let mut corners: Vec<(&MemoryRenderBuffer, Point<i32, Logical>)> = Vec::with_capacity(4);
-        if rt > 0 {
-            corners.push((&self.border_corner_tl, Point::from((0, 0))));
-            corners.push((&self.border_corner_tr, Point::from((w_i - rt, 0))));
-        }
-        if rb > 0 {
-            corners.push((&self.border_corner_bl, Point::from((0, full_h - rb))));
-            corners.push((&self.border_corner_br, Point::from((w_i - rb, full_h - rb))));
-        }
-        for (corner, off) in corners {
+        // Rounded corners (arcs at each corner's radius), none where square.
+        let [c_tl, c_tr, c_br, c_bl] = &self.border_corners;
+        let corners = [
+            (tl, c_tl, Point::<i32, Logical>::from((0, 0))),
+            (tr, c_tr, Point::from((w_i - tr, 0))),
+            (br, c_br, Point::from((w_i - br, full_h - br))),
+            (bl, c_bl, Point::from((0, full_h - bl))),
+        ];
+        for (r, corner, off) in corners {
+            if r <= 0 {
+                continue;
+            }
             if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
                 (location + off.to_physical_precise_round(scale)).to_f64(),
@@ -999,52 +1393,27 @@ where
         // treated as sitting underneath it. Buttons must therefore come
         // before the background here, or the (semi-opaque) background --
         // being "in front" -- clips the buttons out entirely.
-
-        // Close button (rightmost) -- red circle.
-        let close_loc = location + (header_end_offset - button_offset).to_physical_precise_round(scale);
-        if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
-            renderer,
-            close_loc.to_f64(),
-            &self.close_button,
-            Some(head),
-            None,
-            None,
-            Kind::Unspecified,
-        ) {
-            elements.push(DecorationRenderElement::from(el).into());
-        } else {
-            warn!("Failed to import close button texture");
-        }
-
-        // Maximize button (second from right) -- blue square, plain solid color.
-        elements.push(
-            DecorationRenderElement::from(SolidColorRenderElement::from_buffer(
-                &self.maximize_button,
-                location + (header_end_offset - button_offset.upscale(2)).to_physical_precise_round(scale),
-                scale,
-                head,
+        //
+        // The controls take the window's alpha, not the header's dimmed one:
+        // focus already shows in them (outlines when inactive).
+        for (slot, buffer) in [(3, &self.minimize_button), (2, &self.maximize_button), (1, &self.close_button)] {
+            let loc = location + (header_end_offset - button_offset.upscale(slot)).to_physical_precise_round(scale);
+            if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                loc.to_f64(),
+                buffer,
+                Some(alpha),
+                None,
+                None,
                 Kind::Unspecified,
-            ))
-            .into(),
-        );
-
-        // Minimize button (third from right) -- yellow triangle.
-        let minimize_loc = location + (header_end_offset - button_offset.upscale(3)).to_physical_precise_round(scale);
-        if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
-            renderer,
-            minimize_loc.to_f64(),
-            &self.minimize_button,
-            Some(head),
-            None,
-            None,
-            Kind::Unspecified,
-        ) {
-            elements.push(DecorationRenderElement::from(el).into());
-        } else {
-            warn!("Failed to import minimize button texture");
+            ) {
+                elements.push(DecorationRenderElement::from(el).into());
+            } else {
+                warn!("Failed to import window control texture");
+            }
         }
 
-        // Title text (item #9) -- over the glass, left-aligned, vertically
+        // Title (item #9) -- over the glass, left-aligned, vertically
         // centered. Pushed before the background so the (semi-opaque) glass
         // doesn't clip it, same as the buttons.
         if let Some(title_buf) = self.title_buffer.as_ref() {
@@ -1065,12 +1434,18 @@ where
             }
         }
 
-        // Background (drawn last so it sits behind the buttons) -- glassy rounded bar.
+        // Background (drawn last so it sits behind the buttons) -- the flat
+        // glass, in the waterdrop's top corners, with its rim and seam. A
+        // frosted bar has none here: a `FrostElement` follows these elements
+        // and is its glass.
+        if self.frosted {
+            return elements;
+        }
         if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
             renderer,
             location.to_f64(),
             &self.background,
-            Some(head),
+            Some(alpha),
             None,
             None,
             Kind::Unspecified,
@@ -1173,5 +1548,279 @@ impl WindowElement {
         let mut state = self.decoration_state();
         state.decoration = Some(WindowDecoration::new(window_id, title, app_id));
         debug!("Initialized GeckoOS decoration for window {}", window_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anim::Mode;
+
+    /// The alpha of pixel `(x, y)` in a straight-alpha buffer `w` wide.
+    fn alpha_at(buf: &[u8], w: u32, x: u32, y: u32) -> u8 {
+        buf[((y * w + x) * 4 + 3) as usize]
+    }
+
+    fn rgb_at(buf: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * w + x) * 4) as usize;
+        [buf[i + 2], buf[i + 1], buf[i]]
+    }
+
+    #[test]
+    fn buffers_are_premultiplied_for_the_renderer() {
+        // ARGB8888 in memory is B, G, R, A.
+        assert_eq!(premultiply(vec![200, 100, 50, 128]), vec![100, 50, 25, 128]);
+        assert_eq!(premultiply(vec![200, 100, 50, 255]), vec![200, 100, 50, 255]);
+        assert_eq!(premultiply(vec![200, 100, 50, 0]), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn the_frame_is_a_waterdrop_and_square_when_maximized() {
+        assert_eq!(frame_shape(false, true), Radii([16.0, 4.0, 16.0, 16.0]));
+        assert!(frame_shape(true, true).is_square(), "maximized or fullscreen: square");
+        assert_eq!(frame_shape(false, false), Radii([16.0, 4.0, 0.0, 0.0]), "no clip: square bottom");
+    }
+
+    #[test]
+    fn the_glass_rounds_top_left_wide_and_top_right_tight() {
+        let (w, h) = (200, HEADER_BAR_HEIGHT as u32);
+        let buf = rasterize_glass_bar(w, h, 16.0, 4.0, [255, 255, 255, 255]);
+        // 3 px in from each top corner: outside the 16 px curve, inside the 4 px one.
+        assert_eq!(alpha_at(&buf, w, 2, 2), 0, "top-left is round");
+        assert!(alpha_at(&buf, w, w - 3, 2) > 200, "top-right is nearly sharp");
+        assert_eq!(alpha_at(&buf, w, w - 1, 0), 0, "but not square");
+        assert_eq!(alpha_at(&buf, w, 0, h - 1), 255, "the bottom meets the client");
+        let square = rasterize_glass_bar(w, h, 0.0, 0.0, [255, 255, 255, 255]);
+        assert_eq!(alpha_at(&square, w, 0, 0), 255);
+        assert_eq!(alpha_at(&square, w, w - 1, 0), 255);
+    }
+
+    #[test]
+    fn border_edges_run_between_each_corner() {
+        let mut bar = HeaderBar::new();
+        bar.redraw(300, 232, &TitleSource::default());
+        assert_eq!(bar.corner_px(), [16, 4, 16, 16]);
+        // The right edge starts under the 4 px corner, the left under the 16.
+        let h = 232;
+        let len = |b: &SolidColorBuffer| {
+            let e = SolidColorRenderElement::from_buffer(b, (0, 0), 1.0, 1.0, Kind::Unspecified);
+            smithay::backend::renderer::element::Element::geometry(&e, 1.0.into()).size
+        };
+        assert_eq!(len(&bar.border_top).w, 300 - 16 - 4);
+        assert_eq!(len(&bar.border_right).h, h - 4 - 16);
+        assert_eq!(len(&bar.border_left).h, h - 16 - 16);
+        bar.square = true;
+        bar.redraw(300, 232, &TitleSource::default());
+        assert_eq!(bar.corner_px(), [0, 0, 0, 0]);
+        assert_eq!(len(&bar.border_top).w, 300);
+    }
+
+    fn state(focus: f32) -> ControlState {
+        ControlState {
+            focus,
+            hover: false,
+            busy: false,
+            mode: Mode::Full,
+            phase: 0.0,
+            quiet: [0x2a, 0x26, 0x20, 0x8c],
+        }
+    }
+
+    #[test]
+    fn controls_are_the_spinners_shapes_in_its_colours() {
+        let close = control_layers(2, &state(1.0));
+        assert_eq!(close.len(), 1);
+        assert_eq!((close[0].shape, close[0].fill), (Shape::Circle, None));
+        assert_eq!(close[0].stroke, [0x2a, 0x26, 0x20, 0xd8]);
+        assert_eq!(control_layers(1, &state(1.0))[0].fill, None);
+        assert_eq!(control_layers(0, &state(1.0))[0].shape, Shape::Triangle);
+
+        let hover_close = control_layers(2, &ControlState { hover: true, ..state(1.0) });
+        assert_eq!(hover_close[0].fill, Some(SPINNER_RED), "hover reveals spinner red");
+        assert_eq!(hover_close[0].stroke, [0xa1, 0x2c, 0x2c, 0xff]);
+
+        let hover_max = control_layers(1, &ControlState { hover: true, ..state(1.0) });
+        assert_eq!(hover_max[0].fill, Some(SPINNER_BLUE), "hover reveals spinner blue");
+
+        let hover_min = control_layers(0, &ControlState { hover: true, ..state(1.0) });
+        assert_eq!(hover_min[0].shape, Shape::Triangle);
+        assert_eq!(hover_min[0].fill, Some(SPINNER_YELLOW), "hover reveals spinner yellow");
+    }
+
+    #[test]
+    fn the_shape_is_14px_centred_in_its_32px_target() {
+        let w = BUTTON_WIDTH;
+        let rest = rasterize_control(&control_layers(1, &state(1.0)));
+        assert_eq!(alpha_at(&rest, w, 16, 16), 0, "at rest the centre stays unfilled");
+        assert!(alpha_at(&rest, w, 16, 9) > 0, "at rest the monochrome outline is drawn");
+
+        let buf = rasterize_control(&control_layers(1, &ControlState { hover: true, ..state(1.0) }));
+        assert_eq!(alpha_at(&buf, w, 16, 16), 255);
+        assert_eq!(rgb_at(&buf, w, 16, 16), SPINNER_BLUE);
+        assert_eq!(alpha_at(&buf, w, 3, 3), 0, "the target's corner stays empty");
+        assert_eq!(alpha_at(&buf, w, 16, 7), 0, "above the shape");
+        // The outline: its edge is the dark blue, not the fill.
+        let edge = rgb_at(&buf, w, 16, 9);
+        assert!(edge[2] < SPINNER_BLUE[2], "outlined: {edge:?}");
+    }
+
+    #[test]
+    fn an_inactive_window_draws_outlines_in_the_quiet_ink_crossfading() {
+        let off = control_layers(2, &state(0.0));
+        assert_eq!(off.len(), 1);
+        assert_eq!((off[0].fill, off[0].stroke), (None, [0x2a, 0x26, 0x20, 0x8c]));
+        let buf = rasterize_control(&off);
+        assert_eq!(alpha_at(&buf, BUTTON_WIDTH, 16, 16), 0, "no fill");
+        let mid = control_layers(2, &state(0.5));
+        assert_eq!(mid.len(), 2, "both, mid-crossfade");
+        assert!((mid[0].alpha + mid[1].alpha - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn busy_runs_the_spinner_and_a_hovered_slot_stays_put() {
+        let busy = ControlState { busy: true, ..state(0.0) };
+        let shapes: Vec<Shape> = (0..3).map(|s| control_layers(s, &busy)[0].shape).collect();
+        assert_eq!(shapes, vec![Shape::Circle, Shape::Square, Shape::Triangle]);
+        assert!(control_layers(0, &busy)[0].fill.is_some(), "the spinner is in colour, even inactive");
+        let hovered = control_layers(2, &ControlState { hover: true, ..busy });
+        assert_eq!(hovered[0].shape, Shape::Circle, "close is still close under the pointer");
+        // Reduced: own shapes, blinking. Off: own shapes, own outlines.
+        let reduced = ControlState { mode: Mode::Reduced, ..busy };
+        assert_eq!(control_layers(0, &reduced)[0].shape, Shape::Triangle);
+        let off = ControlState { mode: Mode::Off, ..busy };
+        let l = control_layers(1, &off)[0];
+        assert_eq!((l.shape, l.fill, l.stroke), (Shape::Square, None, [0x33, 0x64, 0x7c, 0xff]));
+    }
+
+    fn flat_key(width: u32, focus: u8, dark: bool) -> FlatKey {
+        let colors = super::super::identity::bar_colors(Some([0xea, 0xb3, 0x08]), dark, [0xfb, 0xfa, 0xf7]);
+        FlatKey {
+            width,
+            shape: Radii([16.0, 4.0, 0.0, 0.0]),
+            glass: colors.glass,
+            glass_inactive: colors.glass_inactive,
+            accent: colors.accent,
+            dark,
+            focus,
+        }
+    }
+
+    #[test]
+    fn the_flat_bar_has_a_rim_on_top_and_the_accent_for_a_seam() {
+        let (w, h) = (200, HEADER_BAR_HEIGHT as u32);
+        let buf = rasterize_flat_bar(&flat_key(w, 20, false), h);
+        // The top row is lighter than the glass under it (white at 75%).
+        let rim = rgb_at(&buf, w, 100, 0);
+        let body = rgb_at(&buf, w, 100, 10);
+        assert!(rim[2] > body[2], "the rim is whiter: {rim:?} over {body:?}");
+        // The bottom row takes the accent (gold: blue falls well below red).
+        let seam = rgb_at(&buf, w, 100, h - 1);
+        assert!(seam[0] as i32 - seam[2] as i32 > 40, "{seam:?}");
+        // The rounded corner is still cut, rim and seam included.
+        assert_eq!(alpha_at(&buf, w, 0, 0), 0);
+        assert_eq!(alpha_at(&buf, w, w - 1, 0), 0, "the sharp corner is still a hair round");
+        assert!(alpha_at(&buf, w, 0, h - 1) >= 230, "the bottom stays square");
+    }
+
+    #[test]
+    fn the_flat_bars_seam_and_glass_fade_with_focus() {
+        let (w, h) = (120, HEADER_BAR_HEIGHT as u32);
+        let on = rasterize_flat_bar(&flat_key(w, 20, false), h);
+        let off = rasterize_flat_bar(&flat_key(w, 0, false), h);
+        let strength = |buf: &[u8]| {
+            let p = rgb_at(buf, w, 60, h - 1);
+            p[0] as i32 - p[2] as i32
+        };
+        assert!(strength(&on) > strength(&off) * 2, "the seam fades: {} vs {}", strength(&on), strength(&off));
+        let mid = rasterize_flat_bar(&flat_key(w, 10, false), h);
+        assert!(strength(&mid) < strength(&on) && strength(&mid) > strength(&off));
+    }
+
+    #[test]
+    fn a_dark_flat_bar_has_a_faint_rim() {
+        let (w, h) = (120, HEADER_BAR_HEIGHT as u32);
+        let dark = rasterize_flat_bar(&flat_key(w, 20, true), h);
+        let light = rasterize_flat_bar(&flat_key(w, 20, false), h);
+        let lift = |buf: &[u8]| rgb_at(buf, w, 60, 0)[0] as i32 - rgb_at(buf, w, 60, 8)[0] as i32;
+        assert!(lift(&dark) > 0 && lift(&dark) < 60, "14%: {}", lift(&dark));
+        // On a near-white glass a white rim has nowhere to go.
+        assert!(lift(&light) >= 0);
+    }
+
+    #[test]
+    fn a_frosted_bar_draws_no_glass_of_its_own() {
+        let mut flat = HeaderBar::new();
+        flat.redraw(300, 232, &TitleSource::default());
+        assert!(flat.drawn_flat.is_some());
+        flat.frosted = true;
+        flat.redraw(300, 232, &TitleSource::default());
+        assert!(flat.drawn_flat.is_none(), "the element draws it");
+        assert_eq!(flat.bar_radii(), Radii([16.0, 4.0, 0.0, 0.0]));
+        flat.square = true;
+        flat.redraw(300, 232, &TitleSource::default());
+        assert!(flat.bar_radii().is_square());
+    }
+
+    #[test]
+    fn the_label_is_icon_name_then_quiet_document() {
+        let colors = super::super::identity::bar_colors(Some([0xea, 0xb3, 0x08]), false, [0xfb, 0xfa, 0xf7]);
+        let icon = Icon { size: 20, rgba: [255, 0, 0, 255].repeat(400) };
+        let src = TitleSource {
+            label: super::super::identity::title_label(Some("Notes"), "Groceries"),
+            icon: Some(std::sync::Arc::new(icon)),
+            colors,
+        };
+        if title_font().is_none() {
+            return; // no DejaVu on this machine: the bar draws no text
+        }
+        let (w, h, buf) = rasterize_label(&src, 400).unwrap();
+        assert_eq!(h, HEADER_BAR_HEIGHT as u32);
+        assert_eq!(rgb_at(&buf, w, 10, 16), [255, 0, 0], "the icon, centred");
+        assert_eq!(alpha_at(&buf, w, 10, 2), 0);
+        let narrow = rasterize_label(&src, 60).unwrap();
+        assert!(narrow.0 <= 60, "clipped to the space it has");
+        let plain = TitleSource { label: super::super::identity::title_label(None, "xterm"), icon: None, colors };
+        let (pw, _, _) = rasterize_label(&plain, 400).unwrap();
+        assert!(pw < w, "no icon, no name");
+    }
+
+    #[test]
+    fn header_bar_respects_button_code_double_click_and_middle_click() {
+        let mut bar = HeaderBar::new();
+        bar.width = 400;
+        bar.window_height = 300;
+        let btn_right: u32 = 0x111;
+
+        // Right-clicks inside controls and titlebar are ignored.
+        bar.pointer_enter((390.0, 10.0).into());
+        assert_eq!(bar.resolve_pointer_press(btn_right, 100), None);
+        bar.pointer_enter((350.0, 10.0).into());
+        assert_eq!(bar.resolve_pointer_press(btn_right, 110), None);
+        bar.pointer_enter((100.0, 10.0).into());
+        assert_eq!(bar.resolve_pointer_press(btn_right, 120), None);
+
+        // Middle-click anywhere on the titlebar lowers the window.
+        bar.pointer_enter((100.0, 10.0).into());
+        assert_eq!(bar.resolve_pointer_press(BTN_MIDDLE, 130), Some(TitlebarAction::Lower));
+
+        // Left-clicks on controls act directly without priming double-click.
+        bar.pointer_enter((390.0, 10.0).into());
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 140), Some(TitlebarAction::Close));
+        bar.pointer_enter((350.0, 10.0).into());
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 150), Some(TitlebarAction::MaximizeToggle));
+        bar.pointer_enter((320.0, 10.0).into());
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 160), Some(TitlebarAction::Minimize));
+
+        // Left-click titlebar then quick nearby second click toggles maximize; 3rd starts fresh move.
+        bar.pointer_enter((120.0, 12.0).into());
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 200), Some(TitlebarAction::StartMove));
+        bar.pointer_enter((123.0, 14.0).into());
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 450), Some(TitlebarAction::MaximizeToggle));
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 500), Some(TitlebarAction::StartMove));
+
+        // Too slow (> 400ms) or too far (> 6px) starts a move instead of double-click.
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 1000), Some(TitlebarAction::StartMove));
+        bar.pointer_enter((150.0, 14.0).into());
+        assert_eq!(bar.resolve_pointer_press(BTN_LEFT, 1050), Some(TitlebarAction::StartMove));
     }
 }

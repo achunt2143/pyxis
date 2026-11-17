@@ -56,6 +56,52 @@ use crate::{focus::PointerFocusTarget, state::Backend, EvoState};
 #[derive(Debug, Default)]
 pub(crate) struct OldGeometry(RefCell<Option<Rectangle<i32, Logical>>>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TileSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SavedTile {
+    pub side: TileSide,
+    pub restore_geo: Rectangle<i32, Logical>,
+}
+
+/// Pre-tile floating geometry and current tile side for Super+Left/Right snap/restore.
+#[derive(Debug, Default)]
+pub(crate) struct TileState(RefCell<Option<SavedTile>>);
+
+impl TileState {
+    pub fn get(&self) -> Option<SavedTile> {
+        *self.0.borrow()
+    }
+
+    pub fn save(&self, tile: SavedTile) {
+        *self.0.borrow_mut() = Some(tile);
+    }
+
+    pub fn take(&self) -> Option<SavedTile> {
+        self.0.borrow_mut().take()
+    }
+}
+
+/// Name of the active `Output` a fullscreen or shell window is assigned to,
+/// so layout fixups keep windows on secondary outputs anchored cleanly even if
+/// outputs move or resize.
+#[derive(Debug, Default)]
+pub(crate) struct FullscreenOutputName(RefCell<Option<String>>);
+
+impl FullscreenOutputName {
+    pub fn get(&self) -> Option<String> {
+        self.0.borrow().clone()
+    }
+
+    pub fn set(&self, name: Option<String>) {
+        *self.0.borrow_mut() = name;
+    }
+}
+
 /// Marks a window whose location is a guess, made before its size was known.
 ///
 /// A new toplevel gets a location when it is created, but its size only
@@ -127,19 +173,18 @@ impl WindowElement {
         if !self.is_ssd() {
             return None;
         }
-        let WindowSurface::Wayland(toplevel) = self.0.underlying_surface() else {
-            // SSD resize starts an xdg configure-driven grab. X11 windows keep
-            // whatever resize their client does.
-            return None;
-        };
         // The committed state, i.e. what is on screen now. A maximize that
         // is only pending has not changed anything the pointer can see yet.
-        let fills_its_space = toplevel.with_committed_state(|state| {
-            state.is_some_and(|state| {
-                state.states.contains(xdg_toplevel::State::Maximized)
-                    || state.states.contains(xdg_toplevel::State::Fullscreen)
-            })
-        });
+        let fills_its_space = match self.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => toplevel.with_committed_state(|state| {
+                state.is_some_and(|state| {
+                    state.states.contains(xdg_toplevel::State::Maximized)
+                        || state.states.contains(xdg_toplevel::State::Fullscreen)
+                })
+            }),
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(x11) => x11.is_maximized() || x11.is_fullscreen(),
+        };
         if fills_its_space {
             return None;
         }
@@ -196,6 +241,30 @@ impl WindowElement {
         self.user_data()
             .get::<PlacementPending>()
             .is_some_and(|mark| mark.0.get())
+    }
+
+    /// What the title bar says, and in what colours: the app's icon and name
+    /// from its identity (`SetAppIdentity`), looked up by the window's trusted
+    /// app id, never its claim, then the client's own title when it adds
+    /// anything. An X11 window, or an app with no identity, shows its title as
+    /// it always did, on the plain material.
+    pub fn title_source(&self) -> super::ssd::TitleSource {
+        use super::identity;
+        let title = self.window_title();
+        #[cfg(feature = "xwayland")]
+        let x11 = self.is_x11();
+        #[cfg(not(feature = "xwayland"))]
+        let x11 = false;
+        let found = if x11 { None } else { self.app_id().and_then(|id| identity::lookup(&id)) };
+        super::ssd::TitleSource {
+            label: identity::title_label(found.as_ref().map(|i| i.name.as_str()), &title),
+            icon: found.as_ref().and_then(|i| i.icon.clone()),
+            colors: identity::bar_colors(
+                found.and_then(|i| i.accent),
+                identity::dark(),
+                identity::material(identity::dark()),
+            ),
+        }
     }
 
     /// The window's human-readable title for the SSD title bar: the
@@ -488,8 +557,10 @@ impl<BackendData: Backend> PointerTarget<EvoState<BackendData>> for SSD {
             return;
         }
         if self.0.is_ssd() {
-        let mut state = self.0.decoration_state();
-            state.header_bar.clicked(seat, data, &self.0, event.serial);
+            let mut state = self.0.decoration_state();
+            state
+                .header_bar
+                .clicked_button(seat, data, &self.0, event.serial, event.time, event.button);
         }
     }
     fn axis(
@@ -670,7 +741,9 @@ impl SpaceElement for WindowElement {
         if self.is_overlay() {
             // Only where Bloom says it draws (SetOverlayRegion). Everywhere
             // else the overlay is glass, and the click goes to what's beneath.
-            return super::overlay::region_contains(*point)
+            // While the screen is locked the overlay is the lock page and the
+            // whole screen is its to click (shell/lock.rs).
+            return (super::lock::input_locked() || super::overlay::region_contains(*point))
                 && SpaceElement::is_in_input_region(&self.0, point);
         }
         // Same render-origin caveat as `ssd_header_rect`: `point` is relative
@@ -729,6 +802,8 @@ render_elements!(
     // An opening window drawn as Lumen's Bloom (see `anim::bloom`).
     Bloom=crate::anim::shader::BloomSurface<R>,
     Decoration=DecorationRenderElement<R>,
+    // The title bar's frosted glass (see `shell::frost`).
+    Frost=crate::anim::shader::FrostElement,
     // A popup that is fading in (see `popup_pose`).
     Popup=crate::anim::transform::Transformed<WaylandSurfaceRenderElement<R>>,
 );
@@ -740,6 +815,7 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
             Self::Clipped(arg0) => f.debug_tuple("Clipped").field(arg0).finish(),
             Self::Bloom(arg0) => f.debug_tuple("Bloom").field(arg0).finish(),
             Self::Decoration(arg0) => f.debug_tuple("Decoration").field(arg0).finish(),
+            Self::Frost(arg0) => f.debug_tuple("Frost").field(arg0).finish(),
             Self::Popup(arg0) => f.debug_tuple("Popup").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
@@ -815,9 +891,10 @@ impl WindowElement {
 
             // Title + full visible height (header + client) — the SSD title
             // text and the side borders both need these. Computed before the
-            // decoration_state borrow (window_title reads the surface, not the
-            // decoration state).
-            let title = self.window_title();
+            // decoration_state borrow (title_source reads the surface and the
+            // identity table, not the decoration state).
+            let title = self.title_source();
+            let busy = self.is_busy();
             let full_height =
                 (HEADER_BAR_HEIGHT + window_geo.size.h).max(HEADER_BAR_HEIGHT) as u32;
 
@@ -825,11 +902,25 @@ impl WindowElement {
             let square = self.is_square();
             let radius = self.content_corner_radius();
             let programs = if radius > 0.0 { shader::programs(renderer) } else { None };
+            // The bar's glass: true frost (F2) or frosted wallpaper (F1) when
+            // captured, the shader works and the window has been placed on the
+            // output; else the flat fill the header draws itself (F0). The
+            // inactive variant is made only while something shows it.
+            let gear = super::frost::gear_for_window(
+                self,
+                renderer,
+                title.colors.dark,
+                super::frost::Gear::wants_inactive(focus as f32),
+            )
+            .filter(|_| self.frost_anchor().is_some());
+            self.set_frost_tier(gear.as_ref().map_or(super::frost::Tier::F0, |g| g.tier));
             let mut state = self.decoration_state();
             let width = window_geo.size.w;
             state.header_bar.focus = focus as f32;
             state.header_bar.square = square;
             state.header_bar.bottom_round = programs.is_some();
+            state.header_bar.busy = busy;
+            state.header_bar.frosted = gear.is_some();
             state.header_bar.redraw(width as u32, full_height, &title);
             vec = AsRenderElements::<R>::render_elements::<WindowRenderElement<R>>(
                 &state.header_bar,
@@ -841,7 +932,25 @@ impl WindowElement {
 
             location.y += (scale.y * HEADER_BAR_HEIGHT as f64) as i32;
 
+            let bar_radii = state.header_bar.bar_radii();
             drop(state);
+            if let Some(gear) = gear.as_ref() {
+                // Behind the title and the controls (which come first in the
+                // list), in front of nothing: the bar's glass.
+                let geo = Rectangle::new(
+                    header_loc,
+                    Size::<i32, Logical>::from((width, HEADER_BAR_HEIGHT)).to_physical_precise_round(scale),
+                );
+                let bar = super::frost::BarFacts {
+                    geo,
+                    radii: bar_radii.scale(scale.x),
+                    px: scale.x,
+                    focus: focus as f32,
+                    colors: &title.colors,
+                    alpha,
+                };
+                vec.extend(super::frost::bar_elements(self, gear, &bar).into_iter().map(WindowRenderElement::Frost));
+            }
             if let Some(programs) = programs {
                 let loc = location + window_geo.loc.to_physical_precise_round(scale);
                 let size = window_geo.size.to_physical_precise_round(scale);

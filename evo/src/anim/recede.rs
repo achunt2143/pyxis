@@ -22,7 +22,6 @@ use smithay::utils::{Logical, Rectangle};
 
 use super::{
     curve::{Animation, CubicBezier, Timing, Vec2},
-    depth,
     lumen::{self, Effect, Source},
     settings::AnimationSettings,
     shader::GlesAccess,
@@ -32,6 +31,7 @@ use super::{
     warp::{Drawn, Placement},
     window::{Origin, TransformAnim},
 };
+use crate::shell::identity::Radii;
 
 /// Movement (scale and drift) on the way out: a gentle in-out.
 pub const RECEDE_CURVE: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
@@ -132,6 +132,8 @@ fn fade(from: f64, to: f64, start: Duration, duration: Duration) -> TransformAni
 /// The picture a Recede or Emerge draws.
 pub struct RecedeFx {
     source: Source,
+    /// The frame's corners when it left, logical (`picture_radii`).
+    corners: Radii,
 }
 
 impl std::fmt::Debug for RecedeFx {
@@ -141,8 +143,8 @@ impl std::fmt::Debug for RecedeFx {
 }
 
 impl RecedeFx {
-    pub fn new(snapshot: Snapshot) -> Self {
-        Self { source: Source::new(snapshot) }
+    pub fn new(snapshot: Snapshot, corners: Radii) -> Self {
+        Self { source: Source::new(snapshot), corners }
     }
 
     /// One frame for the pose `t`, or `None` to draw the plain fallback (the
@@ -172,7 +174,7 @@ impl RecedeFx {
         // Only the frame (a client's shadow margin stays out), with the
         // frame's own corners.
         params.uv = self.source.uv_of(top_left, frame_px);
-        params.radius = depth::FRAME_RADIUS * s * t.scale.y;
+        params.radii = self.corners.scale(s * t.scale.y);
         params.blur = spec::RECEDE_BLUR_PX * s * p;
         params.alpha = t.alpha;
         let element = self.source.element(renderer, &params, Effect::Recede)?;

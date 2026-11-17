@@ -187,6 +187,27 @@ mod tests {
     }
 
     #[test]
+    fn a_left_rail_inset_moves_the_area_right_and_keeps_windows_off_it() {
+        // The launch bar as a rail: 36 px strip on top, 64 px down the left.
+        let insets = Insets { top: 36, bottom: 0, left: 64, right: 0 };
+        let area = insets.shrink(rect(0, 0, 1280, 800));
+        assert_eq!(area, rect(64, 36, 1216, 764));
+        // A maximized window's frame is the area: it starts right of the rail.
+        assert_eq!((area.loc.x, area.size.w), (64, 1216));
+        // A dragged window can't go under the rail, left or top.
+        assert_eq!(clamp_move((-50, 0).into(), (600, 400).into(), area), (64, 36).into());
+        // A frame placed at the screen's edge (a restored window) is fitted inside.
+        let (loc, size) = fit_frame((0, 24).into(), (1280, 800).into(), (0, 0).into(), area);
+        assert_eq!(size, (1216, 764).into());
+        assert_eq!(loc, (64, 36).into());
+        // A left-edge resize cannot push the window under the rail.
+        let max = max_resize_frame(ResizeEdge::LEFT, (300, 100).into(), (500, 400).into(), area);
+        assert_eq!(max.w, 300 + 500 - 64);
+        // And the parsed `SetWorkArea` body carries the left inset.
+        assert_eq!(parse_insets(&json!({ "top": 36, "bottom": 0, "left": 64 })).unwrap(), insets);
+    }
+
+    #[test]
     fn no_insets_change_nothing() {
         assert_eq!(Insets::default().shrink(rect(0, 0, 640, 480)), rect(0, 0, 640, 480));
     }

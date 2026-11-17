@@ -75,7 +75,7 @@ use smithay::{
             EventLoop, RegistrationToken,
         },
         drm::{
-            control::{connector, crtc, Device, ModeTypeFlags},
+            control::{connector, crtc, Device, Mode as DrmMode, ModeTypeFlags},
             Device as _,
         },
         input::{DeviceCapability, Libinput},
@@ -221,6 +221,32 @@ impl Backend for UdevData {
         if let Some(id) = output.user_data().get::<UdevOutputId>() {
             if let Some(gpu) = self.backends.get_mut(&id.device_id) {
                 if let Some(surface) = gpu.surfaces.get_mut(&id.crtc) {
+                    if let Some(wl_mode) = output.current_mode() {
+                        if let Some(&drm_mode) = surface
+                            .drm_modes
+                            .iter()
+                            .find(|m| {
+                                let wm = WlMode::from(**m);
+                                wm.size == wl_mode.size && wm.refresh == wl_mode.refresh
+                            })
+                            .or_else(|| {
+                                surface
+                                    .drm_modes
+                                    .iter()
+                                    .find(|m| WlMode::from(**m).size == wl_mode.size)
+                            })
+                        {
+                            if let Ok(mut renderer) = self.gpus.single_renderer(&self.primary_gpu) {
+                                if let Err(err) = surface.drm_output.use_mode::<_, OutputRenderElements<UdevRenderer<'_>, WindowRenderElement<UdevRenderer<'_>>>>(
+                                    drm_mode,
+                                    &mut renderer,
+                                    &DrmOutputRenderElements::default(),
+                                ) {
+                                    warn!("Failed to switch DRM mode {:?}: {}", drm_mode.size(), err);
+                                }
+                            }
+                        }
+                    }
                     surface.drm_output.reset_buffers();
                 }
             }
@@ -682,6 +708,7 @@ struct SurfaceData {
         Option<OutputPresentationFeedback>,
         DrmDeviceFd,
     >,
+    drm_modes: Vec<DrmMode>,
     disable_direct_scanout: bool,
     #[cfg(feature = "debug")]
     fps: fps_ticker::Fps,
@@ -933,7 +960,13 @@ impl EvoState<UdevData> {
         };
 
         let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
-        let mut renderer = self.backend_data.gpus.single_renderer(&render_node).unwrap();
+        let mut renderer = match self.backend_data.gpus.single_renderer(&render_node) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                warn!("Failed to get renderer for connector setup: {}", err);
+                return;
+            }
+        };
 
         let output_name = format!("{}-{}", connector.interface().as_str(), connector.interface_id());
         info!(?crtc, "Trying to setup connector {}", output_name,);
@@ -1012,7 +1045,11 @@ impl EvoState<UdevData> {
                         .unwrap_or(0)
                 });
 
-            let drm_mode = connector.modes()[mode_id];
+            let drm_modes: Vec<DrmMode> = connector.modes().to_vec();
+            let Some(mut drm_mode) = drm_modes.get(mode_id).copied() else {
+                warn!("Connector {} reported no DRM modes", output_name);
+                return;
+            };
             let wl_mode = WlMode::from(drm_mode);
             info!(
                 "Output {} selected mode {}x{} @ {}mHz (of {} available, index {}, preferred={})",
@@ -1020,7 +1057,7 @@ impl EvoState<UdevData> {
                 drm_mode.size().0,
                 drm_mode.size().1,
                 drm_mode.vrefresh(),
-                connector.modes().len(),
+                drm_modes.len(),
                 mode_id,
                 drm_mode.mode_type().contains(ModeTypeFlags::PREFERRED),
             );
@@ -1041,11 +1078,33 @@ impl EvoState<UdevData> {
             let x = self
                 .space
                 .outputs()
-                .fold(0, |acc, o| acc + self.space.output_geometry(o).unwrap().size.w);
-            let position = (x, 0).into();
+                .filter_map(|o| self.space.output_geometry(o))
+                .map(|g| g.loc.x + g.size.w)
+                .max()
+                .unwrap_or(0);
+            let mut position = (x, 0).into();
 
+            for m in &drm_modes {
+                output.add_mode(WlMode::from(*m));
+            }
             output.set_preferred(wl_mode);
             output.change_current_state(Some(wl_mode), None, None, Some(position));
+            #[cfg(feature = "echo-ipc")]
+            if let Some((px, py)) = crate::enhancements::echo_ipc::apply_persisted_config_to_output(&output) {
+                position = (px, py).into();
+                if let Some(m) = output.current_mode() {
+                    if let Some(&found) = drm_modes
+                        .iter()
+                        .find(|dm| {
+                            let wm = WlMode::from(**dm);
+                            wm.size == m.size && wm.refresh == m.refresh
+                        })
+                        .or_else(|| drm_modes.iter().find(|dm| WlMode::from(**dm).size == m.size))
+                    {
+                        drm_mode = found;
+                    }
+                }
+            }
             self.space.map_output(&output, position);
 
             output.user_data().insert_if_missing(|| UdevOutputId {
@@ -1060,6 +1119,10 @@ impl EvoState<UdevData> {
                 Ok(driver) => driver,
                 Err(err) => {
                     warn!("Failed to query drm driver: {}", err);
+                    self.space.unmap_output(&output);
+                    self.space.refresh();
+                    output.leave_all();
+                    self.display_handle.remove_global::<EvoState<UdevData>>(global);
                     return;
                 }
             };
@@ -1068,6 +1131,10 @@ impl EvoState<UdevData> {
                 Ok(planes) => planes,
                 Err(err) => {
                     warn!("Failed to query crtc planes: {}", err);
+                    self.space.unmap_output(&output);
+                    self.space.refresh();
+                    output.leave_all();
+                    self.display_handle.remove_global::<EvoState<UdevData>>(global);
                     return;
                 }
             };
@@ -1098,6 +1165,10 @@ impl EvoState<UdevData> {
                 Ok(drm_output) => drm_output,
                 Err(err) => {
                     warn!("Failed to initialize drm output: {}", err);
+                    self.space.unmap_output(&output);
+                    self.space.refresh();
+                    output.leave_all();
+                    self.display_handle.remove_global::<EvoState<UdevData>>(global);
                     return;
                 }
             };
@@ -1123,6 +1194,7 @@ impl EvoState<UdevData> {
                 output,
                 global: Some(global),
                 drm_output,
+                drm_modes,
                 disable_direct_scanout,
                 #[cfg(feature = "debug")]
                 fps: fps_ticker::Fps::default(),
@@ -1134,6 +1206,7 @@ impl EvoState<UdevData> {
             };
 
             device.surfaces.insert(crtc, surface);
+            self.fixup_positions(self.pointer.current_location());
 
             // kick-off rendering
             self.handle.insert_idle(move |state| {
@@ -1149,6 +1222,7 @@ impl EvoState<UdevData> {
             return;
         };
 
+        let mut unmapped_output = false;
         if let Some(pos) = device
             .non_desktop_connectors
             .iter()
@@ -1161,19 +1235,26 @@ impl EvoState<UdevData> {
         } else if let Some(surface) = device.surfaces.remove(&crtc) {
             self.space.unmap_output(&surface.output);
             self.space.refresh();
+            unmapped_output = true;
         }
 
         let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
-        let mut renderer = self.backend_data.gpus.single_renderer(&render_node).unwrap();
-        let _ = device.drm_output_manager.lock().try_to_restore_modifiers::<_, OutputRenderElements<
-            UdevRenderer<'_>,
-            WindowRenderElement<UdevRenderer<'_>>,
-        >>(
-            &mut renderer,
-            // FIXME: For a flicker free operation we should return the actual elements for this output..
-            // Instead we just use black to "simulate" a modeset :)
-            &DrmOutputRenderElements::default(),
-        );
+        if let Ok(mut renderer) = self.backend_data.gpus.single_renderer(&render_node) {
+            let _ = device.drm_output_manager.lock().try_to_restore_modifiers::<_, OutputRenderElements<
+                UdevRenderer<'_>,
+                WindowRenderElement<UdevRenderer<'_>>,
+            >>(
+                &mut renderer,
+                // FIXME: For a flicker free operation we should return the actual elements for this output..
+                // Instead we just use black to "simulate" a modeset :)
+                &DrmOutputRenderElements::default(),
+            );
+        } else {
+            warn!("Failed to get renderer for connector disconnect cleanup");
+        }
+        if unmapped_output {
+            self.fixup_positions(self.pointer.current_location());
+        }
     }
 
     fn device_changed(&mut self, node: DrmNode) {
@@ -1516,28 +1597,21 @@ impl EvoState<UdevData> {
         }
         .unwrap();
 
-        let pointer_images = &mut self.backend_data.pointer_images;
-        let pointer_image = pointer_images
-            .iter()
-            .find_map(|(image, texture)| {
-                if image == &frame {
-                    Some(texture.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                let buffer = MemoryRenderBuffer::from_slice(
-                    &frame.pixels_rgba,
+        let pointer_image = cache_bounded_item(
+            &mut self.backend_data.pointer_images,
+            frame,
+            MAX_POINTER_IMAGES,
+            |img| {
+                MemoryRenderBuffer::from_slice(
+                    &img.pixels_rgba,
                     Fourcc::Argb8888,
-                    (frame.width as i32, frame.height as i32),
+                    (img.width as i32, img.height as i32),
                     1,
                     Transform::Normal,
                     None,
-                );
-                pointer_images.push((frame, buffer.clone()));
-                buffer
-            });
+                )
+            },
+        );
 
         #[cfg(feature = "screencopy")]
         let mut captures = self.screencopy_state.take_pending(&output);
@@ -1794,4 +1868,53 @@ fn render_surface<'a>(
     }
 
     Ok((rendered, states))
+}
+
+const MAX_POINTER_IMAGES: usize = 64;
+
+/// Bounded MRU cache lookup/insertion so animated or multi-scale cursor images
+/// never accumulate without bound on `UdevData::pointer_images`.
+fn cache_bounded_item<K: PartialEq, V: Clone>(
+    cache: &mut Vec<(K, V)>,
+    key: K,
+    cap: usize,
+    build: impl FnOnce(&K) -> V,
+) -> V {
+    if let Some(pos) = cache.iter().position(|(existing, _)| existing == &key) {
+        let entry = cache.remove(pos);
+        let value = entry.1.clone();
+        cache.push(entry);
+        return value;
+    }
+    let value = build(&key);
+    if cap > 0 {
+        while cache.len() >= cap {
+            cache.remove(0);
+        }
+        cache.push((key, value.clone()));
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_image_cache_is_bounded_and_preserves_mru_items() {
+        let mut cache = Vec::new();
+        for i in 0i32..80 {
+            let v = cache_bounded_item(&mut cache, i, MAX_POINTER_IMAGES, |k| *k * 10);
+            assert_eq!(v, i * 10);
+            assert!(cache.len() <= MAX_POINTER_IMAGES);
+        }
+        assert_eq!(cache.len(), MAX_POINTER_IMAGES);
+        assert!(cache.iter().all(|(k, _)| *k >= (80 - MAX_POINTER_IMAGES) as i32));
+        // Touching oldest retained entry promotes it so the next insert evicts key 17 instead.
+        let promoted = cache_bounded_item(&mut cache, 16, MAX_POINTER_IMAGES, |_| -1);
+        assert_eq!(promoted, 160);
+        cache_bounded_item(&mut cache, 999, MAX_POINTER_IMAGES, |k| *k * 10);
+        assert!(cache.iter().any(|(k, _)| *k == 16));
+        assert!(!cache.iter().any(|(k, _)| *k == 17));
+    }
 }

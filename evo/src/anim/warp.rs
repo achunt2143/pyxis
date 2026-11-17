@@ -32,6 +32,7 @@ use super::{
     snapshot::Snapshot,
     transform::WindowTransform,
 };
+use crate::shell::identity::Radii;
 
 /// The element a Droplet frame is: the Lumen program's.
 pub type WarpElement = lumen::LumenElement;
@@ -42,6 +43,8 @@ pub struct Warp {
     /// The icon, output-logical.
     pub target: Rectangle<i32, Logical>,
     accent: [f32; 3],
+    /// The window's corners when it left, logical: where the shape starts.
+    corners: Radii,
     /// The last progress drawn and when, and the progress rate measured from
     /// them (per second): the speed the stretch follows.
     last: Cell<Option<(Duration, f64)>>,
@@ -84,11 +87,12 @@ pub fn smooth_rate(old: f64, sample: f64) -> f64 {
 
 impl Warp {
     /// `accent` is the app's own (Bloom's, from `SetMinimizeTargets`);
-    /// without one the picture's average colour is made into one.
-    pub fn new(snapshot: Snapshot, target: Rectangle<i32, Logical>, accent: Option<[f32; 3]>) -> Self {
+    /// without one the picture's average colour is made into one. `corners`
+    /// are the frame's (`WindowElement::picture_radii`).
+    pub fn new(snapshot: Snapshot, target: Rectangle<i32, Logical>, accent: Option<[f32; 3]>, corners: Radii) -> Self {
         let source = Source::new(snapshot);
         let accent = accent.unwrap_or_else(|| source.average_accent());
-        Self { source, target, accent, last: Cell::new(None), rate: Cell::new(0.0) }
+        Self { source, target, accent, corners, last: Cell::new(None), rate: Cell::new(0.0) }
     }
 
     pub fn snapshot(&self) -> &Snapshot {
@@ -135,13 +139,13 @@ impl Warp {
             )
         };
         let frame = to_px(place.frame);
-        let pose = droplet::pose(frame, to_px(self.target), progress, rate, s);
+        let pose = droplet::pose(frame, to_px(self.target), progress, rate, s, self.corners);
         let snap = self.source.snapshot();
         let top_left = (place.render_origin + snap.origin).to_f64();
         let params = lumen::Params {
             center: pose.center,
             size: pose.size,
-            radius: pose.radius,
+            radii: pose.radii,
             blur: pose.blur,
             tint: pose.tint,
             glow: pose.glow,
@@ -169,6 +173,7 @@ mod tests {
             Snapshot::from_pixels(vec![255; 16], (2, 2).into(), (0, 0).into(), 1.0),
             Rectangle::new((0, 0).into(), (48, 48).into()),
             None,
+            Radii::FRAME,
         );
         let ms = Duration::from_millis;
         assert_eq!(w.measure(ms(1000), 0.0), 0.0, "first sample: at rest");
@@ -185,8 +190,8 @@ mod tests {
     fn an_apps_accent_wins_over_the_picture() {
         let snap = || Snapshot::from_pixels(vec![255; 16], (2, 2).into(), (0, 0).into(), 1.0);
         let target = Rectangle::new((0, 0).into(), (48, 48).into());
-        assert_eq!(Warp::new(snap(), target, Some([1.0, 0.0, 0.0])).accent(), [1.0, 0.0, 0.0]);
-        let own = Warp::new(snap(), target, None).accent();
+        assert_eq!(Warp::new(snap(), target, Some([1.0, 0.0, 0.0]), Radii::FRAME).accent(), [1.0, 0.0, 0.0]);
+        let own = Warp::new(snap(), target, None, Radii::FRAME).accent();
         assert_ne!(own, [1.0, 1.0, 1.0], "a white picture is not a white orb");
     }
 }

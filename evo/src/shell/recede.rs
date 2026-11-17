@@ -105,6 +105,27 @@ pub fn state_json() -> Value {
     })
 }
 
+/// Drop a closing/removed window from the show-desktop memory right away so
+/// closed windows cannot linger in thread-local `RECEDED`.
+pub fn forget_window(window: &WindowElement) {
+    RECEDED.with(|cell| cell.borrow_mut().retain(|w| w != window));
+}
+
+#[cfg(test)]
+pub(crate) fn receded_for_test_push(window: WindowElement) {
+    RECEDED.with(|cell| cell.borrow_mut().push(window));
+}
+
+#[cfg(test)]
+pub(crate) fn receded_contains(window: &WindowElement) -> bool {
+    RECEDED.with(|cell| cell.borrow().iter().any(|w| w == window))
+}
+
+#[cfg(test)]
+pub(crate) fn clear_receded_for_test() {
+    RECEDED.with(|cell| cell.borrow_mut().clear());
+}
+
 /// Which way Super+D goes, given the remembered set and the screen.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Toggle {
@@ -131,7 +152,7 @@ pub fn emerge_delays(count: usize, settings: &anim::AnimationSettings) -> Vec<Du
 
 impl<BackendData: Backend> EvoState<BackendData> {
     /// App windows on screen, front-most first: what a show desktop sends away.
-    fn desktop_windows(&self) -> Vec<WindowElement> {
+    pub(crate) fn desktop_windows(&self) -> Vec<WindowElement> {
         self.space
             .elements()
             .rev()
@@ -228,7 +249,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
             snapshot.size.h,
             began.elapsed().as_secs_f64() * 1000.0
         );
-        Some(Box::new(RecedeFx::new(snapshot)))
+        Some(Box::new(RecedeFx::new(snapshot, window.picture_radii())))
     }
 
     /// Draw `window` receding, starting `delay` from now. Call while it is

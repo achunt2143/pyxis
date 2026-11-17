@@ -125,6 +125,10 @@ pub fn run_winit() {
     let _global = output.create_global::<EvoState<WinitData>>(&display.handle());
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);
+    #[cfg(feature = "echo-ipc")]
+    let initial_pos = crate::enhancements::echo_ipc::apply_persisted_config_to_output(&output).unwrap_or((0, 0));
+    #[cfg(not(feature = "echo-ipc"))]
+    let initial_pos = (0, 0);
 
     #[cfg(feature = "debug")]
     #[allow(deprecated)]
@@ -204,7 +208,7 @@ pub fn run_winit() {
     state
         .shm_state
         .update_formats(state.backend_data.backend.renderer().shm_formats());
-    state.space.map_output(&output, (0, 0));
+    state.space.map_output(&output, initial_pos);
 
     #[cfg(feature = "xwayland")]
     state.start_xwayland();

@@ -31,6 +31,7 @@ use super::{
     lumen::{self, Effect},
     shader::GlesAccess,
 };
+use crate::shell::identity::Radii;
 
 /// Where in the transition (fraction of its nominal duration) the glint
 /// starts; it ends with the transition.
@@ -68,10 +69,10 @@ pub fn band_px(w: f64, h: f64) -> f64 {
 const SLOPE: f64 = 0.6;
 
 /// Uniforms in physical pixels relative to the frame's top-left: `size` the
-/// frame, `radius` its corner radius (the frame's corners at this moment),
+/// frame, `radii` its corner radii (the frame's corners at this moment),
 /// `centre` the band's position along `x + slope·y`, `band` its half-width,
 /// `peak` its alpha. Premultiplied white.
-const GLINT_SHADER: &str = r#"
+pub(super) const GLINT_SHADER: &str = concat!(r#"
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
@@ -80,7 +81,7 @@ precision mediump float;
 varying vec2 v_coords;
 uniform float alpha;
 uniform vec2 size;
-uniform float radius;
+uniform vec4 radii;
 uniform float slope;
 uniform float centre;
 uniform float band;
@@ -88,13 +89,12 @@ uniform float peak;
 #if defined(DEBUG_FLAGS)
 uniform float tint;
 #endif
-
+"#, crate::radii_glsl!(), r#"
 void main() {
     vec2 p = v_coords * size;
     vec2 half_size = size * 0.5;
-    float r = min(radius, min(half_size.x, half_size.y));
-    vec2 q = abs(p - half_size) - half_size + r;
-    float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+    vec4 r = min(radii, vec4(min(half_size.x, half_size.y)));
+    float dist = rbox4(p - half_size, half_size, r);
     float inside = clamp(0.5 - dist, 0.0, 1.0);
 
     float s = (p.x + slope * p.y - centre) / max(band, 1.0);
@@ -108,7 +108,7 @@ void main() {
 #endif
     gl_FragColor = color;
 }
-"#;
+"#);
 
 /// The band's centre along `x + SLOPE·y`, physical px, at glint progress `g`
 /// for a frame `w`×`h` with half-width `band`: from fully off the top-left
@@ -138,7 +138,7 @@ fn compile(gles: &mut GlesRenderer) -> Option<GlesPixelProgram> {
         GLINT_SHADER,
         &[
             UniformName::new("size", UniformType::_2f),
-            UniformName::new("radius", UniformType::_1f),
+            UniformName::new("radii", UniformType::_4f),
             UniformName::new("slope", UniformType::_1f),
             UniformName::new("centre", UniformType::_1f),
             UniformName::new("band", UniformType::_1f),
@@ -182,13 +182,13 @@ pub struct GlintTrack {
 
 impl GlintTrack {
     /// The element for this frame. `frame` is where the window is drawn
-    /// (output-physical), `radius` its corners now (physical px), `g` the
+    /// (output-physical), `radii` its corners now (physical px), `g` the
     /// glint's progress, `px` physical px per logical px (for the band width).
     pub fn element(
         &mut self,
         program: GlesPixelProgram,
         frame: Rectangle<i32, Physical>,
-        radius: f64,
+        radii: Radii,
         g: f64,
         px: f64,
     ) -> Option<GlintElement> {
@@ -210,7 +210,7 @@ impl GlintTrack {
             id: self.id.get_or_insert_with(Id::new).clone(),
             commit: self.commit,
             area: frame,
-            radius: radius as f32,
+            radii,
             centre: centre(g, w, h, band) as f32,
             band: band as f32,
             peak: peak as f32,
@@ -225,7 +225,7 @@ pub struct GlintElement {
     id: Id,
     commit: CommitCounter,
     area: Rectangle<i32, Physical>,
-    radius: f32,
+    radii: Radii,
     centre: f32,
     band: f32,
     peak: f32,
@@ -280,7 +280,7 @@ impl<R: GlesAccess> RenderElement<R> for GlintElement {
         let k = dst.size.w as f32 / self.area.size.w.max(1) as f32;
         let uniforms = [
             Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
-            Uniform::new("radius", self.radius * k),
+            Uniform::new("radii", self.radii.scale(k as f64).as_f32()),
             Uniform::new("slope", SLOPE as f32),
             Uniform::new("centre", self.centre * k),
             Uniform::new("band", self.band * k),

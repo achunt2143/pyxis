@@ -72,7 +72,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
         // plain open.
         if bloom::available() {
             if let Some(open) = TransformAnim::bloom(&settings, now) {
-                let fx = BloomFx::new(&settings, now, self.bloom_accent(window), window.content_corner_radius());
+                let fx = BloomFx::new(&settings, now, self.bloom_accent(window), window.frame_radii());
                 window.start_animation(WindowAnim::new(AnimKind::Open, open).with_bloom(fx));
             }
             return;

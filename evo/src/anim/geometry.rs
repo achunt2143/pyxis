@@ -65,7 +65,7 @@ use super::{
     transform::{wrap, wrap_all, Transformed, WindowTransform},
     window::{stats, ActiveGuard, AnimKind},
 };
-use crate::shell::{WindowElement, WindowRenderElement};
+use crate::shell::{identity::Radii, WindowElement, WindowRenderElement};
 
 type Rect = Rectangle<i32, Logical>;
 
@@ -522,13 +522,19 @@ where
             // The frame's corners as they are now: they square off as a
             // window maximizes (the shadow's appear fades with them) and
             // round again as it leaves.
-            let base = if window.is_ssd() { depth::FRAME_RADIUS } else { depth::CLIENT_RADIUS };
-            let radius = base * window.shadow_appear(now) * px;
-            transition.glint.element(program, frame, radius, g, px)
+            transition.glint.element(program, frame, glint_radii(window.is_ssd(), window.shadow_appear(now), px), g, px)
         }),
         _ => None,
     };
     Some(Drawn { live, snapshot: snapshot_elements, shadow_pose, glint })
+}
+
+/// The glint's clip: the frame's corners (the waterdrop for an Evo frame, the
+/// client's assumed radius otherwise) times `appear`, which is 0 once the
+/// window is square, in physical px.
+fn glint_radii(ssd: bool, appear: f64, px: f64) -> Radii {
+    let base = if ssd { depth::FRAME_RADII } else { Radii::uniform(depth::CLIENT_RADIUS) };
+    base.scale(appear * px)
 }
 
 #[cfg(test)]
@@ -538,6 +544,14 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_glint_clips_to_the_waterdrop_and_squares_off_with_the_window() {
+        assert_eq!(glint_radii(true, 1.0, 1.0), Radii([16.0, 4.0, 16.0, 16.0]));
+        assert_eq!(glint_radii(true, 1.0, 2.0), Radii([32.0, 8.0, 32.0, 32.0]));
+        assert!(glint_radii(true, 0.0, 1.0).is_square(), "maximized: square");
+        assert_eq!(glint_radii(false, 1.0, 1.0), Radii::uniform(depth::CLIENT_RADIUS));
     }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {

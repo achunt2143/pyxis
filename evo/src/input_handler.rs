@@ -72,6 +72,10 @@ impl<BackendData: Backend> EvoState<BackendData> {
 
             KeyAction::CloseWindow => self.close_focused_window(),
 
+            // Super+L. (While locked no shortcut is looked up at all, so this
+            // is never reached to lock a locked screen.)
+            KeyAction::Lock => self.lock_screen(crate::shell::lock::Source::Key),
+
             KeyAction::CycleWindows { reverse } => self.cycle_windows(reverse),
 
             KeyAction::CancelSwitcher => self.switcher_cancel(),
@@ -126,6 +130,12 @@ impl<BackendData: Backend> EvoState<BackendData> {
                 self.restore_last_minimized();
             }
 
+            KeyAction::MaximizeWindow => self.toggle_maximize_focused_window(),
+            KeyAction::UnmaximizeOrMinimizeWindow => self.unmaximize_or_minimize_focused_window(),
+            KeyAction::TileLeft => self.tile_focused_window(crate::shell::TileSide::Left),
+            KeyAction::TileRight => self.tile_focused_window(crate::shell::TileSide::Right),
+            KeyAction::CycleAppWindows { reverse } => self.cycle_app_windows(reverse),
+
             _ => unreachable!(
                 "Common key action handler encountered backend specific action {:?}",
                 action
@@ -141,6 +151,20 @@ impl<BackendData: Backend> EvoState<BackendData> {
         let time = Event::time_msec(&evt);
         let mut suppressed_keys = self.suppressed_keys.clone();
         let keyboard = self.seat.get_keyboard().unwrap();
+
+        crate::shell::lock::note_input();
+        // Locked: every key is the lock page's and nothing is a shortcut.
+        // Alt+Tab, Super+anything, Super+Q, show desktop, VT switching and a
+        // client's keyboard-shortcuts-inhibit are all moot: no shortcut is
+        // even looked up, and the keyboard is put on the overlay first, so a
+        // key arriving before the compositor's next pass can't reach an app.
+        if crate::shell::lock::input_locked() {
+            self.enforce_lock_focus();
+            self.suppressed_keys.clear();
+            self.super_tap = false;
+            keyboard.input::<(), _>(self, keycode, state, serial, time, |_, _, _| FilterResult::Forward);
+            return KeyAction::None;
+        }
 
         for layer in self.layer_shell_state.layer_surfaces().rev() {
             let exclusive = layer.with_cached_state(|data| {
@@ -233,7 +257,7 @@ impl<BackendData: Backend> EvoState<BackendData> {
 
         self.suppressed_keys = suppressed_keys;
         self.super_tap = super_tap;
-        if tapped {
+        if tapped && !crate::shell::lock::input_locked() {
             #[cfg(feature = "echo-ipc")]
             let _ = self.echo_service.read().emit_shortcut_triggered("launcher");
         }
@@ -250,10 +274,22 @@ impl<BackendData: Backend> EvoState<BackendData> {
 
         let state = wl_pointer::ButtonState::from(evt.state());
 
-        if wl_pointer::ButtonState::Pressed == state {
+        // Locked: a click is the overlay's or nobody's. The pointer's focus is
+        // brought to the overlay first (an app that had it must not get this
+        // click), and the click moves no keyboard focus and pings no app.
+        let locked = crate::shell::lock::input_locked();
+        if locked {
+            self.fix_locked_pointer();
+        }
+        if !locked && wl_pointer::ButtonState::Pressed == state {
             // Super+click is a chord, not a tap.
             self.super_tap = false;
             self.update_keyboard_focus(self.pointer.current_location(), serial);
+            // A click is a moment to ask whether the app still answers.
+            let location = self.pointer.current_location();
+            if let Some((window, _)) = self.space.element_under(location).map(|(w, p)| (w.clone(), p)) {
+                self.ping_window(&window, true);
+            }
         };
         let pointer = self.pointer.clone();
         pointer.button(
@@ -269,6 +305,11 @@ impl<BackendData: Backend> EvoState<BackendData> {
     }
 
     fn update_keyboard_focus(&mut self, location: Point<f64, Logical>, serial: Serial) {
+        // Locked: the keyboard is the overlay's (shell/lock.rs); no click or
+        // touch moves it.
+        if crate::shell::lock::input_locked() {
+            return;
+        }
         let keyboard = self.seat.get_keyboard().unwrap();
         let touch = self.seat.get_touch();
         let input_method = self.seat.input_method();
@@ -303,7 +344,9 @@ impl<BackendData: Backend> EvoState<BackendData> {
                     {
                         #[cfg(feature = "xwayland")]
                         if let Some(surface) = window.0.x11_surface() {
-                            self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
+                            if let Some(xwm) = self.xwm.as_mut() {
+                                let _ = xwm.raise_window(surface);
+                            }
                         }
                         keyboard.set_focus(self, Some(window.into()), serial);
                         return;
@@ -341,7 +384,9 @@ impl<BackendData: Backend> EvoState<BackendData> {
                 self.raise_window(&window);
                 #[cfg(feature = "xwayland")]
                 if let Some(surface) = window.0.x11_surface() {
-                    self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
+                    if let Some(xwm) = self.xwm.as_mut() {
+                        let _ = xwm.raise_window(surface);
+                    }
                 }
                 keyboard.set_focus(self, Some(window.into()), serial);
                 return;
@@ -390,11 +435,18 @@ impl<BackendData: Backend> EvoState<BackendData> {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
+        // Locked: the overlay, over the whole screen, or nothing. This is the
+        // one function every pointer, touch and tablet event asks, so no app
+        // surface, layer surface or popup can be returned while it holds.
+        if crate::shell::lock::input_locked() {
+            return self.locked_surface_under(pos);
+        }
         let output = self.space.outputs().find(|o| {
-            let geometry = self.space.output_geometry(o).unwrap();
-            geometry.contains(pos.to_i32_round())
+            self.space
+                .output_geometry(o)
+                .is_some_and(|geometry| geometry.to_f64().contains(pos))
         })?;
-        let output_geo = self.space.output_geometry(output).unwrap();
+        let output_geo = self.space.output_geometry(output)?;
         let layers = layer_map_for_output(output);
 
         let fullscreen = output
@@ -463,6 +515,9 @@ impl<BackendData: Backend> EvoState<BackendData> {
     }
 
     fn on_pointer_axis<B: InputBackend>(&mut self, evt: B::PointerAxisEvent) {
+        if crate::shell::lock::input_locked() {
+            self.fix_locked_pointer();
+        }
         let horizontal_amount = evt
             .amount(input::Axis::Horizontal)
             .unwrap_or_else(|| evt.amount_v120(input::Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.);
@@ -506,6 +561,9 @@ impl<BackendData: Backend> EvoState<BackendData> {
 #[cfg(any(feature = "winit", feature = "x11"))]
 impl<BackendData: Backend> EvoState<BackendData> {
     pub fn process_input_event_windowed<B: InputBackend>(&mut self, event: InputEvent<B>, output_name: &str) {
+        if !matches!(event, InputEvent::DeviceAdded { .. } | InputEvent::DeviceRemoved { .. }) {
+            crate::shell::lock::note_input();
+        }
         match event {
             InputEvent::Keyboard { event } => match self.keyboard_key_to_action::<B>(event) {
                 KeyAction::ScaleUp => {
@@ -568,12 +626,18 @@ impl<BackendData: Backend> EvoState<BackendData> {
                 action => match action {
                     KeyAction::None
                     | KeyAction::CloseWindow
+                    | KeyAction::Lock
                     | KeyAction::CycleWindows { .. }
                     | KeyAction::CancelSwitcher
                     | KeyAction::Shell(_)
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
-                    | KeyAction::RestoreMinimized => self.process_common_key_action(action),
+                    | KeyAction::RestoreMinimized
+                    | KeyAction::MaximizeWindow
+                    | KeyAction::UnmaximizeOrMinimizeWindow
+                    | KeyAction::TileLeft
+                    | KeyAction::TileRight
+                    | KeyAction::CycleAppWindows { .. } => self.process_common_key_action(action),
 
                     _ => tracing::warn!(
                         ?action,
@@ -640,9 +704,15 @@ impl<BackendData: Backend> EvoState<BackendData> {
 #[cfg(feature = "udev")]
 impl EvoState<UdevData> {
     pub fn process_input_event<B: InputBackend>(&mut self, dh: &DisplayHandle, event: InputEvent<B>) {
+        if !matches!(event, InputEvent::DeviceAdded { .. } | InputEvent::DeviceRemoved { .. }) {
+            crate::shell::lock::note_input();
+        }
         match event {
             InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<B>(event) {
                 #[cfg(feature = "udev")]
+                // Never while locked (no shortcut is looked up then; this is
+                // the second lock on the same door).
+                KeyAction::VtSwitch(_) if crate::shell::lock::input_locked() => {}
                 KeyAction::VtSwitch(vt) => {
                     info!(to = vt, "Trying to switch vt");
                     if let Err(err) = self.backend_data.session.change_vt(vt) {
@@ -786,12 +856,18 @@ impl EvoState<UdevData> {
                 action => match action {
                     KeyAction::None
                     | KeyAction::CloseWindow
+                    | KeyAction::Lock
                     | KeyAction::CycleWindows { .. }
                     | KeyAction::CancelSwitcher
                     | KeyAction::Shell(_)
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
-                    | KeyAction::RestoreMinimized => self.process_common_key_action(action),
+                    | KeyAction::RestoreMinimized
+                    | KeyAction::MaximizeWindow
+                    | KeyAction::UnmaximizeOrMinimizeWindow
+                    | KeyAction::TileLeft
+                    | KeyAction::TileRight
+                    | KeyAction::CycleAppWindows { .. } => self.process_common_key_action(action),
 
                     _ => unreachable!(),
                 },
@@ -926,7 +1002,7 @@ impl EvoState<UdevData> {
 
         pointer.motion(
             self,
-            under,
+            new_under.clone(),
             &MotionEvent {
                 location: pointer_location,
                 serial,
@@ -959,20 +1035,20 @@ impl EvoState<UdevData> {
     ) {
         let serial = SCOUNTER.next_serial();
 
-        let max_x = self
+        let Some(bbox) = self
             .space
             .outputs()
-            .fold(0, |acc, o| acc + self.space.output_geometry(o).unwrap().size.w);
+            .filter_map(|o| self.space.output_geometry(o))
+            .filter(|g| g.size.w > 0 && g.size.h > 0)
+            .reduce(|acc, g| acc.merge(g))
+        else {
+            return;
+        };
 
-        let max_h_output = self
-            .space
-            .outputs()
-            .max_by_key(|o| self.space.output_geometry(o).unwrap().size.h)
-            .unwrap();
-
-        let max_y = self.space.output_geometry(max_h_output).unwrap().size.h;
-
-        let mut pointer_location = (evt.x_transformed(max_x), evt.y_transformed(max_y)).into();
+        let mut pointer_location = Point::from((
+            bbox.loc.x as f64 + evt.x_transformed(bbox.size.w),
+            bbox.loc.y as f64 + evt.y_transformed(bbox.size.h),
+        ));
 
         // clamp to screen limits
         pointer_location = self.clamp_coords(pointer_location);
@@ -1316,32 +1392,46 @@ impl EvoState<UdevData> {
     }
 
     fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
-        if self.space.outputs().next().is_none() {
-            return pos;
-        }
-
-        let (pos_x, pos_y) = pos.into();
-        let max_x = self
+        let rects: Vec<smithay::utils::Rectangle<i32, Logical>> = self
             .space
             .outputs()
-            .fold(0, |acc, o| acc + self.space.output_geometry(o).unwrap().size.w);
-        let clamped_x = pos_x.clamp(0.0, max_x as f64);
-        let max_y = self
-            .space
-            .outputs()
-            .find(|o| {
-                let geo = self.space.output_geometry(o).unwrap();
-                geo.contains((clamped_x as i32, 0))
-            })
-            .map(|o| self.space.output_geometry(o).unwrap().size.h);
-
-        if let Some(max_y) = max_y {
-            let clamped_y = pos_y.clamp(0.0, max_y as f64);
-            (clamped_x, clamped_y).into()
-        } else {
-            (clamped_x, pos_y).into()
-        }
+            .filter_map(|o| self.space.output_geometry(o))
+            .filter(|g| g.size.w > 0 && g.size.h > 0)
+            .collect();
+        clamp_point_to_rects(pos, &rects)
     }
+}
+
+/// Clamp `pos` into any arbitrary multi-monitor set of `(x, y, w, h)` output
+/// rects (stacked, staggered, negative origins, or L-shaped). If `pos` is
+/// already inside an output rect it is returned unchanged; otherwise it projects
+/// to the closest point inside the nearest output rect.
+pub(crate) fn clamp_point_to_rects(
+    pos: Point<f64, Logical>,
+    rects: &[smithay::utils::Rectangle<i32, Logical>],
+) -> Point<f64, Logical> {
+    if rects.is_empty() {
+        return pos;
+    }
+    if rects.iter().any(|r| r.size.w > 0 && r.size.h > 0 && r.to_f64().contains(pos)) {
+        return pos;
+    }
+    rects
+        .iter()
+        .filter(|r| r.size.w > 0 && r.size.h > 0)
+        .map(|r| {
+            let min_x = r.loc.x as f64;
+            let min_y = r.loc.y as f64;
+            let max_x = (r.loc.x as f64 + r.size.w as f64 - 1.0).max(min_x);
+            let max_y = (r.loc.y as f64 + r.size.h as f64 - 1.0).max(min_y);
+            let cx = pos.x.clamp(min_x, max_x);
+            let cy = pos.y.clamp(min_y, max_y);
+            let dist_sq = (cx - pos.x).powi(2) + (cy - pos.y).powi(2);
+            (dist_sq, Point::from((cx, cy)))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, pt)| pt)
+        .unwrap_or(pos)
 }
 
 /// Possible results of a keyboard action
@@ -1352,10 +1442,21 @@ enum KeyAction {
     VtSwitch(i32),
     /// Super+Q: ask the focused app window to close
     CloseWindow,
+    /// Super+L: lock the screen
+    Lock,
     /// Alt+Tab, Shift+Alt+Tab
     CycleWindows { reverse: bool },
+    /// Alt+Grave, Alt+Shift+Grave: cycle windows matching focused app_id
+    CycleAppWindows { reverse: bool },
     /// Escape during Alt+Tab: close the switcher, focus stays
     CancelSwitcher,
+    /// Super+Up: toggle maximize/restore on active window
+    MaximizeWindow,
+    /// Super+Down: unmaximize/untile if maximized or tiled, else minimize
+    UnmaximizeOrMinimizeWindow,
+    /// Super+Left / Super+Right: snap/tile or restore active window
+    TileLeft,
+    TileRight,
     /// Tell the shell (`ShortcutTriggered`): it owns what these do
     Shell(&'static str),
     /// Switch the current screen
@@ -1387,9 +1488,15 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
     if bare_alt && tab {
         return Some(KeyAction::CycleWindows { reverse: modifiers.shift });
     }
+    if bare_alt && (keysym == Keysym::grave || keysym == Keysym::asciitilde) {
+        return Some(KeyAction::CycleAppWindows { reverse: modifiers.shift });
+    }
     if modifiers.logo && !modifiers.alt && !modifiers.ctrl && !modifiers.shift {
         if keysym == Keysym::q {
             return Some(KeyAction::CloseWindow);
+        }
+        if keysym == Keysym::l {
+            return Some(KeyAction::Lock);
         }
         if tab {
             return Some(KeyAction::Shell("overview"));
@@ -1399,6 +1506,18 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         }
         if keysym == Keysym::d {
             return Some(KeyAction::Shell("show-desktop"));
+        }
+        if keysym == Keysym::Up || keysym == Keysym::KP_Up {
+            return Some(KeyAction::MaximizeWindow);
+        }
+        if keysym == Keysym::Down || keysym == Keysym::KP_Down {
+            return Some(KeyAction::UnmaximizeOrMinimizeWindow);
+        }
+        if keysym == Keysym::Left || keysym == Keysym::KP_Left {
+            return Some(KeyAction::TileLeft);
+        }
+        if keysym == Keysym::Right || keysym == Keysym::KP_Right {
+            return Some(KeyAction::TileRight);
         }
     }
     if modifiers.logo && (xkb::KEY_1..=xkb::KEY_9).contains(&raw) {
@@ -1463,5 +1582,50 @@ mod tests {
         assert!(matches!(process_keyboard_shortcut(logo, Keysym::Tab), Some(KeyAction::Shell("overview"))));
         assert!(matches!(process_keyboard_shortcut(logo, Keysym::space), Some(KeyAction::Shell("search"))));
         assert!(matches!(process_keyboard_shortcut(logo, Keysym::d), Some(KeyAction::Shell("show-desktop"))));
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::l), Some(KeyAction::Lock)));
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::Up), Some(KeyAction::MaximizeWindow)));
+        assert!(matches!(
+            process_keyboard_shortcut(logo, Keysym::Down),
+            Some(KeyAction::UnmaximizeOrMinimizeWindow)
+        ));
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::Left), Some(KeyAction::TileLeft)));
+        assert!(matches!(process_keyboard_shortcut(logo, Keysym::Right), Some(KeyAction::TileRight)));
+        assert!(matches!(
+            process_keyboard_shortcut(alt, Keysym::grave),
+            Some(KeyAction::CycleAppWindows { reverse: false })
+        ));
+        assert!(matches!(
+            process_keyboard_shortcut(alt_shift, Keysym::asciitilde),
+            Some(KeyAction::CycleAppWindows { reverse: true })
+        ));
+        // Only a bare Super+L: Ctrl+Super+L or Shift+Super+L are someone else's.
+        let logo_shift = mods(|m| {
+            m.logo = true;
+            m.shift = true;
+        });
+        assert!(!matches!(process_keyboard_shortcut(logo_shift, Keysym::l), Some(KeyAction::Lock)));
+        assert!(process_keyboard_shortcut(alt, Keysym::l).is_none());
+    }
+
+    #[test]
+    fn clamp_point_to_rects_handles_stacked_and_staggered_monitors() {
+        use smithay::utils::Rectangle;
+        let stacked = [
+            Rectangle::new((0, 0).into(), (1920, 1080).into()),
+            Rectangle::new((0, 1080).into(), (2560, 1440).into()),
+        ];
+        // Bottom monitor below y=1080 is reachable without clamping to y=1080!
+        assert_eq!(
+            clamp_point_to_rects((1500.0, 1500.0).into(), &stacked),
+            Point::from((1500.0, 1500.0))
+        );
+        // Point off the bottom of the bottom monitor clamps to its bottom edge.
+        assert_eq!(
+            clamp_point_to_rects((1500.0, 3000.0).into(), &stacked),
+            Point::from((1500.0, 2519.0))
+        );
+        // Point outside right edge of narrower top monitor clamps into top monitor or falls cleanly.
+        let clamped_top_right = clamp_point_to_rects((2200.0, 200.0).into(), &stacked);
+        assert!(stacked.iter().any(|r| r.contains(clamped_top_right.to_i32_round())));
     }
 }

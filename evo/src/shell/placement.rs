@@ -31,10 +31,13 @@ use smithay::{
 use tracing::{debug, info};
 
 use super::{
+    element::{SavedTile, TileSide, TileState},
+    grabs::client_size,
     overlay as overlay_mod,
+    ssd::MIN_FRAME_SIZE,
     work_area,
     workspace::WindowLayout,
-    FullscreenSurface, ResizeEdge, WindowElement,
+    FullscreenSurface, OldGeometry, ResizeEdge, WindowElement,
 };
 use crate::{
     focus::KeyboardFocusTarget,
@@ -110,6 +113,35 @@ pub(crate) fn cycle_step(len: usize, index: usize, reverse: bool) -> usize {
 /// not of what it claims: see `WindowElement::is_shell_window`.)
 pub(crate) fn is_bindable_app_id(app_id: &str) -> bool {
     !app_id.is_empty() && app_id != "unknown" && app_id != "vela-default"
+}
+
+/// Whether a `"vela-default"` window is actually a top-level Vela browser
+/// window (launched under a `"browser"` / `"browser-window"` security context)
+/// rather than an auxiliary webapp helper window.
+pub(crate) fn is_vela_browser_context(context_app_id: &str) -> bool {
+    matches!(context_app_id, "browser" | "browser-window")
+}
+
+/// Whether `sync_surface_binding` should bind this window to AppHost.
+///
+/// Shell windows (`bloom`, `bloom-overlay`) are never bound. Normal apps are
+/// bound once they claim a bindable `app_id`. Normal Vela browser windows may
+/// leave their XDG `app_id` as `"vela-default"`, so they are allowed when
+/// their security context `app_id` identifies a browser session (`"browser"`
+/// or `"browser-window"`), while other `"vela-default"` windows remain excluded.
+pub(crate) fn should_bind_window(
+    is_shell: bool,
+    claimed_app_id: Option<&str>,
+    effective_app_id: Option<&str>,
+) -> bool {
+    if is_shell {
+        return false;
+    }
+    match claimed_app_id {
+        Some("vela-default") => effective_app_id.is_some_and(is_vela_browser_context),
+        Some(claimed) => is_bindable_app_id(claimed),
+        None => false,
+    }
 }
 
 /// The `BindSurface` calls to repeat after an Echo reconnect, from
@@ -315,6 +347,12 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         if window.is_overlay() {
             return;
         }
+        // Nothing takes the keyboard from the lock page while the screen is
+        // locked: not a dock click's FocusWindow, not xdg-activation, not a
+        // window mapping (shell/lock.rs holds it on the overlay).
+        if super::lock::input_locked() {
+            return;
+        }
         self.raise_window(window);
         #[cfg(feature = "xwayland")]
         if let Some(surface) = window.0.x11_surface() {
@@ -334,6 +372,53 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         }
     }
 
+    /// Move `window` behind all other app windows in its workspace and space
+    /// without burying it behind desktop shell backdrops. If `window` held the
+    /// keyboard, hand focus to the newly exposed front-most app window.
+    pub fn lower_window(&mut self, window: &WindowElement) {
+        if window.is_shell_window() {
+            return;
+        }
+        self.workspace_manager.lower_window(window);
+        let z = window.z_index();
+        let others: Vec<WindowElement> = self
+            .space
+            .elements()
+            .filter(|w| !w.is_shell_window() && *w != window && w.z_index() == z)
+            .cloned()
+            .collect();
+        if !others.is_empty() && self.is_window_mapped(window) {
+            for other in &others {
+                self.space.raise_element(other, false);
+            }
+            #[cfg(feature = "xwayland")]
+            if let Some(xwm) = self.xwm.as_mut() {
+                for other in &others {
+                    if let Some(surface) = other.0.x11_surface() {
+                        let _ = xwm.raise_window(surface);
+                    }
+                }
+            }
+        }
+        let had_focus = self.focused_app_window().as_ref() == Some(window);
+        if had_focus {
+            let top_other = self
+                .space
+                .elements()
+                .rev()
+                .find(|w| {
+                    w.alive()
+                        && !w.is_shell_window()
+                        && *w != window
+                        && !self.workspace_manager.is_minimized(w)
+                })
+                .cloned();
+            if let Some(top_other) = top_other {
+                self.focus_window(&top_other);
+            }
+        }
+    }
+
     /// Ask an app window to close, as the titlebar's X does: the client
     /// runs its own teardown. The desktop and its overlay are never closed.
     pub fn close_window(&mut self, window: &WindowElement) {
@@ -349,23 +434,241 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         }
     }
 
-    /// Super+Q: close the app window that has the keyboard, if one does.
-    pub fn close_focused_window(&mut self) {
-        let focused = self
-            .seat
+    /// Currently keyboard-focused non-shell live window, if any.
+    pub fn focused_app_window(&self) -> Option<WindowElement> {
+        self.seat
             .get_keyboard()
             .and_then(|k| k.current_focus())
             .and_then(|f| f.wl_surface().map(|s| s.into_owned()))
-            .and_then(|s| self.tracked_window_for_surface(&s));
-        if let Some(window) = focused {
+            .and_then(|s| self.tracked_window_for_surface(&s))
+            .filter(|w| w.alive() && !w.is_shell_window())
+    }
+
+    /// Super+Q: close the app window that has the keyboard, if one does.
+    pub fn close_focused_window(&mut self) {
+        if let Some(window) = self.focused_app_window() {
             self.close_window(&window);
         }
+    }
+
+    /// Maximize `window` across Wayland XDG and X11 windows uniformly.
+    pub fn maximize_window(&mut self, window: &WindowElement) {
+        if window.is_shell_window() {
+            return;
+        }
+        match window.0.underlying_surface() {
+            smithay::desktop::WindowSurface::Wayland(w) => {
+                use smithay::wayland::shell::xdg::XdgShellHandler;
+                let surface = w.clone();
+                XdgShellHandler::maximize_request(self, surface);
+            }
+            #[cfg(feature = "xwayland")]
+            smithay::desktop::WindowSurface::X11(w) => {
+                let surface = w.clone();
+                self.maximize_request_x11(&surface);
+            }
+        }
+    }
+
+    /// Restore `window` from maximized or tiled layout across Wayland and X11.
+    pub fn unmaximize_window(&mut self, window: &WindowElement) {
+        if window.is_shell_window() {
+            return;
+        }
+        if self
+            .workspace_manager
+            .state(window)
+            .is_some_and(|s| s.layout == WindowLayout::Tiled)
+        {
+            self.untile_window(window);
+            return;
+        }
+        match window.0.underlying_surface() {
+            smithay::desktop::WindowSurface::Wayland(w) => {
+                use smithay::wayland::shell::xdg::XdgShellHandler;
+                let surface = w.clone();
+                XdgShellHandler::unmaximize_request(self, surface);
+            }
+            #[cfg(feature = "xwayland")]
+            smithay::desktop::WindowSurface::X11(w) => {
+                let surface = w.clone();
+                self.unmaximize_request_x11(&surface);
+            }
+        }
+    }
+
+    fn apply_frame_rect(
+        &mut self,
+        window: &WindowElement,
+        target: Rectangle<i32, Logical>,
+        layout: WindowLayout,
+        activate: bool,
+    ) {
+        if !self.workspace_manager.is_minimized(window) {
+            self.begin_geometry_transition(window, Some(target.size));
+        }
+        match window.0.underlying_surface() {
+            smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                let size = client_size(window, target.size);
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+                    state.size = Some(size);
+                });
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            smithay::desktop::WindowSurface::X11(surface) => {
+                let _ = surface.set_maximized(false);
+                let _ = surface.configure(Rectangle::new(target.loc, client_size(window, target.size)));
+            }
+        }
+        self.place_window(window, target.loc, activate);
+        self.set_window_layout(window, layout);
+        self.window_moved(window);
+    }
+
+    pub(crate) fn untile_window(&mut self, window: &WindowElement) {
+        let Some(area) = self.work_area_for(window) else {
+            return;
+        };
+        let saved = window
+            .user_data()
+            .get::<TileState>()
+            .and_then(TileState::take)
+            .map(|t| t.restore_geo)
+            .unwrap_or_else(|| default_restore_frame_rect(area));
+        let (loc, size) = work_area::fit_frame(saved.loc, saved.size, (0, 0).into(), area);
+        self.apply_frame_rect(window, Rectangle::new(loc, size), WindowLayout::Floating, true);
+    }
+
+    /// Super+Up: toggle maximize/restore on the focused app window.
+    pub fn toggle_maximize_focused_window(&mut self) {
+        let Some(window) = self.focused_app_window() else {
+            return;
+        };
+        let layout = self
+            .workspace_manager
+            .state(&window)
+            .map_or(WindowLayout::Floating, |s| s.layout);
+        match layout {
+            WindowLayout::Fullscreen => {}
+            WindowLayout::Maximized => self.unmaximize_window(&window),
+            WindowLayout::Floating | WindowLayout::Tiled => self.maximize_window(&window),
+        }
+    }
+
+    /// Super+Down: unmaximize/untile if maximized or tiled, else minimize.
+    pub fn unmaximize_or_minimize_focused_window(&mut self) {
+        let Some(window) = self.focused_app_window() else {
+            return;
+        };
+        let layout = self
+            .workspace_manager
+            .state(&window)
+            .map_or(WindowLayout::Floating, |s| s.layout);
+        match layout {
+            WindowLayout::Fullscreen => {}
+            WindowLayout::Maximized | WindowLayout::Tiled => self.unmaximize_window(&window),
+            WindowLayout::Floating => self.minimize_window(&window),
+        }
+    }
+
+    /// Super+Left / Super+Right: snap/tile the focused window to left/right half
+    /// of its work area, or restore when pressed again for the same side.
+    pub(crate) fn tile_focused_window(&mut self, side: TileSide) {
+        let Some(window) = self.focused_app_window() else {
+            return;
+        };
+        let layout = self
+            .workspace_manager
+            .state(&window)
+            .map_or(WindowLayout::Floating, |s| s.layout);
+        if layout == WindowLayout::Fullscreen {
+            return;
+        }
+        let existing_tile = window.user_data().get::<TileState>().and_then(TileState::get);
+        if layout == WindowLayout::Tiled && existing_tile.is_some_and(|t| t.side == side) {
+            self.untile_window(&window);
+            return;
+        }
+        let Some(area) = self.work_area_for(&window) else {
+            return;
+        };
+        let restore_geo = if layout == WindowLayout::Tiled {
+            existing_tile
+                .map(|t| t.restore_geo)
+                .unwrap_or_else(|| default_restore_frame_rect(area))
+        } else if layout == WindowLayout::Maximized {
+            window
+                .user_data()
+                .get::<OldGeometry>()
+                .and_then(OldGeometry::restore)
+                .unwrap_or_else(|| default_restore_frame_rect(area))
+        } else {
+            self.window_frame(&window)
+                .unwrap_or_else(|| default_restore_frame_rect(area))
+        };
+        window.user_data().insert_if_missing(TileState::default);
+        if let Some(tile) = window.user_data().get::<TileState>() {
+            tile.save(SavedTile { side, restore_geo });
+        }
+        let target = tile_half_rect(area, side);
+        self.apply_frame_rect(&window, target, WindowLayout::Tiled, true);
+    }
+
+    /// Deferred unmaximize triggered once an interactive titlebar drag crosses
+    /// the motion threshold. Anchors horizontally proportionally under the grab
+    /// point so double-clicking a maximized titlebar never jumps before click 2.
+    pub(crate) fn unmaximize_on_drag(
+        &mut self,
+        window: &WindowElement,
+        grab_location: Point<f64, Logical>,
+    ) -> Option<Point<i32, Logical>> {
+        let area = self.work_area_for(window)?;
+        let current_frame = self.window_frame(window).unwrap_or(area);
+        let restored = window
+            .user_data()
+            .get::<OldGeometry>()
+            .and_then(OldGeometry::restore)
+            .unwrap_or_else(|| default_restore_frame_rect(area));
+        let (_, target_size) = work_area::fit_frame(restored.loc, restored.size, (0, 0).into(), area);
+        let frac_x = ((grab_location.x - current_frame.loc.x as f64) / current_frame.size.w.max(1) as f64)
+            .clamp(0.0, 1.0);
+        let raw_x = (grab_location.x - target_size.w as f64 * frac_x).round() as i32;
+        let clamped_loc = work_area::clamp_move((raw_x, current_frame.loc.y).into(), target_size, area);
+
+        match window.0.underlying_surface() {
+            smithay::desktop::WindowSurface::Wayland(surface) => {
+                let size = client_size(window, target_size);
+                surface.with_pending_state(|state| {
+                    state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+                    state.size = Some(size);
+                });
+                surface.send_configure();
+            }
+            #[cfg(feature = "xwayland")]
+            smithay::desktop::WindowSurface::X11(surface) => {
+                let _ = surface.set_maximized(false);
+                let _ = surface.configure(Rectangle::new(clamped_loc, client_size(window, target_size)));
+            }
+        }
+        self.place_window(window, clamped_loc, true);
+        self.set_window_layout(window, WindowLayout::Floating);
+        Some(clamped_loc)
     }
 
     /// `leaving` is closing or being minimized. If it has the keyboard (or
     /// the keyboard has nowhere live to be), hand it to the next app window
     /// down the stack, else to the shell, else to nobody.
     pub fn refocus_after_loss(&mut self, leaving: &WindowElement) {
+        // Locked: the keyboard goes to the overlay, or to nobody if it is
+        // the one that died. Never to the next app down the stack.
+        if super::lock::input_locked() {
+            self.enforce_lock_focus();
+            return;
+        }
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
@@ -426,11 +729,14 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         // (a vela window that has not run its PYXIS block yet claims
         // nothing), but what is bound is who the window is: for an app that
         // is the id its launcher gave the connection, whatever it claims.
-        let bindable = !window.is_shell_window()
-            && window
-                .claimed_app_id()
-                .is_some_and(|claimed| is_bindable_app_id(&claimed));
-        let wanted = bindable.then(|| window.app_id()).flatten();
+        let claimed = window.claimed_app_id();
+        let effective = window.app_id();
+        let bindable = should_bind_window(
+            window.is_shell_window(),
+            claimed.as_deref(),
+            effective.as_deref(),
+        );
+        let wanted = bindable.then_some(effective).flatten();
         window.user_data().insert_if_missing(BoundAppId::default);
         let Some(bound) = window.user_data().get::<BoundAppId>() else {
             return;
@@ -555,14 +861,38 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
 // ---------------------------------------------------------------------------
 
 impl<BackendData: Backend + 'static> EvoState<BackendData> {
-    /// The work area of the output `window` is on, or the first output's: the
-    /// part of it app windows may use (see `super::work_area`).
+    /// The work area of the output `window` is on (including unmapped/minimized
+    /// windows located via their recorded workspace coordinates), or the first
+    /// output's: the part of it app windows may use (see `super::work_area`).
     pub fn work_area_for(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
         let output = self
             .space
             .outputs_for_element(window)
             .first()
             .cloned()
+            .or_else(|| {
+                let frame = self.window_frame(window)?;
+                let center = Point::from((
+                    frame.loc.x + frame.size.w.max(1) / 2,
+                    frame.loc.y + frame.size.h.max(1) / 2,
+                ));
+                self.space
+                    .outputs()
+                    .find(|o| self.space.output_geometry(o).is_some_and(|g| g.contains(center) || g.overlaps(frame)))
+                    .or_else(|| {
+                        self.space.outputs().min_by_key(|o| {
+                            self.space
+                                .output_geometry(o)
+                                .map(|g| {
+                                    let cx = g.loc.x + g.size.w / 2;
+                                    let cy = g.loc.y + g.size.h / 2;
+                                    (center.x - cx).pow(2) + (center.y - cy).pow(2)
+                                })
+                                .unwrap_or(i32::MAX)
+                        })
+                    })
+                    .cloned()
+            })
             .or_else(|| self.space.outputs().next().cloned())?;
         self.space.output_geometry(&output).map(work_area::of_output)
     }
@@ -619,14 +949,22 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     /// fullscreen windows have their own sizes, a window mid-resize is the
     /// grab's, and X11 windows are only moved.
     pub fn fit_to_work_area(&mut self, window: &WindowElement) {
+        self.fit_to_work_area_inner(window, false);
+    }
+
+    /// Fit a floating app window inside the current work area, optionally
+    /// updating minimized windows' stored geometry so restoring after a
+    /// resolution shrink keeps them inside the visible work area.
+    pub(crate) fn fit_to_work_area_inner(&mut self, window: &WindowElement, allow_minimized: bool) {
         if window.is_shell_window() || window.placement_pending() {
             return;
         }
+        let minimized = self.workspace_manager.is_minimized(window);
         let layout = self
             .workspace_manager
             .state(window)
             .map_or(WindowLayout::Floating, |s| s.layout);
-        if layout != WindowLayout::Floating || self.workspace_manager.is_minimized(window) {
+        if layout != WindowLayout::Floating || (minimized && !allow_minimized) {
             return;
         }
         let Some(area) = self.work_area_for(window) else {
@@ -639,7 +977,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             // Not sized yet.
             return;
         }
-        if window.still_settling() {
+        if !minimized && window.still_settling() {
             return;
         }
         let toplevel = window.0.toplevel().cloned();
@@ -649,7 +987,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             // still has the maximized size), and fitting that one would move
             // the window for a size it is leaving: wait for the commit that
             // acknowledges it.
-            if toplevel_is_resizing(toplevel) || configure_in_flight(toplevel) {
+            if toplevel_is_resizing(toplevel) || (!minimized && configure_in_flight(toplevel)) {
                 return;
             }
         }
@@ -665,32 +1003,42 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             })
             .unwrap_or_default();
         let (location, size) = work_area::fit_frame(frame.loc, frame.size, min, area);
+        let target = if size != frame.size {
+            work_area::clamp_move(frame.loc, size, area)
+        } else {
+            location
+        };
         if size != frame.size {
-            if let Some(toplevel) = toplevel {
-                // Ask once per size: a client that keeps its size (a minimum
-                // we could not read, a bug) must not be asked on every commit.
-                let asked = window.user_data().get::<FitAsked>().and_then(|a| a.0.get());
-                if asked != Some((size.w, size.h)) {
-                    window.user_data().insert_if_missing(FitAsked::default);
-                    if let Some(mark) = window.user_data().get::<FitAsked>() {
-                        mark.0.set(Some((size.w, size.h)));
+            match window.0.underlying_surface() {
+                smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                    // Ask once per size: a client that keeps its size (a minimum
+                    // we could not read, a bug) must not be asked on every commit.
+                    let asked = window.user_data().get::<FitAsked>().and_then(|a| a.0.get());
+                    if asked != Some((size.w, size.h)) {
+                        window.user_data().insert_if_missing(FitAsked::default);
+                        if let Some(mark) = window.user_data().get::<FitAsked>() {
+                            mark.0.set(Some((size.w, size.h)));
+                        }
+                        let client = client_size(window, size);
+                        if !minimized {
+                            self.begin_geometry_transition(window, Some(size));
+                            window.begin_settling();
+                        }
+                        toplevel.with_pending_state(|state| state.size = Some(client));
+                        if toplevel.is_initial_configure_sent() {
+                            toplevel.send_configure();
+                        }
                     }
-                    let client = (size.w, (size.h - window.decoration_height()).max(1)).into();
-                    self.begin_geometry_transition(window, Some(size));
-                    window.begin_settling();
-                    toplevel.with_pending_state(|state| state.size = Some(client));
-                    if toplevel.is_initial_configure_sent() {
-                        toplevel.send_configure();
-                    }
+                }
+                #[cfg(feature = "xwayland")]
+                smithay::desktop::WindowSurface::X11(surface) => {
+                    let client = client_size(window, size);
+                    let _ = surface.configure(Rectangle::new(target, client));
                 }
             }
         }
-        // Moved to where the frame will be inside, whether or not the client
-        // has caught up with its new size: the top-left is what must be
-        // below the bar and clear of the screen's edge.
-        let target = if size != frame.size { work_area::clamp_move(frame.loc, size, area) } else { location };
         if target != frame.loc {
-            if size == frame.size {
+            if !minimized && size == frame.size {
                 // Only the place changes: the live window slides there.
                 self.begin_geometry_transition(window, Some(size));
             }
@@ -699,8 +1047,9 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     }
 
     /// Bloom reported new edges: fit the windows already open to them. A
-    /// maximized window is resized to the new area; a floating one is shrunk
-    /// and moved until it fits (`fit_to_work_area`).
+    /// maximized window is resized to the new area; a tiled window keeps its
+    /// half; a floating one is shrunk and moved until it fits
+    /// (`fit_to_work_area_inner`).
     pub fn refit_to_work_area(&mut self) {
         let windows: Vec<WindowElement> = self
             .workspace_manager
@@ -709,6 +1058,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             .cloned()
             .collect();
         for window in windows {
+            let minimized = self.workspace_manager.is_minimized(&window);
             let layout = self
                 .workspace_manager
                 .state(&window)
@@ -716,13 +1066,15 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             match layout {
                 WindowLayout::Fullscreen => {}
                 WindowLayout::Maximized => {
-                    let Some(target) = self.maximize_target(&window) else {
+                    let Some(target) = self.work_area_for(&window) else {
                         continue;
                     };
-                    self.begin_geometry_transition(&window, Some(target.size));
+                    if !minimized {
+                        self.begin_geometry_transition(&window, Some(target.size));
+                    }
                     match window.0.underlying_surface() {
                         smithay::desktop::WindowSurface::Wayland(toplevel) => {
-                            let size = super::xdg::maximized_client_size(&window, target.size);
+                            let size = client_size(&window, target.size);
                             toplevel.with_pending_state(|state| state.size = Some(size));
                             self.place_window(&window, target.loc, false);
                             if toplevel.is_initial_configure_sent() {
@@ -731,12 +1083,43 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                         }
                         #[cfg(feature = "xwayland")]
                         smithay::desktop::WindowSurface::X11(surface) => {
-                            let _ = surface.configure(target);
+                            let client_rect = Rectangle::new(target.loc, client_size(&window, target.size));
+                            let _ = surface.configure(client_rect);
                             self.place_window(&window, target.loc, false);
                         }
                     }
                 }
-                _ => self.fit_to_work_area(&window),
+                WindowLayout::Tiled => {
+                    let Some(area) = self.work_area_for(&window) else {
+                        continue;
+                    };
+                    let side = window
+                        .user_data()
+                        .get::<TileState>()
+                        .and_then(TileState::get)
+                        .map_or(TileSide::Left, |t| t.side);
+                    let target = tile_half_rect(area, side);
+                    if !minimized {
+                        self.begin_geometry_transition(&window, Some(target.size));
+                    }
+                    match window.0.underlying_surface() {
+                        smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                            let size = client_size(&window, target.size);
+                            toplevel.with_pending_state(|state| state.size = Some(size));
+                            self.place_window(&window, target.loc, false);
+                            if toplevel.is_initial_configure_sent() {
+                                toplevel.send_configure();
+                            }
+                        }
+                        #[cfg(feature = "xwayland")]
+                        smithay::desktop::WindowSurface::X11(surface) => {
+                            let client_rect = Rectangle::new(target.loc, client_size(&window, target.size));
+                            let _ = surface.configure(client_rect);
+                            self.place_window(&window, target.loc, false);
+                        }
+                    }
+                }
+                WindowLayout::Floating => self.fit_to_work_area_inner(&window, true),
             }
         }
     }
@@ -759,6 +1142,11 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     /// Giving it back hands the keyboard to the next app down the stack, else
     /// the shell, like a window that closed (`refocus_after_loss`).
     pub fn set_overlay_keyboard(&mut self, wanted: bool) {
+        // While locked the overlay has the keyboard whatever it asks for, and
+        // cannot give it up (shell/lock.rs).
+        if super::lock::input_locked() {
+            return;
+        }
         let Some(overlay) = self.space.elements().find(|w| w.is_overlay()).cloned() else {
             if wanted {
                 tracing::warn!("SetOverlayFocus: no overlay window to focus");
@@ -844,9 +1232,39 @@ fn configure_in_flight(toplevel: &ToplevelSurface) -> bool {
             .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
             .is_some_and(|data| {
                 let data = data.lock().unwrap();
-                !data.pending_configures().is_empty() || data.has_pending_changes()
+                !data.pending_configures().is_empty()
+                    || data.server_pending.as_ref().is_some_and(|pending| {
+                        let current = data.current_server_state();
+                        pending.size != current.size || pending.states != current.states
+                    })
             })
     })
+}
+
+/// Default floating frame rectangle when an unmaximized window has no saved
+/// `OldGeometry` (e.g. a window mapped self-maximized): 85% of the work area,
+/// clamped to at least `MIN_FRAME_SIZE` (within `area`) and centered.
+pub(crate) fn default_restore_frame_rect(area: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let min_w = MIN_FRAME_SIZE.0.min(area.size.w.max(1));
+    let min_h = MIN_FRAME_SIZE.1.min(area.size.h.max(1));
+    let w = ((area.size.w as f64 * 0.85).round() as i32).clamp(min_w, area.size.w.max(1));
+    let h = ((area.size.h as f64 * 0.85).round() as i32).clamp(min_h, area.size.h.max(1));
+    let x = area.loc.x + ((area.size.w - w) / 2).max(0);
+    let y = area.loc.y + ((area.size.h - h) / 2).max(0);
+    Rectangle::new((x, y).into(), (w, h).into())
+}
+
+/// Exact left or right half of `area` for Super+Left / Super+Right tiling.
+pub(crate) fn tile_half_rect(area: Rectangle<i32, Logical>, side: TileSide) -> Rectangle<i32, Logical> {
+    let left_w = (area.size.w / 2).max(1);
+    let right_w = (area.size.w - left_w).max(1);
+    match side {
+        TileSide::Left => Rectangle::new(area.loc, (left_w, area.size.h.max(1)).into()),
+        TileSide::Right => Rectangle::new(
+            (area.loc.x + left_w, area.loc.y).into(),
+            (right_w, area.size.h.max(1)).into(),
+        ),
+    }
 }
 
 /// Whether an interactive resize of this toplevel is in progress.
@@ -942,5 +1360,282 @@ mod tests {
                 ("com.pyxis.notes".to_string(), 9, Some(300)),
             ]
         );
+    }
+
+    #[test]
+    fn vela_default_is_only_bindable_for_browser_contexts() {
+        assert!(should_bind_window(false, Some("vela-default"), Some("browser")));
+        assert!(should_bind_window(false, Some("vela-default"), Some("browser-window")));
+
+        assert!(!should_bind_window(false, Some("vela-default"), Some("terminal")));
+        assert!(!should_bind_window(false, Some("vela-default"), Some("vela-default")));
+        assert!(!should_bind_window(false, Some("vela-default"), None));
+
+        assert!(should_bind_window(false, Some("com.pyxis.notes"), Some("com.pyxis.notes")));
+        assert!(!should_bind_window(false, Some("unknown"), Some("unknown")));
+        assert!(!should_bind_window(false, None, Some("browser")));
+        assert!(!should_bind_window(true, Some("bloom"), Some("bloom")));
+        assert!(!should_bind_window(true, Some("bloom-overlay"), Some("bloom-overlay")));
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    mod sync_binding_tests {
+        use super::*;
+        use crate::state::{Backend, ClientState, EvoState};
+        use smithay::{
+            input::keyboard::LedState,
+            output::Output,
+            reexports::{
+                calloop::EventLoop,
+                wayland_server::{backend::ClientData, protocol::wl_surface::WlSurface, Display},
+            },
+            wayland::security_context::SecurityContext,
+        };
+        use smithay_client_toolkit::reexports::protocols::xdg::shell::client::{
+            xdg_surface, xdg_toplevel, xdg_wm_base,
+        };
+        use std::{
+            os::unix::net::UnixStream,
+            sync::Arc,
+            time::Duration,
+        };
+        use wayland_client::{
+            delegate_noop,
+            protocol::{wl_compositor, wl_registry, wl_surface},
+            Connection, Dispatch, EventQueue, QueueHandle,
+        };
+
+        struct DummyBackend;
+        impl Backend for DummyBackend {
+            fn seat_name(&self) -> String {
+                "seat0".to_string()
+            }
+            fn reset_buffers(&mut self, _output: &Output) {}
+            fn early_import(&mut self, _surface: &WlSurface) {}
+            fn update_led_state(&mut self, _led_state: LedState) {}
+        }
+
+        #[derive(Default)]
+        struct TestClientData {
+            compositor: Option<wl_compositor::WlCompositor>,
+            wm_base: Option<xdg_wm_base::XdgWmBase>,
+        }
+
+        impl Dispatch<wl_registry::WlRegistry, ()> for TestClientData {
+            fn event(
+                state: &mut Self,
+                registry: &wl_registry::WlRegistry,
+                event: wl_registry::Event,
+                _: &(),
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                if let wl_registry::Event::Global { name, interface, version } = event {
+                    match interface.as_str() {
+                        "wl_compositor" => {
+                            state.compositor = Some(registry.bind(name, version.min(6), qh, ()));
+                        }
+                        "xdg_wm_base" => {
+                            state.wm_base = Some(registry.bind(name, version.min(6), qh, ()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        impl Dispatch<xdg_wm_base::XdgWmBase, ()> for TestClientData {
+            fn event(
+                _: &mut Self,
+                wm_base: &xdg_wm_base::XdgWmBase,
+                event: xdg_wm_base::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_wm_base::Event::Ping { serial } = event {
+                    wm_base.pong(serial);
+                }
+            }
+        }
+
+        impl Dispatch<xdg_surface::XdgSurface, ()> for TestClientData {
+            fn event(
+                _: &mut Self,
+                surface: &xdg_surface::XdgSurface,
+                event: xdg_surface::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_surface::Event::Configure { serial } = event {
+                    surface.ack_configure(serial);
+                }
+            }
+        }
+
+        delegate_noop!(TestClientData: ignore wl_compositor::WlCompositor);
+        delegate_noop!(TestClientData: ignore wl_surface::WlSurface);
+        delegate_noop!(TestClientData: ignore xdg_toplevel::XdgToplevel);
+
+        fn connect_client(
+            event_loop: &mut EventLoop<'static, EvoState<DummyBackend>>,
+            state: &mut EvoState<DummyBackend>,
+            security_context: Option<SecurityContext>,
+        ) -> (Connection, EventQueue<TestClientData>, TestClientData) {
+            let (server_end, client_end) = UnixStream::pair().unwrap();
+            let client_data: Arc<dyn ClientData> = Arc::new(ClientState {
+                security_context,
+                ..ClientState::default()
+            });
+            state
+                .display_handle
+                .insert_client(server_end, client_data)
+                .unwrap();
+
+            let conn = Connection::from_socket(client_end).unwrap();
+            let mut queue = conn.new_event_queue();
+            let qh = queue.handle();
+            let _registry = conn.display().get_registry(&qh, ());
+            let mut cdata = TestClientData::default();
+            pump_client(event_loop, state, &conn, &mut queue, &mut cdata);
+            (conn, queue, cdata)
+        }
+
+        fn pump_client(
+            event_loop: &mut EventLoop<'static, EvoState<DummyBackend>>,
+            state: &mut EvoState<DummyBackend>,
+            conn: &Connection,
+            queue: &mut EventQueue<TestClientData>,
+            cdata: &mut TestClientData,
+        ) {
+            for _ in 0..6 {
+                let _ = conn.flush();
+                let _ = event_loop.dispatch(Some(Duration::from_millis(2)), state);
+                let _ = state.display_handle.flush_clients();
+                if let Some(guard) = conn.prepare_read() {
+                    let _ = guard.read();
+                }
+                let _ = queue.dispatch_pending(cdata);
+            }
+        }
+
+        fn create_toplevel_and_sync(
+            event_loop: &mut EventLoop<'static, EvoState<DummyBackend>>,
+            state: &mut EvoState<DummyBackend>,
+            security_context: Option<SecurityContext>,
+            claimed_app_id: &str,
+        ) -> Option<String> {
+            let (conn, mut queue, mut cdata) =
+                connect_client(event_loop, state, security_context);
+            let qh = queue.handle();
+            let compositor = cdata.compositor.as_ref().unwrap();
+            let wm_base = cdata.wm_base.as_ref().unwrap();
+            let wl_surface = compositor.create_surface(&qh, ());
+            let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
+            let toplevel = xdg_surface.get_toplevel(&qh, ());
+            toplevel.set_app_id(claimed_app_id.to_string());
+            wl_surface.commit();
+            pump_client(event_loop, state, &conn, &mut queue, &mut cdata);
+
+            // Commit once more after receiving & acking initial configure so
+            // both initial state and ack paths are exercised.
+            wl_surface.commit();
+            pump_client(event_loop, state, &conn, &mut queue, &mut cdata);
+
+            let window = state
+                .windows_by_id
+                .values()
+                .max_by_key(|w| state.window_id_for(w))
+                .cloned()
+                .expect("window should be tracked");
+            state.sync_surface_binding(&window);
+            window
+                .user_data()
+                .get::<BoundAppId>()
+                .and_then(|b| b.0.borrow().clone())
+        }
+
+        #[test]
+        fn sync_surface_binding_binds_vela_browser_windows_and_excludes_others() {
+            let mut event_loop: EventLoop<'static, EvoState<DummyBackend>> =
+                EventLoop::try_new().unwrap();
+            let display = Display::<EvoState<DummyBackend>>::new().unwrap();
+            let mut state = EvoState::init(display, event_loop.handle(), DummyBackend, false);
+
+            let creator = {
+                let (s, _c) = UnixStream::pair().unwrap();
+                std::mem::forget(_c);
+                state
+                    .display_handle
+                    .insert_client(s, Arc::new(ClientState::default()))
+                    .unwrap()
+                    .id()
+            };
+
+            let ctx = |app_id: Option<&str>| {
+                Some(SecurityContext {
+                    sandbox_engine: Some("pyxis".into()),
+                    app_id: app_id.map(str::to_string),
+                    instance_id: Some("1".into()),
+                    creator_client_id: creator.clone(),
+                })
+            };
+
+            assert_eq!(
+                create_toplevel_and_sync(
+                    &mut event_loop,
+                    &mut state,
+                    ctx(Some("browser")),
+                    "vela-default",
+                ),
+                Some("browser".to_string())
+            );
+            assert_eq!(
+                create_toplevel_and_sync(
+                    &mut event_loop,
+                    &mut state,
+                    ctx(Some("browser-window")),
+                    "vela-default",
+                ),
+                Some("browser-window".to_string())
+            );
+            assert_eq!(
+                create_toplevel_and_sync(
+                    &mut event_loop,
+                    &mut state,
+                    ctx(Some("terminal")),
+                    "vela-default",
+                ),
+                None
+            );
+            assert_eq!(
+                create_toplevel_and_sync(
+                    &mut event_loop,
+                    &mut state,
+                    ctx(None),
+                    "vela-default",
+                ),
+                None
+            );
+            assert_eq!(
+                create_toplevel_and_sync(
+                    &mut event_loop,
+                    &mut state,
+                    None,
+                    "bloom",
+                ),
+                None
+            );
+            assert_eq!(
+                create_toplevel_and_sync(
+                    &mut event_loop,
+                    &mut state,
+                    None,
+                    "bloom-overlay",
+                ),
+                None
+            );
+        }
     }
 }

@@ -140,6 +140,13 @@ pub fn clear() {
     GHOSTS.with(|g| g.borrow_mut().clear());
 }
 
+/// Drop every ghost that is not an animation of `kind`, completing it. The
+/// locked screen draws only the Veil's ghosts: a window closing or minimizing
+/// as the lock begins must not be drawn for even a frame.
+pub fn retain_kind(kind: super::window::AnimKind) {
+    GHOSTS.with(|g| g.borrow_mut().retain(|ghost| ghost.anim.kind == kind));
+}
+
 /// Whether some ghost is still drawn on behalf of `window`.
 pub fn has_ghost_of(window: &WindowElement) -> bool {
     GHOSTS.with(|g| {
@@ -214,7 +221,9 @@ where
                     .warp
                     .as_ref()
                     .and_then(|w| w.draw(renderer, &place, &t))
-                    .or_else(|| ghost.anim.recede.as_ref().and_then(|r| r.draw(renderer, &place, &t)));
+                    .or_else(|| ghost.anim.recede.as_ref().and_then(|r| r.draw(renderer, &place, &t)))
+                    // The lock's Veil, the same way (`anim::veil`).
+                    .or_else(|| ghost.anim.veil.as_ref().and_then(|v| v.draw(renderer, &place, &t)));
                 let progress = warped.as_ref().map(|d| d.progress);
                 // A close drawn as Evaporate: its progress, and its frame (or
                 // `None` to draw the snapshot plain, fading evenly).

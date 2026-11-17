@@ -73,6 +73,7 @@
 //! the counters per kind, which is what the on-device suite asserts.
 
 pub mod bloom;
+pub mod clear;
 pub mod curve;
 pub mod depth;
 pub mod droplet;
@@ -90,6 +91,7 @@ pub mod slot;
 pub mod snapshot;
 pub mod spec;
 pub mod transform;
+pub mod veil;
 pub mod warp;
 pub mod window;
 

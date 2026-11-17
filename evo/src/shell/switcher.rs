@@ -233,26 +233,56 @@ impl<BackendData: Backend> EvoState<BackendData> {
 
     /// Alt+Tab / Shift+Alt+Tab.
     pub fn cycle_windows(&mut self, reverse: bool) {
+        self.cycle_windows_matching(reverse, false);
+    }
+
+    /// Alt+Grave / Alt+Shift+Grave: cycle windows belonging to the focused
+    /// window's `app_id`.
+    pub fn cycle_app_windows(&mut self, reverse: bool) {
+        self.cycle_windows_matching(reverse, true);
+    }
+
+    fn cycle_windows_matching(&mut self, reverse: bool, same_app_only: bool) {
         self.focus_history.retain(|w| w.alive());
         if self.alt_tab.is_none() {
-            let live: Vec<WindowElement> = self
-                .workspace_manager
-                .active_workspace()
-                .windows()
-                .iter()
-                .filter(|w| w.alive() && w.stack_role() == StackRole::App && self.window_id_for(w).is_some())
-                .cloned()
-                .collect();
-            let order = super::placement::cycle_order(&self.focus_history, &live);
-            if order.len() < 2 {
-                return;
-            }
             let focused = self
                 .seat
                 .get_keyboard()
                 .and_then(|k| k.current_focus())
                 .and_then(|f| smithay::wayland::seat::WaylandFocus::wl_surface(&f).map(|s| s.into_owned()))
                 .and_then(|s| self.tracked_window_for_surface(&s));
+            let required_app_id = if same_app_only {
+                let Some(app_id) = focused
+                    .as_ref()
+                    .filter(|w| w.stack_role() == StackRole::App)
+                    .and_then(|w| w.app_id())
+                else {
+                    return;
+                };
+                Some(app_id)
+            } else {
+                None
+            };
+
+            let live: Vec<WindowElement> = self
+                .workspace_manager
+                .active_workspace()
+                .windows()
+                .iter()
+                .filter(|w| {
+                    w.alive()
+                        && w.stack_role() == StackRole::App
+                        && self.window_id_for(w).is_some()
+                        && required_app_id
+                            .as_ref()
+                            .is_none_or(|id| w.app_id().as_deref() == Some(id.as_str()))
+                })
+                .cloned()
+                .collect();
+            let order = super::placement::cycle_order(&self.focus_history, &live);
+            if order.len() < 2 {
+                return;
+            }
             // With the desktop focused, the first step lands on the most
             // recent app (or the oldest, going backwards), not the second.
             let index = match focused {

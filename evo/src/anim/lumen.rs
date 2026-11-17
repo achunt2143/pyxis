@@ -75,6 +75,7 @@ use super::{
     shader::GlesAccess,
     snapshot::{Snapshot, READBACK_FORMAT},
 };
+use crate::shell::identity::Radii;
 
 // === Effects, counters, switch ===
 
@@ -86,10 +87,23 @@ pub enum Effect {
     Evaporate,
     Recede,
     Glint,
+    /// The lock's blur-and-fade of the windows (`anim::veil`).
+    Veil,
+    /// The unlock's focus pull on the live windows (`anim::clear`, drawn
+    /// through Bloom's texture shader).
+    Clear,
 }
 
 impl Effect {
-    pub const ALL: [Effect; 5] = [Effect::Bloom, Effect::Droplet, Effect::Evaporate, Effect::Recede, Effect::Glint];
+    pub const ALL: [Effect; 7] = [
+        Effect::Bloom,
+        Effect::Droplet,
+        Effect::Evaporate,
+        Effect::Recede,
+        Effect::Glint,
+        Effect::Veil,
+        Effect::Clear,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -98,6 +112,8 @@ impl Effect {
             Effect::Evaporate => "evaporate",
             Effect::Recede => "recede",
             Effect::Glint => "glint",
+            Effect::Veil => "veil",
+            Effect::Clear => "clear",
         }
     }
 
@@ -106,9 +122,9 @@ impl Effect {
     }
 }
 
-static FRAMES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static FRAMES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// Last progress per effect, as f64 bits.
-static PROGRESS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static PROGRESS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Count one frame drawn through `effect`. [`LumenElement`] does this itself
 /// when it draws; an effect drawn by a program of its own calls it.
@@ -296,7 +312,7 @@ pub fn accent_of(snapshot: &Snapshot) -> [f32; 3] {
 
 // === The program ===
 
-const VERTEX: &str = r#"
+pub(super) const VERTEX: &str = r#"
 uniform mat3 u_proj;
 attribute vec2 a_pos;
 attribute vec2 a_local;
@@ -310,7 +326,7 @@ void main() {
 
 /// `v_local` is the fragment's place in the unstretched shape, in pixels from
 /// its centre. Output is premultiplied (blend ONE, ONE_MINUS_SRC_ALPHA).
-const FRAGMENT: &str = r#"
+pub(super) const FRAGMENT: &str = r#"
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
@@ -318,7 +334,7 @@ precision mediump float;
 #endif
 uniform sampler2D u_tex;
 uniform vec2 u_half;
-uniform float u_radius;
+uniform vec4 u_radius;
 uniform vec4 u_uv;
 uniform float u_bias;
 uniform vec2 u_tap;
@@ -329,7 +345,8 @@ uniform float u_glow_r;
 uniform float u_alpha;
 varying vec2 v_local;
 
-float rbox(vec2 p, vec2 b, float r) {
+float rbox(vec2 p, vec2 b, vec4 radii) {
+    float r = p.x < 0.0 ? (p.y < 0.0 ? radii.x : radii.w) : (p.y < 0.0 ? radii.y : radii.z);
     vec2 q = abs(p) - b + r;
     return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
 }
@@ -357,7 +374,7 @@ void main() {
         if (u_tint > 0.0) {
             float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114));
             float lu = c.a > 0.001 ? luma / c.a : 0.5;
-            float roundness = clamp(u_radius / max(min(u_half.x, u_half.y), 1.0), 0.0, 1.0);
+            float roundness = clamp(dot(u_radius, vec4(0.25)) / max(min(u_half.x, u_half.y), 1.0), 0.0, 1.0);
             float m = min(u_half.x, u_half.y);
             float hl = 1.0 - smoothstep(0.0, 0.95 * m, length(v_local + vec2(0.32, 0.38) * u_half));
             vec3 orb = u_accent * (0.72 + 0.5 * lu) + vec3(0.32 * hl * roundness);
@@ -653,8 +670,9 @@ pub struct Params {
     pub center: [f64; 2],
     /// The shape's size before squash and stretch.
     pub size: [f64; 2],
-    /// Corner radius; clamped to half the short side (a circle or a pill).
-    pub radius: f64,
+    /// Corner radii (top-left, top-right, bottom-right, bottom-left); each
+    /// clamped to half the short side (a circle or a pill).
+    pub radii: Radii,
     /// Blur, roughly its radius in pixels. 0 is sharp.
     pub blur: f64,
     /// 0 the picture, 1 an orb of `accent`.
@@ -684,7 +702,7 @@ impl Params {
         Self {
             center: [top_left.x + w / 2.0, top_left.y + h / 2.0],
             size: [w, h],
-            radius: 0.0,
+            radii: Radii::SQUARE,
             blur: 0.0,
             tint: 0.0,
             glow: 0.0,
@@ -697,9 +715,9 @@ impl Params {
         }
     }
 
-    /// The radius actually drawn.
-    pub fn clamped_radius(&self) -> f64 {
-        self.radius.clamp(0.0, self.size[0].min(self.size[1]).max(0.0) / 2.0)
+    /// The radii actually drawn.
+    pub fn clamped_radii(&self) -> Radii {
+        self.radii.fit(self.size[0].max(0.0), self.size[1].max(0.0))
     }
 
     pub fn clamped_stretch(&self) -> f64 {
@@ -900,7 +918,8 @@ impl LumenElement {
         gl.Uniform1i(p.u_tex, 0);
         gl.UniformMatrix3fv(p.u_proj, 1, ffi::FALSE, projection.as_ptr());
         gl.Uniform2f(p.u_half, (w / 2.0) as f32, (h / 2.0) as f32);
-        gl.Uniform1f(p.u_radius, q.clamped_radius() as f32);
+        let r = q.clamped_radii().as_f32();
+        gl.Uniform4f(p.u_radius, r.0, r.1, r.2, r.3);
         gl.Uniform4f(p.u_uv, q.uv[0], q.uv[1], q.uv[2], q.uv[3]);
         gl.Uniform1f(p.u_bias, bias);
         gl.Uniform2f(p.u_tap, tap[0], tap[1]);
@@ -975,7 +994,7 @@ mod tests {
         Params {
             center: [500.0, 400.0],
             size: [200.0, 100.0],
-            radius: 16.0,
+            radii: Radii::FRAME,
             blur: 0.0,
             tint: 0.0,
             glow: 0.0,
@@ -991,12 +1010,13 @@ mod tests {
     #[test]
     fn the_radius_never_exceeds_half_the_short_side() {
         let mut p = params();
-        p.radius = 500.0;
-        assert_eq!(p.clamped_radius(), 50.0);
+        assert_eq!(p.clamped_radii(), Radii([16.0, 4.0, 16.0, 16.0]), "the waterdrop, per corner");
+        p.radii = Radii::uniform(500.0);
+        assert_eq!(p.clamped_radii(), Radii::uniform(50.0));
         p.size = [30.0, 30.0];
-        assert_eq!(p.clamped_radius(), 15.0, "a circle");
-        p.radius = -3.0;
-        assert_eq!(p.clamped_radius(), 0.0);
+        assert_eq!(p.clamped_radii(), Radii::uniform(15.0), "a circle");
+        p.radii = Radii::uniform(-3.0);
+        assert_eq!(p.clamped_radii(), Radii::SQUARE);
     }
 
     #[test]

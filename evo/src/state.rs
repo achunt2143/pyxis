@@ -2,7 +2,6 @@
 use std::os::unix::io::OwnedFd;
 use std::{
     collections::HashMap,
-    io::Write,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
@@ -11,7 +10,7 @@ use std::{
 };
 
 use parking_lot::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use smithay::{
     backend::{
@@ -65,7 +64,7 @@ use smithay::{
             Client, Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Time},
+    utils::{Clock, IsAlive, Logical, Monotonic, Point, Rectangle, Serial, Time},
     wayland::{
         commit_timing::{CommitTimerBarrierStateUserData, CommitTimingManagerState},
         compositor::{
@@ -107,9 +106,7 @@ use smithay::{
         },
         shell::{
             kde::decoration::{KdeDecorationHandler, KdeDecorationState},
-            wlr_layer::{
-                Anchor, Layer, LayerSurfaceAttributes, LayerSurfaceData, WlrLayerShellState,
-            },
+            wlr_layer::WlrLayerShellState,
             xdg::{
                 decoration::{XdgDecorationHandler, XdgDecorationState},
                 ToplevelSurface, XdgShellState,
@@ -128,14 +125,13 @@ use smithay::{
         xdg_foreign::{XdgForeignHandler, XdgForeignState},
     },
 };
-use wayland_client::protocol::wl_surface;
 
 #[cfg(feature = "xwayland")]
 use crate::cursor::Cursor;
 use crate::shell::recede::{MinimizeStyle, RestoreStyle};
 use crate::{
     focus::{KeyboardFocusTarget, PointerFocusTarget},
-    shell::{WindowElement, WindowLayout, Workspace, WorkspaceId, WorkspaceManager},
+    shell::{FullscreenOutputName, WindowElement, WindowLayout, WorkspaceId, WorkspaceManager},
 };
 #[cfg(feature = "xwayland")]
 use smithay::{
@@ -148,7 +144,9 @@ use smithay::{
 };
 
 #[cfg(feature = "echo-ipc")]
-use crate::enhancements::echo_ipc::{GeckoEchoService, WindowAction, WindowInfo};
+use crate::enhancements::echo_ipc::{
+    GeckoEchoService, OutputConfigInfo, OutputModeInfo, WindowAction, WindowInfo,
+};
 #[cfg(feature = "screencopy")]
 use crate::enhancements::screencopy::{ScreencopyHandler, ScreencopyManagerState};
 
@@ -413,19 +411,19 @@ impl<BackendData: Backend> SeatHandler for EvoState<BackendData> {
         }
         // Header tint and shadow depth crossfade between active and inactive.
         crate::anim::depth::focus_changed(focused_window.as_ref());
+        // A window taking the keyboard is a moment to ask whether its app
+        // still answers (shell/busy.rs).
+        if let Some(window) = &focused_window {
+            self.ping_window(window, true);
+        }
         self.note_overlay_keyboard(focused_window.as_ref().is_some_and(|w| w.is_overlay()));
 
         #[cfg(feature = "echo-ipc")]
-        {
+        if !focused_window.as_ref().is_some_and(|w| w.is_shell_window()) {
             let workspace_id = self.workspace_manager.active_workspace_id().0;
-
-            // Get the focused window ID if there is a focused surface
-            let focused_window_id = wl_surface
-                .and_then(|surface| {
-                    // Convert Cow<'_, WlSurface> to WlSurface
-                    self.window_for_surface(surface.clone().into_owned())
-                })
-                .and_then(|window| self.window_id_for(&window));
+            let focused_window_id = focused_window
+                .as_ref()
+                .and_then(|window| self.window_id_for(window));
 
             // Emit focus change event with workspace context
             let _ = self
@@ -1168,6 +1166,8 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
 
     #[cfg(feature = "echo-ipc")]
     pub fn unregister_window(&mut self, window: &WindowElement) -> Option<u32> {
+        self.focus_history.retain(|w| w != window);
+        crate::shell::recede::forget_window(window);
         if let Some(id) = self.window_ids_by_element.remove(&window.0) {
             self.windows_by_id.remove(&id);
             Some(id)
@@ -1508,7 +1508,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                         self.space
                             .map_element(window.clone(), state.location, false);
                         debug!("Mapped window to Space at {:?}", state.location);
-                        if state.layout == WindowLayout::Fullscreen {
+                        if state.layout == WindowLayout::Fullscreen && !window.is_shell_window() {
                             fullscreen_arrivals.push(window.clone());
                         }
                     }
@@ -1647,6 +1647,8 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         // A window closed while still minimizing has nothing left to draw.
         drop(crate::anim::ghosts::take_live(window));
         self.clear_exclusive_fullscreen(window);
+        self.focus_history.retain(|w| w != window);
+        crate::shell::recede::forget_window(window);
         self.workspace_manager.remove_window(window);
         self.space.unmap_elem(window);
         debug!("Removed window from workspace and Space");
@@ -1677,10 +1679,107 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     }
 
     /// Re-run orphan relocation after an output change (see
-    /// `shell::fixup_positions`), and record where each relocated window went.
+    /// `shell::fixup_positions`), reconfigure fullscreen and shell windows to
+    /// match the new output geometry, and refit maximized/floating windows to
+    /// the updated work area.
+    fn resolve_fullscreen_or_shell_output(
+        &self,
+        window: &WindowElement,
+        fallback: &Output,
+    ) -> Output {
+        if let Some(name) = window
+            .user_data()
+            .get::<FullscreenOutputName>()
+            .and_then(FullscreenOutputName::get)
+        {
+            if let Some(named) = self.space.outputs().find(|o| o.name() == name) {
+                return named.clone();
+            }
+        }
+        self.output_for_fullscreen(window, None)
+            .unwrap_or_else(|| fallback.clone())
+    }
+
     pub fn fixup_positions(&mut self, pointer_location: Point<f64, Logical>) {
         for (window, location) in crate::shell::fixup_positions(&mut self.space, pointer_location) {
             self.workspace_manager.record_location(&window, location);
+        }
+
+        let first_output = self.space.outputs().next().cloned();
+        if let Some(first_output) = first_output {
+            let mapped: Vec<WindowElement> = self.space.elements().cloned().collect();
+            for window in &mapped {
+                let is_shell = window.is_shell_window();
+                let is_fullscreen = self
+                    .workspace_manager
+                    .state(window)
+                    .is_some_and(|s| s.layout == WindowLayout::Fullscreen);
+                if !is_shell && !is_fullscreen {
+                    continue;
+                }
+                let target_output = self.resolve_fullscreen_or_shell_output(window, &first_output);
+                self.reconfigure_fullscreen_window(window, &target_output, true);
+            }
+
+            let unmapped_fullscreen: Vec<WindowElement> = self
+                .workspace_manager
+                .all_windows()
+                .filter(|w| {
+                    w.alive()
+                        && !w.is_shell_window()
+                        && !mapped.contains(w)
+                        && self
+                            .workspace_manager
+                            .state(w)
+                            .is_some_and(|s| s.layout == WindowLayout::Fullscreen)
+                })
+                .cloned()
+                .collect();
+            for window in unmapped_fullscreen {
+                let target_output = self.resolve_fullscreen_or_shell_output(&window, &first_output);
+                self.reconfigure_fullscreen_window(&window, &target_output, false);
+            }
+        }
+
+        self.refit_to_work_area();
+    }
+
+    fn reconfigure_fullscreen_window(
+        &mut self,
+        window: &WindowElement,
+        output: &Output,
+        mapped: bool,
+    ) {
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return;
+        };
+        window.user_data().insert_if_missing(FullscreenOutputName::default);
+        if let Some(slot) = window.user_data().get::<FullscreenOutputName>() {
+            slot.set(Some(output.name()));
+        }
+        self.set_window_layout(window, WindowLayout::Fullscreen);
+        match window.0.underlying_surface() {
+            smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                toplevel.with_pending_state(|state| {
+                    state.size = Some(output_geo.size);
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                });
+                if toplevel.is_initial_configure_sent() {
+                    toplevel.send_pending_configure();
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            smithay::desktop::WindowSurface::X11(surface) => {
+                let _ = surface.configure(output_geo);
+            }
+        }
+        self.workspace_manager.record_location(window, output_geo.loc);
+        if mapped {
+            self.space.map_element(window.clone(), output_geo.loc, false);
+            if !window.is_shell_window() {
+                self.clear_exclusive_fullscreen(window);
+                self.set_exclusive_fullscreen(window, output);
+            }
         }
     }
 
@@ -1783,15 +1882,26 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
 
     /// `unminimize_window`, drawn as `style`: a Rise out of the dock icon, or
     /// a second Super+D's Emerge (`shell/recede.rs`).
+    pub fn is_window_minimized(&self, window: &WindowElement) -> bool {
+        self.workspace_manager.is_minimized(window)
+    }
+
     pub fn unminimize_window_as(&mut self, window: &WindowElement, style: RestoreStyle) {
         if !self.workspace_manager.is_minimized(window) {
             return;
         }
         // A minimize still being drawn is turned round, not restarted.
         let ghost = crate::anim::ghosts::take_live(window);
-        let Some((location, layout)) = self.workspace_manager.unminimize_window(window) else {
+        let Some((orig_location, layout)) = self.workspace_manager.unminimize_window(window) else {
             return;
         };
+        if layout == WindowLayout::Floating {
+            self.fit_to_work_area_inner(window, false);
+        }
+        let location = self
+            .workspace_manager
+            .state(window)
+            .map_or(orig_location, |s| s.location);
 
         if self.workspace_manager.workspace_for_window(window) == Some(self.workspace_manager.active_workspace_id()) {
             self.space.map_element(window.clone(), location, false);
@@ -1869,20 +1979,22 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
     /// A minimized window is unmapped from the space, so it reports
     /// `visible: false` at 0,0.
     #[cfg(feature = "echo-ipc")]
-    pub fn sync_toplevels(&mut self) {
-        if self.last_toplevel_sync.elapsed() < Duration::from_millis(250) {
-            return;
-        }
-        self.last_toplevel_sync = Instant::now();
-
+    fn collect_toplevel_infos(&self) -> Vec<WindowInfo> {
         let focused = self.seat.get_keyboard().and_then(|keyboard| keyboard.current_focus());
         let mut toplevels: Vec<WindowInfo> = self
             .windows_by_id
             .iter()
+            // The overlay is left out (it is the shell's chrome, not a
+            // window); the desktop stays, as suites read and hand it focus.
             .filter(|(_, window)| !window.is_overlay())
             .map(|(&window_id, window)| {
                 let location = self.space.element_location(window);
                 let size = window.geometry().size;
+                let minimized = self.is_window_minimized(window);
+                let layout = self
+                    .workspace_manager
+                    .state(window)
+                    .map_or(WindowLayout::Floating, |s| s.layout);
                 WindowInfo {
                     window_id,
                     app_id: window.app_id().unwrap_or_default(),
@@ -1892,23 +2004,107 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                     y: location.map_or(0, |l| l.y),
                     focused: matches!(&focused, Some(KeyboardFocusTarget::Window(w)) if *w == window.0),
                     visible: location.is_some(),
+                    minimized,
+                    maximized: layout == WindowLayout::Maximized,
+                    // The desktop is fullscreen only to lose its titlebar: it
+                    // sits beneath apps, and never has the output to itself.
+                    fullscreen: layout == WindowLayout::Fullscreen && !window.is_shell(),
+                    busy: window.is_busy(),
+                    title_label: window.title_source().label.text(),
                 }
             })
             .collect();
         toplevels.sort_by_key(|w| w.window_id);
+        toplevels
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    fn collect_output_configs(&self) -> Vec<OutputConfigInfo> {
+        self.space
+            .outputs()
+            .filter_map(|o| {
+                let mode = o.current_mode()?;
+                let loc = self.space.output_geometry(o).map(|g| g.loc).unwrap_or((0, 0).into());
+                let modes = o
+                    .modes()
+                    .into_iter()
+                    .map(|m| OutputModeInfo {
+                        width: m.size.w,
+                        height: m.size.h,
+                        refresh_mhz: m.refresh,
+                    })
+                    .collect();
+                Some(OutputConfigInfo {
+                    name: o.name(),
+                    description: o.description(),
+                    width: mode.size.w,
+                    height: mode.size.h,
+                    refresh_mhz: mode.refresh,
+                    scale: o.current_scale().fractional_scale(),
+                    x: loc.x,
+                    y: loc.y,
+                    modes,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    pub(crate) fn mark_toplevel_sync_dirty(&mut self) {
+        self.last_toplevel_sync = Instant::now() - Duration::from_secs(1);
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    pub fn sync_toplevels(&mut self) {
+        if self.last_toplevel_sync.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.last_toplevel_sync = Instant::now();
+
+        let toplevels = self.collect_toplevel_infos();
         self.echo_service.read().set_toplevels(toplevels);
+
+        let outputs = self.collect_output_configs();
+        if crate::enhancements::echo_ipc::sync_outputs_from_space(outputs.clone()) {
+            let _ = self.echo_service.read().emit_outputs_changed(&outputs);
+        }
     }
 
     #[cfg(feature = "echo-ipc")]
     pub fn process_pending_window_actions(&mut self) {
+        // First: a lock begins (and an unlock's Clear starts) before anything
+        // else this pass touches the windows.
+        self.lock_tick();
         self.switcher_tick();
         self.minimize_landed_tick();
+        self.busy_tick();
+        self.frost_tick();
         self.serve_thumbnail_requests();
         if self.echo_service.read().take_rebind_request() {
             self.replay_surface_bindings();
+            // A restarted echo-daemon thinks the screen is unlocked. Evo
+            // knows better, and says so, so Echo agrees (and Bloom's page,
+            // asking Echo, comes up locked).
+            if crate::shell::lock::input_locked() {
+                if let Err(e) = self.echo_service.read().session_lock_remote() {
+                    warn!("lock: could not tell the restarted Echo the screen is locked: {e:#}");
+                }
+            }
         }
         let actions = self.echo_service.read().take_pending_window_actions();
         for pending in actions {
+            // While locked the only requests honoured are the shell/display
+            // layout ones: no window may be focused, restored, closed or
+            // moved by whoever asks.
+            if crate::shell::lock::input_locked()
+                && !matches!(
+                    pending.action,
+                    WindowAction::SetWorkArea(_) | WindowAction::ApplyOutputConfigs
+                )
+            {
+                debug!("lock: refused {:?} while the screen is locked", pending.action);
+                continue;
+            }
             // The shell's own requests are about no window.
             match pending.action {
                 WindowAction::SetWorkArea(insets) => {
@@ -1917,6 +2113,40 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 }
                 WindowAction::OverlayKeyboard(wanted) => {
                     self.set_overlay_keyboard(wanted);
+                    continue;
+                }
+                WindowAction::ApplyOutputConfigs => {
+                    let configs = crate::enhancements::echo_ipc::get_outputs_snapshot();
+                    let single_output_fallback =
+                        self.space.outputs().count() == 1 && configs.len() == 1;
+                    for cfg in configs {
+                        let target_output = self
+                            .space
+                            .outputs()
+                            .find(|o| o.name() == cfg.name)
+                            .or_else(|| {
+                                single_output_fallback
+                                    .then(|| self.space.outputs().next())
+                                    .flatten()
+                            })
+                            .cloned();
+                        if let Some(output) = target_output {
+                            let new_mode = Some(smithay::output::Mode {
+                                size: (cfg.width, cfg.height).into(),
+                                refresh: cfg.refresh_mhz,
+                            });
+                            let new_scale = Some(smithay::output::Scale::Fractional(cfg.scale));
+                            let new_loc = Some((cfg.x, cfg.y).into());
+                            output.change_current_state(new_mode, None, new_scale, new_loc);
+                            self.space.map_output(&output, (cfg.x, cfg.y));
+                            smithay::desktop::layer_map_for_output(&output).arrange();
+                            self.backend_data.reset_buffers(&output);
+                        }
+                    }
+                    self.fixup_positions(self.pointer.current_location());
+                    let outputs = self.collect_output_configs();
+                    crate::enhancements::echo_ipc::sync_outputs_from_space(outputs.clone());
+                    let _ = self.echo_service.read().emit_outputs_changed(&outputs);
                     continue;
                 }
                 _ => {}
@@ -1949,23 +2179,12 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
                 // held by the pointer-button path, and maximize_request
                 // re-borrows it via Space::map_element. This runs from the
                 // event loop with no such borrow outstanding.
-                WindowAction::Maximize | WindowAction::Unmaximize => {
-                    if let smithay::desktop::WindowSurface::Wayland(w) =
-                        window.0.underlying_surface()
-                    {
-                        use smithay::wayland::shell::xdg::XdgShellHandler;
-                        let surface = w.clone();
-                        if matches!(pending.action, WindowAction::Maximize) {
-                            XdgShellHandler::maximize_request(self, surface);
-                        } else {
-                            XdgShellHandler::unmaximize_request(self, surface);
-                        }
-                    } else {
-                        warn!("{:?} is only implemented for Wayland toplevels", pending.action);
-                    }
-                }
+                WindowAction::Maximize => self.maximize_window(&window),
+                WindowAction::Unmaximize => self.unmaximize_window(&window),
                 WindowAction::Close => self.close_window(&window),
-                WindowAction::SetWorkArea(_) | WindowAction::OverlayKeyboard(_) => {}
+                WindowAction::SetWorkArea(_)
+                | WindowAction::OverlayKeyboard(_)
+                | WindowAction::ApplyOutputConfigs => {}
             }
         }
     }
@@ -2002,8 +2221,6 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
         pointer_location: Point<f64, Logical>,
         window: &WindowElement,
     ) -> Point<i32, Logical> {
-        use rand::distributions::{Distribution, Uniform};
-
         let output = self
             .space
             .output_under(pointer_location)
@@ -2028,15 +2245,7 @@ impl<BackendData: Backend + 'static> EvoState<BackendData> {
             });
         }
 
-        let max_x = output_geometry.loc.x + (((output_geometry.size.w as f32) / 3.0) * 2.0) as i32;
-        let max_y = output_geometry.loc.y + (((output_geometry.size.h as f32) / 3.0) * 2.0) as i32;
-        let x_range = Uniform::new(output_geometry.loc.x, max_x);
-        let y_range = Uniform::new(output_geometry.loc.y, max_y);
-        let mut rng = rand::thread_rng();
-        let x = x_range.sample(&mut rng);
-        let y = y_range.sample(&mut rng);
-
-        Point::from((x, y))
+        crate::shell::random_point_in_area(output_geometry)
     }
 }
 
@@ -2151,5 +2360,994 @@ pub trait Backend {
     /// udev implements it today.
     fn snapshot_window(&mut self, _window: &WindowElement, _scale: f64) -> Option<crate::anim::Snapshot> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::{
+        output::{Mode, PhysicalProperties, Subpixel},
+        reexports::calloop::EventLoop,
+        utils::Transform,
+        wayland::shell::xdg::XdgToplevelSurfaceData,
+    };
+    use smithay_client_toolkit::reexports::protocols::xdg::shell::client::{
+        xdg_surface, xdg_toplevel as client_xdg_toplevel, xdg_wm_base,
+    };
+    use std::os::unix::{io::AsFd, net::UnixStream};
+    use wayland_client::{
+        delegate_noop,
+        protocol::{wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface},
+        Connection, Dispatch, EventQueue, QueueHandle,
+    };
+
+    struct DummyBackend;
+    impl Backend for DummyBackend {
+        fn seat_name(&self) -> String {
+            "seat0".to_string()
+        }
+        fn reset_buffers(&mut self, _output: &Output) {}
+        fn early_import(&mut self, _surface: &WlSurface) {}
+        fn update_led_state(&mut self, _led_state: LedState) {}
+    }
+
+    #[derive(Default)]
+    struct TestClientData {
+        compositor: Option<wl_compositor::WlCompositor>,
+        shm: Option<wl_shm::WlShm>,
+        wm_base: Option<xdg_wm_base::XdgWmBase>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for TestClientData {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, version } = event {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor = Some(registry.bind(name, version.min(6), qh, ()));
+                    }
+                    "wl_shm" => {
+                        state.shm = Some(registry.bind(name, version.min(1), qh, ()));
+                    }
+                    "xdg_wm_base" => {
+                        state.wm_base = Some(registry.bind(name, version.min(6), qh, ()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl Dispatch<xdg_wm_base::XdgWmBase, ()> for TestClientData {
+        fn event(
+            _: &mut Self,
+            wm_base: &xdg_wm_base::XdgWmBase,
+            event: xdg_wm_base::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_wm_base::Event::Ping { serial } = event {
+                wm_base.pong(serial);
+            }
+        }
+    }
+
+    impl Dispatch<xdg_surface::XdgSurface, ()> for TestClientData {
+        fn event(
+            _: &mut Self,
+            surface: &xdg_surface::XdgSurface,
+            event: xdg_surface::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_surface::Event::Configure { serial } = event {
+                surface.ack_configure(serial);
+            }
+        }
+    }
+
+    delegate_noop!(TestClientData: ignore wl_compositor::WlCompositor);
+    delegate_noop!(TestClientData: ignore wl_surface::WlSurface);
+    delegate_noop!(TestClientData: ignore wl_shm::WlShm);
+    delegate_noop!(TestClientData: ignore wl_shm_pool::WlShmPool);
+    delegate_noop!(TestClientData: ignore wl_buffer::WlBuffer);
+    delegate_noop!(TestClientData: ignore client_xdg_toplevel::XdgToplevel);
+
+    fn pump(
+        event_loop: &mut EventLoop<'static, EvoState<DummyBackend>>,
+        state: &mut EvoState<DummyBackend>,
+        conn: &Connection,
+        queue: &mut EventQueue<TestClientData>,
+        cdata: &mut TestClientData,
+    ) {
+        for _ in 0..8 {
+            let _ = conn.flush();
+            let _ = event_loop.dispatch(Some(Duration::from_millis(2)), state);
+            state.space.refresh();
+            let _ = state.display_handle.flush_clients();
+            if let Some(guard) = conn.prepare_read() {
+                let _ = guard.read();
+            }
+            let _ = queue.dispatch_pending(cdata);
+        }
+    }
+
+    fn connect(
+        event_loop: &mut EventLoop<'static, EvoState<DummyBackend>>,
+        state: &mut EvoState<DummyBackend>,
+        security_context: Option<SecurityContext>,
+    ) -> (Connection, EventQueue<TestClientData>, TestClientData) {
+        let (server_end, client_end) = UnixStream::pair().unwrap();
+        let client_data: Arc<dyn ClientData> = Arc::new(ClientState {
+            security_context,
+            ..ClientState::default()
+        });
+        state
+            .display_handle
+            .insert_client(server_end, client_data)
+            .unwrap();
+        let conn = Connection::from_socket(client_end).unwrap();
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+        let mut cdata = TestClientData::default();
+        pump(event_loop, state, &conn, &mut queue, &mut cdata);
+        (conn, queue, cdata)
+    }
+
+    fn spawn_mapped_window(
+        event_loop: &mut EventLoop<'static, EvoState<DummyBackend>>,
+        state: &mut EvoState<DummyBackend>,
+        conn: &Connection,
+        queue: &mut EventQueue<TestClientData>,
+        cdata: &mut TestClientData,
+        app_id: &str,
+        width: i32,
+        height: i32,
+        setup_toplevel: impl FnOnce(&client_xdg_toplevel::XdgToplevel),
+    ) -> (WindowElement, wl_surface::WlSurface, client_xdg_toplevel::XdgToplevel, tempfile::NamedTempFile, wl_buffer::WlBuffer) {
+        let qh = queue.handle();
+        let compositor = cdata.compositor.as_ref().unwrap();
+        let shm = cdata.shm.as_ref().unwrap().clone();
+        let wm_base = cdata.wm_base.as_ref().unwrap();
+
+        let wl_surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        toplevel.set_app_id(app_id.to_string());
+        setup_toplevel(&toplevel);
+        wl_surface.commit();
+        pump(event_loop, state, conn, queue, cdata);
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let stride = width * 4;
+        file.as_file().set_len((stride * height) as u64).unwrap();
+        let pool = shm.create_pool(file.as_file().as_fd(), stride * height, &qh, ());
+        let buffer = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, &qh, ());
+        wl_surface.attach(Some(&buffer), 0, 0);
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.commit();
+        pump(event_loop, state, conn, queue, cdata);
+
+        let window = state
+            .space
+            .elements()
+            .find(|w| w.claimed_app_id().as_deref() == Some(app_id))
+            .cloned()
+            .unwrap_or_else(|| panic!("expected mapped window for {app_id}"));
+        (window, wl_surface, toplevel, file, buffer)
+    }
+
+    fn pending_toplevel_state(
+        window: &WindowElement,
+    ) -> (Option<smithay::utils::Size<i32, Logical>>, bool, usize) {
+        let toplevel = window.0.toplevel().unwrap();
+        let (size, fullscreen) = toplevel.with_pending_state(|s| {
+            (s.size, s.states.contains(xdg_toplevel::State::Fullscreen))
+        });
+        let pending_count = smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .pending_configures()
+                .len()
+        });
+        (size, fullscreen, pending_count)
+    }
+
+    #[test]
+    fn fixup_positions_resizes_shell_fullscreen_maximized_and_floating_windows() {
+        let mut event_loop: EventLoop<'static, EvoState<DummyBackend>> =
+            EventLoop::try_new().unwrap();
+        let display = Display::<EvoState<DummyBackend>>::new().unwrap();
+        let mut state = EvoState::init(display, event_loop.handle(), DummyBackend, false);
+
+        let mode_1080 = Mode {
+            size: (1920, 1080).into(),
+            refresh: 60_000,
+        };
+        let output = Output::new(
+            "TEST-1".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Test".into(),
+                model: "Test".into(),
+                serial_number: "0".into(),
+            },
+        );
+        output.change_current_state(Some(mode_1080), Some(Transform::Normal), None, Some((0, 0).into()));
+        output.set_preferred(mode_1080);
+        state.space.map_output(&output, (0, 0));
+
+        let (t_conn, mut t_queue, mut t_data) = connect(&mut event_loop, &mut state, None);
+
+        let (bloom, _bs, _bt, _bf, _bb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &t_conn,
+            &mut t_queue,
+            &mut t_data,
+            "bloom",
+            1920,
+            1080,
+            |_| {},
+        );
+        let (overlay, _os, _ot, _of, _ob) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &t_conn,
+            &mut t_queue,
+            &mut t_data,
+            "bloom-overlay",
+            1920,
+            1080,
+            |_| {},
+        );
+
+        let creator_client_id = {
+            let (s, _c) = UnixStream::pair().unwrap();
+            std::mem::forget(_c);
+            state
+                .display_handle
+                .insert_client(s, Arc::new(ClientState::default()))
+                .unwrap()
+                .id()
+        };
+        let (a_conn, mut a_queue, mut a_data) = connect(
+            &mut event_loop,
+            &mut state,
+            Some(SecurityContext {
+                sandbox_engine: Some("pyxis".into()),
+                app_id: Some("app-suite".into()),
+                instance_id: Some("1".into()),
+                creator_client_id,
+            }),
+        );
+        let (fs_win, fs_s, fs_t, _fsf, _fsb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "fullscreen-app",
+            1920,
+            1080,
+            |_| {},
+        );
+        fs_t.set_fullscreen(None);
+        fs_s.commit();
+        let (min_fs_win, min_fs_s, min_fs_t, _mfsf, _mfsb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "minimized-fs-app",
+            1920,
+            1080,
+            |_| {},
+        );
+        min_fs_t.set_fullscreen(None);
+        min_fs_s.commit();
+        pump(&mut event_loop, &mut state, &a_conn, &mut a_queue, &mut a_data);
+        let (max_win, _ms, _mt, _mf, _mb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "maximized-app",
+            1920,
+            1080,
+            |t| t.set_maximized(),
+        );
+        let (float_win, _fls, _flt, _flf, _flb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "floating-app",
+            1000,
+            800,
+            |_| {},
+        );
+        state.place_window(&float_win, (1400, 600).into(), false);
+        state.minimize_window(&min_fs_win);
+        pump(&mut event_loop, &mut state, &t_conn, &mut t_queue, &mut t_data);
+        pump(&mut event_loop, &mut state, &a_conn, &mut a_queue, &mut a_data);
+
+        // Sanity check initial fullscreen / shell state at 1920x1080.
+        assert_eq!(pending_toplevel_state(&bloom).0, Some((1920, 1080).into()));
+        assert_eq!(pending_toplevel_state(&overlay).0, Some((1920, 1080).into()));
+        assert_eq!(pending_toplevel_state(&fs_win).0, Some((1920, 1080).into()));
+
+        // Simulate an output resolution change to 1280x720 and reposition to (0, 0).
+        let mode_720 = Mode {
+            size: (1280, 720).into(),
+            refresh: 60_000,
+        };
+        output.change_current_state(Some(mode_720), None, None, Some((0, 0).into()));
+        output.set_preferred(mode_720);
+
+        state.fixup_positions((100.0, 100.0).into());
+
+        // Bloom, bloom-overlay, and fullscreen app windows are reconfigured to 1280x720 + Fullscreen.
+        for win in [&bloom, &overlay, &fs_win] {
+            let (size, is_fs, pending_count) = pending_toplevel_state(win);
+            assert_eq!(size, Some((1280, 720).into()));
+            assert!(is_fs);
+            assert!(pending_count >= 1, "expected pending configure to be sent");
+            assert_eq!(state.space.element_location(win), Some((0, 0).into()));
+            assert_eq!(
+                state.workspace_manager.state(win).map(|s| s.layout),
+                Some(WindowLayout::Fullscreen)
+            );
+        }
+
+        // Minimized fullscreen window gets resized too, without being unminimized.
+        assert!(!state.is_window_mapped(&min_fs_win));
+        assert_eq!(pending_toplevel_state(&min_fs_win).0, Some((1280, 720).into()));
+        assert!(pending_toplevel_state(&min_fs_win).1);
+
+        // Maximized and floating windows are refitted to the new work area.
+        let new_work_area =
+            crate::shell::work_area::of_output(Rectangle::new((0, 0).into(), (1280, 720).into()));
+        let expected_max_client: smithay::utils::Size<i32, Logical> = (
+            new_work_area.size.w,
+            (new_work_area.size.h - max_win.decoration_height()).max(1),
+        )
+            .into();
+        assert_eq!(pending_toplevel_state(&max_win).0, Some(expected_max_client));
+        assert_eq!(state.space.element_location(&max_win), Some(new_work_area.loc));
+
+        let (float_pending_size, _, _) = pending_toplevel_state(&float_win);
+        let float_client_size = float_pending_size.expect("floating window should be resized to fit");
+        assert!(float_client_size.w <= new_work_area.size.w);
+        assert!(float_client_size.h + float_win.decoration_height() <= new_work_area.size.h);
+        let float_loc = state.space.element_location(&float_win).unwrap();
+        assert!(float_loc.x >= new_work_area.loc.x);
+        assert!(float_loc.y >= new_work_area.loc.y);
+        assert!(float_loc.x + float_client_size.w <= new_work_area.loc.x + new_work_area.size.w);
+        assert!(
+            float_loc.y + float_client_size.h + float_win.decoration_height()
+                <= new_work_area.loc.y + new_work_area.size.h
+        );
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    #[test]
+    fn sync_toplevels_lists_the_desktop_but_not_the_overlay() {
+        let mut event_loop: EventLoop<'static, EvoState<DummyBackend>> =
+            EventLoop::try_new().unwrap();
+        let display = Display::<EvoState<DummyBackend>>::new().unwrap();
+        let mut state = EvoState::init(display, event_loop.handle(), DummyBackend, false);
+
+        let (t_conn, mut t_queue, mut t_data) = connect(&mut event_loop, &mut state, None);
+        let _bloom = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &t_conn,
+            &mut t_queue,
+            &mut t_data,
+            "bloom",
+            800,
+            600,
+            |_| {},
+        );
+        let _overlay = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &t_conn,
+            &mut t_queue,
+            &mut t_data,
+            "bloom-overlay",
+            800,
+            600,
+            |_| {},
+        );
+
+        let creator_client_id = {
+            let (s, _c) = UnixStream::pair().unwrap();
+            std::mem::forget(_c);
+            state
+                .display_handle
+                .insert_client(s, Arc::new(ClientState::default()))
+                .unwrap()
+                .id()
+        };
+        let (a_conn, mut a_queue, mut a_data) = connect(
+            &mut event_loop,
+            &mut state,
+            Some(SecurityContext {
+                sandbox_engine: Some("pyxis".into()),
+                app_id: Some("com.pyxis.notes".into()),
+                instance_id: Some("1".into()),
+                creator_client_id,
+            }),
+        );
+        let _app = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.pyxis.notes",
+            600,
+            400,
+            |_| {},
+        );
+
+        assert_eq!(state.windows_by_id.len(), 3);
+        let infos = state.collect_toplevel_infos();
+        let mut ids: Vec<&str> = infos.iter().map(|i| i.app_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["bloom", "com.pyxis.notes"]);
+        assert!(infos.iter().all(|i| !i.fullscreen));
+
+        state.last_toplevel_sync = Instant::now() - Duration::from_secs(1);
+        state.sync_toplevels();
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    fn make_output(name: &str, w: i32, h: i32, x: i32, y: i32) -> Output {
+        let mode = Mode {
+            size: (w, h).into(),
+            refresh: 60_000,
+        };
+        let output = Output::new(
+            name.to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Test".into(),
+                model: "Test".into(),
+                serial_number: name.to_string(),
+            },
+        );
+        output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((x, y).into()));
+        output.set_preferred(mode);
+        output
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    fn attach_shm_buffer(
+        event_loop: &mut EventLoop<'static, EvoState<DummyBackend>>,
+        state: &mut EvoState<DummyBackend>,
+        conn: &Connection,
+        queue: &mut EventQueue<TestClientData>,
+        cdata: &mut TestClientData,
+        wl_surface: &wl_surface::WlSurface,
+        width: i32,
+        height: i32,
+    ) -> (tempfile::NamedTempFile, wl_buffer::WlBuffer) {
+        let qh = queue.handle();
+        let shm = cdata.shm.as_ref().unwrap().clone();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let stride = width * 4;
+        file.as_file().set_len((stride * height) as u64).unwrap();
+        let pool = shm.create_pool(file.as_file().as_fd(), stride * height, &qh, ());
+        let buffer = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, &qh, ());
+        wl_surface.attach(Some(&buffer), 0, 0);
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.commit();
+        pump(event_loop, state, conn, queue, cdata);
+        (file, buffer)
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    #[test]
+    fn wave_a_list_windows_flags_and_shell_focus_suppression() {
+        let _lock = crate::shell::lock::test_lock_guard();
+        let mut event_loop: EventLoop<'static, EvoState<DummyBackend>> =
+            EventLoop::try_new().unwrap();
+        let display = Display::<EvoState<DummyBackend>>::new().unwrap();
+        let mut state = EvoState::init(display, event_loop.handle(), DummyBackend, false);
+        let (echo_srv, mut spy) = GeckoEchoService::new_for_test();
+        state.echo_service = Arc::new(RwLock::new(echo_srv));
+
+        let output = make_output("TEST-LIST", 1280, 800, 0, 0);
+        state.space.map_output(&output, (0, 0));
+
+        let (t_conn, mut t_queue, mut t_data) = connect(&mut event_loop, &mut state, None);
+        let (bloom, _bs, _bt, _bf, _bb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &t_conn,
+            &mut t_queue,
+            &mut t_data,
+            "bloom",
+            1280,
+            800,
+            |_| {},
+        );
+        let (overlay, _os, _ot, _of, _ob) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &t_conn,
+            &mut t_queue,
+            &mut t_data,
+            "bloom-overlay",
+            1280,
+            800,
+            |_| {},
+        );
+
+        let creator_client_id = {
+            let (s, _c) = UnixStream::pair().unwrap();
+            std::mem::forget(_c);
+            state
+                .display_handle
+                .insert_client(s, Arc::new(ClientState::default()))
+                .unwrap()
+                .id()
+        };
+        let (a_conn, mut a_queue, mut a_data) = connect(
+            &mut event_loop,
+            &mut state,
+            Some(SecurityContext {
+                sandbox_engine: Some("pyxis".into()),
+                app_id: Some("com.wavea.notes".into()),
+                instance_id: Some("1".into()),
+                creator_client_id,
+            }),
+        );
+        let (app_win, _as, _at, _af, _ab) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.wavea.notes",
+            600,
+            400,
+            |_| {},
+        );
+
+        // The desktop is listed too (suites read its focus); these checks are the app's.
+        fn app_infos(state: &EvoState<DummyBackend>) -> Vec<WindowInfo> {
+            state
+                .collect_toplevel_infos()
+                .into_iter()
+                .filter(|i| i.app_id != "bloom")
+                .collect()
+        }
+        let initial = app_infos(&state);
+        assert_eq!(initial.len(), 1);
+        assert!(!initial[0].minimized);
+        assert!(!initial[0].maximized);
+        assert!(!initial[0].fullscreen);
+        assert!(initial[0].visible);
+
+        // Maximize -> minimized keeps real flags -> unminimize -> fullscreen.
+        state.maximize_window(&app_win);
+        let max_infos = app_infos(&state);
+        assert!(max_infos[0].maximized);
+        assert!(!max_infos[0].minimized);
+        assert!(!max_infos[0].fullscreen);
+
+        state.minimize_window(&app_win);
+        let min_infos = app_infos(&state);
+        assert!(min_infos[0].minimized);
+        assert!(min_infos[0].maximized);
+        assert!(!min_infos[0].visible);
+
+        state.unminimize_window(&app_win);
+        let unmax_win = app_win.clone();
+        state.unmaximize_window(&unmax_win);
+        if let Some(toplevel) = app_win.0.toplevel().cloned() {
+            use smithay::wayland::shell::xdg::XdgShellHandler;
+            XdgShellHandler::fullscreen_request(&mut state, toplevel, None);
+        }
+        let fs_infos = app_infos(&state);
+        assert!(fs_infos[0].fullscreen);
+        assert!(!fs_infos[0].maximized);
+        assert!(!fs_infos[0].minimized);
+
+        // Focusing shell windows (`bloom`, `bloom-overlay`) must NEVER emit WindowFocusChanged.
+        let _ = spy.drain_signals();
+        let keyboard = state.seat.get_keyboard().unwrap();
+        keyboard.set_focus(
+            &mut state,
+            Some(bloom.clone().into()),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+        );
+        keyboard.set_focus(
+            &mut state,
+            Some(overlay.clone().into()),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+        );
+        let shell_focus_signals: Vec<_> = spy
+            .drain_signals()
+            .into_iter()
+            .filter(|(name, _)| name == "WindowFocusChanged")
+            .collect();
+        assert!(
+            shell_focus_signals.is_empty(),
+            "shell focus must not emit WindowFocusChanged, saw {shell_focus_signals:?}"
+        );
+
+        // Focusing a real app window DOES emit WindowFocusChanged.
+        keyboard.set_focus(
+            &mut state,
+            Some(app_win.clone().into()),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+        );
+        let app_focus_signals: Vec<_> = spy
+            .drain_signals()
+            .into_iter()
+            .filter(|(name, _)| name == "WindowFocusChanged")
+            .collect();
+        assert_eq!(app_focus_signals.len(), 1);
+        assert_eq!(app_focus_signals[0].1["window_id"], state.window_id_for(&app_win).unwrap());
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    #[test]
+    fn wave_a_resize_cancel_unset_top_left_commit_and_self_unmaximize() {
+        let _lock = crate::shell::lock::test_lock_guard();
+        let mut event_loop: EventLoop<'static, EvoState<DummyBackend>> =
+            EventLoop::try_new().unwrap();
+        let display = Display::<EvoState<DummyBackend>>::new().unwrap();
+        let mut state = EvoState::init(display, event_loop.handle(), DummyBackend, false);
+
+        let output = make_output("TEST-RESIZE", 1280, 800, 0, 0);
+        state.space.map_output(&output, (0, 0));
+
+        let (a_conn, mut a_queue, mut a_data) = connect(&mut event_loop, &mut state, None);
+        let (win, wl_s, wl_t, _f1, _b1) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.wavea.resize",
+            800,
+            600,
+            |_| {},
+        );
+        state.place_window(&win, (400, 150).into(), false);
+        let root_surface = win.wl_surface().unwrap().into_owned();
+
+        // (a) Simulate an interrupted resize grab (e.g. lock screen release_grabs) calling unset.
+        smithay::wayland::compositor::with_states(&root_surface, |states| {
+            let cell = states
+                .data_map
+                .get::<std::cell::RefCell<crate::shell::SurfaceData>>()
+                .unwrap();
+            cell.borrow_mut().resize_state = crate::shell::ResizeState::Resizing(crate::shell::ResizeData {
+                edges: crate::shell::ResizeEdge::TOP_LEFT,
+                initial_window_location: (400, 150).into(),
+                initial_window_size: (800, 600).into(),
+            });
+        });
+        if let Some(xdg) = win.0.toplevel() {
+            xdg.with_pending_state(|s| s.states.set(xdg_toplevel::State::Resizing));
+        }
+        crate::shell::cancel_resize_on_unset(&mut state, &win);
+        smithay::wayland::compositor::with_states(&root_surface, |states| {
+            let cell = states
+                .data_map
+                .get::<std::cell::RefCell<crate::shell::SurfaceData>>()
+                .unwrap();
+            assert_eq!(cell.borrow().resize_state, crate::shell::ResizeState::NotResizing);
+        });
+        if let Some(xdg) = win.0.toplevel() {
+            assert!(!xdg.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Resizing)));
+        }
+
+        // (b) WaitingForFinalAck / WaitingForCommit adjusts origin on commit for TOP_LEFT edge.
+        let initial_geo_size = win.geometry().size;
+        smithay::wayland::compositor::with_states(&root_surface, |states| {
+            let cell = states
+                .data_map
+                .get::<std::cell::RefCell<crate::shell::SurfaceData>>()
+                .unwrap();
+            cell.borrow_mut().resize_state = crate::shell::ResizeState::WaitingForCommit(crate::shell::ResizeData {
+                edges: crate::shell::ResizeEdge::TOP_LEFT,
+                initial_window_location: (400, 150).into(),
+                initial_window_size: initial_geo_size,
+            });
+        });
+        let (_f2, _b2) = attach_shm_buffer(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            &wl_s,
+            700,
+            500,
+        );
+        // Client shrank by 100x100 from top-left, so origin shifts +100,+100 cleanly.
+        assert_eq!(state.space.element_location(&win), Some((500, 250).into()));
+
+        // (c) Self-maximized window (`OldGeometry` is None) computes centered 85% floating size.
+        let _ = wl_t;
+        let (max_win, _ms, _mt, _mf, _mb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.wavea.selfmax",
+            1280,
+            768,
+            |t| t.set_maximized(),
+        );
+        assert!(max_win.user_data().get::<crate::shell::OldGeometry>().is_none());
+        let area = crate::shell::work_area::of_output(Rectangle::new((0, 0).into(), (1280, 800).into()));
+        let expected_frame = crate::shell::placement::default_restore_frame_rect(area);
+        state.unmaximize_window(&max_win);
+        let (pending_size, _, _) = pending_toplevel_state(&max_win);
+        assert_eq!(
+            pending_size,
+            Some((
+                expected_frame.size.w,
+                (expected_frame.size.h - max_win.decoration_height()).max(1)
+            ).into())
+        );
+        assert_eq!(state.space.element_location(&max_win), Some(expected_frame.loc));
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    #[test]
+    fn wave_a_multi_output_xy_shell_outputs_edge_flush_and_minimized_refit() {
+        let _lock = crate::shell::lock::test_lock_guard();
+        let mut event_loop: EventLoop<'static, EvoState<DummyBackend>> =
+            EventLoop::try_new().unwrap();
+        let display = Display::<EvoState<DummyBackend>>::new().unwrap();
+        let mut state = EvoState::init(display, event_loop.handle(), DummyBackend, false);
+        let (echo_srv, mut spy) = GeckoEchoService::new_for_test();
+        state.echo_service = Arc::new(RwLock::new(echo_srv));
+
+        // Vertically stacked outputs: secondary output lives at (0, 1080).
+        let out1 = make_output("OUT-1", 1920, 1080, 0, 0);
+        let out2 = make_output("OUT-2", 1920, 1080, 0, 1080);
+        state.space.map_output(&out1, (0, 0));
+        state.space.map_output(&out2, (0, 1080));
+
+        let (t_conn, mut t_queue, mut t_data) = connect(&mut event_loop, &mut state, None);
+        let (bloom2, _bs, _bt, _bf, _bb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &t_conn,
+            &mut t_queue,
+            &mut t_data,
+            "bloom",
+            1920,
+            1080,
+            |_| {},
+        );
+        // Pin secondary shell window onto OUT-2.
+        state.place_window(&bloom2, (0, 1080).into(), false);
+        if let Some(slot) = bloom2.user_data().get::<FullscreenOutputName>() {
+            slot.set(Some("OUT-2".to_string()));
+        }
+
+        let (a_conn, mut a_queue, mut a_data) = connect(&mut event_loop, &mut state, None);
+        // Edge-flush SSD window at (0, 0) (has -8px resize band bbox loc).
+        let (edge_win, _es, _et, _ef, _eb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.wavea.edgeflush",
+            800,
+            600,
+            |_| {},
+        );
+        state.place_window(&edge_win, (0, 0).into(), false);
+
+        // Minimized floating window sized large (1400x900) on OUT-1 before shrink.
+        let (min_win, _ms, _mt, _mf, _mb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.wavea.minimized",
+            1400,
+            900,
+            |_| {},
+        );
+        state.place_window(&min_win, (100, 100).into(), false);
+        state.minimize_window(&min_win);
+
+        // Shrink OUT-1 while keeping OUT-2 stacked at (0, 1080), trigger lock + ApplyOutputConfigs.
+        let _ = spy.drain_signals();
+        let mode_small = Mode {
+            size: (1024, 600).into(),
+            refresh: 60_000,
+        };
+        out1.change_current_state(Some(mode_small), None, None, Some((0, 0).into()));
+        out1.set_preferred(mode_small);
+        crate::shell::lock::request_lock(crate::shell::lock::Source::Key);
+        state.lock_tick();
+        assert!(crate::shell::lock::input_locked());
+
+        state
+            .echo_service
+            .read()
+            .push_window_action_for_test(0, WindowAction::ApplyOutputConfigs);
+        state.process_pending_window_actions();
+
+        // Stacked output (0, 1080) preserved and secondary shell window remains on OUT-2!
+        assert_eq!(state.space.output_geometry(&out2).map(|g| g.loc), Some((0, 1080).into()));
+        assert_eq!(state.space.element_location(&bloom2), Some((0, 1080).into()));
+        assert_eq!(pending_toplevel_state(&bloom2).0, Some((1920, 1080).into()));
+
+        // Edge-flush window at (0, 0) stayed anchored without random teleporting!
+        assert_eq!(state.space.element_location(&edge_win), Some((0, 0).into()));
+
+        // Minimized floating window got shrunk while minimized, and fits after restore.
+        let shrunk_area = crate::shell::work_area::of_output(Rectangle::new((0, 0).into(), (1024, 600).into()));
+        let (min_pending, _, _) = pending_toplevel_state(&min_win);
+        let min_pending = min_pending.expect("minimized oversized window reconfigured");
+        assert!(min_pending.w <= shrunk_area.size.w);
+        assert!(min_pending.h + min_win.decoration_height() <= shrunk_area.size.h);
+
+        // OutputsChanged signal emitted cleanly even if transitioned while locked.
+        let output_signals: Vec<_> = spy
+            .drain_signals()
+            .into_iter()
+            .filter(|(name, _)| name == "OutputsChanged")
+            .collect();
+        assert!(!output_signals.is_empty());
+
+        // Restore minimized window cleanly inside shrunk work area.
+        state.unminimize_window(&min_win);
+        let restored_loc = state.space.element_location(&min_win).unwrap();
+        assert!(restored_loc.x >= shrunk_area.loc.x);
+        assert!(restored_loc.y >= shrunk_area.loc.y);
+    }
+
+    #[cfg(feature = "echo-ipc")]
+    #[test]
+    fn wave_a_window_ux_tiling_lowering_app_cycling_and_cleanup() {
+        let _lock = crate::shell::lock::test_lock_guard();
+        crate::shell::recede::clear_receded_for_test();
+        let mut event_loop: EventLoop<'static, EvoState<DummyBackend>> =
+            EventLoop::try_new().unwrap();
+        let display = Display::<EvoState<DummyBackend>>::new().unwrap();
+        let mut state = EvoState::init(display, event_loop.handle(), DummyBackend, false);
+
+        let output = make_output("TEST-UX", 1280, 800, 0, 0);
+        state.space.map_output(&output, (0, 0));
+
+        let (a_conn, mut a_queue, mut a_data) = connect(&mut event_loop, &mut state, None);
+        let (doc1, _, doc1_t, _f1, _b1) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.wavea.docs",
+            640,
+            400,
+            |t| t.set_title("Doc One".to_string()),
+        );
+        // Spawn 2nd docs window and 1 terminal window with distinct app_ids/titles.
+        let doc2_s = a_data.compositor.as_ref().unwrap().create_surface(&a_queue.handle(), ());
+        let doc2_xdg = a_data.wm_base.as_ref().unwrap().get_xdg_surface(&doc2_s, &a_queue.handle(), ());
+        let doc2_t = doc2_xdg.get_toplevel(&a_queue.handle(), ());
+        doc2_t.set_app_id("com.wavea.docs".to_string());
+        doc2_t.set_title("Doc Two".to_string());
+        doc2_s.commit();
+        pump(&mut event_loop, &mut state, &a_conn, &mut a_queue, &mut a_data);
+        let (_df2, _db2) = attach_shm_buffer(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            &doc2_s,
+            640,
+            400,
+        );
+        let doc2 = state
+            .space
+            .elements()
+            .find(|w| **w != doc1 && w.claimed_app_id().as_deref() == Some("com.wavea.docs"))
+            .unwrap()
+            .clone();
+
+        let (term, _, _tt, _tf, _tb) = spawn_mapped_window(
+            &mut event_loop,
+            &mut state,
+            &a_conn,
+            &mut a_queue,
+            &mut a_data,
+            "com.wavea.term",
+            600,
+            400,
+            |_| {},
+        );
+        let _ = doc1_t;
+
+        state.place_window(&doc1, (100, 120).into(), false);
+        state.focus_window(&term);
+        state.focus_window(&doc2);
+        state.focus_window(&doc1);
+
+        // Super+Left tiles to left half of work area; pressing again restores.
+        let area = crate::shell::work_area::of_output(Rectangle::new((0, 0).into(), (1280, 800).into()));
+        state.tile_focused_window(crate::shell::TileSide::Left);
+        assert_eq!(state.workspace_manager.state(&doc1).map(|s| s.layout), Some(WindowLayout::Tiled));
+        assert_eq!(state.space.element_location(&doc1), Some(area.loc));
+        assert_eq!(
+            pending_toplevel_state(&doc1).0,
+            Some((area.size.w / 2, (area.size.h - doc1.decoration_height()).max(1)).into())
+        );
+
+        state.tile_focused_window(crate::shell::TileSide::Left);
+        assert_eq!(state.workspace_manager.state(&doc1).map(|s| s.layout), Some(WindowLayout::Floating));
+        assert_eq!(state.space.element_location(&doc1), Some((100, 120).into()));
+
+        // Super+Up toggles maximize; Super+Down unmaximizes then minimizes.
+        state.toggle_maximize_focused_window();
+        assert_eq!(state.workspace_manager.state(&doc1).map(|s| s.layout), Some(WindowLayout::Maximized));
+        state.unmaximize_or_minimize_focused_window();
+        assert_eq!(state.workspace_manager.state(&doc1).map(|s| s.layout), Some(WindowLayout::Floating));
+        state.unmaximize_or_minimize_focused_window();
+        assert!(state.is_window_minimized(&doc1));
+
+        // Restore doc1, test Alt+Grave only cycles same `app_id` ("com.wavea.docs", skipping `term`).
+        state.focus_window(&doc2);
+        state.focus_window(&doc1);
+        state.cycle_app_windows(false);
+        assert_eq!(state.focused_app_window().as_ref(), Some(&doc2));
+
+        // Lower doc2 puts it behind other app windows and moves focus to doc1.
+        state.lower_window(&doc2);
+        let first_app = state
+            .space
+            .elements()
+            .find(|w| !w.is_shell_window())
+            .cloned();
+        assert_eq!(first_app.as_ref(), Some(&doc2));
+        assert_ne!(state.focused_app_window().as_ref(), Some(&doc2));
+
+        // Removing/unregistering a window scrubs it immediately from `focus_history` and `RECEDED`.
+        crate::shell::recede::receded_for_test_push(doc2.clone());
+        assert!(crate::shell::recede::receded_contains(&doc2));
+        assert!(state.focus_history.contains(&doc2));
+        state.remove_window_from_workspace(&doc2);
+        assert!(!crate::shell::recede::receded_contains(&doc2));
+        assert!(!state.focus_history.contains(&doc2));
     }
 }

@@ -316,7 +316,12 @@ impl<BackendData: Backend> EvoState<BackendData> {
             snapshot.size.h,
             began.elapsed().as_secs_f64() * 1000.0
         );
-        Some(Box::new(Warp::new(snapshot, target, accent_for(window.app_id().as_deref()))))
+        Some(Box::new(Warp::new(
+            snapshot,
+            target,
+            accent_for(window.app_id().as_deref()),
+            window.picture_radii(),
+        )))
     }
 
     /// The frame `window` is drawn at now, `None` if it is not in the Space.

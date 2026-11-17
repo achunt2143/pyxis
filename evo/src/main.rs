@@ -16,6 +16,7 @@ static GLOBAL: profiling::tracy_client::ProfiledAllocator<std::alloc::System> =
     profiling::tracy_client::ProfiledAllocator::new(std::alloc::System, 10);
 
 fn main() {
+    geckoOS_evo::install_crash_handler();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();

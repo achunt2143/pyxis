@@ -35,14 +35,20 @@ use super::{
     spec::{FOCUS, LIFT, STANDARD_CURVE},
     transform::WindowTransform,
 };
-use crate::shell::{placement::is_bindable_app_id, WindowElement};
+use crate::shell::{identity::Radii, placement::is_bindable_app_id, WindowElement};
 
-/// Corner radius of an SSD frame, logical px. The title bar's rounded top is
-/// rasterized at the same radius (`ssd::GLASS_CORNER_RADIUS`).
-pub const FRAME_RADIUS: f64 = 16.0;
+/// Corner radii of an SSD frame, logical px: the waterdrop
+/// (`identity::CORNER_RADII`). The title bar's top is rasterized with the same
+/// corners (`ssd.rs`), and every consumer takes all four.
+pub const FRAME_RADII: Radii = Radii::FRAME;
 /// Radius assumed for a window Evo does not decorate (a client-drawn frame, an
 /// X11 window): only the shadow follows it.
 pub const CLIENT_RADIUS: f64 = 8.0;
+/// The radius the client content's bottom corners are clipped to. The
+/// waterdrop's two bottom corners are one radius, so the clip stays a single
+/// number (`ClippedSurface`).
+pub const CONTENT_RADIUS: f64 = FRAME_RADII.0[2];
+const _: () = assert!(FRAME_RADII.0[2] == FRAME_RADII.0[3], "the clip rounds both bottom corners alike");
 
 /// A shadow's look at one instant, in logical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,15 +59,15 @@ pub struct ShadowStyle {
     pub offset_y: f64,
     /// Peak alpha of the shadow.
     pub strength: f64,
-    /// The frame's corner radius.
-    pub radius: f64,
+    /// The frame's corner radii.
+    pub radii: Radii,
 }
 
 // Inactive windows sit low and tight, the focused one floats higher with a
 // larger, softer shadow, and a window in the hand is higher again.
-const INACTIVE: ShadowStyle = ShadowStyle { sigma: 6.0, offset_y: 3.0, strength: 0.34, radius: 0.0 };
-const ACTIVE: ShadowStyle = ShadowStyle { sigma: 14.0, offset_y: 9.0, strength: 0.56, radius: 0.0 };
-const LIFTED_EXTRA: ShadowStyle = ShadowStyle { sigma: 6.0, offset_y: 8.0, strength: 0.10, radius: 0.0 };
+const INACTIVE: ShadowStyle = ShadowStyle { sigma: 6.0, offset_y: 3.0, strength: 0.34, radii: Radii::SQUARE };
+const ACTIVE: ShadowStyle = ShadowStyle { sigma: 14.0, offset_y: 9.0, strength: 0.56, radii: Radii::SQUARE };
+const LIFTED_EXTRA: ShadowStyle = ShadowStyle { sigma: 6.0, offset_y: 8.0, strength: 0.10, radii: Radii::SQUARE };
 
 /// The header bar's brightness while the window is inactive, as a fraction of
 /// its active alpha (glass, title and buttons alike).
@@ -78,7 +84,7 @@ pub struct DepthInput {
     pub app: bool,
     /// Maximized or fullscreen: no shadow, square corners.
     pub square: bool,
-    /// Evo draws its frame (rounded at `FRAME_RADIUS`).
+    /// Evo draws its frame (rounded at `FRAME_RADII`).
     pub ssd: bool,
     /// 0 inactive .. 1 active, mid-crossfade in between.
     pub focus: f64,
@@ -95,7 +101,7 @@ pub fn plan(input: &DepthInput) -> Option<ShadowStyle> {
         sigma: lerp(INACTIVE.sigma, ACTIVE.sigma, input.focus) + LIFTED_EXTRA.sigma * input.lift,
         offset_y: lerp(INACTIVE.offset_y, ACTIVE.offset_y, input.focus) + LIFTED_EXTRA.offset_y * input.lift,
         strength: lerp(INACTIVE.strength, ACTIVE.strength, input.focus) + LIFTED_EXTRA.strength * input.lift,
-        radius: if input.ssd { FRAME_RADIUS } else { CLIENT_RADIUS },
+        radii: if input.ssd { FRAME_RADII } else { Radii::uniform(CLIENT_RADIUS) },
     })
 }
 
@@ -104,9 +110,20 @@ pub fn plan(input: &DepthInput) -> Option<ShadowStyle> {
 /// maximized window is square.
 pub fn content_radius(ssd: bool, square: bool) -> f64 {
     if ssd && !square {
-        FRAME_RADIUS
+        CONTENT_RADIUS
     } else {
         0.0
+    }
+}
+
+/// See `WindowElement::picture_radii`.
+pub fn picture_radii(square: bool, ssd: bool) -> Radii {
+    if square {
+        Radii::SQUARE
+    } else if ssd {
+        FRAME_RADII
+    } else {
+        Radii::uniform(CLIENT_RADIUS)
     }
 }
 
@@ -165,7 +182,7 @@ pub fn shadow_params(
             Size::from((frame.size.w as f64, frame.size.h as f64)),
         ),
         shift: (0.0, shift_y),
-        radius: style.radius * px,
+        radii: style.radii.scale(px),
         sigma,
         strength: style.strength,
         alpha,
@@ -304,6 +321,24 @@ impl WindowElement {
         self.user_data().get::<DepthSlot>().map_or(1.0, |s| s.appear.borrow().value(now))
     }
 
+    /// The frame's corners as drawn now, logical px: the waterdrop for an app
+    /// window Evo decorates, square when it is maximized or fullscreen, and
+    /// square for anything else (nothing of Evo's to match). What an opening
+    /// window's Bloom lands on.
+    pub fn frame_radii(&self) -> Radii {
+        if !self.depth_app() || !self.is_ssd() {
+            return Radii::SQUARE;
+        }
+        Radii::frame(self.is_square())
+    }
+
+    /// The corners a picture of this window starts from (Droplet, Recede),
+    /// logical px: square while it fills its space, the waterdrop for a frame
+    /// Evo draws, the assumed client radius otherwise.
+    pub fn picture_radii(&self) -> Radii {
+        picture_radii(self.is_square(), self.is_ssd())
+    }
+
     /// The radius, in logical pixels, to clip this window's content at its
     /// bottom corners to (0: don't).
     pub fn content_corner_radius(&self) -> f64 {
@@ -364,7 +399,14 @@ mod tests {
         assert!(plan(&app()).is_some());
         assert_eq!(plan(&DepthInput { square: true, ..app() }), None);
         assert_eq!(content_radius(true, true), 0.0);
-        assert_eq!(content_radius(true, false), FRAME_RADIUS);
+        assert_eq!(content_radius(true, false), 16.0);
+    }
+
+    #[test]
+    fn pictures_start_from_the_frames_corners() {
+        assert_eq!(picture_radii(false, true), Radii([16.0, 4.0, 16.0, 16.0]));
+        assert!(picture_radii(true, true).is_square(), "maximized: square");
+        assert_eq!(picture_radii(false, false), Radii::uniform(CLIENT_RADIUS));
     }
 
     #[test]
@@ -375,8 +417,8 @@ mod tests {
     #[test]
     fn only_a_frame_evo_draws_has_content_to_round() {
         assert_eq!(content_radius(false, false), 0.0);
-        assert_eq!(plan(&DepthInput { ssd: false, ..app() }).unwrap().radius, CLIENT_RADIUS);
-        assert_eq!(plan(&app()).unwrap().radius, FRAME_RADIUS);
+        assert_eq!(plan(&DepthInput { ssd: false, ..app() }).unwrap().radii, Radii::uniform(CLIENT_RADIUS));
+        assert_eq!(plan(&app()).unwrap().radii, FRAME_RADII);
     }
 
     #[test]
@@ -432,7 +474,9 @@ mod tests {
         let one = shadow_params(frame, &style, 1.0, 1.0).unwrap();
         let two = shadow_params(frame, &style, 2.0, 1.0).unwrap();
         assert!((two.sigma - one.sigma * 2.0).abs() < 1e-9);
-        assert!((two.radius - one.radius * 2.0).abs() < 1e-9);
+        assert_eq!(two.radii, one.radii.scale(2.0));
+        // The shadow keeps the waterdrop: the top-right corner stays sharp.
+        assert_eq!(one.radii, Radii([16.0, 4.0, 16.0, 16.0]));
         assert_eq!(two.shift.1, one.shift.1 * 2.0);
     }
 

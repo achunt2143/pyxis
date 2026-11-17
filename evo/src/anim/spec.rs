@@ -70,6 +70,25 @@ pub const RECEDE_SCALE_TO: f64 = 0.88;
 pub const RECEDE_DRIFT_PX: f64 = 14.0;
 pub const RECEDE_BLUR_PX: f64 = 10.0;
 
+// Lumen's Veil (the screen locks) and Clear (it unlocks); the lock page's own
+// half of both is Bloom's (docs/internal/pyxis-glass-and-lock-plan.md).
+//
+// Veil: each app window's picture blurs 0 -> 14 px, loses its colour and fades
+// out over 600 ms, beneath the lock page fading in. Clear: the desktop and the
+// windows come into focus about the field the password was typed in, over
+// 900 ms: blur 14 -> 0 px and scale 1.04 -> 1, both on
+// `f = 1 - (1 - min(1, t / 0.85))^3` (so they are done at 85% of the run, and
+// the last 15% is only the lock page's ring leaving).
+pub const VEIL: Duration = ms(600);
+pub const VEIL_BLUR_PX: f64 = 14.0;
+/// How far toward grey the picture goes by the end (1 would be a flat grey).
+pub const VEIL_DESATURATE: f64 = 0.85;
+pub const CLEAR: Duration = ms(900);
+pub const CLEAR_BLUR_PX: f64 = 14.0;
+pub const CLEAR_SCALE_FROM: f64 = 1.04;
+/// The share of Clear's run the focus pull takes.
+pub const CLEAR_PULL_FRACTION: f64 = 0.85;
+
 // geometry: maximize, fullscreen, fit to the work area.
 pub const GEOMETRY: Duration = ms(280);
 pub const GEOMETRY_ZETA: f64 = 1.0;

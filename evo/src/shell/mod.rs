@@ -49,6 +49,10 @@ mod element;
 mod grabs;
 mod animation;
 mod geometry_anim;
+pub(crate) mod busy;
+pub(crate) mod frost;
+pub(crate) mod identity;
+pub(crate) mod lock;
 pub(crate) mod minimize;
 pub(crate) mod overlay;
 pub(crate) mod placement;
@@ -75,9 +79,14 @@ impl FullscreenSurface {
         *self.0.borrow_mut() = Some(window);
     }
 
+    /// The window that has the output to itself, if any. Never a dead one,
+    /// and never the shell's: the desktop vela window asks for fullscreen
+    /// while it still claims `vela-default`, before it is known to be the
+    /// shell, so it can land here as an app; held, it made the output draw
+    /// (and route input to) only the desktop and the overlay, over black.
     pub fn get(&self) -> Option<WindowElement> {
         let mut window = self.0.borrow_mut();
-        if window.as_ref().map(|w| !w.alive()).unwrap_or(false) {
+        if window.as_ref().is_some_and(|w| !w.alive() || w.is_shell_window()) {
             *window = None;
         }
         window.clone()
@@ -210,6 +219,7 @@ impl<BackendData: Backend> CompositorHandler for EvoState<BackendData> {
                             self.place_window(&window, current_loc + buffer_offset, false);
                         }
                     }
+                    self.handle_toplevel_commit(surface);
                 }
                 if !&root.alive() {
                     self.remove_window_from_workspace(&window);
@@ -410,6 +420,69 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
     };
 }
 
+/// Pick a random top-left origin within the upper-left two-thirds of `area`,
+/// guarding against sub-3px spans so `Uniform::new` cannot panic.
+pub(crate) fn random_point_in_area(area: Rectangle<i32, Logical>) -> Point<i32, Logical> {
+    use rand::distributions::{Distribution, Uniform};
+
+    let span_x = (((area.size.w as f32) / 3.0) * 2.0) as i32;
+    let span_y = (((area.size.h as f32) / 3.0) * 2.0) as i32;
+    let mut rng = rand::thread_rng();
+    let x = if span_x > 0 {
+        Uniform::new(area.loc.x, area.loc.x + span_x).sample(&mut rng)
+    } else {
+        area.loc.x
+    };
+    let y = if span_y > 0 {
+        Uniform::new(area.loc.y, area.loc.y + span_y).sample(&mut rng)
+    } else {
+        area.loc.y
+    };
+    (x, y).into()
+}
+
+/// Resolve output positions on layout fixup: preserve explicit non-overlapping
+/// `(x, y)` coordinates (e.g. stacked monitors from `ApplyOutputConfigs`), and
+/// only reflow into a flat horizontal strip when outputs are unpositioned /
+/// overlapping.
+pub(crate) fn resolve_output_positions(
+    rects: &[Rectangle<i32, Logical>],
+) -> Vec<Point<i32, Logical>> {
+    let any_overlap = rects.iter().enumerate().any(|(i, a)| {
+        a.size.w > 0
+            && a.size.h > 0
+            && rects[i + 1..]
+                .iter()
+                .any(|b| b.size.w > 0 && b.size.h > 0 && a.overlaps(*b))
+    });
+    if !any_overlap {
+        return rects.iter().map(|r| r.loc).collect();
+    }
+    let mut offset_x = 0;
+    rects
+        .iter()
+        .map(|r| {
+            let loc = Point::from((offset_x, 0));
+            offset_x += r.size.w.max(0);
+            loc
+        })
+        .collect()
+}
+
+/// Whether an app window's visible frame geometry (`location` + `geometry().size`,
+/// excluding negative `-8px` SSD resize band / CSD shadow offsets) is completely
+/// outside every live usable output area.
+pub(crate) fn is_window_orphaned(
+    frame_geo: Rectangle<i32, Logical>,
+    outputs: &[Rectangle<i32, Logical>],
+) -> bool {
+    if outputs.is_empty() {
+        return false;
+    }
+    !outputs.iter().any(|o_geo| o_geo.overlaps(frame_geo))
+}
+
+#[allow(dead_code)]
 fn place_new_window(
     space: &mut Space<WindowElement>,
     pointer_location: Point<f64, Logical>,
@@ -418,8 +491,6 @@ fn place_new_window(
 ) -> Point<i32, Logical> {
     // place the window at a random location on same output as pointer
     // or if there is not output in a [0;800]x[0;800] square
-    use rand::distributions::{Distribution, Uniform};
-
     let output = space
         .output_under(pointer_location)
         .next()
@@ -442,35 +513,40 @@ fn place_new_window(
         });
     }
 
-    let max_x = output_geometry.loc.x + (((output_geometry.size.w as f32) / 3.0) * 2.0) as i32;
-    let max_y = output_geometry.loc.y + (((output_geometry.size.h as f32) / 3.0) * 2.0) as i32;
-    let x_range = Uniform::new(output_geometry.loc.x, max_x);
-    let y_range = Uniform::new(output_geometry.loc.y, max_y);
-    let mut rng = rand::thread_rng();
-    let x = x_range.sample(&mut rng);
-    let y = y_range.sample(&mut rng);
-
-    space.map_element(window.clone(), (x, y), activate);
-    (x, y).into()
+    let loc = random_point_in_area(output_geometry);
+    space.map_element(window.clone(), loc, activate);
+    loc
 }
 
-/// Pull outputs back into a row and re-place windows stranded off every
-/// output. Returns the windows it moved, so the caller (`EvoState::
-/// fixup_positions`) can record their new places: this has only the space.
+/// Preserve explicit non-overlapping output coordinates (or reflow into a row if
+/// overlapping) and re-place app windows stranded off every output. Returns
+/// the windows it moved, so the caller (`EvoState::fixup_positions`) can record
+/// their new places: this has only the space.
 pub fn fixup_positions(
     space: &mut Space<WindowElement>,
     pointer_location: Point<f64, Logical>,
 ) -> Vec<(WindowElement, Point<i32, Logical>)> {
     // fixup outputs
-    let mut offset = Point::<i32, Logical>::from((0, 0));
-    for output in space.outputs().cloned().collect::<Vec<_>>().into_iter() {
-        let size = space
-            .output_geometry(&output)
-            .map(|geo| geo.size)
-            .unwrap_or_else(|| Size::from((0, 0)));
-        space.map_output(&output, offset);
+    let current_outputs: Vec<_> = space.outputs().cloned().collect();
+    let current_rects: Vec<_> = current_outputs
+        .iter()
+        .map(|output| {
+            space
+                .output_geometry(output)
+                .unwrap_or_else(|| Rectangle::from_size(Size::from((0, 0))))
+        })
+        .collect();
+    let resolved_locs = resolve_output_positions(&current_rects);
+    for ((output, old_rect), new_loc) in current_outputs
+        .into_iter()
+        .zip(current_rects)
+        .zip(resolved_locs)
+    {
+        if new_loc != old_rect.loc {
+            output.change_current_state(None, None, None, Some(new_loc));
+        }
+        space.map_output(&output, new_loc);
         layer_map_for_output(&output).arrange();
-        offset.x += size.w;
     }
 
     // fixup windows
@@ -485,13 +561,18 @@ pub fn fixup_positions(
         })
         .collect::<Vec<_>>();
     for window in space.elements() {
-        let window_location = match space.element_location(window) {
-            Some(loc) => loc,
-            None => continue,
+        if window.is_shell_window() {
+            continue;
+        }
+        let Some(window_location) = space.element_location(window) else {
+            continue;
         };
-        let geo_loc = window.bbox().loc + window_location;
-
-        if !outputs.iter().any(|o_geo| o_geo.contains(geo_loc)) {
+        let frame_size = window.geometry().size;
+        let frame_geo = Rectangle::new(
+            window_location,
+            (frame_size.w.max(1), frame_size.h.max(1)).into(),
+        );
+        if is_window_orphaned(frame_geo, &outputs) {
             orphaned_windows.push(window.clone());
         }
     }
@@ -502,4 +583,56 @@ pub fn fixup_positions(
             (window, location)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_point_in_area_handles_tiny_dimensions_without_panicking() {
+        for (w, h) in [(0, 0), (1, 1), (2, 2), (3, 1), (1, 3)] {
+            let area = Rectangle::new((10, 20).into(), (w, h).into());
+            let pt = random_point_in_area(area);
+            assert!(pt.x >= 10);
+            assert!(pt.y >= 20);
+        }
+        // Negative-sized Rectangles constructed directly via fields also guard cleanly.
+        let negative = Rectangle {
+            loc: Point::from((10, 20)),
+            size: Size::from((0, 0)),
+        };
+        assert_eq!(random_point_in_area(negative), Point::from((10, 20)));
+    }
+
+    #[test]
+    fn resolve_output_positions_preserves_disjoint_xy_and_reflows_overlaps() {
+        let stacked = [
+            Rectangle::new((0, 0).into(), (1920, 1080).into()),
+            Rectangle::new((100, 1080).into(), (2560, 1440).into()),
+        ];
+        assert_eq!(
+            resolve_output_positions(&stacked),
+            vec![Point::from((0, 0)), Point::from((100, 1080))]
+        );
+
+        let overlapping = [
+            Rectangle::new((0, 0).into(), (1920, 1080).into()),
+            Rectangle::new((1000, 0).into(), (1920, 1080).into()),
+        ];
+        assert_eq!(
+            resolve_output_positions(&overlapping),
+            vec![Point::from((0, 0)), Point::from((1920, 0))]
+        );
+    }
+
+    #[test]
+    fn edge_flush_frame_is_not_orphaned_despite_negative_resize_band_offset() {
+        let outputs = [Rectangle::new((0, 0).into(), (1920, 1080).into())];
+        let edge_flush = Rectangle::new((0, 0).into(), (800, 600).into());
+        assert!(!is_window_orphaned(edge_flush, &outputs));
+
+        let off_screen = Rectangle::new((2000, 100).into(), (800, 600).into());
+        assert!(is_window_orphaned(off_screen, &outputs));
+    }
 }

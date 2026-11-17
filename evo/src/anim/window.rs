@@ -32,15 +32,22 @@ pub enum AnimKind {
     Minimize,
     Restore,
     Geometry,
+    /// The screen locking: a window's picture blurring away under the lock
+    /// page (`anim::veil`).
+    Veil,
+    /// The screen unlocking: a window coming into focus (`anim::clear`).
+    Clear,
 }
 
 impl AnimKind {
-    pub const ALL: [AnimKind; 5] = [
+    pub const ALL: [AnimKind; 7] = [
         AnimKind::Open,
         AnimKind::Close,
         AnimKind::Minimize,
         AnimKind::Restore,
         AnimKind::Geometry,
+        AnimKind::Veil,
+        AnimKind::Clear,
     ];
 
     pub fn name(self) -> &'static str {
@@ -50,6 +57,8 @@ impl AnimKind {
             AnimKind::Minimize => "minimize",
             AnimKind::Restore => "restore",
             AnimKind::Geometry => "geometry",
+            AnimKind::Veil => "veil",
+            AnimKind::Clear => "clear",
         }
     }
 
@@ -60,8 +69,8 @@ impl AnimKind {
 
 #[derive(Debug, Default)]
 pub struct AnimStats {
-    started: [AtomicU64; 5],
-    completed: [AtomicU64; 5],
+    started: [AtomicU64; 7],
+    completed: [AtomicU64; 7],
     active: AtomicU32,
 }
 
@@ -312,6 +321,9 @@ pub struct WindowAnim {
     /// The picture a show desktop's Recede, or its Emerge, is drawn from
     /// through Lumen (see `anim::recede`); the `TransformAnim` is its motion.
     pub recede: Option<Box<super::recede::RecedeFx>>,
+    /// The picture the lock's Veil is drawn from through Lumen (see
+    /// `anim::veil`); the `TransformAnim` is its fade.
+    pub veil: Option<Box<super::veil::VeilFx>>,
     _guard: ActiveGuard,
 }
 
@@ -321,7 +333,7 @@ impl WindowAnim {
     }
 
     pub fn with_stats(stats: &Arc<AnimStats>, kind: AnimKind, anim: TransformAnim) -> Self {
-        Self { kind, anim, warp: None, bloom: None, recede: None, _guard: stats.begin(kind) }
+        Self { kind, anim, warp: None, bloom: None, recede: None, veil: None, _guard: stats.begin(kind) }
     }
 
     /// Draw this animation as a genie warp of `warp`'s snapshot.
@@ -333,6 +345,12 @@ impl WindowAnim {
     /// Draw this minimize or restore as a Recede or Emerge of `fx`'s picture.
     pub fn with_recede(mut self, fx: Option<Box<super::recede::RecedeFx>>) -> Self {
         self.recede = fx;
+        self
+    }
+
+    /// Draw this lock fade as a Veil of `fx`'s picture.
+    pub fn with_veil(mut self, fx: Option<Box<super::veil::VeilFx>>) -> Self {
+        self.veil = fx;
         self
     }
 
@@ -500,6 +518,30 @@ mod tests {
         assert!(slot.is_none());
         assert_eq!((stats.started(AnimKind::Open), stats.completed(AnimKind::Open), stats.active()), (1, 1, 0));
         assert_eq!(stats.started(AnimKind::Close), 0);
+    }
+
+    #[test]
+    fn the_locks_veil_and_clear_are_counted_like_any_animation() {
+        let stats = AnimStats::new();
+        let names: Vec<_> = AnimKind::ALL.iter().map(|k| k.name()).collect();
+        assert!(names.contains(&"veil") && names.contains(&"clear"));
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), AnimKind::ALL.len(), "every kind has its own counter");
+        let veil = WindowAnim::with_stats(&stats, AnimKind::Veil, crate::anim::veil::transform(&full(), ms(0)).unwrap());
+        let clear = WindowAnim::with_stats(
+            &stats,
+            AnimKind::Clear,
+            crate::anim::clear::transform(&full(), ms(0), Point::from((640.0, 400.0))).unwrap(),
+        );
+        assert_eq!((stats.started(AnimKind::Veil), stats.started(AnimKind::Clear), stats.active()), (1, 1, 2));
+        drop(veil);
+        drop(clear);
+        for kind in AnimKind::ALL {
+            assert_eq!(stats.started(kind), stats.completed(kind), "{kind:?} balanced at rest");
+        }
+        assert_eq!(stats.active(), 0);
     }
 
     #[test]
