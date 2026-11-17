@@ -2,26 +2,73 @@
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pyxis docs</title>
-<meta name="description" content="What Pyxis looks, moves and sounds like.">
+<meta name="description" content="Pyxis is a desktop that behaves like light. Feature guide, identity and release notes.">
 <style>
-:root{--bg:#fafbfc;--fg:#1c2230;--mut:#5b6577;--line:#dde2ea;--code:#eef1f6;--acc:#2f6fed}
-@media(prefers-color-scheme:dark){:root{--bg:#0e121b;--fg:#e4e8f0;--mut:#98a2b5;--line:#262d3b;--code:#171d29;--acc:#7aa5ff}}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:860px;margin:0 auto;padding:32px 16px 80px}
-h1,h2,h3,h4{line-height:1.25;margin:2em 0 .6em}h1{margin-top:0;font-size:2.1rem}
-h2{border-bottom:1px solid var(--line);padding-bottom:.3em}
-a{color:var(--acc)}hr{border:0;border-top:1px solid var(--line);margin:2em 0}
-code{background:var(--code);padding:.12em .35em;border-radius:5px;font-size:.88em}
-pre{background:var(--code);padding:14px;border-radius:8px;overflow-x:auto}pre code{background:none;padding:0}
-table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}
-th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
-th{background:var(--code)}blockquote{margin:1em 0;padding:0 1em;border-left:3px solid var(--line);color:var(--mut)}
-</style></head><body><main>
-<h1>Pyxis docs</h1>
-<p>A desktop that behaves like light.</p>
-<ul>
-<li><a href="feature-guide/"><strong>Feature guide</strong></a> &mdash; a visual tour of the alpha 5 desktop.</li>
-<li><a href="identity/"><strong>Identity</strong></a> &mdash; what Pyxis looks, moves and sounds like.</li>
-<li><a href="releases/alpha5/"><strong>Alpha 5 release notes</strong></a> &mdash; what's new.</li>
-</ul>
-</main></body></html>
+:root{--c1:#4facfe;--c2:#38e0f5;--c3:#a6f5d6;--c4:#dff4ff;--c5:#5b8cff;
+ --ink:#14202e;--ink-q:#14202ecc;--veil:255,255,255;--glass:.52;--drop:16px 4px 16px 16px}
+:root[data-sky=night]{--c1:#0b1026;--c2:#1b2350;--c3:#2a1f4d;--c4:#0f3b4a;--c5:#141a3a;--ink:#ece9e3;--ink-q:#ece9e3cc;--veil:16,18,40}
+:root[data-sky=dusk]{--c1:#ee9ca7;--c2:#8e54e9;--c3:#4776e6;--c4:#ffc6cf;--c5:#3a2f7a;--ink:#fff;--ink-q:#ffffffd9;--veil:30,20,70}
+:root[data-sky=gold]{--c1:#f6c365;--c2:#fd9a6e;--c3:#e77fd8;--c4:#ffd9a0;--c5:#9a6cf0;--ink:#2a1a14;--ink-q:#2a1a14cc;--veil:255,248,236}
+*{box-sizing:border-box}
+html{min-height:100%}
+body{margin:0;min-height:100vh;color:var(--ink);font:17px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;
+ background:var(--c5);position:relative;overflow-x:hidden;transition:background .6s,color .6s}
+.sky{position:fixed;inset:0;z-index:-1;overflow:hidden;background:linear-gradient(160deg,var(--c1),var(--c5))}
+.sky i{position:absolute;border-radius:50%;filter:blur(70px);opacity:.75;animation:drift 28s ease-in-out infinite alternate}
+.sky i:nth-child(1){width:55vmax;height:55vmax;background:var(--c2);left:-15vmax;top:-12vmax}
+.sky i:nth-child(2){width:50vmax;height:50vmax;background:var(--c3);right:-14vmax;top:12vh;animation-delay:-9s}
+.sky i:nth-child(3){width:45vmax;height:45vmax;background:var(--c4);left:20vw;bottom:-22vmax;animation-delay:-17s;opacity:.6}
+@keyframes drift{to{transform:translate(6vmax,4vmax) scale(1.12)}}
+main{max-width:980px;margin:0 auto;padding:9vh 20px 60px}
+.mark{display:flex;gap:12px;align-items:center;margin-bottom:28px}
+.mark svg{width:22px;height:22px;display:block}
+.mark span{letter-spacing:.28em;text-transform:uppercase;font-size:.78rem;color:var(--ink-q)}
+h1{font-size:clamp(2.6rem,7vw,4.6rem);line-height:1.05;margin:0 0 .35em;font-weight:300;letter-spacing:-.02em}
+h1 b{font-weight:700}
+.lede{max-width:34em;font-size:1.2rem;color:var(--ink-q);margin:0 0 56px}
+.grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.card{display:block;text-decoration:none;color:inherit;padding:26px 26px 24px;
+ border-radius:var(--drop);border:1px solid rgba(var(--veil),.45);
+ background:rgba(var(--veil),var(--glass));-webkit-backdrop-filter:blur(22px) saturate(1.3);backdrop-filter:blur(22px) saturate(1.3);
+ box-shadow:0 10px 30px -12px rgba(0,0,0,.35);transition:transform .25s,box-shadow .25s,background .25s;position:relative}
+.card:hover,.card:focus-visible{transform:translateY(-4px);box-shadow:0 18px 40px -14px rgba(0,0,0,.45);background:rgba(var(--veil),.68)}
+.card:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+.dot{width:38px;height:38px;border-radius:12px 3px 12px 12px;margin-bottom:18px;display:grid;place-items:center;color:#fff;box-shadow:0 6px 16px -6px var(--a)}
+.dot svg{width:20px;height:20px}
+.card h2{margin:0 0 6px;font-size:1.3rem}
+.card p{margin:0;color:var(--ink-q);font-size:.97rem}
+.card .go{display:inline-block;margin-top:16px;font-size:.9rem;font-weight:600}
+.card .go::after{content:" \2192";transition:margin .2s}.card:hover .go::after{margin-left:4px}
+footer{margin-top:64px;font-size:.88rem;color:var(--ink-q)}
+footer a{color:inherit}
+@media(prefers-color-scheme:dark){:root:not([data-sky]){--c1:#0b1026;--c2:#1b2350;--c3:#2a1f4d;--c4:#0f3b4a;--c5:#141a3a;--ink:#ece9e3;--ink-q:#ece9e3cc;--veil:16,18,40}}
+@media(prefers-reduced-motion:reduce){.sky i{animation:none}.card{transition:none}}
+</style></head><body>
+<div class="sky" aria-hidden="true"><i></i><i></i><i></i></div>
+<main>
+<div class="mark" aria-hidden="true">
+ <svg viewBox="0 0 24 24"><path d="M12 21 3 5h18z" fill="#ffb80d"/></svg>
+ <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" fill="#69cdff"/></svg>
+ <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="#ff4a4a"/></svg>
+ <span>Pyxis &middot; alpha 5</span>
+</div>
+<h1>A desktop that<br><b>behaves like light.</b></h1>
+<p class="lede">Windows come into focus out of a soft blur, tinted by their app. The wallpaper follows the real day, and the shell takes its colour from the sky behind it.</p>
+<div class="grid">
+ <a class="card" href="feature-guide/" style="--a:#0284c7">
+  <div class="dot" style="background:#0284c7"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg></div>
+  <h2>Feature guide</h2><p>A visual tour of the alpha 5 desktop: apps, cards, motion, lock screen and more.</p><span class="go">Take the tour</span></a>
+ <a class="card" href="identity/" style="--a:#7c3aed">
+  <div class="dot" style="background:#7c3aed"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c3 4 6 7 6 11a6 6 0 0 1-12 0c0-4 3-7 6-11z"/></svg></div>
+  <h2>Identity</h2><p>What Pyxis looks, moves and sounds like: the waterdrop, Lumen motion, colour and copy.</p><span class="go">Read the identity</span></a>
+ <a class="card" href="releases/alpha5/" style="--a:#d97706">
+  <div class="dot" style="background:#d97706"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h10l4 4v14H5z"/><path d="M9 12h6M9 16h6"/></svg></div>
+  <h2>Alpha 5 release notes</h2><p>Daylight wallpaper, frosted windows, a lock screen and per-app sandboxes.</p><span class="go">See what's new</span></a>
+</div>
+<footer>Pyxis is open source on <a href="https://github.com/achunt2143/pyxis">GitHub</a>. This page follows your local time of day.</footer>
+</main>
+<script>
+(function(){var h=new Date().getHours(),s=h<5||h>=21?'night':h<7?'dusk':h<10?'gold':h<17?'':h<19?'gold':'dusk';
+if(s)document.documentElement.dataset.sky=s}())
+</script>
+</body></html>
