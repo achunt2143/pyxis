@@ -744,6 +744,36 @@ Both SDKs must converge on the same packaging API.
 }
 ```
 
+### 16.3 Package signing
+
+A device refuses to install an `.ipk` unless it carries a valid detached
+signature, except on a dev image with `/etc/pyxis/allow-unsigned-packages`.
+The verifier is `echo/src/services/package_sig.rs`; this section is the
+packaging side.
+
+- `<pkg>.ipk.sig`: the raw output of
+  `openssl dgst -sha256 -sign <key.pem> -out <pkg>.ipk.sig <pkg>.ipk`.
+- `<pkg>.ipk.sig.keyid` (optional): the key id, one line. The device verifies
+  against `/etc/pyxis/keys/<keyid>.pub`, or tries every key in that directory
+  when the file is absent.
+- Keys: `pyxis keygen <id>` writes `<id>.pem` (private, mode 0600) and
+  `<id>.pub` (P-256, `openssl genpkey -algorithm EC`, then `pkey -pubout`).
+  Copy the `.pub` to each device as `/etc/pyxis/keys/<id>.pub`. Keep the
+  `.pem` out of the repository.
+- `pyxis sign <file.ipk> --key <pem> [--key-id <id>]` signs an existing
+  package. Without `--key-id` any stale `.sig.keyid` beside it is removed.
+- Signing during packaging: `pyxis package` (and `pyxis-sdk`/`pyxis-pdk`
+  `package`) signs the `.ipk` it just emitted when `pyxis.json` has
+  `"signing": {"key": "<path>", "keyId": "<id>"}` (`key` relative to the
+  project root; `keyId` optional), or when `PYXIS_SIGNING_KEY` (and
+  optionally `PYXIS_SIGNING_KEY_ID`) is set. The environment overrides the
+  file. `PYXIS_SIGNING_KEY_ID` alone is an error. An unsigned package
+  removes any `.sig`/`.sig.keyid` left beside it by an earlier build.
+- Verify by hand: `openssl dgst -sha256 -verify <pub> -signature <pkg>.ipk.sig <pkg>.ipk`.
+
+Signing needs `openssl` on the host. Without it, packaging with signing
+configured fails with a clear error rather than shipping unsigned.
+
 ## 17. Device install protocol
 
 The CLIs should support direct installation to a target device.

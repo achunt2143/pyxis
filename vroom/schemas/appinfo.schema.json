@@ -33,6 +33,11 @@
       "type": "string",
       "minLength": 1
     },
+    "accent": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "App identity accent color (#rrggbb) for waterdrop icon, window title bar seam, and --px-accent."
+    },
     "largeIcon": {
       "type": "string"
     },
@@ -62,11 +67,13 @@
     },
     "requiredPermissions": {
       "type": "array",
-      "description": "Declared app permissions (spec §19.1). `notifications.manage`, `appmanager.install`, `appmanager.manage`, `settings.write`, `windows.manage`, `terminal`, `filesystem.user`, `filesystem.system` and `filesystem.apps` are privileged: declaring them is always valid, but Nova grants the corresponding capability only to apps on the platform trust list (spec §19.2).",
+      "description": "Declared app permissions (spec §19.1). `network.manage`, `notifications.manage`, `appmanager.install`, `appmanager.manage`, `settings.write`, `windows.manage`, `terminal`, `filesystem.user`, `filesystem.system` and `filesystem.apps` are privileged: declaring them is always valid, but Nova grants the corresponding capability only to apps on the platform trust list (spec §19.2).",
       "items": {
         "type": "string",
         "enum": [
           "network",
+          "network.read",
+          "network.manage",
           "notifications",
           "camera",
           "microphone",

@@ -27,6 +27,8 @@ pub const VERSION_PATTERN: &str = r"^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)?$"
 /// `schemas/appinfo.schema.json`, and echo's `nova::APPINFO_PERMISSIONS`.
 pub const PERMISSIONS: &[&str] = &[
     "network",
+    "network.read",
+    "network.manage",
     "notifications",
     "camera",
     "microphone",
@@ -57,6 +59,7 @@ pub const PERMISSIONS: &[&str] = &[
 /// granted them at runtime. Packaging emits a warning so the author learns
 /// this at build time rather than by silent no-op on device.
 pub const PRIVILEGED_PERMISSIONS: &[&str] = &[
+    "network.manage",
     "notifications.manage",
     "appmanager.install",
     "appmanager.manage",
@@ -143,6 +146,22 @@ pub struct ServiceConfig {
     pub unit: String,
 }
 
+/// Optional package signing (`pyxis.json` `"signing"`). When present, the
+/// package command signs each `.ipk` it emits with `openssl dgst -sha256`
+/// (see `signing.rs`). Environment variables `PYXIS_SIGNING_KEY` and
+/// `PYXIS_SIGNING_KEY_ID` override these fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigningConfig {
+    /// Private key (PEM) used to sign. Relative paths resolve against the
+    /// project root.
+    pub key: String,
+    /// Key id written beside the signature (`<pkg>.ipk.sig.keyid`); the
+    /// device then verifies against `/etc/pyxis/keys/<keyId>.pub`.
+    #[serde(rename = "keyId", default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageConfig {
@@ -175,6 +194,10 @@ pub struct ProjectConfig {
     pub entry: Option<String>,
     pub icon: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sdk: Option<SdkConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pdk: Option<PdkConfig>,
@@ -182,6 +205,8 @@ pub struct ProjectConfig {
     pub permissions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<ServiceConfig>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing: Option<SigningConfig>,
     pub package: PackageConfig,
 }
 
@@ -229,6 +254,16 @@ impl Project {
             return Err(PyxisError::Config(
                 "title, vendor, and icon must be non-empty".into(),
             ));
+        }
+        if let Some(accent) = &c.accent {
+            if accent.len() != 7
+                || !accent.starts_with('#')
+                || !accent[1..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(PyxisError::Config(format!(
+                    "accent `{accent}` must be a 6-digit hex color (#rrggbb)"
+                )));
+            }
         }
         if let Some(perms) = &c.permissions {
             for p in perms {

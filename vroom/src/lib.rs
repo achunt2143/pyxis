@@ -12,6 +12,7 @@ pub mod device;
 pub mod error;
 pub mod ipk;
 pub mod manifest;
+pub mod signing;
 pub mod stage;
 pub mod template;
 
@@ -34,6 +35,15 @@ pub fn op_package(project_dir: &Path) -> Result<PathBuf> {
     let project = Project::load(project_dir)?;
     let appinfo = stage::stage(&project)?;
     let artifact = ipk::build_ipk(&project)?;
+    // Optional detached signature (spec §16.3). An unsigned build clears any
+    // sidecar left by an earlier signed build of the same name.
+    match signing::resolve(&project)? {
+        Some(s) => {
+            signing::sign_package(&artifact, &s.key, s.key_id.as_deref())?;
+            eprintln!("[pyxis] signed {} with {}", artifact.display(), s.key.display());
+        }
+        None => signing::remove_sidecars(&artifact),
+    }
     // Artifact metadata (spec §16.2)
     let meta = serde_json::json!({
         "id": project.config.id,
@@ -51,6 +61,28 @@ pub fn op_package(project_dir: &Path) -> Result<PathBuf> {
     .map_err(|e| PyxisError::Package(format!("writing artifact metadata: {e}")))?;
     eprintln!("[pyxis] created {}", artifact.display());
     Ok(artifact)
+}
+
+/// `pyxis sign <file.ipk> --key <private.pem> [--key-id <id>]`
+pub fn op_sign(package: &Path, key: &Path, key_id: Option<&str>) -> Result<PathBuf> {
+    let sig = signing::sign_package(package, key, key_id)?;
+    eprintln!("[pyxis] wrote {}", sig.display());
+    if key_id.is_some() {
+        eprintln!("[pyxis] wrote {}", signing::keyid_path(package).display());
+    }
+    Ok(sig)
+}
+
+/// `pyxis keygen <id>`: a P-256 key pair in `dir`, with where the public key goes.
+pub fn op_keygen(id: &str, dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let (pem, pubkey) = signing::keygen(id, dir)?;
+    eprintln!("[pyxis] private key: {}  (keep it secret, keep it out of git)", pem.display());
+    eprintln!("[pyxis] public key:  {}", pubkey.display());
+    eprintln!(
+        "[pyxis] copy the public key to each device as /etc/pyxis/keys/{id}.pub \
+         (the device refuses unsigned packages unless /etc/pyxis/allow-unsigned-packages exists)"
+    );
+    Ok((pem, pubkey))
 }
 
 /// `pyxis install [--device <name>]` — packages if needed, then runs the

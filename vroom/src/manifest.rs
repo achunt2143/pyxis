@@ -15,6 +15,10 @@ pub struct AppInfo {
     pub app_type: Runtime,
     pub main: String,
     pub icon: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     #[serde(rename = "uiRevision")]
     pub ui_revision: u32,
     #[serde(rename = "requiredPermissions", skip_serializing_if = "Option::is_none")]
@@ -48,6 +52,8 @@ impl AppInfo {
             app_type: c.runtime,
             main,
             icon,
+            accent: c.accent.as_ref().map(|a| a.to_ascii_lowercase()),
+            category: c.category.clone(),
             ui_revision: 1,
             required_permissions: c.permissions.clone(),
             services: c.services.as_ref().map(|svcs| {
@@ -84,5 +90,65 @@ impl AppInfo {
     pub fn to_json(&self) -> String {
         // serde_json cannot fail on this plain struct
         serde_json::to_string_pretty(self).expect("appinfo serialization")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PackageConfig, Project, ProjectConfig, SdkConfig, WebBuilder};
+    use std::path::PathBuf;
+
+    fn sample_project(category: Option<&str>) -> Project {
+        Project {
+            root: PathBuf::from("/tmp/sample-app"),
+            config: ProjectConfig {
+                id: "com.example.clock".into(),
+                title: "Clock".into(),
+                vendor: "Example".into(),
+                version: "1.0.0".into(),
+                runtime: Runtime::Web,
+                source_dir: None,
+                public_dir: None,
+                build_dir: None,
+                entry: Some("index.html".into()),
+                icon: "assets/icon.png".into(),
+                accent: Some("#0D9488".into()),
+                category: category.map(str::to_string),
+                sdk: Some(SdkConfig {
+                    builder: WebBuilder::Static,
+                    out_dir: None,
+                }),
+                pdk: None,
+                permissions: None,
+                services: None,
+                signing: None,
+                package: PackageConfig {
+                    section: "applications".into(),
+                    priority: "optional".into(),
+                    architecture: "all".into(),
+                    depends: None,
+                    maintainer_email: None,
+                    description: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn category_round_trips_and_omits_none() {
+        let with_cat = AppInfo::from_project(&sample_project(Some("utilities"))).unwrap();
+        assert_eq!(with_cat.category.as_deref(), Some("utilities"));
+        let serialized = with_cat.to_json();
+        assert!(serialized.contains("\"category\": \"utilities\""));
+        let parsed: AppInfo = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.category.as_deref(), Some("utilities"));
+
+        let without_cat = AppInfo::from_project(&sample_project(None)).unwrap();
+        assert_eq!(without_cat.category, None);
+        let serialized_none = without_cat.to_json();
+        assert!(!serialized_none.contains("\"category\""));
+        let parsed_legacy: AppInfo = serde_json::from_str(&serialized_none).unwrap();
+        assert_eq!(parsed_legacy.category, None);
     }
 }

@@ -56,6 +56,25 @@ enum Command {
     Lint,
     /// Launch the Pyxis emulator (requires PYXIS_EMULATOR_CMD)
     Emulator,
+    /// Sign an .ipk with a detached signature (<file>.sig)
+    Sign {
+        /// Package to sign
+        file: PathBuf,
+        /// PEM private key
+        #[arg(long)]
+        key: PathBuf,
+        /// Key id written to <file>.sig.keyid (devices check /etc/pyxis/keys/<id>.pub)
+        #[arg(long = "key-id")]
+        key_id: Option<String>,
+    },
+    /// Generate a signing key pair: <id>.pem (private) and <id>.pub (public)
+    Keygen {
+        /// Key id, e.g. `pyxis-dev-2026`
+        id: String,
+        /// Directory to write the keys into (default: current directory)
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -85,6 +104,12 @@ fn main() -> ExitCode {
         Command::Run { device } => geckoOS_vroom::op_run(&cli.project, device.as_deref()),
         Command::Doctor => geckoOS_vroom::op_doctor(&cli.project),
         Command::Lint => geckoOS_vroom::op_lint(&cli.project),
+        Command::Sign { file, key, key_id } => {
+            geckoOS_vroom::op_sign(&file, &key, key_id.as_deref()).map(|_| ())
+        }
+        Command::Keygen { id, out_dir } => {
+            geckoOS_vroom::op_keygen(&id, &out_dir).map(|_| ())
+        }
         Command::Emulator => match std::env::var("PYXIS_EMULATOR_CMD") {
             Ok(cmd) => {
                 let status = std::process::Command::new("sh").args(["-c", &cmd]).status();

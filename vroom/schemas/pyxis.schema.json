@@ -44,6 +44,11 @@
       "type": "string",
       "minLength": 1
     },
+    "accent": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "App identity accent color (#rrggbb) for waterdrop icon, window title bar seam, and --px-accent."
+    },
     "sdk": {
       "type": "object",
       "properties": {
@@ -97,13 +102,33 @@
         "additionalProperties": false
       }
     },
+    "signing": {
+      "type": "object",
+      "description": "Optional detached signing of the emitted .ipk (see docs/pyxis-sdk-pdk-spec.md, section 16.3). Environment variables PYXIS_SIGNING_KEY and PYXIS_SIGNING_KEY_ID override these fields.",
+      "required": ["key"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Private key (PEM). Relative paths resolve against the project root."
+        },
+        "keyId": {
+          "type": "string",
+          "pattern": "^[^/\\0]+$",
+          "description": "Key id; the device verifies against /etc/pyxis/keys/<keyId>.pub."
+        }
+      },
+      "additionalProperties": false
+    },
     "permissions": {
       "type": "array",
-      "description": "Requested app permissions (spec §19.1). `notifications.manage`, `appmanager.install`, `appmanager.manage`, `settings.write`, `windows.manage`, `terminal`, `filesystem.user`, `filesystem.system` and `filesystem.apps` are privileged: any app may declare them, but they are granted only to apps on the platform trust list (spec §19.2).",
+      "description": "Requested app permissions (spec §19.1). `network.manage`, `notifications.manage`, `appmanager.install`, `appmanager.manage`, `settings.write`, `windows.manage`, `terminal`, `filesystem.user`, `filesystem.system` and `filesystem.apps` are privileged: any app may declare them, but they are granted only to apps on the platform trust list (spec §19.2).",
       "items": {
         "type": "string",
         "enum": [
           "network",
+          "network.read",
+          "network.manage",
           "notifications",
           "camera",
           "microphone",
