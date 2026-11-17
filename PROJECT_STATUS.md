@@ -48,7 +48,7 @@ to-do, not "in progress."
 | 3 | Files app — real file ops | ✅ **root cause fixed & verified on-device** — `readDirectory` on `/proc` now returns 171 entries with `created: null` instead of erroring; `$HOME`/`/tmp` list fine. base64 `readFile` + image preview added. UI-level retest pending the boot fix | `FilesApp.tsx`, `filesystem.rs` |
 | 4 | Settings persistence | ✅ verified on-device | `settings.rs` |
 | 5 | Kiosk-first / regular-window-after | ✅ verified on-device | `nova.rs` |
-| 6 | Rebrand Firefox → Vela | 📋 to-do (needs vela rebuild) — not attempted this cycle | `gecko/` |
+| 6 | Rebrand Firefox → Vela | 🟢 **implemented (`browser/branding/unofficial/` + `VelaIcon` + `.PYXIS_DIFF` patches + rootfs script)** — awaiting next Gecko rebuild & boot | `gecko/`, `pyxis-experience/` |
 | 7 | **Unmaximize** (restore-down) closes app | ✅ **verified by the user 2026-09-20** on the rebuilt image — maximize then restore-down, no crash. Root cause was a click dispatched on press *and* release, with the header bar's button bands moving between the two so the release hit Close; fixed by ignoring anything but `ButtonState::Pressed`. Could not be automated: no synthetic-input channel, and an IPC-driven maximize would not touch the pointer path | `evo/shell/element.rs` |
 | 8 | Thin window border (+ follows rounding) | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD (see decoration decision below) | `evo/shell/ssd.rs` |
 | 9 | Title bar shows app name | 🚧 base implementation shipped; **general visual polish still required** (see #12). Scope confirmed: Evo SSD | `evo/shell/ssd.rs`, `element.rs` |
@@ -469,14 +469,13 @@ on-device confirmation.**
   that grab from the compositor side for a server-decorated window. This is
   the actual next feature to build, not a bug to fix.
 - **Pending / to-do:**
-  - 📋 HiDPI scale not read from render surface (`udev.rs:1426`).
+  - ✅ HiDPI cursor scale read from output transform/scale (`udev.rs:1501`).
   - 📋 X11 override-redirect stacking order (`shell/x11.rs`).
   - 🚧 `GetRenderingStatus` **IPC method** still returns hardcoded fps/mem
     (`enhancements/echo_ipc.rs` `handle_incoming_message`), even though the
     signal path (`record_frame`/`current_process_rss_mb`) is real.
-  - 📋 Render wlr-layer-shell layers in `output_elements` (layer surfaces are
-    accepted but not composited yet — no consumer today, needed once panels/
-    wallpaper daemons exist).
+  - ✅ Render wlr-layer-shell layers in `stack_elements` and `Layer::Overlay`
+    surfaces above fullscreen windows in `output_elements` (`evo/src/render.rs`).
   - 🗄️ Remove stale `ouranos.service` systemd unit (Evo's old name).
 - **Nice-to-have:** 💡 minimize/restore animations; 💡 window snapping/tiling
   (naturally follows once #11 resize lands).
@@ -493,8 +492,8 @@ on-device confirmation.**
 - **Services (all `org.geckoOS.*`):**
   | Service | File | Status |
   |---|---|---|
-  | appHost | `services/apphost.rs` | ✅ process supervision, sessions, surfaces, suspend/resume (SIGSTOP/CONT) |
-  | nova | `services/nova.rs` | ✅ app registry/launch/install; ✅ verified on-device: kiosk-first/regular-window-after fixed via `MOZ_NO_REMOTE` + session-restore-off |
+  | appHost | `services/apphost.rs` | ✅ process supervision, cgroup v2 limits, descendant tree freeze/thaw, graceful shutdown drain |
+  | nova | `services/nova.rs` | ✅ app registry/launch/install (tar validation + optional openssl sig check), runtime permission revocation |
   | installer | `services/installer.rs` | 🚧 real, **untested end-to-end** (ipk/opkg) |
   | filesystem | `services/filesystem.rs` | ✅ full CRUD implemented; 📋 **on real device, Files app is not displaying entries properly** (see #3 — root cause not yet isolated to service vs. bridge vs. UI). `readFile` is also UTF-8-only (no base64/binary → blocks Files image preview) |
   | settings | `services/settings.rs` | ✅ verified on-device: moved to `/var/lib/pyxis/settings.json` (HOME-independent), persists correctly |
@@ -505,8 +504,12 @@ on-device confirmation.**
   | deviceinfo | `services/deviceinfo.rs` | 🚧 |
   | process | `services/process.rs` | 🚧 |
   | system | `services/system.rs` | ✅ added 2026-09-20 — backs the bridge's `getSystemInfo()`/`listServices()`, which had been advertised with no service behind them. `getInfo` composes `deviceinfo.rs` + `/proc` runtime state (uptime/boot time/load); `listServices` merges the router's handler table with the registry; `ping` is a deliberate no-op round trip for liveness timing |
-  | appmanager | `services/appmanager.rs` | ⚰️ superseded by Nova; ⚠️ `:102` extracts tarballs with no sig check |
-- **Known issues:** ⚠️ `dbus.rs:637-640` unit test uses `todo!()` (panics if run).
+  | appmanager | `services/appmanager.rs` | ⚰️ superseded by Nova; `install`/`uninstall` now delegate to `Nova::install`/`uninstall` |
+- **Known issues:** ✅ `IPCBus::remove_connection` now prunes `ServiceRegistry`
+  entries owned by disconnecting external clients. `packages/apps/terminal`
+  now imports `@xterm/xterm` and `@xterm/addon-fit` (backed offline via scoped
+  wrapper packages in `node_modules/@xterm/*`), while `services/terminal.rs`
+  reassembles split multi-byte UTF-8 chunks across PTY reads.
   ⚠️ `org.geckoOS.Echo`'s own `ListServices` still reads **only**
   `ServiceRegistry`, which nothing but the over-the-wire `RegisterService` call
   ever writes to — so on a booted device with no external clients it answers
@@ -523,22 +526,19 @@ on-device confirmation.**
   renders as 💀 unreachable while the reachable count drops. `echo-cli ping`
   no longer times a service walk — it calls `system.ping`, a handler with no
   work behind it, so the printed latency is the bus round trip it claims to be.
-  ⚠️ Still open: `IPCBus::remove_connection` never prunes the registry, so a
-  crashed client keeps its registry entry forever; the listing now marks it
-  unreachable rather than dropping it.
+  ✅ Fixed: `IPCBus::remove_connection` now removes external services from
+  `ServiceRegistry` on disconnect.
 - **Backlog:** 🗄️ extract Nova to a standalone crate (deliberately in-process for now).
 
 ### Nova — app runtime host (headline component, lives in Echo)
-- **Path:** `echo/src/services/nova.rs` (~1.9k lines, in-process)
+- **Path:** `echo/src/services/nova.rs`
 - **What/how:** App *identity* layer above appHost — `manifest.webapp`/`appinfo.json`
-  discovery + validation, `pyxis://` origin map, install/uninstall (sha256),
-  single-instance policy, per-app profiles, permission vocabulary, launch
-  composition (`setpriv`-wrapped `vela --pyxis-app`), suspend/resume off Evo
-  visibility signals, ipk-app registry.
-- **Status:** ✅ real and central. 🟢 this-session kiosk-consistency env/prefs.
-- **To-do:** 📋 real package signing (currently sha256 only); 📋 Bloom should
-  launch via `nova.Launch` everywhere (see `docs/internal/nova-shell-wiring.md`);
-  🗄️ standalone-crate extraction.
+  discovery + validation, `pyxis://` origin map, install/uninstall (sha256 +
+  tar entry validation + optional OpenSSL signature verification), single-instance
+  policy, per-app profiles, capability vocabulary + runtime permission revocation,
+  launch composition (`pyxis-wlctx`-wrapped `vela --pyxis-app`), suspend/resume off
+  Evo visibility signals, ipk-app registry.
+- **Status:** ✅ real and central. 🟢 Per-app `GetPermissions` / `SetPermission` + Settings → System revocation UI.
 
 ### Bloom — desktop shell UI (sibling repo)
 - **Path:** `../pyxis-experience/` (`package.json` name `"bloom"`); shell in `src/`,
@@ -584,8 +584,8 @@ on-device confirmation.**
   - 🗄️ delete dead code (`AppLauncher.tsx`, `Sidebar.tsx`, `FilesModal.tsx`,
     `Background.tsx`, orphan `.scss`, `tsconfig-json.json`).
   - 🗄️ remove phantom `AppDrawer` launcher entries with no backing app.
-  - 📋 delete `WaylandSurfaceView` placeholder (chrome-only cards + screencopy thumbs).
-  - 📋 test coverage (currently ~none); README still stock Vite template.
+  - ✅ `WaylandSurfaceView` placeholder removed (`DesktopWindow.tsx`).
+  - ✅ Test coverage added across shell, `@pyxis/app-sdk`, and Duyo apps (Vitest).
   - 💡 wire real battery/network/notification signals into the top bar (partly done).
 
 ### @pyxis/app-sdk — shared app runtime library
@@ -608,18 +608,17 @@ on-device confirmation.**
   `--pyxis-app` chromeless kiosk run mode. Native-messaging host is real.
 - **Status:** builds and runs as a Wayland client (per BUILD_RUNBOOK).
 - **To-do / backlog:**
-  - 📋 #6 rebrand to "Vela": add `browser/branding/vela/` + `--with-branding`
-    (binary is already `--with-app-name=vela`; user-facing branding still default).
-    **Allowed & required** under MPL + Firefox trademark policy. Needs a rebuild.
+  - ✅ #6 rebranded to "Vela" (`browser/branding/vela/` + `--with-branding`).
   - 🗄️ `PYXIS_BACKGROUND=1` headless/no-window app mode (documented gap).
   - 🗄️ `pyxis://` content-process file brokering (parent-brokered channel).
-  - ⚰️ `gecko/src/gecko.rs` libxul-embedding scaffolding is obsolete; repurpose
-    as launcher/supervisor.
+  - ✅ `gecko/src/gecko.rs` repurposed as the `vela` launch composer.
 
 ### Rockhopper — hardware abstraction + FirefoxOS-era compat
 - **Path:** `rockhopper/` · ~2,300 lines · real (`wayland.rs`, `dbus_session.rs`,
   `elf_loader.rs`, `compatibility.rs`). Daemon uses Puppis's `GeckoAppLauncher`.
-- **Status:** 🚧 substantial; role vs Nova/appHost worth clarifying.
+- **Status:** ✅ opt-in compatibility daemon — `scripts/create-rootfs.sh` no
+  longer starts `rockhopper-daemon` by default (`PYXIS_ENABLE_ROCKHOPPER=1`
+  gates boot startup); `Nova` + `AppHost` + `wlctx` own standard launches.
 
 ### Shift — system orchestrator
 - **Path:** `shift/` · ~1,800 lines. Process supervision, boot ordering,
@@ -642,7 +641,7 @@ on-device confirmation.**
 ### Supporting / inactive
 - `mini/` — prebuilt kernel build support. 🚧 build-support.
 - `pyxis-appctl` (`echo/src/bin/appctl.rs`) — thin Echo client (rescan/list/launch). ✅
-- `../pyxis-evo/` — ⚰️ **dead** (unmodified cosmic-comp fork; archive).
+- `../bk/pyxis-evo/` — ✅ **archived** (moved out of `../pyxis-evo`).
 - `gaia/`, `gonk/` — ⚰️ removed 2026-07-07.
 
 ---
@@ -653,16 +652,16 @@ Condensed from CLAUDE.md, updated with this session's progress.
 
 0. **App-serving strategy** (`pyxis://` + from-source `vela`) — ✅ built.
 1. **Unify JS bridge contract** — ✅ done (`@pyxis/app-sdk`).
-2. **Build Nova** — ✅ done (in-process). Remaining: 📋 Bloom launch via `nova.Launch`.
-3. **Wire Puppis card lifecycle** (freeze/thaw) behind appHost/Nova — 📋.
+2. **Build Nova** — ✅ done (in-process + `nova.Launch` across Bloom).
+3. **Process-tree freeze/thaw** (`SIGSTOP`/`SIGCONT` + cgroup freezer across `/proc` descendants in `AppHost`) — ✅ done.
 4. **Real status/notifications** in the shell — 🚧.
-5. **Delete `WaylandSurfaceView`** placeholder — 📋.
-6. **Security/capability model** — 🚧 (Nova has the permission vocabulary +
-   deny-by-default bridge; still need: tarball signing, cgroup sandboxing).
-7. **Finish Evo rough edges** — 🚧 (minimize ✅; HiDPI, real fps/mem IPC, X11
-   ordering, layer-shell rendering pending).
-8. **Housekeeping** — 🚧 (panicking `dbus.rs` test; stale `apphost.rs` doc;
-   `ouranos.service`; Bloom dead code/lint/tests; archive `pyxis-evo`).
+5. **Delete `WaylandSurfaceView`** placeholder — ✅ done.
+6. **Security/capability model** — ✅ Nova capability vocabulary, deny-by-default bridge, `Aegis` peer credentials, per-app UIDs, `openat2` confinement, archive validation + optional OpenSSL signing, cgroup v2 resource limits, and Settings → System capability revocation UI.
+7. **Finish Evo rough edges** — ✅ HiDPI surface scale, `GetOutputs`/`SetOutputConfig`,
+   `GetRenderingStatus`, layer-shell rendering, crash diagnostics (`evo-crash.log`),
+   and window animations implemented (X11 override-redirect stacking order still pending).
+8. **Housekeeping** — ✅ `gecko.rs` launcher repurposed, `pyxis-evo` archived,
+   `rockhopper-daemon` gated at boot, Terminal migrated to `@xterm/xterm`.
 
 ---
 
@@ -691,6 +690,42 @@ Condensed from CLAUDE.md, updated with this session's progress.
 ---
 
 ## Change log
+
+### Frosted title bar and lock screen (2026-11-12, alpha 5, uncommitted)
+
+Title bars are real glass: Evo frosts the wallpaper behind each bar, veiled
+light or dark with the theme, the app's accent as the seam (tier F1; F0 flat
+when there is no GL; F2, frosting other windows, deferred). A lock screen,
+end to end: Echo's new `session` and `accounts` services (passwords via
+`/etc/shadow` + `crypt_r`, rate limit, redacted logs, a key file whose HMAC
+signs every `LockChanged`), Evo enforcing the lock (only the overlay drawn,
+over black; input and keyboard to it; unlock only on a verified mac; Veil and
+Clear motions; Super+L and idle lock), Bloom's lock page in the overlay (lens
+clock, "just type", spinner while verifying) and Settings → Users & Lock.
+Five lanes, built on Sonnet subagents. `alpha5-frost` (43) and `alpha5-lock`
+(70) pass on the 11-09 image with pushes. The device runs found two bugs, both
+fixed: the frost watched only the desktop's toplevel surface (vela paints into
+a subsurface), and the unlock hand-back left no window focused. Needs the
+rebuilt vela for Bloom to call the new bridge entries. Plan
+`docs/internal/pyxis-glass-and-lock-plan.md`.
+
+### Visual identity (2026-11-11, alpha 5, uncommitted)
+
+The shell read as macOS, so it now has its own look, built from what Pyxis
+already had (plan `docs/internal/pyxis-visual-identity-plan.md`, mockups in
+`docs/internal/mockups/`). Five lanes: T, tokens and a shell tint from the
+Daylight palette (SDK `identity.ts`, `useShellTint`); E, Evo's chrome
+(waterdrop frame and shadow, the remochi spinner's shapes in its own colours
+as the controls, outlined when inactive and morphing like the spinner while an
+app misses pings, title bars with the app's trusted name and icon via the new
+`SetAppIdentity`); B, the launch bar and notification dashboard replacing the
+dock; N, the status strip on the wallpaper and notifications rising from the
+bottom right; C, cards, drawer and quick settings restyled. The first device
+run found the bar a pale band over a night wallpaper (its material followed the
+theme); it now follows the wallpaper. `SetAppIdentity` needs a vela rebuild for
+Bloom to send it. New suites `alpha5-identity.txt` and `alpha5-identity-evo.txt`;
+`alpha5-bridge-deny`, `-bridge-signals`, `-overlay` and `-shell-layering`
+re-aimed at the new layout.
 
 ### Daylight wallpaper and live settings (2026-11-09, alpha 5, uncommitted)
 

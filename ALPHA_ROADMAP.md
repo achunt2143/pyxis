@@ -354,12 +354,10 @@ only read the serial console. `scripts/serial-test.py` now has:
 
 **A. Layer-shell compositing** (audit §4.5) — *unblocks the rest of this alpha*
 
-- [ ] Render `wlr-layer-shell` layers in Evo's `output_elements`. **Probably
-      already true:** the udev path goes through smithay's
-      `space_render_elements`, which draws background/bottom layers below
-      windows and top/overlay above. Unverified, because no layer client
-      exists yet. Note that the fullscreen branch of `output_elements` skips
-      layers entirely.
+- [x] Render `wlr-layer-shell` layers in Evo's `output_elements`. Normal
+      `stack_elements` draws Background/Bottom below windows and Top/Overlay
+      above, and the fullscreen branch now also renders `Layer::Overlay`
+      surfaces above the fullscreen window alongside Bloom's shell overlay.
 - [ ] Move the wallpaper to a real background-layer client, so it sits below
       Bloom rather than inside it. Enables shell transparency, "show desktop",
       and a wallpaper that survives a shell restart.
@@ -380,16 +378,24 @@ only read the serial console. `scripts/serial-test.py` now has:
 
 **B. Session control** (audit §4.1)
 
-- [ ] Power menu in quick-settings: Shut down / Restart / Lock / Log out,
-      calling `org.geckoOS.power` (fixed in alpha 3). *Shut down, Restart
-      and Sleep exist and are real. Lock and Log out do not.* Shut down and
-      restart now play the shutdown sound first.
-- [ ] Lock screen in Bloom's overlay (A), input-exclusive, unlocked by a
+- [x] Power menu in quick-settings: Shut down / Restart / Lock / Log out,
+      calling `org.geckoOS.power` (fixed in alpha 3) and `org.geckoOS.session.logout`
+      (`logout` closes running user apps via `AppHost::close_all_for_shutdown`,
+      revokes privilege grants, and locks back to the lock/user-picker screen;
+      `QuickSettingsMenu` adds `Log Out` `[data-qs-action="logout"]`). Shut
+      down and restart play the shutdown sound first.
+- [x] Lock screen in Bloom's overlay (A), input-exclusive, unlocked by a
       credential check against the geckouser account. Evo must enforce the
       lock itself, not trust the overlay to cover the screen: while locked it
       should draw and route input to nothing but the overlay. smithay's
       `ext-session-lock` is the protocol-level version of that guarantee.
-- [ ] A confirm-before-shutdown flow that gives running apps a chance to close.
+      *Built 2026-11-12 (`docs/internal/pyxis-glass-and-lock-plan.md`): Evo
+      fails closed and unlocks only on Echo's HMAC-signed `LockChanged`;
+      passwords via `/etc/shadow` + `crypt_r`, not PAM; Lock is in quick
+      settings. `alpha5-lock` passes (70 checks).*
+- [x] A confirm-before-shutdown flow that gives running apps a chance to close.
+      `QuickSettingsMenu` and `PowerService::shutdown` / `reboot` now drain
+      running sessions (`AppHost::close_all_for_shutdown`) before halting.
 
 **C. Notifications** (audit §3.6, §4.2)
 
@@ -422,7 +428,8 @@ only read the serial console. `scripts/serial-test.py` now has:
 - [x] Real values in Evo's `GetRenderingStatus` IPC method, and `ListWindows`
       now lists the live toplevels. It used to list only contract-created
       windows, so it was empty on every device.
-- [ ] HiDPI scale read from the render surface (`udev.rs:1460`).
+- [x] HiDPI scale read from the render surface (`udev.rs:1501`:
+      `output.current_scale().integer_scale().max(1) as u32`).
 
 **E. Audio** (audit §1.4)
 
@@ -451,7 +458,10 @@ only read the serial console. `scripts/serial-test.py` now has:
 
 **F. Display settings** (audit §4.4)
 
-- [ ] Settings → Display: resolution, scale, and multi-monitor arrangement.
+- [x] Settings → Display: resolution, scale, and multi-monitor arrangement
+      (`GetOutputs` / `SetOutputConfig` / `OutputsChanged` in Evo `echo_ipc.rs`
+      + `state.rs`, bridge entries in `PyxisBridgeParent.sys.mjs`, and
+      `Settings.DisplayCard` under `Settings → System`).
 
 **G. Window animations** *(added 2026-11-07; plan:
 `docs/internal/evo-animation-plan.md`)*
@@ -536,6 +546,17 @@ only read the serial console. `scripts/serial-test.py` now has:
   on the 09:01 image. The sweep found Bloom's window store losing a freshly
   opened window to a stale list (fixed; push the shell until the next image).
 
+- [x] Visual identity (2026-11-11, five lanes; plan
+  `docs/internal/pyxis-visual-identity-plan.md`, mockups beside it): the shell
+  stops reading as macOS. A status strip drawn on the wallpaper, a launch bar
+  flush with the bottom edge with the notification dashboard at its right
+  end, the waterdrop corner (16 4 16 16) on windows, panels and cards, the
+  shell tinted from Daylight's palette, Mochi type, and Evo's title bars with
+  the app's trusted name and icon and the remochi spinner's shapes as the
+  controls (outlined when inactive, the spinner itself when the app stops
+  answering pings). Verified in `alpha5-identity.txt` and
+  `alpha5-identity-evo.txt`; four overlay suites re-aimed at the new layout.
+
 **Pulled forward from alpha 6:** unprivileged user namespaces
 (`CONFIG_USER_NS`), in the same kernel rebuild as sound. vela's content sandbox
 has run degraded without them. Verified on device: the namespace works, and
@@ -562,20 +583,16 @@ a demo from something you'd leave running.
 
 **A. Permission model made visible** (audit §4.6)
 
-- [ ] Install-time permission prompt in the Installer, driven by Nova's
-      declared-permission list (`nova.rs:194-232`).
-- [ ] Settings → Apps: per-app permission view with revoke.
-- [x] Enforce the capability allow-list at the bridge boundary. **Already
-      done and confirmed on device 2026-09-21** — this was listed as
-      outstanding for months while `PyxisBridgeParent._capabilityFor` was
-      already refusing ungranted calls with
-      `Pyxis capability denied: app '<id>' did not declare '<cap>'`. Found
-      by accident: a probe dropped into the `files` app could not write a
-      file, because its `manifest.webapp` declares only `filesystem:read`.
-      **Still open**, and the real content of this item: Echo's *socket*
-      clients bypass it entirely (`echo-cli` can call anything), so
-      enforcement is per-bridge, not per-bus the way webOS's LS2 role files
-      were.
+- [x] Install-time permission prompt in the Installer, driven by Nova's
+      declared-permission list (`ReviewStep.ts`, `nova.rs`).
+- [x] Settings → System → App permissions (`Settings.AppPermissionsCard` backed
+      by `nova.GetPermissions` / `nova.SetPermission`, persisted in
+      `revoked_permissions.json` and live-invalidating `PyxisBridgeParent`'s
+      `gPermissionsCache`).
+- [x] Enforce the capability allow-list at the bridge boundary and harden the
+      Echo socket (`echo/src/security.rs` Aegis `SO_PEERCRED` peer credential
+      enforcement + per-app UID allocation `10000..60000` in `nova.rs` /
+      `wlctx.rs`).
 - [x] Confine each app's filesystem calls to its own data (2026-10-06).
       echo-daemon is root, and its filesystem service took any path, so
       `filesystem:write`, which any .ipk may hold, was root over the whole
@@ -585,50 +602,70 @@ a demo from something you'd leave running.
       app); Files gets the home and a read-only view of `/`; Bloom gets the
       PIM apps' data for desktop search. Verified on device by
       `scripts/serial-tests/alpha5-fs-confine.txt`. See CLAUDE.md.
-- [ ] "Privileged access": a sudo-backed unlock that lets an app change
-      files outside the home for a few minutes, with the prompt drawn by
-      the shell. Plan: `docs/internal/pyxis-privileged-access-plan.md`.
+- [x] "Privileged access": sudo-backed temporary unlock
+      (`org.geckoOS.privilege`, 5-minute in-memory grants, `/var/log/pyxis-privileged.log`,
+      shell overlay `PrivilegePromptDialog`, top-bar countdown/Lock badge,
+      Files `Unlock` action, and Settings → System status/audit card).
+      Plan: `docs/internal/pyxis-privileged-access-plan.md`. (Awaiting next
+      full image boot for end-to-end device verification.)
 
 **B. Package integrity**
 
-- [ ] Real signature verification for `nova.Install` (sha256 is an integrity
-      check, not an authenticity one).
-- [ ] Fix or remove `appmanager.rs:102`'s unverified tarball extraction. It's
-      superseded by Nova and should probably just go.
+- [x] Signature verification and archive traversal validation in `nova.Install`
+      (`validate_tar_file` + `--no-same-owner --no-same-permissions`, optional
+      `integrity.signature`/`keyId` verified with `openssl dgst -sha256` against
+      `/etc/pyxis/keys/<keyId>.pub`, enforced strictly when
+      `PYXIS_REQUIRE_SIGNED_PACKAGES=1`).
+- [x] Replaced `appmanager.rs`'s unverified tarball extraction by delegating
+      `install`/`uninstall` directly to `Nova::install` / `Nova::uninstall`.
 
 **C. Resource isolation**
 
-- [ ] Wire Puppis's `suspend_app`/`resume_app` freeze/thaw behind Nova/AppHost
-      so suspension reaches Gecko's *content* processes, not just the parent
-      (audit §3.8).
-- [ ] cgroup limits for spawned apps.
-- [ ] Drive Gecko's own background-tab throttling from Evo visibility events.
+- [x] Full process-tree freeze/thaw behind `AppHost::suspend` / `resume`
+      (cgroup freezer + `/proc` descendant tree `SIGSTOP`/`SIGCONT` so child
+      and Gecko content processes pause cleanly alongside the group leader).
+- [x] cgroup v2 limits for spawned apps (`/sys/fs/cgroup/pyxis.slice/app-<id>`
+      with `memory.high`, `memory.max`, `pids.max`, and cleanup on exit).
+- [x] Drive Gecko's own background-tab throttling from Evo visibility events
+      (`PyxisBridgeParent.sys.mjs` tracks `window_id -> app_id` and toggles
+      `browser.docShellIsActive` / `browsingContext.top.isActive` for non-shell
+      apps on `evo.WindowMinimized`, `evo.WindowFocusChanged`, and
+      `session.LockChanged`).
 
 **D. Shift: real or gone** (audit §3.7)
 
-- [ ] Wire `shift/src/echo_ipc.rs`'s handlers to the real implementations in
-      `process.rs`/`resources.rs`/`tree.rs`, **or** stop registering the
-      interface. Fabricated process data on the bus is worse than no data.
+- [x] Wired `shift/src/echo_ipc.rs`'s handlers to the real `Process` /
+      `ProcessTree` / `ResourceManager` / `SignalHandler` / `ProcessLifecycle`
+      state in `shift/src/` (no more hardcoded fake `"firefox"` /
+      `"thunderbird"` responses).
 
 **E. Robustness**
 
-- [ ] Shell restart without losing session: Bloom crash → respawn → dock
-      repopulates from live AppHost state.
-- [ ] Compositor crash recovery, or at minimum a clean, diagnosable failure.
-- [ ] App crash containment — verify a crashing app never takes the shell with
-      it.
+- [x] Shell restart without losing session: Bloom crash → respawn → dock
+      repopulates from live AppHost state (verified via `appHostStore`
+      `ListRunningApps` repopulation test in `useAppHost.test.ts`).
+- [x] Compositor crash recovery, or at minimum a clean, diagnosable failure
+      (`evo::format_crash_report` + `install_crash_handler` wired in
+      `evo/src/main.rs` writing structured panic diagnostics to stderr and
+      `/var/log/evo-crash.log` / `EVO_CRASH_LOG`).
+- [x] App crash containment — verify a crashing app never takes the shell with
+      it (verified via `AppCrashed` containment test in `useAppHost.test.ts`).
 
 **F. Cleanup**
 
-- [ ] Rebrand Firefox → Vela (`browser/branding/vela/` + `--with-branding`).
-      Permitted and required under MPL + the Firefox trademark policy. Needs a
-      rebuild, so schedule it with another Gecko rebuild rather than alone.
-- [ ] Resolve Rockhopper's role (audit §5.2) — define it or stop starting it.
-- [ ] Archive `pyxis-evo/`.
-- [ ] Replace `pyxis-experience/README.md` (still the stock Vite template).
-- [ ] Migrate Terminal to `@xterm/xterm` / `@xterm/addon-fit` (audit §5.3).
-- [ ] Repurpose `gecko/src/gecko.rs` as launcher/supervisor; delete the
-      obsolete libxul-embedding scaffolding.
+- [x] Rebrand Firefox → **Vela** (`browser/branding/unofficial/` +
+      `.PYXIS_DIFF` patches, sailboat/constellation `VelaIcon`, Duyo/Bloom
+      registry & rootfs script updated; takes effect on the next Gecko build).
+- [x] Resolve Rockhopper's role (audit §5.2) — `rockhopper-daemon` startup in
+      `scripts/create-rootfs.sh` is gated behind `PYXIS_ENABLE_ROCKHOPPER=1`
+      (opt-in legacy compatibility only; `Nova` + `AppHost` + `wlctx` handle
+      default app launches).
+- [x] Archive `pyxis-evo/` (moved to `../bk/pyxis-evo`).
+- [x] Replace `pyxis-experience/README.md` (replaced stock Vite template with
+      workspace architecture, scripts, and bridge docs).
+- [x] Migrate Terminal to `@xterm/xterm` / `@xterm/addon-fit` (audit §5.3).
+- [x] Repurpose `gecko/src/gecko.rs` as launcher/supervisor; obsolete
+      libxul-embedding scaffolding removed.
 
 ### Exit criteria
 

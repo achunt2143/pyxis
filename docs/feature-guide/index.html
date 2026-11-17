@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pyxis Feature Guide</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lato:ital,wght@0,300;0,400;0,700;1,400;1,700&display=swap">
+<style>
+/* Layout: a long guided walk in six chapters; each feature is a text column beside its screenshot, framed in Pyxis's waterdrop corner (16 4 16 16). */
+:root {
+  --paper: #f5f3f6;
+  --card: #ffffff;
+  --ink: #26222b;
+  --quiet: #6b6473;
+  --line: #e1dce5;
+  --chip: #ebe7ee;
+  --red: #e23d3d;      /* the spinner's red, deepened for text */
+  --blue: #2a7ea6;     /* the spinner's blue, deepened for text */
+  --yellow: #c98a00;   /* the spinner's yellow, deepened for text */
+  --red-fill: #ff4a4a;
+  --blue-fill: #69cdff;
+  --yellow-fill: #ffb80d;
+  --shadow: 0 1px 2px rgba(38,34,43,.06), 0 10px 30px rgba(38,34,43,.10);
+  --display: 'Lato', 'Helvetica Neue', Arial, sans-serif;
+  --body: 'Lato', 'Helvetica Neue', Arial, sans-serif;
+  --drop: 16px 4px 16px 16px;
+  --drop-sm: 10px 3px 10px 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #141218; --card: #1e1b23; --ink: #ece9e3; --quiet: #a59fae; --line: #2f2b36; --chip: #26232c;
+    --red: #ff7a7a; --blue: #7fd3ff; --yellow: #ffc845;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 12px 32px rgba(0,0,0,.35);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #141218; --card: #1e1b23; --ink: #ece9e3; --quiet: #a59fae; --line: #2f2b36; --chip: #26232c;
+  --red: #ff7a7a; --blue: #7fd3ff; --yellow: #ffc845;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 12px 32px rgba(0,0,0,.35);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font-family: var(--body); font-size: 17px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1120px; margin: 0 auto; }
+h1, h2, h3 { text-wrap: balance; margin: 0; }
+p { margin: 0; }
+a { color: var(--blue); }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+
+/* ---------- top ---------- */
+header.top { padding-block: 56px 28px; display: grid; gap: 28px; }
+.brand { display: flex; align-items: center; gap: 14px; color: var(--quiet); font-size: 13px; letter-spacing: .32em; text-transform: uppercase; }
+.brand .shapes { display: inline-flex; gap: 6px; }
+h1 { font-family: var(--display); font-weight: 300; font-size: clamp(56px, 11vw, 120px); letter-spacing: .28em; line-height: 1; margin-right: -.28em; }
+.lede { font-size: clamp(19px, 2.3vw, 23px); max-width: 40ch; color: var(--ink); }
+.lede em { font-style: italic; font-weight: 700; }
+.hero-shot { margin-top: 8px; }
+
+nav.chapters { display: flex; flex-wrap: wrap; gap: 8px; padding-block: 8px 0; }
+nav.chapters a {
+  display: inline-flex; align-items: center; gap: 8px; text-decoration: none; color: var(--ink);
+  background: var(--chip); padding: 7px 14px 7px 11px; border-radius: var(--drop-sm); font-size: 14px;
+}
+nav.chapters a:hover { background: var(--line); }
+
+/* ---------- shots ---------- */
+.shot {
+  display: block; width: 100%; padding: 0; border: 0; background: none; cursor: zoom-in;
+  border-radius: var(--drop); overflow: hidden; box-shadow: var(--shadow); line-height: 0;
+}
+.shot img { width: 100%; height: auto; display: block; }
+.shot.strip { border-radius: var(--drop-sm); }
+figure { margin: 0; display: grid; gap: 10px; min-width: 0; }
+figcaption { font-size: 14px; color: var(--quiet); line-height: 1.45; }
+
+/* ---------- chapters ---------- */
+section.chapter { padding-block: 72px 8px; border-top: 1px solid var(--line); margin-top: 56px; }
+.chapter-head { display: grid; gap: 12px; margin-bottom: 40px; max-width: 62ch; }
+.eyebrow { display: flex; align-items: center; gap: 10px; font-size: 13px; letter-spacing: .28em; text-transform: uppercase; color: var(--quiet); }
+h2 { font-family: var(--display); font-weight: 300; font-size: clamp(34px, 5vw, 52px); letter-spacing: .18em; text-transform: uppercase; line-height: 1.1; }
+.chapter-head p { color: var(--quiet); font-size: 18px; }
+
+.feature { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 40px; align-items: start; padding-block: 36px; }
+.feature + .feature { border-top: 1px dashed var(--line); }
+.feature.flip > .text { order: 2; }
+.feature.wide { grid-template-columns: 1fr; }
+.feature .text { display: grid; gap: 14px; min-width: 0; }
+h3 { font-weight: 700; font-size: 24px; line-height: 1.25; }
+.def { font-size: 18px; }
+.def em { font-style: italic; font-weight: 700; }
+ul.can { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+ul.can li { position: relative; padding-left: 22px; }
+ul.can li::before {
+  content: ""; position: absolute; left: 2px; top: .62em; width: 8px; height: 8px;
+  border-radius: 4px 1px 4px 4px; background: var(--blue-fill);
+}
+.label { font-size: 12px; letter-spacing: .22em; text-transform: uppercase; color: var(--quiet); }
+kbd {
+  font-family: var(--body); font-size: 13px; font-weight: 700; color: var(--ink);
+  background: var(--card); border: 1px solid var(--line); border-bottom-width: 2px;
+  padding: 1px 7px; border-radius: 5px; white-space: nowrap;
+}
+
+.trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.duo { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.quad { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px 22px; }
+.stack { display: grid; gap: 18px; }
+.tag { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding: 2px 8px; border-radius: var(--drop-sm); background: var(--chip); color: var(--ink); }
+
+/* running-light legend */
+.lights { display: grid; gap: 10px; margin-top: 4px; }
+.light { display: grid; grid-template-columns: 44px 1fr; align-items: center; gap: 12px; font-size: 15px; }
+.light i { display: block; height: 3px; border-radius: 2px; background: var(--blue-fill); }
+.light .short { width: 18px; margin-left: 13px; }
+.light .long { width: 34px; margin-left: 5px; }
+.light .faint { width: 18px; margin-left: 13px; opacity: .35; }
+.light .red { width: 18px; margin-left: 13px; background: var(--red-fill); }
+.light .pulse { width: 18px; margin-left: 13px; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+
+/* motion names */
+.motion figure h4 { margin: 0; font-size: 18px; font-weight: 700; display: flex; align-items: baseline; gap: 10px; }
+.motion figure h4 span { font-weight: 400; color: var(--quiet); font-size: 14px; }
+
+/* apps grid */
+.apps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 40px 28px; }
+.app { display: grid; gap: 12px; min-width: 0; }
+.app-head { display: flex; align-items: center; gap: 12px; }
+.app-icon { width: 36px; height: 36px; border-radius: 10px 3px 10px 10px; display: grid; place-items: center; color: #fff; flex: none; }
+.app-icon svg { width: 20px; height: 20px; }
+.app h3 { font-size: 21px; }
+.app p { color: var(--quiet); font-size: 16px; }
+
+/* security rooms */
+.rooms { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 18px; border-radius: var(--drop); background: var(--card); box-shadow: var(--shadow); }
+.room { border: 1.5px solid var(--line); border-radius: var(--drop-sm); padding: 12px 10px; display: grid; gap: 6px; justify-items: start; min-width: 0; }
+.room b { font-size: 14px; }
+.room small { font-size: 12px; color: var(--quiet); line-height: 1.35; }
+.room .dot { width: 10px; height: 10px; border-radius: 5px 1px 5px 5px; }
+.rooms .gate { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: var(--drop-sm); background: var(--chip); font-size: 14px; }
+.rooms .gate svg { flex: none; }
+.promises { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 28px; margin-top: 28px; }
+.promise { display: grid; gap: 4px; }
+.promise b { font-size: 16px; }
+.promise span { color: var(--quiet); font-size: 15px; }
+
+/* shortcuts */
+.keys { width: 100%; border-collapse: collapse; font-size: 16px; }
+.keys td { padding: 11px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.keys td:first-child { width: 42%; white-space: nowrap; }
+.keys tr:last-child td { border-bottom: 0; }
+.keys-wrap { overflow-x: auto; background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 6px 16px; }
+
+/* sound */
+.sound-card { background: var(--card); border-radius: var(--drop); box-shadow: var(--shadow); padding: 22px; display: grid; gap: 16px; }
+.wave { display: flex; align-items: center; gap: 3px; height: 40px; }
+.wave i { flex: 1; background: var(--blue-fill); border-radius: 2px; opacity: .8; }
+.sound-list { display: flex; flex-wrap: wrap; gap: 8px; }
+
+footer { padding-block: 64px 72px; color: var(--quiet); font-size: 14px; border-top: 1px solid var(--line); margin-top: 72px; display: grid; gap: 6px; }
+
+/* lightbox */
+dialog#zoom { padding: 0; border: 0; background: transparent; max-width: min(1400px, 96vw); width: 96vw; }
+dialog#zoom::backdrop { background: rgba(10, 8, 14, .82); }
+dialog#zoom img { width: 100%; height: auto; display: block; border-radius: var(--drop); }
+dialog#zoom p { color: #ece9e3; font-size: 15px; padding-top: 10px; text-align: center; }
+
+@media (max-width: 860px) {
+  .feature, .feature.flip { grid-template-columns: 1fr; gap: 22px; }
+  .feature.flip > .text { order: 0; }
+  .trio { grid-template-columns: 1fr; }
+  .apps, .quad, .promises { grid-template-columns: 1fr; }
+  .rooms { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .duo { grid-template-columns: 1fr; }
+  h1 { letter-spacing: .18em; margin-right: -.18em; }
+}
+@media (prefers-reduced-motion: reduce) { .light .pulse { animation: none; } }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="tri" viewBox="0 0 14 14"><path d="M1.5 2.5h11L7 12z" /></symbol>
+    <symbol id="sq" viewBox="0 0 14 14"><rect x="2" y="2" width="10" height="10" rx="1.5" /></symbol>
+    <symbol id="ci" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5.2" /></symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+
+<header class="top">
+  <div class="brand">
+    <span class="shapes" aria-hidden="true">
+      <svg width="14" height="14" fill="#ffb80d"><use href="#tri"/></svg>
+      <svg width="14" height="14" fill="#69cdff"><use href="#sq"/></svg>
+      <svg width="14" height="14" fill="#ff4a4a"><use href="#ci"/></svg>
+    </span>
+    A guide to everything it does
+  </div>
+  <h1>PYXIS</h1>
+  <p class="lede">A desktop that follows the light outside your window, keeps every app in its own space, and asks for your password in <em>one</em> place only.</p>
+  <figure class="hero-shot">
+    <button class="shot" type="button"><img src="shots/tour-windows-depth.webp" alt="The Pyxis desktop with Notes open in front of another window, the status strip at the top and the launch bar at the bottom" width="1280" height="800"></button>
+    <figcaption>Every screenshot in this guide was taken on a running Pyxis system. Tap any picture to see it larger.</figcaption>
+  </figure>
+  <nav class="chapters" aria-label="Chapters">
+    <a href="#desktop"><svg width="12" height="12" fill="var(--yellow-fill)"><use href="#tri"/></svg>The desktop</a>
+    <a href="#windows"><svg width="12" height="12" fill="var(--blue-fill)"><use href="#sq"/></svg>Windows</a>
+    <a href="#motion"><svg width="12" height="12" fill="var(--red-fill)"><use href="#ci"/></svg>Motion</a>
+    <a href="#yours"><svg width="12" height="12" fill="var(--yellow-fill)"><use href="#tri"/></svg>Make it yours</a>
+    <a href="#safe"><svg width="12" height="12" fill="var(--blue-fill)"><use href="#sq"/></svg>Lock and safety</a>
+    <a href="#apps"><svg width="12" height="12" fill="var(--red-fill)"><use href="#ci"/></svg>The apps</a>
+    <a href="#keys"><svg width="12" height="12" fill="var(--yellow-fill)"><use href="#tri"/></svg>Shortcuts</a>
+  </nav>
+</header>
+
+<!-- ============ THE DESKTOP ============ -->
+<section class="chapter" id="desktop">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--yellow-fill)"><use href="#tri"/></svg>Chapter one</div>
+    <h2>The desktop</h2>
+    <p>What you see before you open anything: a wallpaper that changes through the day, a thin strip of information at the top, and a bar of apps at the bottom.</p>
+  </div>
+
+  <div class="feature wide">
+    <div class="text">
+      <h3>Daylight wallpaper</h3>
+      <p class="def">The wallpaper <em>follows the sun</em> where you are. Soft colour drifts slowly across the screen, and its palette moves from deep night blue, through dawn and golden hour, to full day and back.</p>
+      <ul class="can">
+        <li>Morning and evening look different, even at the same height of sun.</li>
+        <li>Pick another wallpaper instead: Aurora, Sunset, Forest or Mochi.</li>
+        <li>Choose <span class="tag">Flowing</span> or <span class="tag">Still</span>, or pin one time of day to keep it there.</li>
+        <li>It stops moving when windows cover it, so it costs no power when you can't see it.</li>
+      </ul>
+    </div>
+    <div class="trio">
+      <figure><button class="shot" type="button"><img src="shots/tour-desktop-day.webp" alt="Daylight wallpaper at midday" loading="lazy" width="1280" height="800"></button><figcaption><b>Day.</b> Bright and pale.</figcaption></figure>
+      <figure><button class="shot" type="button"><img src="shots/tour-desktop-dusk.webp" alt="Daylight wallpaper at dusk" loading="lazy" width="1280" height="800"></button><figcaption><b>Dusk.</b> Warm pinks into violet.</figcaption></figure>
+      <figure><button class="shot" type="button"><img src="shots/tour-desktop-night.webp" alt="Daylight wallpaper at night" loading="lazy" width="1280" height="800"></button><figcaption><b>Night.</b> Deep blue, and the text turns light to stay readable.</figcaption></figure>
+    </div>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>The status strip</h3>
+      <p class="def">A line of information drawn straight onto the wallpaper, with no bar behind it. Its text changes colour with the wallpaper so it always stands out.</p>
+      <ul class="can">
+        <li><b>Left:</b> the search line. Type here, or just start typing anywhere on the desktop.</li>
+        <li><b>Centre:</b> the day and time, in 12 or 24 hours and your own time zone.</li>
+        <li><b>Right:</b> Wi-Fi, volume and battery. Click them to open Quick settings.</li>
+      </ul>
+    </div>
+    <figure><button class="shot strip" type="button"><img src="shots/tour-status-strip.webp" alt="The status strip: search on the left, Monday and the time in the centre, Wi-Fi, volume and battery on the right" loading="lazy" width="1280" height="36"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>The launch bar</h3>
+      <p class="def">Your apps along the bottom of the screen, each as a droplet-shaped icon in its own colour.</p>
+      <ul class="can">
+        <li><b>Apps</b> (the grid) opens the full list of apps. <b>Cards</b> (the stack) shows every open window.</li>
+        <li>A thin light under an icon tells you about that app at a glance:</li>
+      </ul>
+      <div class="lights" aria-label="What the light under an icon means">
+        <div class="light"><i class="short"></i><span>Running</span></div>
+        <div class="light"><i class="long"></i><span>Running, and the window you're using now</span></div>
+        <div class="light"><i class="pulse"></i><span>Starting up</span></div>
+        <div class="light"><i class="faint"></i><span>Minimized</span></div>
+        <div class="light"><i class="red"></i><span>Crashed</span></div>
+      </div>
+      <ul class="can">
+        <li>The bell at the right end shows your newest notifications and a count of unread ones.</li>
+        <li>Prefer a sidebar? Move the bar to the left edge in Settings.</li>
+      </ul>
+    </div>
+    <figure><button class="shot strip" type="button"><img src="shots/tour-launch-bar.webp" alt="The launch bar: Apps and Cards buttons on the left, Terminal, Vela, Files and Notes icons in the middle, the notification bell on the right" loading="lazy" width="1280" height="64"></button></figure>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>The app drawer</h3>
+      <p class="def">Every app on the system in one panel, opened from the Apps button or by tapping the <kbd>Super</kbd> key on its own.</p>
+      <ul class="can">
+        <li>Type to filter as soon as it opens.</li>
+        <li>Sort by kind: <span class="tag">PIM</span> <span class="tag">Utilities</span> <span class="tag">System</span>.</li>
+        <li>New apps appear the moment they're installed, and vanish when removed.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-app-drawer.webp" alt="The Applications panel with search box, category filters and eight app icons" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Just type</h3>
+      <p class="def">Start typing on the desktop and search opens by itself. Press <kbd>Super</kbd> <kbd>Space</kbd> to open it from anywhere, even over an app filling the screen.</p>
+      <ul class="can">
+        <li>Finds apps, and also your notes, contacts and tasks.</li>
+        <li>Turns what you typed into an action: take a note, add a task, search the web, or run it in Terminal.</li>
+        <li>Press <kbd>Enter</kbd> to open the top result.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-search.webp" alt="Search showing Notes as the matching app and quick actions to take a note, add a task, search the web or run in Terminal" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>Quick settings</h3>
+      <p class="def">The things you change most often, one click from anywhere.</p>
+      <ul class="can">
+        <li>Wi-Fi, Do Not Disturb, Dark theme, and battery percentage in the strip.</li>
+        <li>Volume and brightness sliders.</li>
+        <li>Lock, Sleep, Log out, Restart and Shut down. Restart and Shut down ask first.</li>
+        <li>The gear opens the full Settings app.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-quick-settings.webp" alt="Quick settings panel with Wi-Fi, Do Not Disturb, Dark Theme and Battery tiles, volume and brightness sliders, and power buttons" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Notifications</h3>
+      <p class="def">Messages from apps and the system rise in the bottom-right corner, then wait for you in the notification centre.</p>
+      <ul class="can">
+        <li>Toasts appear above every window, so you see them while you work.</li>
+        <li>Open the centre from the bell to read, dismiss one, or clear them all.</li>
+        <li><b>Do Not Disturb</b> keeps toasts quiet without losing anything.</li>
+        <li>You decide what the lock screen shows: nothing, a count, or the full message.</li>
+      </ul>
+    </div>
+    <div class="stack">
+      <figure><button class="shot" type="button"><img src="shots/tour-notification-toast.webp" alt="A notification toast rising in the bottom-right corner" loading="lazy" width="1280" height="800"></button><figcaption>A toast as it arrives.</figcaption></figure>
+      <figure><button class="shot" type="button"><img src="shots/tour-notification-centre.webp" alt="The notification centre listing two notifications with a Clear all button" loading="lazy" width="1280" height="800"></button><figcaption>The notification centre, opened from the bell.</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============ WINDOWS ============ -->
+<section class="chapter" id="windows">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--blue-fill)"><use href="#sq"/></svg>Chapter two</div>
+    <h2>Windows</h2>
+    <p>Every app gets the same frame, drawn by Pyxis itself, so all windows look and behave alike whatever they were built with.</p>
+  </div>
+
+  <div class="feature wide">
+    <div class="text">
+      <h3>The title bar</h3>
+      <p class="def">A strip of <em>frosted glass</em>: the wallpaper shows through it, softly blurred. It carries the app's own name and its three controls.</p>
+      <ul class="can">
+        <li>The controls are Pyxis's own shapes: <b>▽</b> minimize, <b>☐</b> maximize, <b>○</b> close, in the colours of the Pyxis spinner.</li>
+        <li>The window's top-right corner is sharp and the rest are round. It's the shape of a waterdrop, and it's on every Pyxis icon too.</li>
+        <li>If an app stops responding, its controls start to move, so you know it's busy and not broken.</li>
+        <li>Double-click the bar to maximize. Drag it to move. Drag any edge to resize.</li>
+      </ul>
+    </div>
+    <figure><button class="shot strip" type="button"><img src="shots/tour-title-bar.webp" alt="Close-up of the Notes title bar: frosted pink-to-lilac glass, the name Notes, and triangle, square and circle controls" loading="lazy" width="2176" height="64"></button><figcaption>The Notes title bar, close up.</figcaption></figure>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>Depth and focus</h3>
+      <p class="def">The window you're using sits forward, with a larger, softer shadow. Windows behind it settle back and their title text dims.</p>
+      <ul class="can">
+        <li>Lifting a window to drag it deepens its shadow, as if you picked it up.</li>
+        <li>Windows never slide under the strip or the launch bar. They stop at the edge.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-windows-depth.webp" alt="Notes in front of another window, with a soft shadow beneath it" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Maximized windows</h3>
+      <p class="def">A maximized window fills the space between the strip and the launch bar, so neither is ever hidden. Its corners go square to meet the edges.</p>
+      <ul class="can">
+        <li>Snap a window to half the screen, or full, with <kbd>Super</kbd> and the arrow keys.</li>
+        <li>Full-screen apps (a video, a game) do cover everything; the strip and bar step aside.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-maximized.webp" alt="Notes maximized between the status strip and the launch bar" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>Cards</h3>
+      <p class="def">See every open window at once, as live pictures laid out side by side. Open it with the Cards button or <kbd>Super</kbd> <kbd>Tab</kbd>.</p>
+      <ul class="can">
+        <li>Each card flies out of its own window, and back into it when you choose one.</li>
+        <li>Click a card to go to it. Close a window from its card, or close all.</li>
+        <li>Each card is tinted in its app's colour.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-cards-overview.webp" alt="The Cards overview showing File Manager, Notes, Tasks and Contacts as cards" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Switching with Alt+Tab</h3>
+      <p class="def">Hold <kbd>Alt</kbd> and press <kbd>Tab</kbd> to walk through your windows, the one you used last first. Let go of Alt to jump to the highlighted one.</p>
+      <ul class="can">
+        <li>A quick tap swaps straight back to your previous window without showing anything.</li>
+        <li><kbd>Shift</kbd> walks backwards. <kbd>Esc</kbd> cancels and leaves you where you were.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-alt-tab.webp" alt="The Alt+Tab switcher with Tasks highlighted among four windows" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+</section>
+
+<!-- ============ MOTION ============ -->
+<section class="chapter motion" id="motion">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--red-fill)"><use href="#ci"/></svg>Chapter three</div>
+    <h2>Motion</h2>
+    <p>Windows move like light through a lens: they come into focus, round into droplets, and burn away. These pictures are frozen half-way through each animation.</p>
+  </div>
+
+  <div class="quad">
+    <figure>
+      <h4>Bloom <span>opening a window</span></h4>
+      <button class="shot" type="button"><img src="shots/tour-motion-open.webp" alt="Settings opening, still soft and out of focus" loading="lazy" width="1280" height="800"></button>
+      <figcaption>A new window starts soft and slightly tinted in its app's colour, then sharpens into focus as it settles.</figcaption>
+    </figure>
+    <figure>
+      <h4>Droplet <span>minimizing</span></h4>
+      <button class="shot" type="button"><img src="shots/tour-motion-minimize.webp" alt="A window shrinking into an orb on its way to the launch bar" loading="lazy" width="1280" height="800"></button>
+      <figcaption>The window rounds into a glowing orb of its app's colour and arcs down into its icon, which ripples as it lands. Restoring plays it backwards.</figcaption>
+    </figure>
+    <figure>
+      <h4>Evaporate <span>closing</span></h4>
+      <button class="shot" type="button"><img src="shots/tour-motion-close.webp" alt="Files closing, its edges dissolving" loading="lazy" width="1280" height="800"></button>
+      <figcaption>A closed window burns away, starting from the close button, with a glowing edge in its app's colour.</figcaption>
+    </figure>
+    <figure>
+      <h4>Recede <span>show desktop</span></h4>
+      <button class="shot" type="button"><img src="shots/tour-motion-show-desktop.webp" alt="Windows sinking back and blurring as the desktop is shown" loading="lazy" width="1280" height="800"></button>
+      <figcaption>Press <kbd>Super</kbd> <kbd>D</kbd> and every window sinks back and blurs away, one after another. Press it again and they return in the same order.</figcaption>
+    </figure>
+  </div>
+  <div class="feature">
+    <div class="text">
+      <h3>Choose how much motion</h3>
+      <p class="def">In Settings → Accessibility, pick <span class="tag">Full</span>, <span class="tag">Reduced</span> or <span class="tag">Off</span>.</p>
+      <ul class="can">
+        <li><b>Reduced</b> keeps only short fades: nothing flies, scales or spins.</li>
+        <li><b>Off</b> makes every change instant.</li>
+        <li>After you maximize a window, a soft band of light sweeps across it. That's the only flourish, and it goes with Full.</li>
+      </ul>
+    </div>
+    <div></div>
+  </div>
+</section>
+
+<!-- ============ MAKE IT YOURS ============ -->
+<section class="chapter" id="yours">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--yellow-fill)"><use href="#tri"/></svg>Chapter four</div>
+    <h2>Make it yours</h2>
+    <p>Every change in Settings shows up at once, in every app and in the shell, with no restart.</p>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>Appearance</h3>
+      <p class="def">Theme, wallpaper and where the launch bar sits, all on one page.</p>
+      <ul class="can">
+        <li><b>Light</b>, <b>Dark</b>, or <b>Auto</b>, which turns dark at dusk and light at dawn.</li>
+        <li>Live previews of every wallpaper, and a time slider to see Daylight at any hour.</li>
+        <li>The shell's colours are tinted from the wallpaper, so they always belong together.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-app-settings.webp" alt="Settings on the Appearance page with theme, launch bar and wallpaper choices" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Dark theme</h3>
+      <p class="def">Apps and panels switch to dark surfaces with light text. Turn it on from Quick settings or Settings.</p>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-dark-theme.webp" alt="Notes in the dark theme" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>Launch bar on the left</h3>
+      <p class="def">Turn the launch bar into a rail down the left edge. Windows make room for it right away.</p>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-left-rail.webp" alt="The launch bar as a vertical rail on the left edge" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Time and place</h3>
+      <p class="def">Pyxis needs to know where you are to follow the sun. It works it out from your time zone, or you can set your place by hand.</p>
+      <ul class="can">
+        <li>Search every time zone by city.</li>
+        <li>Switch the clock between 12 and 24 hours.</li>
+        <li>See today's sunrise and sunset for where you are.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-settings-datetime.webp" alt="Settings on the Date and Time page" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>System</h3>
+      <p class="def">What this computer is and what it's running, plus the system-wide switches.</p>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-settings-system.webp" alt="Settings on the System page" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Sound</h3>
+      <p class="def">Pyxis has its own system sounds for starting up, notifications, errors and shutting down. Set the volume from Quick settings, or pick an output and its level in Settings → Sound.</p>
+    </div>
+    <div class="sound-card" aria-hidden="true">
+      <div class="label">System sounds</div>
+      <div class="wave" id="wave"></div>
+      <div class="sound-list"><span class="tag">Start up</span><span class="tag">Notification</span><span class="tag">Error</span><span class="tag">Shut down</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ LOCK AND SAFETY ============ -->
+<section class="chapter" id="safe">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--blue-fill)"><use href="#sq"/></svg>Chapter five</div>
+    <h2>Lock and safety</h2>
+    <p>Pyxis keeps apps apart from each other and from the system, and asks you before anything important changes.</p>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>The lock screen</h3>
+      <p class="def">Lock with <kbd>Super</kbd> <kbd>L</kbd>, from Quick settings, or let Pyxis lock itself when you step away. While it's locked, nothing on screen but the lock can be seen or clicked.</p>
+      <ul class="can">
+        <li>Locks itself after a set time idle (10 minutes to begin with), and when the computer sleeps.</li>
+        <li>After five wrong passwords it makes you wait before trying again, a little longer each time.</li>
+        <li>Unlocking clears the lock away like a lens coming into focus.</li>
+        <li>Just start typing your password; there is nothing to click first. No password set? The lock opens with a press.</li>
+      </ul>
+    </div>
+    <div class="stack">
+      <figure><button class="shot" type="button"><img src="shots/tour-lock-screen.webp" alt="The lock screen at rest: a large clock, the date, and Just type to unlock" loading="lazy" width="1280" height="800"></button><figcaption>At rest: the clock, the date, and nothing else.</figcaption></figure>
+      <figure><button class="shot" type="button"><img src="shots/tour-lock-typing.webp" alt="The lock screen with the user's picture, name and a password being typed" loading="lazy" width="1280" height="800"></button><figcaption>Start typing and your picture and the password field appear.</figcaption></figure>
+    </div>
+  </div>
+
+  <div class="feature flip">
+    <div class="text">
+      <h3>Users and passwords</h3>
+      <p class="def">Your name, accent colour and password, plus the lock settings and the other people who use this computer.</p>
+      <ul class="can">
+        <li>Change your display name and accent colour.</li>
+        <li>Set or change your password.</li>
+        <li>Add or remove accounts (it asks for your password), and switch between users.</li>
+      </ul>
+    </div>
+    <figure><button class="shot" type="button"><img src="shots/tour-settings-users-lock.webp" alt="Settings on the Users and Lock page with display name, accent colours and password fields" loading="lazy" width="1280" height="800"></button></figure>
+  </div>
+
+  <div class="feature">
+    <div class="text">
+      <h3>One place asks for your password</h3>
+      <p class="def">Anything that changes the system, such as installing or removing an app, changing the network, or managing users, brings up a Pyxis dialog that says who's asking and what for.</p>
+      <ul class="can">
+        <li>It always comes from Pyxis itself, never from inside an app's window. If an app shows you a password box, it isn't Pyxis asking.</li>
+        <li>Cancel, and nothing happens.</li>
+        <li>Shut down and Restart ask too, so a stray click can't turn the computer off.</li>
+      </ul>
+    </div>
+    <div class="stack">
+      <figure><button class="shot" type="button"><img src="shots/tour-root-dialog.webp" alt="The Install software dialog asking for a password to install com.pyxis.hello 0.2.0" loading="lazy" width="1280" height="800"></button><figcaption>Installing an app asks for your password.</figcaption></figure>
+      <figure><button class="shot" type="button"><img src="shots/tour-power-dialog.webp" alt="The Shut Down Pyxis confirmation dialog" loading="lazy" width="1280" height="800"></button><figcaption>Shutting down asks you to confirm.</figcaption></figure>
+    </div>
+  </div>
+
+  <div class="feature wide">
+    <div class="text">
+      <h3>Every app in its own space</h3>
+      <p class="def">Each app runs as if it were a separate person on the computer, with its own files, its own scratch space and only the permissions it asked for when it was installed.</p>
+    </div>
+    <div class="rooms" role="img" aria-label="Diagram: four apps, each in its own box with its own files, behind a gate that only Pyxis controls">
+      <div class="room"><span class="dot" style="background:#d9a400"></span><b>Notes</b><small>its own notes<br>can't see Tasks</small></div>
+      <div class="room"><span class="dot" style="background:#6a52d9"></span><b>Tasks</b><small>its own tasks<br>can't see Notes</small></div>
+      <div class="room"><span class="dot" style="background:#14907e"></span><b>Contacts</b><small>its own contacts<br>can't see Files</small></div>
+      <div class="room"><span class="dot" style="background:#e06a1b"></span><b>A new app</b><small>only what it declared<br>signed to install</small></div>
+      <div class="gate">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+        <span><b>The system</b>: your settings, other users, the network and system files. Apps can only reach it through Pyxis, and Pyxis asks you first.</span>
+      </div>
+    </div>
+    <div class="promises">
+      <div class="promise"><b>Apps can't read each other's data</b><span>Your notes stay with Notes, your contacts with Contacts.</span></div>
+      <div class="promise"><b>Apps only do what they declared</b><span>An app that never asked for the network or your files doesn't get them.</span></div>
+      <div class="promise"><b>Only signed apps install</b><span>A package that's been tampered with, or that nobody signed, is refused.</span></div>
+      <div class="promise"><b>Apps can't watch your screen</b><span>An app can't take screenshots, read other windows, or type into them.</span></div>
+      <div class="promise"><b>A firewall is on</b><span>Unexpected connections from outside are blocked.</span></div>
+      <div class="promise"><b>Permissions you can take back</b><span>See what each app may do, and turn things off, in Settings.</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ APPS ============ -->
+<section class="chapter" id="apps">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--red-fill)"><use href="#ci"/></svg>Chapter six</div>
+    <h2>The apps</h2>
+    <p>Eight apps come with Pyxis. More can be installed with the App Installer.</p>
+  </div>
+
+  <div class="apps">
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#c87414"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span><h3>Files</h3></div>
+      <p>Browse your home folder, Documents, Downloads, Pictures and the rest. List or grid view, sort, search, new folders, and how much space is left.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-files.webp" alt="The Files app on the Home folder" loading="lazy" width="1280" height="800"></button>
+    </div>
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#d4a100"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 3h9l4 4v14H6z"/><path d="M15 3v4h4"/></svg></span><h3>Notes</h3></div>
+      <p>Write, pin, tag and search notes. Everything saves as you type, and your notes show up in desktop search.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-notes.webp" alt="The Notes app editing a note called Weekend plans" loading="lazy" width="1280" height="800"></button>
+    </div>
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#14907e"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="9" cy="8" r="3.5"/><path d="M3 20c0-3.5 2.7-6 6-6s6 2.5 6 6"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14c2 .8 3 3 3 6"/></svg></span><h3>Contacts</h3></div>
+      <p>People, grouped and starred, with their email, phone and address. Copy an address in one click, or import and export cards.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-contacts.webp" alt="The Contacts app showing Maya Chen" loading="lazy" width="1280" height="800"></button>
+    </div>
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#6a52d9"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg></span><h3>Tasks</h3></div>
+      <p>To-dos with due dates, priorities and lists. Views for Today, Upcoming and Completed, and quick add from desktop search.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-tasks.webp" alt="The Tasks app listing tasks" loading="lazy" width="1280" height="800"></button>
+    </div>
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#5a6573"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></span><h3>Settings</h3></div>
+      <p>Appearance, Sound, Accessibility, Network, Date &amp; Time, Users &amp; Lock, System and About. Changes apply everywhere straight away.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-settings.webp" alt="The Settings app" loading="lazy" width="1280" height="800"></button>
+    </div>
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#1f74ad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3v14M12 4l6 11h-6M12 7l-5 8h5"/><path d="M4 18c2 2 14 2 16 0"/></svg></span><h3>Vela</h3></div>
+      <p>The web browser, with tabs. It opens on its own start page: the time, a greeting, one box to search or type an address, and your pinned sites. Every new tab starts there too.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-browser.webp" alt="Vela on its start page: a large clock, a greeting, a search box and five pinned site tiles" loading="lazy" width="1280" height="800"></button>
+    </div>
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#1d2630"><svg viewBox="0 0 24 24" fill="none" stroke="#3ee0b5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7l5 5-5 5M12 18h7"/></svg></span><h3>Terminal</h3></div>
+      <p>A command line for people who want one, in its own window like any other app.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-terminal.webp" alt="The Terminal app" loading="lazy" width="1280" height="800"></button>
+    </div>
+    <div class="app">
+      <div class="app-head"><span class="app-icon" style="background:#d9561c"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></span><h3>App Installer</h3></div>
+      <p>Install a new app from a package file. It shows you what the app is and what it wants to do before anything is installed, and installing asks for your password.</p>
+      <button class="shot" type="button"><img src="shots/tour-app-installer.webp" alt="The App Installer" loading="lazy" width="1280" height="800"></button>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SHORTCUTS ============ -->
+<section class="chapter" id="keys">
+  <div class="chapter-head">
+    <div class="eyebrow"><svg width="14" height="14" fill="var(--yellow-fill)"><use href="#tri"/></svg>For quick hands</div>
+    <h2>Shortcuts</h2>
+    <p>These work everywhere, whichever app you're in. <kbd>Super</kbd> is the key with the Windows or Command symbol.</p>
+  </div>
+  <div class="keys-wrap">
+    <table class="keys">
+      <tbody>
+        <tr><td><kbd>Super</kbd> on its own</td><td>Open the app drawer</td></tr>
+        <tr><td><kbd>Super</kbd> <kbd>Space</kbd></td><td>Search</td></tr>
+        <tr><td><kbd>Super</kbd> <kbd>Tab</kbd></td><td>Cards: every open window</td></tr>
+        <tr><td><kbd>Alt</kbd> <kbd>Tab</kbd></td><td>Switch windows, most recent first (add <kbd>Shift</kbd> to go back)</td></tr>
+        <tr><td><kbd>Super</kbd> <kbd>D</kbd></td><td>Show the desktop, and press again to bring windows back</td></tr>
+        <tr><td><kbd>Super</kbd> <kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd></td><td>Snap a window to a side, maximize, or restore</td></tr>
+        <tr><td><kbd>Super</kbd> <kbd>Q</kbd></td><td>Close the current window</td></tr>
+        <tr><td><kbd>Super</kbd> <kbd>L</kbd></td><td>Lock</td></tr>
+        <tr><td>Start typing on the desktop</td><td>Search, with what you typed already in it</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Close a panel, or cancel Alt+Tab</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<footer>
+  <span>Pyxis 0.1.0, alpha 5 · November 2026</span>
+  <span>Screenshots from a running Pyxis system at 1280 × 800.</span>
+</footer>
+
+</div>
+
+<dialog id="zoom" aria-label="Enlarged screenshot">
+  <img id="zoom-img" alt="">
+  <p id="zoom-cap"></p>
+</dialog>
+
+<script>
+(function () {
+  var dlg = document.getElementById('zoom');
+  var img = document.getElementById('zoom-img');
+  var cap = document.getElementById('zoom-cap');
+  document.querySelectorAll('button.shot').forEach(function (b) {
+    var i = b.querySelector('img');
+    b.setAttribute('aria-label', 'Enlarge: ' + i.alt);
+    b.addEventListener('click', function () {
+      img.src = i.src; img.alt = i.alt; cap.textContent = i.alt;
+      if (dlg.showModal) dlg.showModal();
+    });
+  });
+  dlg.addEventListener('click', function () { dlg.close(); });
+
+  var wave = document.getElementById('wave');
+  for (var k = 0; k < 48; k++) {
+    var h = Math.round(18 + 78 * Math.abs(Math.sin(k * 0.55) * Math.cos(k * 0.17)));
+    var bar = document.createElement('i');
+    bar.style.height = h + '%';
+    wave.appendChild(bar);
+  }
+})();
+</script>

@@ -22,7 +22,7 @@ A full desktop Linux OS built from scratch, architecturally descended from two r
 | **Rockhopper** | Hardware abstraction + legacy (FirefoxOS-era) compat layer (formerly "Persephone", then briefly "Shift" — "Shift" is now the system orchestrator's name instead, see below) | `rockhopper/` (workspace member) | Real, substantial (~2,300 lines): `wayland.rs`, `dbus_session.rs`, `elf_loader.rs`, `compatibility.rs`. |
 | **Shift** | System orchestrator: process supervision, boot ordering, power states (formerly "Cronus") | `shift/` (workspace member) | **Real bookkeeping over a simulated process layer** (~1,800 lines). The process table, tree, lifecycle log and limits are real; beneath them `fork_and_exec` spawns nothing, resource sampling returns constants, and the Echo methods (`LaunchProcess`, `TerminateProcess`, …) answer success without acting. `shift-daemon` runs at boot and launches nothing. It used to `kill(2)` its bookkeeping ids as though they were kernel pids; since 2026-09-25 it refuses to signal anything it didn't spawn, which is everything. Wire the Echo stubs to the library **only** after `fork_and_exec` is real. |
 | **Vroom** | **Pyxis SDK/PDK packaging toolchain** — builds/packages/installs web (SDK) and native (PDK) apps as `.ipk` via `pyxis`/`pyxis-sdk`/`pyxis-pdk` CLIs (repurposed 2026-07-25; its previous life as a "GPU acceleration / perf monitoring" layer, formerly "Kratos", was audited and confirmed **100% simulated** — hardcoded dashboard numbers, fake GPU structs, zero consumers — and deleted) | `vroom/` (workspace member; spec `vroom/docs/pyxis-sdk-pdk-spec.md`, schemas `vroom/schemas/`, reference script `vroom/tools/`) | Real: `pyxis.json` project config + validation, `appinfo.json`/`CONTROL/control` generation, staging tree, `.ipk` emission (`opkg-build` when present, built-in root-owned tar.gz writer otherwise), web builders (static/vite/webpack via npm), native builders (cmake/meson/cargo/make/qmake), device profiles + scp/ssh `opkg install`, `new` templates, `doctor`/`lint`/`inspect`. **Phase 3 done 2026-07-25** (`vroom/docs/pyxis-phase3-implementation.md`): service packaging (`pyxis.json` `services[]`, policy-gated activation via `/etc/pyxis/allow-packaged-services`), upgrade-aware maintainer scripts (postinst/prerm/postrm + `packaging/` overrides), and the registry/launcher side — which is **Nova + `pyxis-appctl`** (a thin Echo client in `echo/src/bin/appctl.rs`), deliberately *not* the spec's standalone registry daemon. |
-| **Installer** | `.ipk`/opkg package installation service (`org.geckoOS.installer`): discovery, metadata-without-install, `opkg install`/`remove`, each followed by a Nova registry refresh. Frontend is the Remochi **App Installer** app (`pyxis-experience/packages/apps/installer`, Wizard-based). | `echo/src/services/installer.rs` (in-process in echo-daemon) | Real (added 2026-07-25). Owns the *package* layer only — opkg owns files + status db, Nova owns identity/launch (hence `Nova::uninstall` refusing ipk apps and pointing at `opkg remove`). Install paths are canonicalized and confined to `/var/lib/pyxis/incoming`, `/media`, `/tmp`, `/home`, `/root`. See `vroom/docs/pyxis-phase3-implementation.md` §7. |
+| **Installer** | `.ipk`/opkg package installation service (`org.geckoOS.installer`): discovery, metadata-without-install, `opkg install`/`remove`, each followed by a Nova registry refresh. Frontend is the Remochi **App Installer** app (`pyxis-experience/packages/apps/installer`, Wizard-based). | `echo/src/services/installer.rs` (in-process in echo-daemon) | Real (added 2026-07-25). Owns the *package* layer only — opkg owns files + status db, Nova owns identity/launch (hence `Nova::uninstall` refusing ipk apps and pointing at `opkg remove`). Install paths are canonicalized and confined to `/var/lib/pyxis/incoming`, `/media` and `/home`, and since 2026-11-16 a package must carry a valid detached signature unless the dev-image marker allows unsigned (see "Wave 2" under Bus permissions). See `vroom/docs/pyxis-phase3-implementation.md` §7. |
 | **Nova** | App runtime host: manifest/origin/install/launch-composition layer above `appHost` (formerly conceptual "pyxis-hostd") | `echo/src/services/nova.rs` (in-process in echo-daemon, **not** a standalone `nova/` crate) | **Real** (~1,900 lines), registered in `echo/src/bin/daemon.rs` (`register_nova_handlers`). Does `manifest.webapp` discovery/validation, `pyxis://` origin mapping (`origins.map`), native-manifest generation, launch composition (delegates to `appHost`), install/uninstall (sha256 integrity + atomic swap), and Evo-visibility-driven suspend/resume. Built in-process rather than as the standalone daemon `nova-runtime-host-plan.md` §8 specifies (deliberate: reuses the one proven request-dispatch path; standalone-crate extraction is a tracked follow-up per the user's "wire in now, extract later" call). At **reload** it pre-generates each app's native `manifest.json` (a `setpriv`-wrapped `vela` launch that drops to geckouser + grants video/render groups) so `appHost.ListApps`/`LaunchApp` see the full app set. **Since 2026-07-25 it is also the ipk-app registry** (SDK/PDK spec §10): scans `/usr/pyxis/applications/*/appinfo.json` (both `web` and `native` runtimes — native apps get a setpriv-wrapped direct-exec manifest, no vela/profile), writes derived manifests to the Nova-owned `/var/lib/pyxis/nova/native/` (AppHost's third scan root; never into the opkg-owned app dir), maps appinfo's §19 permission vocabulary onto the bridge capabilities (deny-by-default for unmapped ones), and refuses `Uninstall` for opkg-owned apps. Driven from devices by `pyxis-appctl` (rescan/list/info/launch/close/focus). **Every app launch is `pyxis-wlctx`, run as root, which makes the app's own Wayland socket (carrying the app id) and drops to the app user `pyxisapp` (uid 1001) itself** — see [Wayland trust classes](#wayland-trust-classes-evo). |
 | **gecko** | Gecko/Firefox integration + native bridge host process | `gecko/` (workspace member) | Native-messaging host (`native-host.rs`) is real and working. `gecko/src/gecko.rs`'s libxul-FFI-embedding scaffolding is **obsolete direction** — no maintained desktop libxul embedding API exists (GeckoView is Android-only, EmbedLite is Sailfish-only/stale). Superseded by the from-source custom-Gecko-build plan (see below); `gecko.rs` should be repurposed as launcher/supervisor, not an embedder. |
 | **Puppis** | Gecko native-app lifecycle management (launch/suspend/resume/terminate, resource tracking) | `puppis/` (workspace member) | Real (~730 lines), used by Rockhopper's daemon (`GeckoAppLauncher`). Extracted 2026-07-07 from the old `gaia` crate — `gaia` was a full legacy shell (its own actix-web HTTP/WebSocket server serving a static JS UI, long superseded by Bloom, plus several source files that turned out to be entirely orphaned — never even wired into its own module tree). Only `gecko_app_launcher.rs`, the one piece of `gaia` genuinely still in use, was kept; the rest (`ui_server.rs`, static assets, its own now-unused `node_modules/` JS build pipeline) was deleted rather than carried forward under a new name. `suspend_app`/`resume_app` (real webOS-style freeze/thaw logic) already live in this crate — still worth wiring into Nova/appHost per the roadmap below, just not discarded. |
@@ -137,11 +137,11 @@ directly, and this is the half that covers it.
   PipeWire itself stays geckouser's, `wpctl` is echo's. The GPU needs only the `video`/`render` gids,
   set per launch. The Gecko content sandbox is unchanged in kind: it runs as
   pyxisapp with user namespaces.
-- **Apps still share one uid**, so the kernel doesn't separate app A from app B
-  (their data dirs are all pyxisapp's; the bridge's scopes and the filesystem
-  service's confinement are what do). A uid per app is the next step: it
-  touches `APP_UID`/`app_owner`, the `--uid` Nova passes, and the runtime dir,
-  and nothing else.
+- **Every app has its own uid since 2026-11-16** (wave 2, see [Bus
+  permissions](#bus-permissions-and-hardening-wave-1)): pyxisapp 1001 is now
+  only the fallback (`PYXIS_PER_APP_UID=0`, or a uid table that can't be
+  written). What is above about "pyxisapp" holds per app: its own uid and
+  private gid, its data dir as `HOME`, `/run/user/<uid>`, and a private `/tmp`.
 - Why a security context, not the alternatives: *pid lookup in appHost*
   is asynchronous (a global's `can_view` filter is synchronous), racy against
   pid reuse, and makes the compositor call back into Echo from its hot path.
@@ -169,9 +169,11 @@ directly, and this is the half that covers it.
 - Not filtered, on purpose: `ext-idle-notify` (a timing side channel only;
   smithay has no filter for it), `keyboard-shortcuts-inhibit` (honoured for the
   focused app, as a game would expect), xdg-activation/foreign (focus- and
-  token-bound). A window's *title* is still the client's text, so an app can
-  caption itself "Files": the SSD bar cannot yet tell the user whose title
-  it is.
+  token-bound). A window's *title* is still the client's text, but since
+  lane E the bar's primary label is the app's name from `SetAppIdentity`,
+  looked up by the trusted app id, with the client's title after it, quieter:
+  an app captioning itself "Files" reads "Weather · Files". With no table
+  (Bloom on a vela without the bridge entry) the title is the client's own.
 - On-device suite: `scripts/serial-tests/alpha5-wayland-trust.txt`, with
   `pyxis-wlprobe` (`echo/src/bin/wlprobe.rs`) as the test client. Both new
   binaries are staged by `create-rootfs.sh`; for `--push` runs they must be
@@ -206,6 +208,64 @@ establish, so don't re-derive it:
 Consequence for the open bugs: #7 (maximize→unmaximize crash), #8, #9 and #11
 (resize) are all **Evo SSD work**, not GTK's. They are not blocked on a
 decision — the decision is above.
+
+**Identity (built 2026-11-11, visual-identity lane E; `evo/src/shell/{identity,busy,ssd}.rs`,
+plan `docs/internal/pyxis-visual-identity-plan.md`).**
+
+- **Waterdrop frame**: corners `identity::CORNER_RADII` = 16 4 16 16
+  (top-left, top-right, bottom-right, bottom-left), as `identity::Radii`,
+  square when maximized/fullscreen. Lane T's contract test in pyxis-experience
+  reads `identity.rs` by name: keep `CORNER_RADII` and the `SPINNER_*`
+  constants' names and shapes. Every rounded consumer takes all four corners:
+  the glass and border arcs (`ssd.rs`), the shadow (`ShadowStyle.radii`; the
+  closed form picks each row's left and right corner, so per-quadrant is
+  exact), Bloom's open clip (`BloomFx` lands each corner on its own), the
+  glint, Lumen's `Params.radii` (Droplet starts from
+  `WindowElement::picture_radii`, so a maximized window starts square;
+  Recede likewise). The shaders share `radii_glsl!()` (`corner_of`, `rbox4`;
+  y down). Evaporate does not clip (its snapshot carries the frame's alpha).
+  The client clip (`ClippedSurface`) is unchanged: both bottom corners are 16
+  (`depth::CONTENT_RADIUS`, a const assert keeps them equal).
+  `cargo test dump_shaders -- --ignored` with `EVO_SHADER_DUMP=<dir>` writes
+  every such shader out for a host GLES compile (surfaceless EGL works on the
+  dev box, radeonsi and llvmpipe).
+- **Controls**: the remochi spinner's shapes and colours (`SPINNER_*` and
+  their outlines), 14 px centred in the 32 px targets, rasterized from SDFs
+  (`rasterize_control`). Inactive: outlines in the title's quiet ink,
+  crossfading with the filled shapes over the focus token. Controls and the
+  glass are drawn at the window's alpha; only the label dims when inactive
+  (a dimmed glass turned the wallpaper's colour). **Every title-bar buffer is
+  premultiplied** in `memory_buffer` (the renderer blends textures as
+  premultiplied): rasterized straight, anti-aliased edges showed as a bright
+  fringe, and light text on the dark bar smeared.
+- **Busy** (`shell/busy.rs`): `xdg_wm_base.ping` when a window takes focus
+  (`focus_changed`) or is clicked (`on_pointer_button`), and every 5 s
+  (`busy_tick`, in `process_pending_window_actions`); no pong in 2 s = busy
+  until the next pong. State is per client, in the `ShellClient`'s data map
+  (smithay allows one ping out at a time). Busy slots run the spinner's
+  morph (`busy::morph`, 1.1 s, slots a third apart); a hovered slot shows its
+  own control, so close stays close. Reduced: each slot blinks its colour in
+  place; off: each shape's own dark outline (inactive's are quiet ink).
+  `ListWindows` entries gain `busy`. `pyxis-wlprobe window APP SECS
+  [--no-pong | --pong-after N]` is a mapped, SSD test window.
+- **Title** (`identity.rs`): `org.geckoOS.evo SetAppIdentity {apps:[{app_id,
+  name, accent, icon}], dark}` → `{ok, apps, icons}` (bridge `windows:manage`,
+  **needs a vela rebuild** for Bloom to send it; echo-cli works now). Icons are
+  PNG data URLs decoded once and scaled to 20 px; a bad icon or accent is
+  dropped from its entry, never costing the name. The bar shows icon + bold
+  name looked up by the trusted `app_id()` (never the claim; X11 windows never
+  get one), then the client's title in quiet ink only when it adds anything,
+  with vela's `pyxis://<id> - ` prefix and ` — <brand>` suffix stripped. The
+  bar's fill is frost of the wallpaper since 2026-11-12 (see [Frosted title
+  bar and lock screen](#frosted-title-bar-and-lock-screen)); the accent is
+  its bottom seam and the ink is fixed per theme.
+  `ListWindows` entries gain `title_label`. Bloom: `useAppIdentity`
+  (overlay), which rasterizes each app's waterdrop icon on a canvas.
+- On-device suite: `scripts/serial-tests/alpha5-identity-evo.txt` (push the
+  two icons in `scripts/serial-tests/identity-icons/`; its header has the
+  command line). Passed 2026-11-11 on the 11-09 image with evo, echo-cli and
+  pyxis-wlprobe pushed. vela's real title is `pyxis://notes - Notes —
+  Nightly`, which the bar shows as just "Notes".
 
 **Depth (built 2026-11-07, lane D; `evo/src/anim/{depth,shader}.rs`).** The
 frame reads as one rounded card above whatever is beneath it:
@@ -368,7 +428,8 @@ overlay is transparent), so it is a flat translucent bar now.
   can be laid over a rootfs without a rebuild: `serial-test.py --push
   ../pyxis-experience/dist:/usr/share/geckoOS/apps/bloom/webroot` (a directory
   pushes its files).
-- Not done: the lock screen (the overlay is where it goes), and no IPC to put
+- The lock screen lives here too (built 2026-11-12; see [Frosted title bar
+  and lock screen](#frosted-title-bar-and-lock-screen)). Not done: no IPC to put
   an app fullscreen, so the fullscreen-hides-the-shell path is unit-reasoned
   and not covered on device.
 
@@ -460,6 +521,18 @@ overlay is transparent), so it is a flat translucent bar now.
   request made while one is out runs after it, and a list that may have
   missed a signal is followed by another once the sample has caught up
   (`compositorWindowsProvider.test.tsx` replays the race).
+  **A second way, found by the identity sweep (fixed 2026-11-11):** Evo sends
+  `WindowCreated` at map time, when most windows have no app id yet
+  (`"unknown"`), and nothing when the id arrives, and the desktop's first
+  `ListWindows` can be a sample from before vela has named a window. About one
+  boot in two the store kept a full-screen window as `vela-default` (seen with
+  the exposure line's `store=bloom,vela-default`) that no later signal
+  touched, so the wallpaper paused for the whole run. Now the first list, and
+  any window created with an unresolved id (`unknown`, `vela-default`, empty),
+  start up to `ID_RETRIES` relists a second apart until the list gives it an
+  id or no longer has it, and the exposure filter trusts the list's app id
+  over the store's. `PYXIS-WALLPAPER-EXPOSURE` now ends with `store=<ids>`
+  (every window the store holds); 4 of 4 runs passed after, 1 of 3 before.
 - **Cost** (4 GB VM, software GL, Evo plus every geckouser process): idle
   desktop +5.0 points of one core flowing against still (budget 8); a floating
   app on screen +7.1-7.6; a maximized app 0 (paused); a Files open 45-47 fps
@@ -480,11 +553,208 @@ overlay is transparent), so it is a flat translucent bar now.
   `ThemeWrapper` by the theme, which rebuilt every app (losing what was on
   screen) at every change, twice a day with Auto. `ThemeSync` now steers the
   wrapper's own theme from inside (`appShellTheme.test.tsx`).
-- Not done: More Daylight families, the bar and dock tinting from the
-  wallpaper, a GeoIP/Wi-Fi location. remochi's `Button` draws its "( )" caps
+- Not done: More Daylight families, a GeoIP/Wi-Fi location. (The shell's
+  tint from the wallpaper is done: see [Visual identity](#visual-identity-the-shell).)
+  remochi's `Button` draws its "( )" caps
   as text, so a bare `Button` reads as "(Set by hand…)" on device; not worth
   working around, since the apps are to be rebased onto Duyo (the user's new
   UI framework, a separate integration path).
+
+## Visual identity (the shell)
+
+**Built 2026-11-11** (the shell read as macOS; plan, lanes and the decisions:
+`docs/internal/pyxis-visual-identity-plan.md`; mockups:
+`docs/internal/mockups/pyxis-identity.html`). Built from what Pyxis already
+had: the waterdrop corner (16 4 16 16, top-right sharp, from the app icons),
+the app's accent as light, Daylight's palette, Mochi type, and the remochi
+spinner's shapes and colours as the window controls (kept by the user's call;
+Evo's half is in [Window decoration model](#window-decoration-model),
+"Identity"). All React, each new component self-contained, so the Duyo
+port's Phase 3 can wrap it rather than rewrite it.
+
+- **Tokens** (lane T): SDK `packages/app-sdk/src/identity.ts` (`CORNER`,
+  `waterdrop(size)`, `SPINNER`, `IDENTITY_FONTS`, `shellTint`, new exports
+  only) and Bloom's `src/styles/identity.css` (`--px-corner*`,
+  `--px-spinner-*`, `--px-font-*`, `.px-display/.px-ui/.px-accent`).
+  `identityContract.test.ts` reads `evo/src/shell/identity.rs` and fails when
+  the corner or spinner values drift.
+- **Tint** (`useShellTint`, mounted in both Bloom documents; pure maths in
+  `shellTint(palette, theme)`): from the wallpaper's own palette (`skyFor`,
+  honouring `pinnedTime`), mixed in OKLab. Three families of variables, and
+  which to use matters:
+  - `--px-ink*`: text drawn **on the wallpaper** (the strip). Follows the
+    wallpaper, not the theme (light at night, dark by day), >= 4.5:1 against
+    the palette's mean.
+  - `--px-material*` / `--px-material-ink*`: **panels** (quick settings, the
+    centre, the drawer, cards, search). Follows the theme.
+  - `--px-edge-material*` / `--px-edge-ink*`: **the launch bar** and what sits
+    on it (Apps/Cards tiles, dashboard chips). Follows the wallpaper, like the
+    ink. Added after the first device run: with the image's light theme the
+    bar was a pale band across a night wallpaper.
+- **Status strip** (lane N, `TopSystemBar.tsx`, `STATUS_STRIP_HEIGHT` 36): no
+  background, `--px-ink` with a legibility shadow. Search as an underline
+  ("Just type", `DesktopSearch.tsx`), the clock centred in Mochi Light, the
+  status cluster (Wi-Fi, volume, battery) opening quick settings. The Bell and
+  the Settings gear are gone. Work-area top inset: 36.
+- **Launch bar** (lane B, `LaunchBar.tsx`, replacing the deleted
+  `BottomDock.tsx`): 64 px, full width, flush with the bottom edge, its
+  material fading up from the edge, no blur. Apps and Cards at the left end
+  (Apps centre `DX+36`), app icons in the middle as 40 px accent waterdrops,
+  52 px apart, centred on the screen; running = a 3 px accent line on the
+  screen edge (focused longer, starting pulses, minimized faint, crashed red).
+  Every dock contract kept (`data-shell-edge="bottom"` + `data-app` for
+  minimize targets, the Lumen ripple). Work-area bottom inset: 64.
+- **Dashboard** (`NotificationDashboard.tsx`, at the bar's right end): the
+  newest one or two unread notifications as chips, then a count in spinner
+  red, which opens the centre (`DX+DW-27`, there only while a notification is
+  stored). Toasts rise from above it (`NotificationToasts.tsx`, stack right
+  edge 1268, bottom 728); the centre opens upward from it.
+- **Cards, drawer, quick settings** (lane C): waterdrop panels in the strong
+  material, display-type heads (`CARDS`, `APPLICATIONS`, `QUICK SETTINGS`),
+  card title strips tinted with the app's accent and the chosen card ringed
+  in it; the overview's flights and thumbnails untouched (the picture's top
+  corners are the frame's, scaled). Quick settings' controls moved: volume
+  slider line at `PANELT+295`, track `PANELR-318`..`PANELR-62`; Do Not Disturb
+  at `PANELR-56, PANELT+88` (`PANELT` = strip + 8, `PANELR` = right - 14).
+- **Suites re-aimed** for the layout (`alpha5-bridge-deny`, `-bridge-signals`,
+  `-overlay`, `-shell-layering`), and the old vela's refusal of
+  `SetAppIdentity` is excluded where they check vela.log, as the earlier
+  bridge entries are. New suite `alpha5-identity.txt` (strip and bar rects,
+  the 36/64 work area, toasts bottom right, title-bar names, centre, quick
+  settings, drawer, cards, shots at four pinned times); on a vela without
+  `SetAppIdentity` it stands in with echo-cli (`IDENTITY-STAND-IN`).
+  Swept 2026-11-11 on the 11-09 image: `alpha5-identity`, `-identity-evo`,
+  `-bridge-deny`, `-bridge-signals`, `-overlay`, `-shell-layering`,
+  `-shortcuts-shell`, `-notifications`, `-thumbnails`, `-windows`, `-audio`
+  and `-wallpaper` all pass (303 assertions), with evo, echo-cli,
+  pyxis-wlprobe, the shell's `dist` and the two test icons pushed (the
+  command line is in `alpha5-identity.txt`'s header) until the next image.
+- **Left rail** (2026-11-12): `pyxis.launchBar.position` = `bottom` (default)
+  | `left`, in Echo's schema and the SDK's copy, chosen in Settings →
+  Appearance ("Launch bar", `data-launch-bar-choice`). The rail is 64 px wide
+  below the strip (`0,36 64x764`), Apps and Cards at the top, icons 52 px
+  apart, running lines on the left edge, the dashboard count alone at the
+  bottom (no chips); toasts and the centre anchor `left: 76, bottom: 12`
+  (`RAIL_ANCHOR` in `launchBarState.ts`). Work area `{top 36, bottom 0, left
+  64}`; a switch re-sends it and Evo re-fits windows off the rail (Evo needed
+  no change: `SetWorkArea`'s `left` was already honoured). The edge marker is
+  `data-shell-edge="left"`, and `useMinimizeTargets` measures `[data-shell-edge]
+  [data-app]`, so Droplet lands on the rail's icons.
+- **Dialogs** (2026-11-12, restyled 2026-11-16): `ShellDialog.tsx` is the
+  shell's own scrim (`data-shell-region`, the overlay keyboard, Escape cancels
+  and Enter confirms, both taken in the capture phase so the panel beneath
+  stays open) around **remochi's dialog card** (`mochi-dialog` header, title,
+  `Divider`, content, actions; error tone = `mochi-dialog--error`) with
+  **remochi caps Buttons** (`ShellPill` wraps `Button`: primary = blue,
+  destructive = warning; not the `drop` appearance, by the user's call). The
+  privilege prompt is built the same way, with remochi's `Input`. remochi's
+  own `Dialog` component can't be used in the overlay: its overlay element
+  takes no region marker and its keyboard handling isn't the overlay's, and
+  its card is `opacity: 0` outside that overlay, so the shell sets the resting
+  pose itself. Used for the Launch Error (`launch-error`) and the Restart /
+  Shut Down confirm (`restart`, `shutdown`; cancel is
+  `[data-dialog-action="cancel"]`). Buttons carry `aria-label` = their text
+  (the caps' brackets are text, so the name was "(OK)").
+- `LeftLauncher.tsx` (and `src/styles/pinned-item-overrides.css`, only it
+  imports) is imported nowhere, dev server included: dead code, left for the
+  user to delete.
+- **The apps and Duyo**: the identity stops at Bloom's two documents; what
+  remochi, Duyo, the SDK and Phase 3 need for it to reach the apps (corner,
+  material and accent tokens; remochi's theme-variable shadowing trap; a
+  per-app accent in the manifests) is in `docs/internal/pyxis-identity-upstream.md`.
+- **Design calls made 2026-11-12**: remochi's scallop aligns with the waterdrop
+  where appropriate, apps keep the Button caps, and what the title bar *says*
+  is held for the Gecko port's branding. The frosted title bar and the lock
+  screen followed: [Frosted title bar and lock screen](#frosted-title-bar-and-lock-screen).
+- **The next image** carries all of it (binaries, Bloom and the eight apps, the
+  test icons in `/usr/share/pyxis-test/`; the vela bridge needs no compile,
+  its JS is copied): `docs/internal/next-image-checklist.md`.
+
+## Frosted title bar and lock screen
+
+**Built 2026-11-12** (plan, mockups and the binding "Contracts" section:
+`docs/internal/pyxis-glass-and-lock-plan.md`,
+`docs/internal/mockups/pyxis-glass-and-lock.html`, which has a live lock
+prototype). Verified on device by `alpha5-frost.txt` (43 checks) and
+`alpha5-lock.txt` (70 checks) on the 11-09 image with evo, echo-daemon,
+echo-cli and Bloom's dist pushed.
+
+- **Frost** (`evo/src/shell/frost.rs`, `FrostElement` in `anim/shader.rs`):
+  the title bar is real glass, since Evo can see behind it. Tier **F1**
+  captures the desktop window (Bloom's wallpaper) when its surface *tree*
+  commits, at most 4 times a second, shrinks it to 1/8, blurs and veils it per
+  theme (light: 52% toward `#fcfbf8`, OKLab L >= 0.86, chroma x1.25 cap 0.06;
+  dark: 50% toward `#101228`, L <= 0.30, cap 0.07; inactive: chroma x0.35, veil
+  +0.20, a second texture), and each bar draws the crop under itself with grain,
+  a 1 px white rim on top and the app's accent as a 1 px seam at the bottom
+  (the accent left the fill). The lightness band keeps the ink fixed per theme
+  (`#2a2620` / `#ece9e3`, >= 7:1 over any wallpaper, a unit test sweeps it).
+  **F0** is one flat colour (Bloom's `material` from `SetAppIdentity`, veiled)
+  for `SetFrost off`, no GL, a failed shader, or a bar not yet drawn once. **F2**
+  (frost of other windows under the bar) is not built: over another window a
+  bar shows the wallpaper; `frost.rs`'s header names the seam.
+  - **Watch the whole surface tree.** vela paints into a subsurface, so the
+    desktop's own toplevel hardly commits: watching it alone left the frost
+    showing the first palette it saw. `tree_commit` sums every surface's
+    counter, reading each from the states `with_surface_tree_downward` hands
+    over. **Never call `with_renderer_surface_state` inside that walk**: it
+    re-locks the surface the walk holds and hangs the compositor thread (it
+    did on device: the IPC thread still answered, so only the screen died).
+  - Cost (4 GB VM, software GL): an update 3-7 ms (readback included, budget
+    10 ms, `over_budget` counts the rest), ~20 updates in 5 s over a flowing
+    wallpaper, 0 with nothing moving; fps 23-26 with frost on against 19 with
+    it off in the same run (no cost seen).
+  - Switches (echo-cli only): `EVO_FROST=off|wallpaper`, `evo.SetFrost
+    {mode}`, `evo.GetFrostState` → `{mode, program, tiers{id: f0|f1}, updates
+    {f1}, last_ms, over_budget, skipped}`.
+- **Lock: Evo owns what is secret, Echo the decision, Bloom the look.**
+  - **Echo** (`echo/src/services/session.rs`, `accounts.rs`): `org.geckoOS.session`
+    `lock`/`unlock`/`getState` and `org.geckoOS.accounts` `list`/`setPassword`/
+    `setProfile`. Passwords are checked against `/etc/shadow` with libxcrypt's
+    `crypt_r` (no PAM: the build host has no libpam headers), set with
+    `chpasswd`. Rate limit in the daemon (5 tries, then 30 s doubling to 15
+    min). `Message`'s `Debug` prints `<redacted>` for `session.unlock` and
+    `accounts.setPassword` (the routing and daemon debug lines print whole
+    messages). geckouser has no password on the image (`*`): the lock is then
+    press-to-enter. Settings keys `pyxis.lock.after` (null|1..120 min, 10),
+    `pyxis.lock.onSleep` (true), `pyxis.lock.notifications` (hidden|count|full).
+    `power.sleep` locks first.
+  - **Echo tells Evo without bus identity**: echo-daemon writes 32 random bytes
+    (hex) to `/run/pyxis/session.key` (root 0600) at start; every
+    `LockChanged {locked, seq, mac}` carries an HMAC-SHA256 of
+    `pyxis-lock:<0|1>:<seq>`. Evo locks on any lock signal and unlocks only on
+    a verified mac with a fresh seq (re-reading the key once on a failure);
+    `echo-cli emit` forgeries are refused and counted. Any client can still
+    *guess* through `session.unlock`; the rate limit is what holds.
+  - **Evo** (`evo/src/shell/lock.rs`, `anim/{veil,clear}.rs`): while locked
+    `output_elements` draws only the overlay (and the Veil's ghosts) over black,
+    input goes to the overlay or nowhere, the keyboard is forced to it, every
+    shortcut and VT switch is off, window actions except `SetWorkArea` are
+    refused, thumbnails answer `[]`. The overlay dying leaves it locked and
+    black. Lock sources: Super+L, `evo.Lock`, idle (`SetIdleLock {seconds}`,
+    from Bloom's `pyxis.lock.after`), `LockChanged {locked:true}`. **Veil**
+    (600 ms): snapshot ghosts blurring, greying and fading through Lumen.
+    **Clear** (900 ms): live surfaces through Bloom's open shader, blur 14 → 0
+    and 1.04 → 1 about `SetLockOrigin` (Bloom's field), while Bloom's opaque
+    lock layer opens a hole `r = D(0.5t + 0.5t²)`. After unlock Evo hands the
+    keyboard to the front app (not gated on the overlay's keyboard note: a
+    lock's focus is forced, and the gate left no window focused on device).
+    `GetLockState` (echo-cli) for suites.
+  - **Bloom** (`src/lock/`, `ShellLayer`'s lock mode, `useIdleLock`, SDK
+    `session.ts`/`accounts.ts`/`useSession.ts` on `EchoClient.callMethodStrict`
+    so a refused call never falls back to the mock's success): lens clock
+    (`-moz-element` of its own Daylight on Gecko, a lightened gradient
+    elsewhere), states rest/awake/verify/wrong/wait/unlocking/ambient/no-password
+    (`data-lock-state`), Lock in quick settings. Settings → **Users & Lock**
+    (`data-settings-section="users"`): profile, password, lock settings, Lock now.
+  - **Needs the rebuilt vela** for Bloom to call `session.*`, `accounts.*` and
+    the evo lock methods (all new bridge entries, `regen --check` passes). On
+    the 11-09 vela they are refused, so the overlay draws the ordinary shell
+    over black while locked, and the suite drives `session.*` with echo-cli.
+  - **Found by the suite, not the lock's:** after `pkill -9` of the shell's
+    vela, no shell came back within a minute on the 11-09 image, though
+    geckoOS-boot runs it under `supervise_daemon`. Unexplained; the lock suite
+    prints it instead of asserting it.
 
 ## Global shortcuts (Evo)
 
@@ -1149,6 +1419,23 @@ module's API for later lanes is the header of `anim/mod.rs`).
   diagnoses were wrong because every probe fired at or before load;
   `PYXIS-DIAG chrome-late:` logs the settled state 5s in and is what
   `scripts/serial-tests/kiosk-relaunch.txt` asserts on.
+- **App windows get the browser's shortcuts** (2026-11-16): the
+  browser-init.js patch disables every `<key>` in `mainKeyset` for a
+  `pyxisapp` window, so Ctrl+N/T/W/L/F/Q reach the page. Many are `reserved`
+  (a page can't preventDefault them), and Ctrl+N in Notes/Contacts/Tasks used
+  to open a full Firefox window inside the app. Copy/paste (`editMenuKeys`)
+  and the external browser are untouched. The dev vela loads browser-init.js
+  from source through a symlink, so on an image it can be pushed to
+  `/usr/lib/pyxis-gecko/browser/chrome/browser/content/browser/browser-init.js`
+  with no rebuild.
+- **Vela's start page** (2026-11-16): a static page the browser app ships
+  (`pyxis-experience/packages/apps/browser/public/start/`, the dashboard's
+  pinned sites, a DuckDuckGo box, a clock and a sky that follows the hour),
+  opened as `file:///usr/share/geckoOS/apps/browser/webroot/start/index.html`
+  so the browser window gives it no bridge. Nova writes it into the browser
+  profile's user.js only (`BROWSER_START_URL`, `browser_start_prefs`) as
+  `browser.startup.homepage` and `pyxis.newtab.url`, which the
+  AboutNewTab.sys.mjs patch reads (Firefox has had no new-tab pref since 41).
 - **`CONFIG_USER_NS` and sound are on from alpha 5** (`scripts/build-kernel.sh`'s
   `ensure_y` list; the real kernel config is `scripts/.config` plus that list,
   **not** `mini/linux/.config`, which is an older kernel the image does not
@@ -1164,8 +1451,9 @@ module's API for later lanes is the header of `anim/mod.rs`).
   The reaper now waits only on the pids it launched
   (`AppHost::reap_once`). Anything else that spawns must wait on its own
   child (`process.rs` and `terminal.rs` do).
-- **remochi is 0.4.0 since 2026-11-09** (with `@duyojs/duyo` 1.1.0; port plan
-  `docs/internal/pyxis-duyo-port-plan.md`). 0.4 renamed `Button`'s `variant`
+- **remochi is 0.5.1 with `@duyojs/duyo` 1.1.3 as of alpha 5** (0.4.0 /
+  1.1.0 came in 2026-11-09; port plan `docs/internal/pyxis-duyo-port-plan.md`;
+  both repos are in `~/Development/`). 0.4 renamed `Button`'s `variant`
   to `type` (`htmlType` is the native one). It also fixed the two traps
   below, whose workarounds are still in the code until the Duyo port removes
   them:
@@ -1189,9 +1477,9 @@ module's API for later lanes is the header of `anim/mod.rs`).
 
 `dbus.rs`'s `todo!()` test, the `ouranos.service` unit, Bloom's dead components/orphan `.scss`/`tsconfig-json.json`, the "12 `no-explicit-any` errors", `AppDrawer`'s phantom launcher entries, `useEcho.ts`'s react-hooks/refs violation, "Evo minimize not implemented", `apphost.rs`'s doc comment, and the claim that Nova scans `/usr/palm/applications` (it scans `/usr/pyxis/applications`) were all carried here long after the code stopped matching them.
 
-## The one thing webOS got right that Pyxis hasn't built
+## The one thing webOS got right, and Pyxis now has
 
-webOS's LS2 bus enforced a **JSON role-file allow-list per identity** *at the bus itself*, before any message was delivered. Pyxis enforces at the **bridge** instead (`PyxisBridgeParent`'s `BRIDGE_CAPABILITIES`, deny-by-default since 2026-09-27, checked against the app's declared `permissions[]`), which covers every `pyxis://` app but **not** a native client that opens the Echo socket directly: `echo-cli` can still call anything. So the gap is narrower than this section used to claim — it is bus-level enforcement for non-bridge clients, plus the user-visible half (install-time prompt, per-app view, revoke) in roadmap item 6. See `nova-runtime-host-plan.md` §5/§7 and `pyxis-webos-parity-analysis.md` §4 item 6.
+webOS's LS2 bus enforced a **JSON role-file allow-list per identity** *at the bus itself*. Pyxis now does both halves: the **bridge** (`PyxisBridgeParent`'s `BRIDGE_CAPABILITIES`, deny-by-default since 2026-09-27) for `pyxis://` pages, and **Echo itself** for every socket client (2026-11-16, see [Bus permissions](#bus-permissions-and-hardening-wave-1)). What is left of this item is the user-visible half (install-time prompt, per-app view, revoke) in roadmap item 6.
 
 **The Wayland half has the same shape, and is narrower since 2026-11-07**: Evo
 separates apps from the system by connection class (see [Wayland trust
@@ -1205,14 +1493,12 @@ filter could: an app can no longer `ptrace` the shell, read its `/proc/<pid>`
 or its profile (`/var/lib/pyxis/profiles/bloom` is geckouser 0700). What remains
 open:
 
-- **Apps share one uid with each other** (see above), so the kernel doesn't
-  keep one app out of another's process or profile; a uid per app is the next step.
-- **Echo's socket is mode 0666 and has no peer credentials**, and an app has to
-  reach it (the bridge connects to it), so a native client that opens the
-  socket directly can still call anything on the bus (`echo-cli` does). The
-  bridge's deny-by-default table covers only `pyxis://` apps. Closing this
-  needs identity on the bus (peer credentials plus a role file), which the uid
-  split makes possible and nobody has built.
+- Apps have separate uids (since 2026-11-16), so the kernel keeps one app out
+  of another's processes, data and profile; nothing yet confines an app's
+  syscalls (no seccomp filter or LSM profile for native apps).
+- **Echo's socket is mode 0666**, as it must be (apps reach it), but since
+  2026-11-16 Echo checks every call and signal by the peer's kernel identity
+  (`SO_PEERCRED`): see [Bus permissions](#bus-permissions-and-hardening-wave-1).
 - **Anything root or geckoOS-boot starts that draws a window is trusted**, by
   design. Check new launch paths. The one that looked like a gap, Puppis's
   `GeckoAppLauncher` (reached from Rockhopper), isn't a launch path: it **starts
@@ -1224,10 +1510,126 @@ open:
   exec, so that can't happen unwrapped by accident. Every launch Nova makes
   (vela apps, native ipk apps, the external browser) goes through
   `contained_launch`; a nova test counts the call sites.
-- A **window's title** is still the client's text; and apps can still use
+- A **window's title** is still the client's text, though the bar leads with
+  the app's trusted name once Bloom sends `SetAppIdentity`; and apps can still use
   `/tmp` (sticky, shared with the shell's uid for reading world-readable files).
-- `PR_SET_NO_NEW_PRIVS` is not set on the app (Gecko's own sandbox sets it for
-  content); setting it at the launch would be a further hardening.
+- `PR_SET_NO_NEW_PRIVS` is set on every app by `pyxis-wlctx` (wlctx.rs, after
+  the uid drop). No LSM profile or seccomp filter confines native apps yet.
+
+## Bus permissions and hardening (wave 1)
+
+**Built 2026-11-16** (audit and lanes: `docs/internal/pyxis-hardening-plan.md`;
+wave 2 is planned there). Verified on device: the shell's uid is refused
+`process.spawn` and `Echo.EmitSignal`, an app's is refused `process.spawn`,
+root still works, and an app connection hears none of a terminal's output while
+root hears all of it; nine overlay/Echo suites pass.
+
+- **Tiers** (`echo/src/security.rs`, from `SO_PEERCRED`, never from the
+  message): `Root` (uid 0, the daemon's, system accounts below 1000) passes
+  everything; `Shell` (uid 1000, the shell's vela) passes every rule but
+  `RootOnly` (all of `org.geckoOS.process.*`, `Echo.EmitSignal`, and
+  filesystem calls with no `scope`); `User` (1002-9999) and `App` (1001,
+  10000+, and any other unplanned uid, `nobody` included) get only what
+  `access_rule` grants by capability, checked against the caller's app,
+  resolved from its pid (`AppHost::app_id_for_pid`, walking parents to the
+  `pyxis-wlctx` helper) and Nova's manifest grants. Unlisted `org.geckoOS.*`
+  methods are Root/Shell only. `Tier::is_privileged()` is Root or Shell.
+  `org.geckoOS.*` names can be registered by Root only.
+- **The bus and the bridge must agree.** A method the bridge forwards to an app
+  must be allowed in `access_rule` too, or the app is refused on a device while
+  the dev mock answers. When adding a bridge entry, add the rule.
+  (`novaBridgeContract.test.ts` pins the SDK's nova calls to the bridge table.)
+- **Signals** (`echo/src/signal_policy.rs`): only Root may emit on an
+  `org.geckoOS.*` interface (a refusal is logged once per connection), and each
+  connection hears what `signal_rule` allows: Root and Shell everything (the
+  bridge then filters per page), an app only public signals and those its
+  capabilities cover, mirroring `BRIDGE_SIGNALS`. Signals not in that table
+  (`Echo.Shutdown`, `Echo.Pong`) are Root/Shell only.
+- **Passwords** (`session.rs`, `privilege.rs`, `accounts.rs`): an account with
+  no password still unlocks the screen press-to-enter, but privileged access
+  refuses it with `reason: "no-password"` (the prompt sends the user to
+  Settings → Users & Lock). The rate limit is per user and persists in
+  `/run/pyxis/auth-limits.json` (`PYXIS_AUTH_LIMITS` overrides), so an Echo
+  restart no longer resets it. `privilege.Authenticate` must name a
+  `requestId`; the prompt's app name comes from Nova, never the caller.
+- **Terminal**: the user's shell runs as the session user (not root) with a
+  cleared environment. `process.kill` takes only known signal names or 1-64.
+- **Image** (needs the rootfs and kernel rebuilt, not yet verified on device):
+  `PYXIS_DEV_IMAGE` (default 1) keeps the root shells on tty1/ttyS0 that the
+  harness needs; 0 gives getty logins. `/etc/sysctl.d/90-pyxis-hardening.conf`
+  (kptr/dmesg restrict, Yama ptrace 1, protected links/fifos/regular, BPF and
+  redirect hardening) is applied by rcS; `/tmp` is `nosuid,nodev`. The kernel
+  gains Yama, Landlock, lockdown (integrity, forced at build time), usercopy,
+  fortify, slab and init-on-alloc hardening, and loses kexec
+  (`scripts/build-kernel.sh`).
+
+### Wave 2 (2026-11-16)
+
+Verified on device with the binaries, bridge, Bloom, Settings, Installer and
+manifests pushed (the image predates it), and the dev marker pushed too.
+
+- **Signed packages** (`echo/src/services/package_sig.rs`, used by both the
+  installer and `nova.Install`): a package installs only with a detached
+  `<pkg>.sig` (raw `openssl dgst -sha256 -sign` bytes; optional
+  `<pkg>.sig.keyid`, else every key is tried) that verifies against
+  `/etc/pyxis/keys/<id>.pub`. **Dev images allow unsigned** packages: the marker
+  `/etc/pyxis/allow-unsigned-packages` is created by create-rootfs.sh when
+  `PYXIS_DEV_IMAGE=1` (the suites' acceptance .ipk is unsigned; an image
+  without the marker refuses it, as `nova.Install`'s and the installer's
+  `"unsigned"` errors say). Both paths verify and install a root-owned private
+  copy, never the user-writable original; Nova refuses tar members that aren't
+  regular files or directories. Install sources: `/var/lib/pyxis/incoming`,
+  `/media`, `/home` (not `/tmp` or `/root`). vroom signs: `pyxis keygen <id>`,
+  `pyxis sign <ipk> --key <pem> [--key-id <id>]`, or `signing` in pyxis.json.
+- **Privileged ids are the image's**: only System-tier (image) apps may hold a
+  `PRIVILEGED_APP_IDS` id's privileged capabilities; an .ipk named `terminal`
+  gets none, and nor does a built-in re-shipped as an .ipk update.
+- **A uid per app** (`nova.rs` `app_uid`): from `/var/lib/pyxis/uids.json`
+  (`{"high_water", "apps": {id: uid}}`), allocated from 10000 up, never reused;
+  the shell's apps (bloom, bloom-overlay, `PYXIS_SHELL_APPS`) never get an
+  entry. `pyxis-wlctx` gives each app a private `/tmp` (tmpfs, the host's
+  `/tmp/.X11-unix` bound in).
+- **`network` split**: `network:read` (status, addresses, scan) and privileged
+  `network:manage` (connect, DNS, hostname, interfaces); a plain `network` in a
+  manifest means read.
+- **Firewall** (needs the rootfs and kernel rebuilt): nftables, default-drop
+  inbound (loopback, established, DHCP, ICMP/ND rate-limited), applied by rcS;
+  netfilter is in the kernel's ensure list.
+- **Still open**: no update mechanism, the Wi-Fi password is on nmcli's argv,
+  no seccomp/LSM confinement of native apps.
+
+### Wave 3: one root-access dialog (2026-11-16)
+
+Every root action asks the user, as polkit does on Ubuntu, through the shell's
+`PrivilegePromptDialog` (contract and lanes: `pyxis-hardening-plan.md`,
+"Wave 3"). Verified on device by `alpha5-root-dialog.txt`.
+
+- **What asks** (`echo/src/actions.rs`): `package.install`
+  (`installer.Install`, `nova.Install`) and `package.remove`
+  (`installer.Remove`, `nova.Uninstall`) every time; `network.manage`
+  (connectWifi, disconnectWifi, setInterfaceEnabled, setDNS, setHostname) once,
+  then 300 s per app; `accounts.manage` (create, delete) every time; and the
+  older `filesystem.system-write` flow. Not prompted (GNOME's defaults):
+  timezone, power, `accounts.setPassword`, session, settings, windows. **Root
+  callers (Evo, echo-cli as root) never ask; the shell does** (as `bloom`).
+- **How** (`daemon.rs` `hold_decision`, `privilege.rs` `authorize`): after the
+  access check, a call whose action has no live grant is held in a spawned task
+  (the connection keeps reading, so the shell's own answer can arrive on it);
+  Echo emits `PrivilegeRequested` with `action` and `details` (taken from the
+  call by Echo, never the app's text) and the call completes on
+  `privilege.Authenticate {requestId, password}`, or fails with error text
+  `{"reason":"denied"|"timeout"|"no-password",…}` on `Dismiss`, after 120 s, or
+  for an account with no password. Grants are per (app, action), cleared on
+  lock. An app whose id doesn't resolve is refused outright.
+- **Clients**: held calls get 150 s in the bridge (`HELD_CALL_TIMEOUT_MS`); the
+  SDK's `callMethod` rethrows Echo's refusals (`isPolicyRefusal`) instead of
+  falling back to the mock, which used to turn a refused install into a fake
+  success; `installErrorText` words them. echo-cli (`EchoClient::call_method`)
+  now skips signals and frames not answering its call: with a held call the
+  connection stays free, so signals arrive before the reply.
+- **Dialog**: title and sentence per action from `details` and Nova's name
+  ("Installer wants to install **Weather** 1.2"); `data-privilege-request-action`
+  marks the action for suites (`data-privilege-action` is the buttons').
 
 ## Consolidated roadmap (dependency order)
 
@@ -1377,3 +1779,4 @@ Read these directly for full depth — this file is a summary, not a replacement
 - `pyxis-gecko-embedding-plan.md` — commits to the `pyxis://` custom-scheme + from-source Gecko build ("Approach A") over libxul FFI embedding ("Approach B", rejected).
 - `pyxis-scheme-and-kiosk-plan.md` — file-by-file implementation plan for the `pyxis://` protocol handler and `vela` kiosk run mode.
 - `nova-runtime-host-plan.md` — full crate design for `nova/` (app manifest/install/launch-composition layer).
+- `docs/internal/pyxis-visual-identity-plan.md` (and `mockups/`) — the shell's visual identity; `pyxis-identity-upstream.md` — what remochi, Duyo and the apps need for it; `next-image-checklist.md` — what the next rebuild picks up and how to verify it. `pyxis-glass-and-lock-plan.md` — the frosted title bar and the lock screen, with the lanes' binding contracts.
